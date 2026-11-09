@@ -24,7 +24,9 @@
 #include "agx_abi.h"
 #include "agx_bo.h"
 #include "agx_compile.h"
+#ifdef HAVE_LIBDRM
 #include "agx_device_virtio.h"
+#endif
 #include "agx_scratch.h"
 #include "decode.h"
 #include "glsl_types.h"
@@ -33,14 +35,22 @@
 #include "libagx_shaders.h"
 
 #include <fcntl.h>
+#ifdef HAVE_LIBDRM
 #include <xf86drm.h>
 #include "drm-uapi/dma-buf.h"
 #include "vdrm.h"
+#endif
+#ifdef _WIN32
+#include "agx_device_d3dkmt.h"
+#include <windows.h> /* HANDLE / CloseHandle, agx_close_device() */
+#endif
 #include "util/blob.h"
 #include "util/log.h"
 #include "util/mesa-blake3.h"
 #include "util/os_file.h"
+#ifdef HAVE_LIBDRM
 #include "util/os_mman.h"
+#endif
 #include "util/os_time.h"
 #include "util/simple_mtx.h"
 #include "util/u_math.h"
@@ -48,6 +58,12 @@
 #include "git_sha1.h"
 #include "nir_serialize.h"
 
+/*
+ * The Linux DRM / virtio-gpu backend bodies. A non-libdrm backend (the
+ * Windows winsys in agx_device_win.c / agx_device_d3dkmt.c) installs its own
+ * agx_device_ops_t before agx_open_device() runs and never reaches these.
+ */
+#ifdef HAVE_LIBDRM
 int
 asahi_simple_ioctl(struct agx_device *dev, unsigned cmd, void *req)
 {
@@ -86,6 +102,7 @@ agx_drm_bo_madvise(struct agx_device *dev, uint32_t handle, bool dontneed,
    *retained = args.retained != 0;
    return 0;
 }
+#endif /* HAVE_LIBDRM */
 
 /* clang-format off */
 static const struct debug_named_value agx_debug_options[] = {
@@ -159,8 +176,11 @@ agx_bo_free(struct agx_device *dev, struct agx_bo *bo)
                     DRM_ASAHI_BIND_UNBIND))
       agx_va_free(dev, bo->va, false);
 
+#ifdef HAVE_LIBDRM
+   /* prime_fd is always -1 on Windows: no dma-buf there. */
    if (bo->prime_fd != -1)
       close(bo->prime_fd);
+#endif
 
    /* Reset the handle. This has to happen before the GEM close to avoid a race.
     */
@@ -180,6 +200,7 @@ agx_bo_free(struct agx_device *dev, struct agx_bo *bo)
  * a log as a bare EIO with no cause. Ask the VM for its sticky status and put
  * the real error next to the rejected op.
  */
+#ifdef HAVE_LIBDRM
 static bool
 agx_drm_vm_status(struct agx_device *dev, int32_t *error)
 {
@@ -249,6 +270,7 @@ agx_drm_bo_bind(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
 
    return ret;
 }
+#endif /* HAVE_LIBDRM */
 
 uint64_t
 agx_bo_get_g17p_vdm_alias(struct agx_device *dev, struct agx_bo *bo)
@@ -388,6 +410,7 @@ agx_bind_timestamps(struct agx_device *dev, struct agx_bo *bo, uint32_t *handle)
    return ret;
 }
 
+#ifdef HAVE_LIBDRM
 static struct agx_bo *
 agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
              enum agx_bo_flags flags)
@@ -892,6 +915,34 @@ const agx_device_ops_t agx_device_drm_ops = {
    .bo_free = agx_drm_bo_close,
    .bo_madvise = agx_drm_bo_madvise,
 };
+#else /* !HAVE_LIBDRM */
+/*
+ * dma-buf import/export has no Windows equivalent here; Win32 external
+ * memory goes through the D3DKMT winsys (agx_d3dkmt_bo_*_external) instead.
+ * hk still references these from its fd paths, whose extensions are not
+ * advertised on Windows.
+ */
+struct agx_bo *
+agx_bo_import(struct agx_device *dev, int fd)
+{
+   errno = ENOTSUP;
+   return NULL;
+}
+
+int
+agx_bo_export(struct agx_device *dev, struct agx_bo *bo)
+{
+   errno = ENOTSUP;
+   return -1;
+}
+
+bool
+agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo)
+{
+   errno = ENOTSUP;
+   return false;
+}
+#endif /* HAVE_LIBDRM */
 
 static uint64_t
 gcd(uint64_t n, uint64_t m)
@@ -979,10 +1030,12 @@ agx_cleanup_partial_device(struct agx_device *dev, unsigned initialized)
       simple_mtx_destroy(&dev->bo_map_lock);
       agxdecode_destroy_context(dev->agxdecode);
    }
+#ifdef HAVE_LIBDRM
    if (initialized & AGX_INIT_VIRTIO) {
       vdrm_device_close(dev->vdrm);
       dev->vdrm = NULL;
    }
+#endif
 }
 
 bool
@@ -997,6 +1050,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
    /* A backend with preset operations has already identified its device. */
    if (dev->ops.get_params == NULL) {
+#ifdef HAVE_LIBDRM
       dev->ops = agx_device_drm_ops;
 
       /* DRM version check */
@@ -1032,6 +1086,10 @@ agx_open_device(void *memctx, struct agx_device *dev)
       }
 
       drmFreeVersion(version);
+#else
+      /* Every non-libdrm caller (the Windows winsys) presets dev->ops. */
+      goto fail;
+#endif
    }
 
    memset(&dev->params, 0, sizeof(dev->params));
@@ -1167,7 +1225,12 @@ agx_open_device(void *memctx, struct agx_device *dev)
    assert(reservation == LIBAGX_PRINTF_BUFFER_ADDRESS);
    reservation += LIBAGX_PRINTF_BUFFER_SIZE;
 
+#ifdef _WIN32
+   /* VidMm reserves and maps GPU VA in 64 KiB units. */
+   dev->guard_size = 0x10000;
+#else
    dev->guard_size = AIL_PAGESIZE;
+#endif
 
    // Put the USC heap at the bottom of the user address space, 4GiB aligned
    dev->shader_base =
@@ -1333,6 +1396,25 @@ agx_open_device(void *memctx, struct agx_device *dev)
          : agx_va_user_limit(dev->chip, heap_below_usc,
                              vm_create.kernel_start);
    uint64_t user_size = user_limit - user_start;
+
+#ifdef _WIN32
+   /* One AGX leaf table covers 2048 native 16 KiB pages (32 MiB).  WDDM's
+    * 4 KiB/64 KiB choice is made at this table granularity, so isolate the
+    * fixed zero/scratch mappings from both long-lived render heaps. */
+   const uint64_t uat_leaf_span = UINT64_C(0x02000000);
+   if ((AGX_ZERO_PAGE_ADDRESS & (uat_leaf_span - 1)) != 0 ||
+       (dev->shader_base & (uat_leaf_span - 1)) != 0 ||
+       (user_start & (uat_leaf_span - 1)) != 0 ||
+       (AGX_ZERO_PAGE_ADDRESS / uat_leaf_span) ==
+          (dev->shader_base / uat_leaf_span) ||
+       (AGX_ZERO_PAGE_ADDRESS / uat_leaf_span) ==
+          (user_start / uat_leaf_span) ||
+       (dev->shader_base / uat_leaf_span) ==
+          (user_start / uat_leaf_span)) {
+      fprintf(stderr, "D3DKMT VA heaps do not occupy distinct UAT leaves\n");
+      goto fail;
+   }
+#endif
 
    int ret = dev->ops.simple_ioctl(dev, DRM_IOCTL_ASAHI_VM_CREATE, &vm_create);
    if (ret) {
@@ -1669,7 +1751,18 @@ agx_close_device(struct agx_device *dev)
       util_vma_heap_finish(&dev->g17p_vdm_alias_heap);
    glsl_type_singleton_decref();
 
+   /* D3DKMT keeps its winsys object in hdev; only the private AGXKMD backend
+    * keeps an NT HANDLE there.  Release both at this one ownership boundary
+    * so a successful Vulkan teardown cannot leak either. */
+#ifdef _WIN32
+   if (dev->ops.simple_ioctl == agx_device_d3dkmt_ops.simple_ioctl)
+      agx_d3dkmt_close_device(dev);
+   else
+      CloseHandle((HANDLE)dev->hdev);
+   dev->hdev = NULL;
+#else
    close(dev->fd);
+#endif
    dev->fd = -1;
 }
 
@@ -1777,6 +1870,7 @@ agx_destroy_command_queue(struct agx_device *dev, uint32_t queue_id)
                                 &queue_destroy);
 }
 
+#ifdef HAVE_LIBDRM
 int
 agx_import_sync_file(struct agx_device *dev, struct agx_bo *bo, int fd)
 {
@@ -1820,6 +1914,22 @@ agx_export_sync_file(struct agx_device *dev, struct agx_bo *bo)
 
    return export_sync_file_ioctl.fd;
 }
+#else /* !HAVE_LIBDRM */
+/* dma-buf implicit sync does not exist on Windows. */
+int
+agx_import_sync_file(struct agx_device *dev, struct agx_bo *bo, int fd)
+{
+   errno = ENOTSUP;
+   return -1;
+}
+
+int
+agx_export_sync_file(struct agx_device *dev, struct agx_bo *bo)
+{
+   errno = ENOTSUP;
+   return -1;
+}
+#endif /* HAVE_LIBDRM */
 
 void
 agx_debug_fault(struct agx_device *dev, uint64_t addr)

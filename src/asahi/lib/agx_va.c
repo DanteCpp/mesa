@@ -22,8 +22,16 @@ struct agx_va *
 agx_va_alloc(struct agx_device *dev, uint64_t size_B, uint64_t align_B,
              enum agx_va_flags flags, uint64_t fixed_va)
 {
+#ifdef _WIN32
+   const uint64_t d3dkmt_granularity = UINT64_C(0x10000);
+   if (size_B > UINT64_MAX - (d3dkmt_granularity - 1))
+      return NULL;
+   size_B = ALIGN_POT(size_B, d3dkmt_granularity);
+   align_B = MAX2(align_B, d3dkmt_granularity);
+#endif
    assert((fixed_va != 0) == !!(flags & AGX_VA_FIXED));
-   assert((fixed_va % align_B) == 0);
+   if ((fixed_va % align_B) != 0)
+      return NULL;
 
    /* All allocations need a guard at the end to prevent overreads.
     *

@@ -21,6 +21,9 @@
 #include "util/u_printf.h"
 #include "util/vma.h"
 
+/* Internal-only marker consumed by the D3DKMT winsys. It is never sent to
+ * drm_asahi; queue.c only emits it when write_set_contract is true. */
+#define AGX_SUBMIT_WRITE_SET_COMPLETE (1u << 31)
 #include "agx_bo.h"
 #include "agx_chip.h"
 #include "agx_pack.h"
@@ -28,6 +31,16 @@
 #include "layout.h"
 #include "libagx_dgc.h"
 
+/*
+ * honeykrisp-h1-execution.md SS2.1 row D2: vdrm.h and asahi_proto.h are not
+ * self-contained without libdrm (asahi_proto.h embeds struct vdrm_shmem,
+ * pulled from vdrm.h's own libdrm-using guts) and neither is needed by this
+ * header itself -- only by pointer (struct vdrm_device *dev->vdrm,
+ * struct asahi_ccmd_submit_res *agx_submit_virt::extres below). On Windows
+ * (no HAVE_LIBDRM) forward-declare instead; the real includes move into the
+ * virtio-only TUs that need the full definitions (agx_device_virtio.c,
+ * agx_device.c under HAVE_LIBDRM).
+ */
 #ifdef HAVE_LIBDRM
 #include "vdrm.h"
 #include "asahi_proto.h"
@@ -137,6 +150,11 @@ typedef struct {
 
    int (*simple_ioctl)(struct agx_device *dev, unsigned cmd, void *req);
    void (*bo_munmap)(struct agx_device *dev, struct agx_bo *bo);
+   /* Make CPU writes to [offset, offset + size) of a BO visible to the
+    * GPU. NULL for coherent backends (Linux DRM and virtio); the D3DKMT
+    * winsys publishes the range through D3DKMTInvalidateCache. */
+   int (*bo_sync_for_device)(struct agx_device *dev, struct agx_bo *bo,
+                             size_t offset, size_t size);
    void (*bo_free)(struct agx_device *dev, uint32_t handle);
 
 } agx_device_ops_t;
@@ -178,6 +196,8 @@ struct agx_device {
    /* Native DRM 0.2 added the four render resource-specifier high dwords.
     * Stock 0.0 kernels do not consume an oversized render packet's tail. */
    bool render_rsrc_spec_hi;
+   /* The D3DKMT winsys enforces an exact GPU write set per submit. */
+   bool write_set_contract;
    agx_device_ops_t ops;
 
    /* vdrm device */
@@ -189,6 +209,16 @@ struct agx_device {
 
    /* Device handle */
    int fd;
+
+   /*
+    * honeykrisp-h1-execution.md SS1: Windows winsys handle (agx_device_win.c
+    * agx_win_open_device()), used as the DeviceIoControl target for every
+    * ntagx_ioctl() call. NULL/unused on Linux/virtio, where `fd` above is
+    * the live handle instead; `fd` stays -1 on Windows (opaque pointer, not
+    * cast to/from `int fd` -- real type is an NT HANDLE, kept void* here so
+    * this header stays includable without <windows.h>).
+    */
+   void *hdev;
 
    /* VM handle */
    uint32_t vm_id;
@@ -318,7 +348,9 @@ static inline int
 agx_bo_sync_for_device(struct agx_bo *bo, size_t offset, size_t size)
 {
    agx_bo_assert_range(bo, offset, size);
-   return 0;
+   if (bo->dev->ops.bo_sync_for_device == NULL)
+      return 0;
+   return bo->dev->ops.bo_sync_for_device(bo->dev, bo, offset, size);
 }
 
 /*

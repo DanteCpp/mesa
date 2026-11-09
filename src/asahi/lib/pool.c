@@ -137,5 +137,8 @@ agx_pool_upload_aligned_with_bo(struct agx_pool *pool, const void *data,
    memcpy(transfer.cpu, data, sz);
    agx_bo_assert_range(*out_bo,
                               transfer.gpu - (*out_bo)->va->addr, sz);
+   if (agx_bo_sync_for_device(*out_bo,
+                              transfer.gpu - (*out_bo)->va->addr, sz))
+      return 0;
    return transfer.gpu;
 }

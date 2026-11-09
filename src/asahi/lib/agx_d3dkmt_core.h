@@ -236,7 +236,7 @@ bool agx_d3dkmt_pool_release_record(
 #define AGX_D3DKMT_BO_WRITEBACK (1u << 3)
 #define AGX_D3DKMT_BO_SHAREABLE (1u << 4)
 #define AGX_D3DKMT_BO_READONLY  (1u << 5)
-#define AGX_D3DKMT_BO_SCANOUT_DONOR (1u << 6)
+#define AGX_D3DKMT_BO_SCANOUT_DONOR (1u << 9)
 
 /* A drm_asahi_gem_bind_op with the GEM handle already resolved to D3DKMT. */
 struct agx_d3dkmt_bind {

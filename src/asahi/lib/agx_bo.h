@@ -50,6 +50,14 @@ enum agx_bo_flags {
     * is the application's pointer, which is never unmapped or moved, and the
     * BO is never cached. Implies AGX_BO_NO_CACHE. */
    AGX_BO_HOST_PTR = 1 << 8,
+
+   /* Windows D3DKMT only: this BO is Aurora's tight-linear scanout image and
+    * offers itself to the KMD as the content DONOR for the desktop primary
+    * the same process creates immediately afterwards (AppleAgxWddm
+    * agxw_contract.h AGXW_ALLOC_SCANOUT_DONOR).  Ignored by every other
+    * winsys. Bit 9: upstream took bit 8 for AGX_BO_HOST_PTR.
+    */
+   AGX_BO_SCANOUT_DONOR = 1 << 9,
 };
 
 enum agx_va_flags {
@@ -159,6 +167,12 @@ agx_bo_writer(uint32_t queue, uint32_t syncobj)
 {
    return (((uint64_t)queue) << 32) | syncobj;
 }
+
+#if AGX_GPU_DIAG >= 2
+bool ntagx_bo_log_enabled(void);
+#else
+#define ntagx_bo_log_enabled() false
+#endif
 
 struct agx_bo *agx_bo_create(struct agx_device *dev, size_t size,
                              unsigned align, enum agx_bo_flags flags,

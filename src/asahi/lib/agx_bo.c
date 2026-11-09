@@ -627,6 +627,22 @@ agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo)
    simple_mtx_unlock(&dev->bo_map_lock);
 }
 
+/* NTAGX_BO_LOG=1 prints the identity of every BO.  Read straight from the
+ * environment rather than via dev->debug, so "the flag was not read" can never
+ * be mistaken for "the thing did not happen".  Cached; agx_bo_create is hot. */
+#if AGX_GPU_DIAG >= 2
+bool
+ntagx_bo_log_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *v = getenv("NTAGX_BO_LOG");
+      cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+   }
+   return cached == 1;
+}
+#endif
+
 struct agx_bo *
 agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
               enum agx_bo_flags flags, const char *label)
