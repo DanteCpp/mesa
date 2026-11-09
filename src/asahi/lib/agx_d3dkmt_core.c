@@ -785,3 +785,88 @@ agx_d3dkmt_create_flags_external(
     * physically-chunked and arbitrary user pages are not. */
    return flags;
 }
+
+/*
+ * Checks every import shares: the KMD's reply is for this allocation, in the
+ * layout this file was written against, and describes geometry the KMD could
+ * have produced (allocation_size is a nonzero multiple of the 64 KiB WDDM
+ * page and covers what was requested).
+ */
+static bool
+import_reply_valid(const struct agx_d3dkmt_allocation_info *kmd,
+                   uint32_t allocation)
+{
+   if (kmd == NULL || allocation == 0)
+      return false;
+   if (kmd->version != AGX_D3DKMT_ALLOCATION_INFO_VERSION ||
+       kmd->struct_size != sizeof(*kmd) || kmd->allocation != allocation)
+      return false;
+   if (kmd->allocation_size == 0 ||
+       (kmd->allocation_size &
+        (AGX_D3DKMT_RESERVATION_GRANULARITY - 1)) != 0)
+      return false;
+   if (kmd->requested_size == 0 ||
+       kmd->requested_size > kmd->allocation_size)
+      return false;
+   if (!(kmd->flags & AGXW_ALLOC_SHAREABLE) ||
+       (kmd->flags & AGXW_ALLOC_VM_PRIVATE))
+      return false;
+   return true;
+}
+
+/* Native-page aligned `claimed`, if it fits inside the KMD allocation. */
+static bool
+import_aligned_size(uint64_t claimed, const struct agx_d3dkmt_allocation_info *kmd,
+                    uint64_t *size_out)
+{
+   const uint64_t page = AGX_D3DKMT_PAGE_SIZE;
+
+   if (claimed == 0 || claimed > kmd->allocation_size ||
+       claimed > UINT64_MAX - (page - 1))
+      return false;
+
+   const uint64_t aligned = (claimed + page - 1) & ~(page - 1);
+   if (aligned > kmd->allocation_size)
+      return false;
+
+   *size_out = aligned;
+   return true;
+}
+
+int
+agx_d3dkmt_import_size(const struct agxw_alloc_private *blob,
+                       const struct agx_d3dkmt_allocation_info *kmd,
+                       uint32_t allocation, uint64_t *size_out)
+{
+   uint64_t size;
+
+   if (blob == NULL || size_out == NULL || !import_reply_valid(kmd, allocation))
+      return AGX_D3DKMT_ERR_INVAL;
+
+   /* One allocation per resource: the opened blob must be the very blob the
+    * KMD planned from. A sharer that inflates (or shrinks) the size or
+    * changes the cache class after the fact no longer matches. */
+   if (blob->size != kmd->requested_size || blob->flags != kmd->flags)
+      return AGX_D3DKMT_ERR_INVAL;
+
+   if (!import_aligned_size(blob->size, kmd, &size))
+      return AGX_D3DKMT_ERR_INVAL;
+
+   *size_out = size;
+   return AGX_D3DKMT_OK;
+}
+
+int
+agx_d3dkmt_borrowed_import_size(uint64_t claimed_size,
+                                const struct agx_d3dkmt_allocation_info *kmd,
+                                uint32_t allocation, uint64_t *size_out)
+{
+   uint64_t size;
+
+   if (size_out == NULL || !import_reply_valid(kmd, allocation) ||
+       !import_aligned_size(claimed_size, kmd, &size))
+      return AGX_D3DKMT_ERR_INVAL;
+
+   *size_out = size;
+   return AGX_D3DKMT_OK;
+}

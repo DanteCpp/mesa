@@ -508,6 +508,75 @@ int agx_d3dkmt_read_range_add(struct agxw_submit_read_range *ranges,
                               uint32_t *count, uint32_t capacity,
                               uint64_t gpu_va, uint64_t length);
 
+/* -------------------------------------------------------------------------
+ * Imported allocation geometry.
+ *
+ * The 32-byte allocation blob an opener receives from D3DKMTOpenResource is
+ * the one the SHARER's user-mode driver wrote at CreateAllocation time. Its
+ * `size` is a claim by another process, not a fact about the allocation, so
+ * it must never size this process's BO, CPU lock range or GPU VA range on its
+ * own. The size an import may use is decided against geometry the KMD
+ * reports for the allocation it actually created.
+ *
+ * The KMD reports it through one escape, issued on the importing device for
+ * an allocation handle that device has opened:
+ *
+ *    op      = AGX_D3DKMT_ESC_QUERY_ALLOCATION (3)
+ *    payload = struct agx_d3dkmt_allocation_info (32 bytes)
+ *
+ * AppleAgxWddm's contract (agxw_contract.h) does not define this escape yet.
+ * Until it does, its escape validator refuses op 3 and every external import
+ * fails closed. The KMD side must:
+ *   - resolve `allocation` with DxgkCbAcquireHandleData(DXGK_HANDLE_ALLOCATION)
+ *     in the calling process and refuse a handle it cannot resolve;
+ *   - echo `allocation`, and return the allocation plan's `flags`,
+ *     `requested_size` and `allocation_size` (the value it reported as
+ *     DXGK_ALLOCATIONINFO::Size).
+ * ------------------------------------------------------------------------- */
+#define AGX_D3DKMT_ESC_QUERY_ALLOCATION     3u
+#define AGX_D3DKMT_ALLOCATION_INFO_VERSION  1u
+
+struct agx_d3dkmt_allocation_info {
+   uint32_t version;         /* in:  AGX_D3DKMT_ALLOCATION_INFO_VERSION */
+   uint32_t struct_size;     /* in:  sizeof(struct agx_d3dkmt_allocation_info) */
+   uint32_t allocation;      /* in:  D3DKMT allocation handle; out: echoed */
+   uint32_t flags;           /* out: enum agxw_alloc_flags of the KMD plan */
+   uint64_t requested_size;  /* out: bytes the creating blob asked for */
+   uint64_t allocation_size; /* out: bytes the KMD allocated (64 KiB units) */
+};
+
+#ifdef __cplusplus
+static_assert(sizeof(struct agx_d3dkmt_allocation_info) == 32,
+              "allocation info payload width");
+#else
+_Static_assert(sizeof(struct agx_d3dkmt_allocation_info) == 32,
+               "allocation info payload width");
+#endif
+
+/*
+ * Size a resource-backed import (OPAQUE_WIN32 / OPAQUE_WIN32_KMT).
+ *
+ * `blob` is the opened allocation's private data; `kmd` is the KMD's reply
+ * for `allocation`, or NULL when the KMD gave none. The one-allocation
+ * resource shape is exact: the blob must restate the KMD's requested size and
+ * flags byte for byte, the allocation must be shareable, and the native-page
+ * aligned size must fit inside what the KMD allocated. On success *size_out
+ * is that aligned size. Returns AGX_D3DKMT_ERR_INVAL for any mismatch or
+ * missing reply; nothing is written on failure.
+ */
+int agx_d3dkmt_import_size(const struct agxw_alloc_private *blob,
+                           const struct agx_d3dkmt_allocation_info *kmd,
+                           uint32_t allocation, uint64_t *size_out);
+
+/*
+ * Size a borrowed local-allocation import, whose only size claim is the
+ * importing application's allocationSize. Same KMD reply checks as above;
+ * the aligned claim must fit inside the allocation.
+ */
+int agx_d3dkmt_borrowed_import_size(uint64_t claimed_size,
+                                    const struct agx_d3dkmt_allocation_info *kmd,
+                                    uint32_t allocation, uint64_t *size_out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -508,6 +508,10 @@ d3dkmt_bo_free(struct agx_device *dev, uint32_t handle)
  * blob, checked in d3dkmt_external_open(). */
 #define AGX_D3DKMT_FOREIGN_BLOB_MAX 4096u
 
+static int d3dkmt_query_allocation(struct agx_d3dkmt_winsys *ws,
+                                   agx_kmt_handle allocation,
+                                   struct agx_d3dkmt_allocation_info *info);
+
 struct agx_d3dkmt_external_sizes {
    uint32_t runtime_size;
    uint32_t resource_driver_size;
@@ -766,7 +770,27 @@ agx_d3dkmt_bo_import_external(
    enum agx_bo_flags flags = AGX_BO_SHARED | AGX_BO_SHAREABLE;
    if (private_data.flags & AGXW_ALLOC_WRITEBACK)
       flags |= AGX_BO_WRITEBACK;
-   const size_t size = ALIGN_POT((size_t)private_data.size, AIL_PAGESIZE);
+
+   /* private_data.size is the sharer's claim. Size the BO, its CPU lock and
+    * its GPU VA only from a claim the KMD's own allocation confirms. */
+   struct agx_d3dkmt_allocation_info kmd;
+   uint64_t checked_size = 0;
+   if (d3dkmt_query_allocation(ws, record.allocation, &kmd) != 0 ||
+       agx_d3dkmt_import_size(&private_data, &kmd, record.allocation,
+                              &checked_size) != AGX_D3DKMT_OK ||
+       checked_size > SIZE_MAX) {
+      fprintf(stderr,
+              "D3DKMT import refused: allocation=0x%08x claimed=%llu "
+              "kmd_requested=%llu kmd_size=%llu\n",
+              (unsigned)record.allocation,
+              (unsigned long long)private_data.size,
+              (unsigned long long)kmd.requested_size,
+              (unsigned long long)kmd.allocation_size);
+      d3dkmt_destroy_record(ws, &record);
+      errno = EINVAL;
+      return NULL;
+   }
+   const size_t size = (size_t)checked_size;
 
    struct agx_bo *bo =
       d3dkmt_adopt_allocation(dev, size, AIL_PAGESIZE, flags, &record);
@@ -788,13 +812,30 @@ agx_d3dkmt_bo_import_local(struct agx_device *dev,
       return NULL;
    }
 
-   size = ALIGN_POT(size, AIL_PAGESIZE);
    struct agx_d3dkmt_winsys *ws = agx_d3dkmt_ws(dev);
    const struct agx_d3dkmt_allocation_record record = {
       .allocation = allocation,
       .external_type = AGX_D3DKMT_EXTERNAL_MEMORY_OPAQUE_WIN32_KMT,
       .borrowed = true,
    };
+
+   /* The only size claim here is the application's allocationSize for a
+    * foreign allocation. It must fit inside what the KMD allocated. */
+   struct agx_d3dkmt_allocation_info kmd;
+   uint64_t checked_size = 0;
+   if (d3dkmt_query_allocation(ws, allocation, &kmd) != 0 ||
+       agx_d3dkmt_borrowed_import_size(size, &kmd, allocation,
+                                       &checked_size) != AGX_D3DKMT_OK ||
+       checked_size > SIZE_MAX) {
+      fprintf(stderr,
+              "borrowed local import refused: allocation=0x%08x claimed=%zu "
+              "kmd_size=%llu\n",
+              (unsigned)allocation, size,
+              (unsigned long long)kmd.allocation_size);
+      errno = EINVAL;
+      return NULL;
+   }
+   size = (size_t)checked_size;
 
    if (!d3dkmt_make_resident(ws, allocation)) {
       fprintf(stderr,
@@ -1368,6 +1409,61 @@ d3dkmt_escape(struct agx_d3dkmt_winsys *ws, uint32_t op, void *payload,
 }
 
 /*
+ * The KMD's own geometry for an allocation this device has opened (see
+ * agx_d3dkmt_core.h, "Imported allocation geometry"). Unlike the device
+ * property escapes above it carries an input -- the allocation handle -- and
+ * is issued on ws->device so the KMD resolves that handle in this process.
+ * Any failure, including a KMD that does not know the op, leaves *info zeroed
+ * and returns -1, which the import paths treat as "no KMD size": fail closed.
+ */
+static int
+d3dkmt_query_allocation(struct agx_d3dkmt_winsys *ws, agx_kmt_handle allocation,
+                        struct agx_d3dkmt_allocation_info *info)
+{
+   struct {
+      struct agxw_escape_header hdr;
+      struct agx_d3dkmt_allocation_info info;
+   } blob;
+   static_assert(sizeof(blob) == sizeof(struct agxw_escape_header) +
+                                    sizeof(struct agx_d3dkmt_allocation_info),
+                 "allocation query escape is header + payload, unpadded");
+
+   memset(info, 0, sizeof(*info));
+   memset(&blob, 0, sizeof(blob));
+   blob.hdr = (struct agxw_escape_header){
+      .magic = AGXW_ESCAPE_MAGIC,
+      .version = AGXW_ESCAPE_VERSION,
+      .op = AGX_D3DKMT_ESC_QUERY_ALLOCATION,
+      .payload_size = sizeof(blob.info),
+   };
+   blob.info = (struct agx_d3dkmt_allocation_info){
+      .version = AGX_D3DKMT_ALLOCATION_INFO_VERSION,
+      .struct_size = sizeof(blob.info),
+      .allocation = allocation,
+   };
+
+   struct agx_kmt_escape escape = {
+      .hAdapter = ws->adapter,
+      .hDevice = ws->device,
+      .pPrivateDriverData = &blob,
+      .PrivateDriverDataSize = sizeof(blob),
+   };
+
+   agx_kmt_status st = ws->fns.Escape(&escape);
+   if (!AGX_KMT_SUCCESS(st)) {
+      errno = ENOTSUP;
+      return -1;
+   }
+   if (blob.hdr.status != 0) {
+      errno = -blob.hdr.status;
+      return -1;
+   }
+
+   *info = blob.info;
+   return 0;
+}
+
+/*
  * GET_PARAMS. One of the two escapes -- the AGX global parameter block has no
  * WDDM equivalent at all, and KMTQAITYPE_UMDRIVERPRIVATE is spoken for by the
  * adapter identity blob (CONTRACT.md SS2.4, SS8).
@@ -1611,7 +1707,11 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
           dev, staging,
           read_ranges, &priv->read_range_count) != 0)
       goto out;
-   priv->base.version = AGXW_SUBMIT_PRIVATE_VERSION;
+   /* The record built here is the v3 shape (base + read ranges). Name that
+    * version explicitly: the contract's current AGXW_SUBMIT_PRIVATE_VERSION
+    * has moved on to v5 (split clean set), and tagging a v3 struct with it
+    * makes the shared validator refuse every submit. */
+   priv->base.version = AGXW_SUBMIT_PRIVATE_VERSION_V3;
    priv->base.struct_size = sizeof(*priv);
    priv->base.in_sync_count = 0;
    priv->base.out_sync_count = 0;

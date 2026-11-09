@@ -1126,7 +1126,7 @@ test_contract_blobs_we_emit(void)
    } submit = {
       .header = {
          .base = {
-            .version = AGXW_SUBMIT_PRIVATE_VERSION,
+            .version = AGXW_SUBMIT_PRIVATE_VERSION_V3,
             .struct_size = sizeof(struct agxw_submit_private_v3),
             .flags = AGXW_SUBMIT_READ_SET_COMPLETE,
          },
@@ -1176,6 +1176,126 @@ test_contract_blobs_we_emit(void)
    CHECK_EQ(required, AGXW_GET_TIME_SIZE);
 }
 
+/*
+ * A shared resource's allocation blob is written by the SHARER. Its size must
+ * never size an import on its own: only a size the KMD's allocation confirms
+ * may reach the BO, its CPU lock range and its GPU VA range.
+ */
+static void
+test_import_size_is_kmd_bounded(void)
+{
+   const uint32_t allocation = 0x40000123u;
+   const uint32_t shared_wc = AGXW_ALLOC_SHAREABLE;
+   const struct agxw_alloc_private blob = {
+      .version = AGXW_ALLOC_PRIVATE_VERSION,
+      .struct_size = sizeof(struct agxw_alloc_private),
+      .size = 0x30000u,
+      .flags = shared_wc,
+      .align_log2 = 16,
+   };
+   const struct agx_d3dkmt_allocation_info kmd = {
+      .version = AGX_D3DKMT_ALLOCATION_INFO_VERSION,
+      .struct_size = sizeof(struct agx_d3dkmt_allocation_info),
+      .allocation = allocation,
+      .flags = shared_wc,
+      .requested_size = 0x30000u,
+      .allocation_size = 0x30000u,
+   };
+   uint64_t size = 0;
+
+   /* The one-allocation shape the KMD planned is accepted as is. */
+   CHECK_EQ(agx_d3dkmt_import_size(&blob, &kmd, allocation, &size),
+            AGX_D3DKMT_OK);
+   CHECK_EQ(size, 0x30000u);
+
+   /* A sharer-inflated size is refused, even within the 64 KiB round-up the
+    * KMD applied, and even when it is still page aligned. */
+   struct agxw_alloc_private inflated = blob;
+   inflated.size = 0x40000u;
+   size = 7;
+   CHECK_EQ(agx_d3dkmt_import_size(&inflated, &kmd, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+   CHECK_EQ(size, 7);
+   inflated.size = UINT64_MAX;
+   CHECK_EQ(agx_d3dkmt_import_size(&inflated, &kmd, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+   inflated.size = 0x30001u;
+   CHECK_EQ(agx_d3dkmt_import_size(&inflated, &kmd, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+
+   /* Exact means exact: a shrunken claim or a different cache class is a
+    * different blob from the one the KMD planned. */
+   struct agxw_alloc_private changed = blob;
+   changed.size = 0x10000u;
+   CHECK_EQ(agx_d3dkmt_import_size(&changed, &kmd, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+   changed = blob;
+   changed.flags |= AGXW_ALLOC_WRITEBACK;
+   CHECK_EQ(agx_d3dkmt_import_size(&changed, &kmd, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+
+   /* No KMD reply, a reply for another handle, or a reply in an unknown
+    * layout is missing data: fail closed. */
+   CHECK_EQ(agx_d3dkmt_import_size(&blob, NULL, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+   const struct agx_d3dkmt_allocation_info zero = {0};
+   CHECK_EQ(agx_d3dkmt_import_size(&blob, &zero, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+   struct agx_d3dkmt_allocation_info bad = kmd;
+   bad.allocation = allocation + 1;
+   CHECK_EQ(agx_d3dkmt_import_size(&blob, &bad, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+   bad = kmd;
+   bad.version++;
+   CHECK_EQ(agx_d3dkmt_import_size(&blob, &bad, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+   bad = kmd;
+   bad.struct_size = 24;
+   CHECK_EQ(agx_d3dkmt_import_size(&blob, &bad, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+
+   /* A reply the KMD could not have produced is not trusted either. */
+   bad = kmd;
+   bad.allocation_size = 0x34000u; /* not 64 KiB granular */
+   CHECK_EQ(agx_d3dkmt_import_size(&blob, &bad, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+   bad = kmd;
+   bad.requested_size = bad.allocation_size + 1;
+   CHECK_EQ(agx_d3dkmt_import_size(&blob, &bad, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+   bad = kmd;
+   bad.flags = AGXW_ALLOC_VM_PRIVATE;
+   changed = blob;
+   changed.flags = AGXW_ALLOC_VM_PRIVATE;
+   CHECK_EQ(agx_d3dkmt_import_size(&changed, &bad, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+
+   /* A KMD round-up covers a smaller exact claim; the BO takes the claim at
+    * native-page granularity, never the KMD's padding. */
+   struct agx_d3dkmt_allocation_info rounded = kmd;
+   rounded.requested_size = 0x24000u;
+   rounded.allocation_size = 0x30000u;
+   changed = blob;
+   changed.size = 0x24000u;
+   CHECK_EQ(agx_d3dkmt_import_size(&changed, &rounded, allocation, &size),
+            AGX_D3DKMT_OK);
+   CHECK_EQ(size, 0x24000u);
+
+   /* Borrowed local allocations: the application's allocationSize must fit. */
+   CHECK_EQ(agx_d3dkmt_borrowed_import_size(0x30000u, &kmd, allocation, &size),
+            AGX_D3DKMT_OK);
+   CHECK_EQ(size, 0x30000u);
+   CHECK_EQ(agx_d3dkmt_borrowed_import_size(0x2c001u, &kmd, allocation, &size),
+            AGX_D3DKMT_OK);
+   CHECK_EQ(size, 0x30000u);
+   CHECK_EQ(agx_d3dkmt_borrowed_import_size(0x30001u, &kmd, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+   CHECK_EQ(agx_d3dkmt_borrowed_import_size(0, &kmd, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+   CHECK_EQ(agx_d3dkmt_borrowed_import_size(0x10000u, NULL, allocation, &size),
+            AGX_D3DKMT_ERR_INVAL);
+}
+
 int
 main(void)
 {
@@ -1200,6 +1320,7 @@ main(void)
    test_alloc_flags();
    test_read_range_canonicalization();
    test_contract_blobs_we_emit();
+   test_import_size_is_kmd_bounded();
 
    if (failures) {
       fprintf(stderr, "agx_d3dkmt_core: %d/%d checks FAILED\n", failures,
