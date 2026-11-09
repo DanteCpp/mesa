@@ -29,6 +29,7 @@
 #include "agx_d3dkmt_priv.h"
 
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,8 +87,13 @@ static_assert(AGX_D3DKMT_BO_WRITEBACK == AGX_BO_WRITEBACK, "BO_WRITEBACK");
 static_assert(AGX_D3DKMT_BO_SHAREABLE == AGX_BO_SHAREABLE, "BO_SHAREABLE");
 static_assert(AGX_D3DKMT_BO_READONLY == AGX_BO_READONLY, "BO_READONLY");
 static_assert(AGX_D3DKMT_PAGE_SIZE == AIL_PAGESIZE, "page size");
-static_assert(AGXW_PARAMS_GLOBAL_SIZE == sizeof(struct drm_asahi_params_global),
+static_assert(AGX_D3DKMT_PARAMS_GLOBAL_SIZE ==
+                 sizeof(struct drm_asahi_params_global),
               "GET_PARAMS escape payload size");
+static_assert(AGX_D3DKMT_SUPPORTED_FEATURES == DRM_ASAHI_FEATURE_SOFT_FAULTS,
+              "features the D3DKMT winsys carries");
+static_assert(AGX_D3DKMT_BO_SCANOUT_DONOR == AGX_BO_SCANOUT_DONOR,
+              "BO_SCANOUT_DONOR");
 static_assert(AGXW_GET_TIME_SIZE == sizeof(struct drm_asahi_get_time),
               "GET_TIME escape payload size");
 static_assert((int)AGXW_SYNC_BINARY == (int)DRM_ASAHI_SYNC_SYNCOBJ,
@@ -1237,7 +1243,8 @@ out:
  * asserted away rather than silently ignored.
  * ------------------------------------------------------------------------- */
 static void
-d3dkmt_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr)
+d3dkmt_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
+               size_t length)
 {
    struct agx_d3dkmt_winsys *ws = agx_d3dkmt_ws(dev);
 
@@ -1245,6 +1252,15 @@ d3dkmt_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr)
    assert(fixed_addr == NULL &&
           "placed maps need VK_EXT_map_memory_placed, disabled on Windows");
    (void)fixed_addr;
+
+   /* Lock2 always maps the whole allocation, so a shorter request is
+    * satisfied by it and a longer one cannot be. */
+   if (length > bo->size) {
+      bo->_map = NULL;
+      bo->_map_size = 0;
+      errno = EINVAL;
+      return;
+   }
 
    struct agx_kmt_lock2 lock = {
       .hDevice = ws->device,
@@ -1254,12 +1270,14 @@ d3dkmt_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr)
    agx_kmt_status st = ws->fns.Lock2(&lock);
    if (!AGX_KMT_SUCCESS(st)) {
       bo->_map = NULL;
+      bo->_map_size = 0;
       agx_d3dkmt_fail(st);
       fprintf(stderr, "D3DKMTLock2 failed: handle=%u\n", bo->uapi_handle);
       return;
    }
 
    bo->_map = lock.pData;
+   bo->_map_size = bo->size;
 }
 
 static void
@@ -1274,6 +1292,7 @@ d3dkmt_bo_munmap(struct agx_device *dev, struct agx_bo *bo)
 
    ws->fns.Unlock2(&unlock);
    bo->_map = NULL;
+   bo->_map_size = 0;
 }
 
 static int
@@ -2306,11 +2325,28 @@ d3dkmt_get_time(struct agx_device *dev, struct drm_asahi_get_time *t)
 static int
 d3dkmt_simple_ioctl(struct agx_device *dev, unsigned cmd, void *req)
 {
+   /* agx_create_command_queue_with_render_scs() encodes QUEUE_CREATE with the
+    * pre-render-SCS struct size when it has no layout to pass. The WDDM
+    * context-private record has no render SCS layout field, so a request
+    * that carries one is refused rather than silently dropped. */
+   const unsigned queue_create_legacy =
+      _IOC(_IOC_READ | _IOC_WRITE, DRM_IOCTL_BASE,
+           DRM_COMMAND_BASE + DRM_ASAHI_QUEUE_CREATE,
+           offsetof(struct drm_asahi_queue_create, render_scs_layout));
+   if (cmd == queue_create_legacy)
+      return d3dkmt_queue_create(dev, req);
+
    switch (cmd) {
    case DRM_IOCTL_ASAHI_VM_CREATE:
       return d3dkmt_vm_create(dev, req);
-   case DRM_IOCTL_ASAHI_QUEUE_CREATE:
+   case DRM_IOCTL_ASAHI_QUEUE_CREATE: {
+      const struct drm_asahi_queue_create *q = req;
+      if (q->render_scs_layout[0] != 0 || q->render_scs_layout[1] != 0) {
+         errno = EINVAL;
+         return -1;
+      }
       return d3dkmt_queue_create(dev, req);
+   }
    case DRM_IOCTL_ASAHI_QUEUE_DESTROY:
       return d3dkmt_queue_destroy(dev, req);
    case DRM_IOCTL_ASAHI_GET_TIME:
@@ -2358,6 +2394,23 @@ enum_log_enabled(void)
 #endif
 }
 
+/* One line per process for an AppleAgxWddm adapter this driver cannot use,
+ * whatever the diagnostic level: it is the answer to "why zero devices". */
+static void
+d3dkmt_report_unusable(unsigned reason, const char *fmt, ...)
+{
+   static uint32_t reported[3];
+   if (reason >= ARRAY_SIZE(reported) || p_atomic_xchg(&reported[reason], 1u))
+      return;
+
+   va_list args;
+   va_start(args, fmt);
+   fprintf(stderr, "honeykrisp: AppleAgxWddm adapter not usable: ");
+   vfprintf(stderr, fmt, args);
+   fputc('\n', stderr);
+   va_end(args);
+}
+
 static bool
 query_identity(const struct agx_d3dkmt_fns *fns, agx_kmt_handle adapter,
                struct agx_d3dkmt_policy *policy,
@@ -2385,6 +2438,15 @@ query_identity(const struct agx_d3dkmt_fns *fns, agx_kmt_handle adapter,
 
    int parsed =
       agx_d3dkmt_parse_identity(&blob, sizeof(blob), policy, out);
+   if (parsed != AGX_D3DKMT_OK && blob.magic == AGXW_ADAPTER_IDENTITY_MAGIC &&
+       blob.params_blob_size != AGX_D3DKMT_PARAMS_GLOBAL_SIZE) {
+      d3dkmt_report_unusable(
+         0, "it announces a %u-byte device parameter block (G%u%c, chip "
+            "0x%04x); this driver needs the %u-byte layout with USC/HAL "
+            "generations and memory limits",
+         blob.params_blob_size, blob.gpu_generation,
+         (char)blob.gpu_variant, blob.chip_id, AGX_D3DKMT_PARAMS_GLOBAL_SIZE);
+   }
    if (enum_log_enabled())
       fprintf(stderr,
               "NTAGX_ENUM identity adapter=0x%08x query=0x%08x "
@@ -2593,8 +2655,43 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
    if (enum_log_enabled())
       fprintf(stderr, "NTAGX_ENUM get_params result=%d errno=%d size=%u\n",
               params_status, errno, ws->params_size);
-   if (params_status != 0)
+   if (params_status != 0) {
+      d3dkmt_report_unusable(
+         1, "GET_PARAMS failed (errno %d) for G%u%c chip 0x%04x; the KMD "
+            "publishes no device parameters for this GPU",
+         errno, identity.gpu_generation, (char)identity.gpu_variant,
+         identity.chip_id);
       goto fail_params;
+   }
+
+   /* parse_identity pinned params_blob_size to this exact layout. */
+   struct drm_asahi_params_global *params = ws->params;
+   static_assert(AGX_D3DKMT_PARAMS_GLOBAL_SIZE == sizeof(*params),
+                 "identity-announced params layout");
+   if (!agx_d3dkmt_params_match_identity(&identity, params->chip_id,
+                                         params->gpu_generation,
+                                         params->gpu_variant,
+                                         params->gpu_revision)) {
+      d3dkmt_report_unusable(
+         2, "GET_PARAMS describes chip 0x%04x G%u variant 0x%02x revision "
+            "0x%02x but the adapter identity says chip 0x%04x G%u variant "
+            "0x%02x revision 0x%02x",
+         params->chip_id, params->gpu_generation, params->gpu_variant,
+         params->gpu_revision, identity.chip_id, identity.gpu_generation,
+         identity.gpu_variant, identity.gpu_revision);
+      errno = ENODEV;
+      goto fail_params;
+   }
+
+   /* Hide every feature whose interface this winsys does not translate, so
+    * the driver takes the paths that only need the verbatim command stream. */
+   params->features &= AGX_D3DKMT_SUPPORTED_FEATURES;
+   /* max_commands_per_submission is the KMD's, unmodified: like the M5
+    * Linux kernel, the G17 KMD publishes 1, and hk's queue_submit_looped()
+    * then issues one SubmitCommand per hardware command in stream order,
+    * with the input waits on the first and the output signals on the last
+    * (d3dkmt_submit() places them exactly where the ioctl carries
+    * them). The winsys neither splits nor rewrites the stream. */
 
    bool device_status = d3dkmt_device_lease_acquire(ws);
    if (enum_log_enabled())

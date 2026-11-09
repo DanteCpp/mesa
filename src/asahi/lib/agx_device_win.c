@@ -91,7 +91,11 @@ _Static_assert(sizeof(struct drm_asahi_submit) ==
 _Static_assert(sizeof(struct drm_asahi_vm_create) ==
                   sizeof(struct ntasi_kmd_uapi_vm_create),
                "drm_asahi_vm_create / ntasi_kmd_uapi_vm_create");
-_Static_assert(sizeof(struct drm_asahi_queue_create) ==
+/* The J813 UAPI appended render_scs_layout. AGXKMD knows only the prefix,
+ * which is exactly what agx_create_command_queue_with_render_scs() sends
+ * when it has no layout; a full-size QUEUE_CREATE has no entry in the
+ * kmd_uapi command table and is refused. */
+_Static_assert(offsetof(struct drm_asahi_queue_create, render_scs_layout) ==
                   sizeof(struct ntasi_kmd_uapi_queue_create),
                "drm_asahi_queue_create / ntasi_kmd_uapi_queue_create");
 _Static_assert(sizeof(struct drm_asahi_queue_destroy) ==
@@ -355,9 +359,18 @@ win_bo_bind(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
  * (agx_device.h) requires.
  */
 static void
-win_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr)
+win_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
+            size_t length)
 {
    assert(bo->_map == NULL && "not double mapped");
+
+   /* GEM_MMAP maps the whole BO. */
+   if (length > bo->size) {
+      bo->_map = NULL;
+      bo->_map_size = 0;
+      errno = EINVAL;
+      return;
+   }
 
    struct ntasi_kmd_uapi_gem_mmap gem_mmap = {
       .handle = bo->uapi_handle,
@@ -377,6 +390,7 @@ win_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr)
    }
 
    bo->_map = (void *)(uintptr_t)gem_mmap.user_va;
+   bo->_map_size = bo->size;
 
    if (ntagx_bo_log_enabled()) {
       fprintf(stderr,
@@ -1294,6 +1308,7 @@ win_bo_munmap(struct agx_device *dev, struct agx_bo *bo)
    struct ntasi_kmd_uapi_gem_munmap req = {.handle = bo->uapi_handle};
 
    ntagx_ioctl(dev->hdev, NTASI_KMD_UAPI_IOCTL_GEM_MUNMAP, &req);
+   bo->_map_size = 0;
 }
 
 static void

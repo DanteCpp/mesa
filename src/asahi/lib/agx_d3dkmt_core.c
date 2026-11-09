@@ -700,7 +700,7 @@ agx_d3dkmt_parse_identity(const void *blob, uint32_t blob_size,
       return AGX_D3DKMT_ERR_INVAL;
    if (id.contract_version != AGXW_CONTRACT_VERSION)
       return AGX_D3DKMT_ERR_INVAL;
-   if (id.params_blob_size != AGXW_PARAMS_GLOBAL_SIZE)
+   if (id.params_blob_size != AGX_D3DKMT_PARAMS_GLOBAL_SIZE)
       return AGX_D3DKMT_ERR_INVAL;
 
    *policy = agx_d3dkmt_policy_default();
@@ -869,4 +869,14 @@ agx_d3dkmt_borrowed_import_size(uint64_t claimed_size,
 
    *size_out = size;
    return AGX_D3DKMT_OK;
+}
+
+bool
+agx_d3dkmt_params_match_identity(const struct agxw_adapter_identity *id,
+                                 uint32_t chip_id, uint32_t generation,
+                                 uint32_t variant, uint32_t revision)
+{
+   return id != NULL && id->chip_id == chip_id &&
+          id->gpu_generation == generation && id->gpu_variant == variant &&
+          id->gpu_revision == revision;
 }

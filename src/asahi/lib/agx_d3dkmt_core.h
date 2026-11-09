@@ -52,6 +52,23 @@ extern "C" {
  * Mesa-free; agx_device_d3dkmt.c static_asserts the two agree. */
 #define AGX_D3DKMT_PAGE_SIZE AGXW_PAGE_SIZE
 
+/* sizeof(struct drm_asahi_params_global) in the Mesa UAPI this winsys is
+ * built against (agx_device_d3dkmt.c static_asserts it): the 592-byte G13/G14
+ * block plus usc_generation, gpu_hal_generation, memory_limit and
+ * client_memory_limit, which G17 needs. The KMD's GET_PARAMS escape must
+ * return exactly this layout, and its adapter identity must announce this
+ * size; anything else fails adapter discovery closed. The contract's
+ * AGXW_PARAMS_GLOBAL_SIZE still names the 592-byte layout. */
+#define AGX_D3DKMT_PARAMS_GLOBAL_SIZE 616u
+
+/* drm_asahi_feature bits the D3DKMT winsys can carry. The command stream is
+ * passed to the KMD verbatim, but every other feature either needs a
+ * DRM_IOCTL_ASAHI_GET_PARAMS parameter group (VM_STATUS, its mirror, queue
+ * limits), a sync type (cumulative signals), a per-command sync layout or a
+ * bind flag this winsys does not translate. Anything outside this mask is
+ * dropped from the params the driver sees. */
+#define AGX_D3DKMT_SUPPORTED_FEATURES UINT64_C(0x1) /* SOFT_FAULTS */
+
 /* D3DDDI_RESERVEGPUVIRTUALADDRESS is a Windows UMD ABI rather than an AGX
  * page-table ABI: BaseAddress, MinimumAddress, MaximumAddress and Size are
  * all required to be 64 KiB aligned even though AGX maps native 16 KiB
@@ -477,6 +494,15 @@ enum agx_d3dkmt_cpu_wait_state agx_d3dkmt_cpu_wait_probe(
 int agx_d3dkmt_parse_identity(const void *blob, uint32_t blob_size,
                               struct agx_d3dkmt_policy *policy,
                               struct agxw_adapter_identity *out);
+
+/*
+ * The GET_PARAMS reply must describe the adapter the identity named: the same
+ * chip, generation, variant and revision. A mismatch means the two queries
+ * were answered from different state, so the adapter is refused.
+ */
+bool agx_d3dkmt_params_match_identity(const struct agxw_adapter_identity *id,
+                                      uint32_t chip_id, uint32_t generation,
+                                      uint32_t variant, uint32_t revision);
 
 /*
  * enum agx_bo_flags -> enum agxw_alloc_flags, for

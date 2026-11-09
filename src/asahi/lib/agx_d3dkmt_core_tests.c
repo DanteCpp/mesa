@@ -930,7 +930,7 @@ test_identity_parsing(void)
       .gpu_variant = AGXW_J414S_GPU_VARIANT,
       .gpu_revision = AGXW_J414S_GPU_REVISION,
       .contract_version = AGXW_CONTRACT_VERSION,
-      .params_blob_size = AGXW_PARAMS_GLOBAL_SIZE,
+      .params_blob_size = AGX_D3DKMT_PARAMS_GLOBAL_SIZE,
    };
 
    CHECK_EQ(agx_d3dkmt_parse_identity(&id, sizeof(id), &policy, &out),
@@ -962,12 +962,34 @@ test_identity_parsing(void)
    CHECK_EQ(agx_d3dkmt_parse_identity(&bad, sizeof(bad), &policy, &out),
             AGX_D3DKMT_ERR_INVAL);
 
-   /* A params blob we would mis-size is a hard failure too: the escape
-    * payload size is pinned at 592 on both sides. */
+   /* A params blob we would mis-size is a hard failure too. That includes
+    * the 592-byte G13/G14 layout: it has no USC/HAL generation, so a G17
+    * driver fed it would pick its code generator from zeroes. */
    bad = id;
    bad.params_blob_size = 512;
    CHECK_EQ(agx_d3dkmt_parse_identity(&bad, sizeof(bad), &policy, &out),
             AGX_D3DKMT_ERR_INVAL);
+   bad.params_blob_size = AGXW_PARAMS_GLOBAL_SIZE;
+   CHECK_EQ(agx_d3dkmt_parse_identity(&bad, sizeof(bad), &policy, &out),
+            AGX_D3DKMT_ERR_INVAL);
+
+   /* The J813 (M5) adapter is recognised by the same blob shape. */
+   struct agxw_adapter_identity m5 = id;
+   m5.chip_id = 0x8142;
+   m5.gpu_generation = 17;
+   m5.gpu_variant = 'G';
+   m5.gpu_revision = 0;
+   CHECK_EQ(agx_d3dkmt_parse_identity(&m5, sizeof(m5), &policy, &out),
+            AGX_D3DKMT_OK);
+   CHECK_EQ(out.gpu_generation, 17u);
+
+   /* GET_PARAMS must describe that same adapter. */
+   CHECK(agx_d3dkmt_params_match_identity(&m5, 0x8142, 17, 'G', 0));
+   CHECK(!agx_d3dkmt_params_match_identity(&m5, 0x8142, 14, 'G', 0));
+   CHECK(!agx_d3dkmt_params_match_identity(&m5, 0x6020, 17, 'G', 0));
+   CHECK(!agx_d3dkmt_params_match_identity(&m5, 0x8142, 17, 'S', 0));
+   CHECK(!agx_d3dkmt_params_match_identity(&m5, 0x8142, 17, 'G', 0x10));
+   CHECK(!agx_d3dkmt_params_match_identity(NULL, 0x8142, 17, 'G', 0));
 
    /* Width is asserted, never inferred. */
    CHECK_EQ(agx_d3dkmt_parse_identity(&id, sizeof(id) - 1, &policy, &out),
