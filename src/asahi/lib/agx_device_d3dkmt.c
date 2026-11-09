@@ -54,7 +54,7 @@
  */
 struct agx_d3dkmt_va_lease {
    struct agx_kmt_luid luid;
-   struct agx_d3dkmt_va_range ranges[2];
+   struct agx_d3dkmt_va_range ranges[AGX_D3DKMT_MAX_VM_RESERVATIONS];
    uint32_t range_count;
    uint32_t reserved_mask;
    uint32_t references;
@@ -1032,8 +1032,9 @@ d3dkmt_va_update_init(struct agx_d3dkmt_winsys *ws)
       .flags = AGXW_CONTEXT_PRIVATE_FLAG_VA_INTERLOCK,
       .usc_exec_base = ws->policy.usc_base,
    };
-   if (agxw_context_private_validate(&priv, sizeof(priv), ws->policy.usc_base,
-                                     ws->policy.usc_size) != 0) {
+   if (agxw_context_private_validate_layout(
+          &priv, sizeof(priv), ws->policy.usc_base, ws->policy.usc_size,
+          &ws->policy.layout) != 0) {
       struct agx_kmt_destroysyncobj d = {.hSyncObject = fence.hSyncObject};
       ws->fns.DestroySynchronizationObject(&d);
       errno = EINVAL;
@@ -1339,8 +1340,9 @@ d3dkmt_build_read_set(struct agx_device *dev, struct agx_bo *staging,
    uint32_t count = 0;
    uint64_t staging_va = staging->va->addr;
 
-   if (agx_d3dkmt_read_range_add(
-          ranges, &count, AGXW_MAX_READ_RANGES_PER_SUBMIT,
+   if (agx_d3dkmt_read_range_add_layout(
+          &agx_d3dkmt_ws(dev)->policy.layout, ranges, &count,
+          AGXW_MAX_READ_RANGES_PER_SUBMIT,
           staging_va, staging->size) != AGX_D3DKMT_OK)
       return -1;
 
@@ -1354,8 +1356,9 @@ d3dkmt_build_read_set(struct agx_device *dev, struct agx_bo *staging,
            (bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) == 0))
          continue;
       gpu_va = bo->va->addr;
-      if (agx_d3dkmt_read_range_add(
-             ranges, &count, AGXW_MAX_READ_RANGES_PER_SUBMIT,
+      if (agx_d3dkmt_read_range_add_layout(
+             &agx_d3dkmt_ws(dev)->policy.layout, ranges, &count,
+             AGXW_MAX_READ_RANGES_PER_SUBMIT,
              gpu_va, bo->size) != AGX_D3DKMT_OK) {
          simple_mtx_unlock(&dev->bo_map_lock);
          errno = ENOSPC;
@@ -1739,7 +1742,8 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
           ? AGXW_SUBMIT_WRITE_SET_COMPLETE : 0);
    priv_size = (uint32_t)sizeof(*priv) +
       priv->read_range_count * sizeof(*read_ranges);
-   if (agxw_submit_private_validate(&priv->base, priv_size) != 0) {
+   if (agxw_submit_private_validate_layout(&priv->base, priv_size,
+                                           &ws->policy.layout) != 0) {
       errno = EINVAL;
       goto out;
    }
@@ -2111,25 +2115,66 @@ d3dkmt_vm_create(struct agx_device *dev, struct drm_asahi_vm_create *vm)
     * CONTRACT.md SS4.2), so they are advisory here and only the window below
     * kernel_start is claimed.
     */
-   uint64_t base = dev->params.vm_start;
-   uint64_t end = vm->kernel_start;
+   struct agx_d3dkmt_va_range ranges[AGX_D3DKMT_MAX_VM_RESERVATIONS];
+   uint32_t n;
 
-   if (end <= base) {
-      errno = EINVAL;
-      return -1;
-   }
+   if (agx_chip_g17_m5(dev->chip) || dev->chip == AGX_CHIP_G18G) {
+      /*
+       * The M5 layout keeps the driver range VM_CREATE names at
+       * [0x10_0000_0000, ...) between the heaps, so [vm_start, kernel_start)
+       * is empty. Reserve the windows the layout actually binds instead
+       * (agx_d3dkmt_plan_m5_vm), never the driver range.
+       */
+      struct agx_d3dkmt_vm_plan plan;
+      if (agx_d3dkmt_plan_m5_vm(&ws->policy.layout, dev->params.vm_start,
+                                dev->params.vm_end,
+                                dev->params.vm_kernel_min_size,
+                                dev->shader_base, vm->kernel_start,
+                                vm->kernel_end, &plan) != AGX_D3DKMT_OK) {
+         fprintf(stderr,
+                 "D3DKMT: the M5 address layout (USC 0x%llx, driver range "
+                 "[0x%llx, 0x%llx)) does not fit the adapter's VM [0x%llx, "
+                 "0x%llx)\n",
+                 (unsigned long long)dev->shader_base,
+                 (unsigned long long)vm->kernel_start,
+                 (unsigned long long)vm->kernel_end,
+                 (unsigned long long)ws->policy.layout.user_start,
+                 (unsigned long long)ws->policy.layout.user_end);
+         errno = EINVAL;
+         return -1;
+      }
+      for (uint32_t i = 0; i < plan.outside_count; ++i) {
+         fprintf(stderr,
+                 "D3DKMT: Honeykrisp binds [0x%llx, 0x%llx) but the adapter's "
+                 "user VA is [0x%llx, 0x%llx); those binds will fail\n",
+                 (unsigned long long)plan.outside[i].base,
+                 (unsigned long long)(plan.outside[i].base +
+                                      plan.outside[i].size),
+                 (unsigned long long)ws->policy.layout.user_start,
+                 (unsigned long long)ws->policy.layout.user_end);
+      }
+      memcpy(ranges, plan.ranges, plan.count * sizeof(ranges[0]));
+      n = plan.count;
+   } else {
+      uint64_t base = dev->params.vm_start;
+      uint64_t end = vm->kernel_start;
 
-   /*
-    * CONTRACT.md SS4.2: a single 16 KiB kernel/firmware page sits in the
-    * MIDDLE of the user window. Reserving across it would ask VidMm for a
-    * range that includes an address it has declared internal, so the window
-    * is reserved as the one or two sub-ranges that avoid it.
-    */
-   struct agx_d3dkmt_va_range ranges[2];
-   uint32_t n = agx_d3dkmt_va_split_carveout(base, end - base, ranges);
-   if (n == 0) {
-      errno = EINVAL;
-      return -1;
+      if (end <= base) {
+         errno = EINVAL;
+         return -1;
+      }
+
+      /*
+       * CONTRACT.md SS4.2: a single 16 KiB kernel/firmware page sits in the
+       * MIDDLE of the user window. Reserving across it would ask VidMm for a
+       * range that includes an address it has declared internal, so the
+       * window is reserved as the one or two sub-ranges that avoid it.
+       */
+      n = agx_d3dkmt_va_split_carveout(base, end - base, ranges);
+      if (n == 0) {
+         errno = EINVAL;
+         return -1;
+      }
    }
 
    if (d3dkmt_acquire_va_lease(ws, ranges, n))
@@ -2223,8 +2268,9 @@ d3dkmt_queue_create(struct agx_device *dev, struct drm_asahi_queue_create *q)
    /* Pre-validate with the miniport's own validator rather than a private
     * copy of the rules, so a rejection here means the same thing it would
     * mean in the kernel (CONTRACT.md SS5.2). */
-   if (agxw_context_private_validate(&priv, sizeof(priv), ws->policy.usc_base,
-                                     ws->policy.usc_size) != 0) {
+   if (agxw_context_private_validate_layout(
+          &priv, sizeof(priv), ws->policy.usc_base, ws->policy.usc_size,
+          &ws->policy.layout) != 0) {
       struct agx_kmt_destroysyncobj d = {.hSyncObject = fence.hSyncObject};
       ws->fns.DestroySynchronizationObject(&d);
       errno = EINVAL;
@@ -2399,7 +2445,7 @@ enum_log_enabled(void)
 static void
 d3dkmt_report_unusable(unsigned reason, const char *fmt, ...)
 {
-   static uint32_t reported[3];
+   static uint32_t reported[4];
    if (reason >= ARRAY_SIZE(reported) || p_atomic_xchg(&reported[reason], 1u))
       return;
 
@@ -2679,6 +2725,22 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
          params->chip_id, params->gpu_generation, params->gpu_variant,
          params->gpu_revision, identity.chip_id, identity.gpu_generation,
          identity.gpu_variant, identity.gpu_revision);
+      errno = ENODEV;
+      goto fail_params;
+   }
+
+   /* Every bind, read range, USC window and context/submit record is checked
+    * against the user VA this reply publishes: the 42-bit J813 window minus
+    * its fixed driver range, or the fixed G14 window before G17. */
+   if (agxw_va_layout_from_params(params->gpu_generation, params->vm_start,
+                                  params->vm_end, params->vm_kernel_min_size,
+                                  &ws->policy.layout) != 0) {
+      d3dkmt_report_unusable(
+         3, "GET_PARAMS VM window [0x%llx, 0x%llx) with a 0x%llx-byte driver "
+            "range is not a well-formed J813 layout",
+         (unsigned long long)params->vm_start,
+         (unsigned long long)params->vm_end,
+         (unsigned long long)params->vm_kernel_min_size);
       errno = ENODEV;
       goto fail_params;
    }

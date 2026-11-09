@@ -543,8 +543,9 @@ xfer_context(struct agx_d3dkmt_winsys *ws)
       .flags = AGXW_CONTEXT_PRIVATE_FLAG_VA_INTERLOCK,
       .usc_exec_base = ws->policy.usc_base,
    };
-   if (agxw_context_private_validate(&priv, sizeof(priv), ws->policy.usc_base,
-                                     ws->policy.usc_size) != 0) {
+   if (agxw_context_private_validate_layout(
+          &priv, sizeof(priv), ws->policy.usc_base, ws->policy.usc_size,
+          &ws->policy.layout) != 0) {
       errno = EINVAL;
       return 0;
    }

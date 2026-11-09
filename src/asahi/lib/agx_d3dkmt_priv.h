@@ -90,7 +90,7 @@ struct agx_d3dkmt_winsys {
    /* The user GPU VA window, reserved at VM_CREATE time. Up to two ranges:
     * CONTRACT.md SS4.2 puts a 16 KiB kernel/firmware carve-out page in the
     * MIDDLE of the window, so it is not one contiguous reservation. */
-   struct agx_d3dkmt_va_range va[2];
+   struct agx_d3dkmt_va_range va[AGX_D3DKMT_MAX_VM_RESERVATIONS];
    uint32_t va_count;
 
    /* KMTQAITYPE_UMDRIVERPRIVATE payload: the AGX params blob verbatim. */

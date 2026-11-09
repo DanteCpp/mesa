@@ -10,6 +10,11 @@
 
 #include "agx_d3dkmt_core.h"
 
+/* Self-contained Mesa headers (stdint/stdbool only): the M5 address layout
+ * and the fixed zero/scratch page addresses VM_CREATE must reserve. */
+#include "agx_abi.h"
+#include "agx_m5_va.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,12 +23,25 @@ agx_d3dkmt_read_range_add(struct agxw_submit_read_range *ranges,
                           uint32_t *count, uint32_t capacity,
                           uint64_t gpu_va, uint64_t length)
 {
+   struct agxw_va_layout g14;
+
+   agxw_va_layout_g14(&g14);
+   return agx_d3dkmt_read_range_add_layout(&g14, ranges, count, capacity,
+                                           gpu_va, length);
+}
+
+int
+agx_d3dkmt_read_range_add_layout(const struct agxw_va_layout *layout,
+                                 struct agxw_submit_read_range *ranges,
+                                 uint32_t *count, uint32_t capacity,
+                                 uint64_t gpu_va, uint64_t length)
+{
    uint64_t new_end;
    uint32_t first = 0;
 
    if (ranges == NULL || count == NULL || *count > capacity || length == 0 ||
        gpu_va > UINT64_MAX - length ||
-       !agxw_va_range_is_user(gpu_va, length))
+       !agxw_va_layout_range_is_user(layout, gpu_va, length))
       return AGX_D3DKMT_ERR_INVAL;
    new_end = gpu_va + length;
 
@@ -257,7 +275,7 @@ translate_one(const struct agx_d3dkmt_bind *b,
 
    /* CONTRACT.md SS4.2: the user window is NOT contiguous. This rejects a
     * bind that would straddle or land on the kernel carve-out page. */
-   if (!agxw_va_range_is_user(b->addr, b->range))
+   if (!agxw_va_layout_range_is_user(&policy->layout, b->addr, b->range))
       return AGX_D3DKMT_ERR_INVAL;
 
    memset(op, 0, sizeof(*op));
@@ -353,7 +371,8 @@ agx_d3dkmt_bind_policy(uint64_t shader_base,
        shader_base < AGX_D3DKMT_USC_MIN_BASE ||
        (shader_base & (AGX_D3DKMT_USC_ALIGNMENT - 1)) != 0 ||
        shader_base > UINT64_MAX - AGX_D3DKMT_USC_SIZE ||
-       !agxw_va_range_is_user(shader_base, AGX_D3DKMT_USC_SIZE) ||
+       !agxw_va_layout_range_is_user(&runtime->layout, shader_base,
+                                     AGX_D3DKMT_USC_SIZE) ||
        runtime->usc_base != shader_base ||
        runtime->usc_size != AGX_D3DKMT_USC_SIZE)
       return AGX_D3DKMT_ERR_INVAL;
@@ -879,4 +898,83 @@ agx_d3dkmt_params_match_identity(const struct agxw_adapter_identity *id,
    return id != NULL && id->chip_id == chip_id &&
           id->gpu_generation == generation && id->gpu_variant == variant &&
           id->gpu_revision == revision;
+}
+
+static bool
+plan_overlaps(uint64_t base, uint64_t end, uint64_t other_base,
+              uint64_t other_end)
+{
+   return other_base < other_end && base < other_end && other_base < end;
+}
+
+/* Widen [base, end) to whole reservation units; false on overflow. */
+static bool
+plan_widen(uint64_t base, uint64_t end, struct agx_d3dkmt_va_range *out)
+{
+   const uint64_t mask = AGX_D3DKMT_RESERVATION_GRANULARITY - 1;
+
+   if (base >= end || end > UINT64_MAX - mask)
+      return false;
+   out->base = base & ~mask;
+   out->size = ((end + mask) & ~mask) - out->base;
+   return true;
+}
+
+int
+agx_d3dkmt_plan_m5_vm(const struct agxw_va_layout *layout,
+                      uint64_t vm_start, uint64_t vm_end,
+                      uint64_t vm_kernel_min_size, uint64_t shader_base,
+                      uint64_t kernel_start, uint64_t kernel_end,
+                      struct agx_d3dkmt_vm_plan *plan)
+{
+   struct agx_m5_va_layout m5;
+
+   if (layout == NULL || plan == NULL)
+      return AGX_D3DKMT_ERR_INVAL;
+   memset(plan, 0, sizeof(*plan));
+
+   /* The same layout agx_open_device() derived shader_base and the heaps
+    * from; anything it would refuse cannot be reserved either. */
+   if (!agx_m5_va_layout(vm_start, vm_end, vm_kernel_min_size, shader_base,
+                         &m5) ||
+       kernel_start >= kernel_end)
+      return AGX_D3DKMT_ERR_INVAL;
+
+   /* Ascending; `required` windows must end up reserved. */
+   const struct {
+      uint64_t base, end;
+      bool required;
+   } windows[AGX_D3DKMT_MAX_VM_RESERVATIONS] = {
+      {AGX_ZERO_PAGE_ADDRESS, AGX_SCRATCH_PAGE_ADDRESS + AGX_D3DKMT_PAGE_SIZE,
+       false},
+      {m5.data_start, m5.data_end, true},
+      {m5.shader_start, m5.shader_end, true},
+   };
+
+   uint64_t previous_end = 0;
+   for (uint32_t i = 0; i < AGX_D3DKMT_MAX_VM_RESERVATIONS; ++i) {
+      struct agx_d3dkmt_va_range r;
+
+      if (!plan_widen(windows[i].base, windows[i].end, &r) ||
+          r.base < previous_end ||
+          plan_overlaps(r.base, r.base + r.size, kernel_start, kernel_end) ||
+          plan_overlaps(r.base, r.base + r.size, layout->internal_start,
+                        layout->internal_end)) {
+         memset(plan, 0, sizeof(*plan));
+         return AGX_D3DKMT_ERR_INVAL;
+      }
+      previous_end = r.base + r.size;
+
+      if (!agxw_va_layout_range_is_user(layout, r.base, r.size)) {
+         if (windows[i].required) {
+            memset(plan, 0, sizeof(*plan));
+            return AGX_D3DKMT_ERR_INVAL;
+         }
+         plan->outside[plan->outside_count++] = r;
+         continue;
+      }
+      plan->ranges[plan->count++] = r;
+   }
+
+   return AGX_D3DKMT_OK;
 }

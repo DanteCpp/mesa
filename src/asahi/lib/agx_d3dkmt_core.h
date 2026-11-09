@@ -112,17 +112,24 @@ struct agx_d3dkmt_policy {
     */
    uint64_t usc_base;
    uint64_t usc_size;
+   /* The user GPU VA the adapter publishes (agxw_va_layout_from_params on
+    * the GET_PARAMS reply). Binds, read ranges, the USC window and context
+    * and submit records are checked against it. The default is the G14
+    * layout every pre-J813 adapter has. */
+   struct agxw_va_layout layout;
 };
 
 static inline struct agx_d3dkmt_policy
 agx_d3dkmt_policy_default(void)
 {
-   return (struct agx_d3dkmt_policy){
+   struct agx_d3dkmt_policy policy = {
       .needs_residency = true,
       .node_ordinal = AGXW_NODE_3D,
       .usc_base = 0,
       .usc_size = 0,
    };
+   agxw_va_layout_g14(&policy.layout);
+   return policy;
 }
 
 /* -------------------------------------------------------------------------
@@ -533,6 +540,44 @@ uint32_t agx_d3dkmt_create_flags_external(
 int agx_d3dkmt_read_range_add(struct agxw_submit_read_range *ranges,
                               uint32_t *count, uint32_t capacity,
                               uint64_t gpu_va, uint64_t length);
+
+/* agx_d3dkmt_read_range_add against the adapter's layout; the function above
+ * is this with the G14 layout. */
+int agx_d3dkmt_read_range_add_layout(const struct agxw_va_layout *layout,
+                                     struct agxw_submit_read_range *ranges,
+                                     uint32_t *count, uint32_t capacity,
+                                     uint64_t gpu_va, uint64_t length);
+
+/* -------------------------------------------------------------------------
+ * J813 (M5) VM reservations.
+ *
+ * D3DKMTMapGpuVirtualAddress maps only inside a reservation, so VM_CREATE
+ * reserves every window Honeykrisp's M5 address layout binds
+ * (agx_open_device(), agx_m5_va.h): the fixed zero and scratch pages, the
+ * data window holding the main heap and its read-only alias, and the USC
+ * window at shader_base. Each is widened to the 64 KiB reservation
+ * granularity. The driver range VM_CREATE names [kernel_start, kernel_end)
+ * and the layout's internal range are never reserved: a window touching
+ * either is refused.
+ *
+ * A window the published layout does not contain is not reserved but listed
+ * in `outside`, so the caller can say which binds will fail. The data and
+ * USC windows must be reservable, or the plan fails.
+ * ------------------------------------------------------------------------- */
+#define AGX_D3DKMT_MAX_VM_RESERVATIONS 3u
+
+struct agx_d3dkmt_vm_plan {
+   struct agx_d3dkmt_va_range ranges[AGX_D3DKMT_MAX_VM_RESERVATIONS];
+   uint32_t count;
+   struct agx_d3dkmt_va_range outside[AGX_D3DKMT_MAX_VM_RESERVATIONS];
+   uint32_t outside_count;
+};
+
+int agx_d3dkmt_plan_m5_vm(const struct agxw_va_layout *layout,
+                          uint64_t vm_start, uint64_t vm_end,
+                          uint64_t vm_kernel_min_size, uint64_t shader_base,
+                          uint64_t kernel_start, uint64_t kernel_end,
+                          struct agx_d3dkmt_vm_plan *plan);
 
 /* -------------------------------------------------------------------------
  * Imported allocation geometry.
