@@ -391,7 +391,12 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
       c->sampler_count = dev->samplers.table.alloc;
    }
 
-   c->isp_oclqry_base = dev->occlusion_queries.bo->va->addr;
+   /* G17G (M5) kernels admit no occlusion buffer on a render (e50ba38
+    * refuses a nonzero one), so do not attach the device-global query heap
+    * to the render envelope there. Carried from the j813 bring-up branch. */
+   c->isp_oclqry_base = dev->dev.chip == AGX_CHIP_G17G
+                           ? 0
+                           : dev->occlusion_queries.bo->va->addr;
 
    if (cs->cr.process_empty_tiles)
       c->flags |= DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
