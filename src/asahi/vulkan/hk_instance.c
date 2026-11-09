@@ -17,6 +17,10 @@
 #include "util/driconf.h"
 #include "util/mesa-blake3.h"
 #include "util/os_misc.h"
+#ifdef _WIN32
+#include <string.h>
+#include "git_sha1.h" /* SS2.2 row P8: PACKAGE_VERSION / MESA_GIT_SHA1 */
+#endif
 
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_EnumerateInstanceVersion(uint32_t *pApiVersion)
@@ -56,7 +60,14 @@ static const struct vk_instance_extension_table instance_extensions = {
    .EXT_display_surface_counter = true,
    .EXT_acquire_drm_display = true,
 #endif
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   /* honeykrisp-h1-execution.md SS4 item 2: the GDI/CPU present path
+    * (wsi_common_win32.cpp, upstream-shipped already, SS4 header). */
+   .KHR_win32_surface = true,
+#endif
+#ifndef VK_USE_PLATFORM_WIN32_KHR
    .EXT_headless_surface = true,
+#endif
    .KHR_device_group_creation = true,
    .KHR_external_fence_capabilities = true,
    .KHR_external_memory_capabilities = true,
@@ -78,6 +89,67 @@ hk_EnumerateInstanceExtensionProperties(const char *pLayerName,
       &instance_extensions, pPropertyCount, pProperties);
 }
 
+#ifdef _WIN32
+/*
+ * Windows builds have no expat and no regex, so driconf uses its static table
+ * (driconf_static.h, which does contain 00-hk-defaults.conf) with regexec()
+ * stubbed to REG_NOMATCH: every engine_name_match / application_name_match
+ * rule in that file silently never applies. Re-apply exactly those rules
+ * here. The patterns are plain alternations, which REG_EXTENDED matches
+ * unanchored, i.e. as substrings. An option set explicitly in the
+ * environment keeps its value. Keep in sync with 00-hk-defaults.conf.
+ */
+static bool
+hk_win_name_matches(const char *name, const char *const *alternatives,
+                    unsigned count)
+{
+   for (unsigned i = 0; name && i < count; ++i) {
+      if (strstr(name, alternatives[i]))
+         return true;
+   }
+   return false;
+}
+
+static void
+hk_win_engine_default(bool *option, const char *env_name)
+{
+   if (getenv(env_name) == NULL)
+      *option = true;
+}
+
+static void
+hk_apply_windows_drirc_rules(struct hk_instance *instance)
+{
+   const char *engine = instance->vk.app_info.engine_name;
+   const char *app = instance->vk.app_info.app_name;
+   static const char *const dxvk_or_vkd3d[] = {"DXVK", "vkd3d"};
+   static const char *const vkd3d[] = {"vkd3d"};
+   static const char *const csgo[] = {"csgo"};
+
+   if (hk_win_name_matches(engine, dxvk_or_vkd3d, ARRAY_SIZE(dxvk_or_vkd3d))) {
+      hk_win_engine_default(&instance->drirc.misc.disable_border_emulation,
+                            "hk_disable_border_emulation");
+      hk_win_engine_default(
+         &instance->drirc.misc.enable_vertex_pipeline_stores_atomics,
+         "hk_enable_vertex_pipeline_stores_atomics");
+      hk_win_engine_default(&instance->drirc.misc.report_honeykrisp_driver_id,
+                            "hk_report_honeykrisp_driver_id");
+   }
+
+   if (hk_win_name_matches(engine, vkd3d, ARRAY_SIZE(vkd3d))) {
+      hk_win_engine_default(&instance->drirc.misc.fake_minmax,
+                            "hk_fake_minmax");
+      hk_win_engine_default(&instance->drirc.misc.image_view_min_lod,
+                            "hk_image_view_min_lod");
+   }
+
+   if (hk_win_name_matches(app, csgo, ARRAY_SIZE(csgo))) {
+      hk_win_engine_default(&instance->drirc.misc.mutable_format_srgb_pair,
+                            "hk_mutable_format_srgb_pair");
+   }
+}
+#endif
+
 static void
 hk_init_dri_options(struct hk_instance *instance)
 {
@@ -89,6 +161,9 @@ hk_init_dri_options(struct hk_instance *instance)
                            .engineName = instance->vk.app_info.engine_name,
                            .engineVersion = instance->vk.app_info.engine_version,
                         });
+#ifdef _WIN32
+   hk_apply_windows_drirc_rules(instance);
+#endif
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -120,10 +195,44 @@ hk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    hk_init_dri_options(instance);
 
+   /*
+    * honeykrisp-h1-execution.md SS4 item 4: `enumerate` is consulted
+    * before the drm-node walk (VERIFIED vk_instance.c:445-457) -- Windows
+    * has no DRM render nodes to walk, so install the enumerate callback
+    * instead of try_create_for_drm rather than alongside it (leaving
+    * try_create_for_drm NULL keeps enumerate_drm_physical_devices_locked's
+    * drmGetDevices2() call unreached on Windows, VERIFIED
+    * vk_instance.c:454-460 only takes that branch when
+    * try_create_for_drm is non-NULL).
+    */
+#ifdef _WIN32
+   instance->vk.physical_devices.enumerate = hk_enumerate_physical_devices_win;
+#else
    instance->vk.physical_devices.try_create_for_drm =
       hk_create_drm_physical_device;
+#endif
    instance->vk.physical_devices.destroy = hk_physical_device_destroy;
 
+#ifdef _WIN32
+   /*
+    * honeykrisp-h1-execution.md SS2.2 row P8: build_id_find_nhdr_for_addr
+    * only understands ELF/Mach-O note sections (VERIFIED
+    * src/util/build_id.c has only DETECT_OS_APPLE/ELF paths) -- PE has no
+    * build-id note, so this would always fail on Windows. Derive
+    * driver_build_sha the same way agx_get_driver_uuid() derives the
+    * driver UUID (agx_device.c) instead: BLAKE3(PACKAGE_VERSION
+    * MESA_GIT_SHA1). Good enough for a disk-cache/pipeline-cache key (its
+    * only consumer), doesn't need to be a real build-id.
+    */
+   {
+      const char *driver_id = PACKAGE_VERSION MESA_GIT_SHA1;
+      blake3_hasher blake3_ctx;
+      _mesa_blake3_init(&blake3_ctx);
+      _mesa_blake3_update(&blake3_ctx, driver_id, strlen(driver_id));
+      static_assert(sizeof(instance->driver_build_sha) == BLAKE3_KEY_LEN);
+      _mesa_blake3_final(&blake3_ctx, instance->driver_build_sha);
+   }
+#else
    const struct build_id_note *note =
       build_id_find_nhdr_for_addr(hk_CreateInstance);
    if (!note) {
@@ -141,6 +250,7 @@ hk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    static_assert(sizeof(instance->driver_build_sha) == BLAKE3_KEY_LEN);
    copy_build_id_to_sha1(instance->driver_build_sha, note);
+#endif
 
    *pInstance = hk_instance_to_handle(instance);
    return VK_SUCCESS;

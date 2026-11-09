@@ -66,3 +66,7 @@ hk_device_memory_addr(const struct hk_device_memory *mem)
 extern const VkExternalMemoryProperties hk_opaque_fd_mem_props;
 extern const VkExternalMemoryProperties hk_dma_buf_mem_props;
 extern const VkExternalMemoryProperties hk_host_ptr_mem_props;
+#ifdef _WIN32
+extern const VkExternalMemoryProperties hk_opaque_win32_mem_props;
+extern const VkExternalMemoryProperties hk_opaque_win32_kmt_mem_props;
+#endif

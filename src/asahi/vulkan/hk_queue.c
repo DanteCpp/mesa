@@ -40,7 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <xf86drm.h>
+#include "drm-uapi/drm.h"
 #include "util/cache_ops.h"
 #include "util/list.h"
 #include "util/macros.h"
@@ -66,8 +66,6 @@ static VkResult
 queue_signal_timeline(struct hk_device *dev, struct hk_queue *queue,
                       struct vk_queue_submit *submit)
 {
-   int fd = dev->dev.fd;
-
    /* Each output becomes signalled only when this queue point and its
     * predecessor chain complete.
     */
@@ -78,8 +76,8 @@ queue_signal_timeline(struct hk_device *dev, struct hk_queue *queue,
       const struct vk_drm_syncobj *syncobj =
          vk_sync_as_drm_syncobj(signal->sync);
 
-      int ret = drmSyncobjTransfer(
-         fd, syncobj->syncobj, signal->signal_value,
+      int ret = dev->vk.sync->transfer(
+         dev->vk.sync, syncobj->syncobj, signal->signal_value,
          queue->drm.syncobj, queue->drm.timeline_value, 0);
       if (ret)
          return vk_errorf(dev, VK_ERROR_UNKNOWN,
@@ -99,7 +97,46 @@ static VkResult
 queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
                    struct vk_queue_submit *submit)
 {
-   int fd = dev->dev.fd;
+#ifdef _WIN32
+   /* A signal-only empty submit is DXVK's D3D11 fence completion boundary.
+    * A WDDM GPU wait/signal pair on a context with no DMA buffer is not an
+    * execution guarantee: the callbacks succeed while the output fence never
+    * advances. Prior work on this queue is already submitted, so wait for the
+    * queue point on the CPU and publish the outputs through the provider's
+    * CPU signal path. A binary output carries API value 0 and needs the
+    * binary signal: timeline_signal(0) is a no-op that deadlocks a later
+    * epoch-one wait. */
+   if (submit->wait_count == 0 && submit->signal_count != 0) {
+      uint32_t queue_syncobj = queue->drm.syncobj;
+      uint64_t queue_point = queue->drm.timeline_value;
+
+      if (dev->vk.sync->timeline_wait(
+             dev->vk.sync, &queue_syncobj, &queue_point, 1, INT64_MAX,
+             DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
+                DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+             NULL))
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+
+      for (unsigned i = 0; i < submit->signal_count; ++i) {
+         struct vk_sync_signal *signal = &submit->signals[i];
+         assert(vk_sync_type_is_drm_syncobj(signal->sync->type));
+         uint32_t output = vk_sync_as_drm_syncobj(signal->sync)->syncobj;
+         int ret;
+
+         if (signal->sync->flags & VK_SYNC_IS_TIMELINE) {
+            uint64_t point = signal->signal_value;
+            ret = dev->vk.sync->timeline_signal(dev->vk.sync, &output, &point,
+                                                1);
+         } else {
+            ret = dev->vk.sync->signal(dev->vk.sync, &output, 1);
+         }
+         if (ret)
+            return vk_error(dev, VK_ERROR_DEVICE_LOST);
+      }
+
+      return VK_SUCCESS;
+   }
+#endif
 
    /* Transfer the waits into the queue timeline. */
    for (unsigned i = 0; i < submit->wait_count; ++i) {
@@ -108,8 +145,8 @@ queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
       assert(vk_sync_type_is_drm_syncobj(wait->sync->type));
       const struct vk_drm_syncobj *syncobj = vk_sync_as_drm_syncobj(wait->sync);
 
-      int ret = drmSyncobjTransfer(
-         fd, queue->drm.syncobj, ++queue->drm.timeline_value,
+      int ret = dev->vk.sync->transfer(
+         dev->vk.sync, queue->drm.syncobj, ++queue->drm.timeline_value,
          syncobj->syncobj, wait->wait_value, 0);
       if (ret)
          return vk_errorf(dev, VK_ERROR_UNKNOWN,
@@ -529,17 +566,23 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
    if (dev->dev.chip == AGX_CHIP_G17P && util_has_cache_ops())
       util_post_flush_fence();
 
+   /* Windows has no virtio backend, and struct asahi_ccmd_submit_res is only
+    * declared, not defined, without libdrm. */
+#ifdef HAVE_VDRM
    if (dev->dev.is_virtio) {
       u_rwlock_rdlock(&dev->external_bos.lock);
       virt.extres_count = util_dynarray_num_elements(
          &dev->external_bos.list, struct asahi_ccmd_submit_res);
       virt.extres = util_dynarray_begin(&dev->external_bos.list);
    }
+#endif
 
    int ret = dev->dev.ops.submit(&dev->dev, submit, &virt);
 
+#ifdef HAVE_VDRM
    if (dev->dev.is_virtio)
       u_rwlock_rdunlock(&dev->external_bos.lock);
+#endif
 
    if (ret) {
       /* ASAHI_MESA_DEBUG=trace decodes every command stream before it is
@@ -1772,10 +1815,11 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
          if (sync->flags & VK_SYNC_IS_TIMELINE) {
             uint64_t point = 0;
             timeline++;
-            done = !drmSyncobjQuery(dev->dev.fd, &handle, &point, 1) &&
+            done = !dev->vk.sync->query(dev->vk.sync, &handle, &point, 1,
+                                        0) &&
                    point >= submit->waits[i].wait_value;
          } else {
-            done = !drmSyncobjWait(dev->dev.fd, &handle, 1, 0, 0, NULL);
+            done = !dev->vk.sync->wait(dev->vk.sync, &handle, 1, 0, 0, NULL);
          }
          if (!done) {
             pending++;
@@ -1842,7 +1886,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
           queue, (struct hk_cmd_buffer *const *)submit->command_buffers,
           submit->command_buffer_count)) {
       uint64_t point = 0;
-      if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &point, 1) == 0)
+      if (dev->vk.sync->query(dev->vk.sync, &queue->drm.syncobj, &point, 1,
+                              0) == 0)
          completed = point;
    }
 
@@ -2776,8 +2821,8 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
    if (dev->dev.debug & AGX_DBG_SYNC) {
       /* Wait for completion */
-      int err = drmSyncobjTimelineWait(
-         dev->dev.fd, &queue->drm.syncobj, &queue->drm.timeline_value, 1,
+      int err = dev->vk.sync->timeline_wait(
+         dev->vk.sync, &queue->drm.syncobj, &queue->drm.timeline_value, 1,
          INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
 
       if (err) {
@@ -2969,7 +3014,7 @@ hk_queue_create(struct hk_device *dev,
    queue->drm.render_rq = 0;
    queue->drm.virt_ring_idx = drm_priority + 1;
 
-   if (drmSyncobjCreate(dev->dev.fd, 0, &queue->drm.syncobj)) {
+   if (dev->vk.sync->create(dev->vk.sync, 0, &queue->drm.syncobj)) {
       mesa_loge("drmSyncobjCreate() failed %d\n", errno);
       vk_queue_finish(&queue->vk);
       vk_free(&dev->vk.alloc, queue);
@@ -2979,8 +3024,8 @@ hk_queue_create(struct hk_device *dev,
    }
 
    uint64_t initial_value = 1;
-   if (drmSyncobjTimelineSignal(dev->dev.fd, &queue->drm.syncobj,
-                                &initial_value, 1)) {
+   if (dev->vk.sync->timeline_signal(dev->vk.sync, &queue->drm.syncobj,
+                                     &initial_value, 1)) {
       hk_queue_finish(dev, queue);
       return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
                        "DRM_IOCTL_TIMELINE_SYNCOBJ_SIGNAL failed: %m");
@@ -3080,7 +3125,7 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
    /* Stop/join the submit worker before releasing anything it can use. */
    vk_queue_finish(&queue->vk);
    hk_cmd_pending_finish_queue(dev, queue);
-   drmSyncobjDestroy(dev->dev.fd, queue->drm.syncobj);
+   dev->vk.sync->destroy(dev->vk.sync, queue->drm.syncobj);
    if (queue->drm.id != UINT32_MAX)
       agx_destroy_command_queue(&dev->dev, queue->drm.id);
    for (unsigned i = 1; i < HK_QUEUE_SIBLINGS_MAX; ++i) {

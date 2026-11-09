@@ -22,12 +22,19 @@
 #include "util/log.h"
 #include "util/os_misc.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include "asahi/lib/agx_device_d3dkmt.h"
+#endif
+
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <string.h>
+#ifndef _WIN32
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 /* GPU memory is system memory that the kernel cannot evict or swap, and
  * heapBudget is only advisory, so the heap limit alone lets a process (or
@@ -87,6 +94,42 @@ const VkExternalMemoryProperties hk_host_ptr_mem_props = {
    .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
 };
 
+#ifdef _WIN32
+/* The NT and KMT forms deliberately are not mutually compatible. Creating an
+ * NT-security shared resource does not mint hGlobalShare, while the legacy KMT
+ * form is non-owning. Advertising them as compatible would allow an export
+ * allocation that no D3DKMT_CREATEALLOCATION flag set can satisfy. */
+const VkExternalMemoryProperties hk_opaque_win32_mem_props = {
+   .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                             VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+   .exportFromImportedHandleTypes =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+   .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+};
+
+const VkExternalMemoryProperties hk_opaque_win32_kmt_mem_props = {
+   .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                             VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+   .exportFromImportedHandleTypes =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT,
+   .compatibleHandleTypes =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT,
+};
+
+static enum agx_d3dkmt_external_memory_type
+hk_d3dkmt_external_type(VkExternalMemoryHandleTypeFlags handle_types)
+{
+   switch (handle_types) {
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT:
+      return AGX_D3DKMT_EXTERNAL_MEMORY_OPAQUE_WIN32;
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT:
+      return AGX_D3DKMT_EXTERNAL_MEMORY_OPAQUE_WIN32_KMT;
+   default:
+      return AGX_D3DKMT_EXTERNAL_MEMORY_NONE;
+   }
+}
+#endif
+
 static enum agx_bo_flags
 hk_memory_type_flags(const VkMemoryType *type,
                      VkExternalMemoryHandleTypeFlagBits handle_types)
@@ -99,6 +142,18 @@ hk_memory_type_flags(const VkMemoryType *type,
    return flags;
 }
 
+/*
+ * honeykrisp-h1-execution.md SS2.2 row P9 (same rationale, this file's
+ * analogue): this bookkeeping is virtio-gpu-only (guarded at every call
+ * site by `dev->dev.is_virtio`, which is unconditionally false on Windows
+ * -- agx_win_open_device() always sets it), but the bodies below name
+ * `struct asahi_ccmd_submit_res` BY VALUE, which needs the complete type
+ * (agx_device.h forward-declares it only, SS2.1 row D2, when !HAVE_LIBDRM).
+ * Gate on the same HAVE_VDRM define P9 introduces (src/asahi/lib/meson.build,
+ * defined for Linux builds only) so there is exactly one virtio-availability
+ * define, not two.
+ */
+#ifdef HAVE_VDRM
 static void
 hk_add_ext_bo_locked(struct hk_device *dev, struct agx_bo *bo)
 {
@@ -170,6 +225,19 @@ hk_remove_ext_bo(struct hk_device *dev, struct agx_bo *bo)
       u_rwlock_wrunlock(&dev->external_bos.lock);
    }
 }
+#else
+static inline void
+hk_add_ext_bo(struct hk_device *dev, struct agx_bo *bo)
+{
+   /* No virtio on Windows (HAVE_VDRM unset) -- dev->dev.is_virtio is always
+    * false, so the Linux body above is always a no-op here too. */
+}
+
+static inline void
+hk_remove_ext_bo(struct hk_device *dev, struct agx_bo *bo)
+{
+}
+#endif /* HAVE_VDRM */
 
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_GetMemoryFdPropertiesKHR(VkDevice device,
@@ -389,6 +457,43 @@ hk_memory_release_replay_va(struct hk_device *dev,
    hk_device_va_alias_put(dev);
 }
 
+#ifdef _WIN32
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetMemoryWin32HandlePropertiesKHR(
+   VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType,
+   HANDLE handle, VkMemoryWin32HandlePropertiesKHR *pProperties)
+{
+   VK_FROM_HANDLE(hk_device, dev, device);
+   struct hk_physical_device *pdev = hk_device_physical(dev);
+   const enum agx_d3dkmt_external_memory_type external_type =
+      hk_d3dkmt_external_type(handleType);
+   if (external_type == AGX_D3DKMT_EXTERNAL_MEMORY_NONE || handle == NULL)
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   if (external_type == AGX_D3DKMT_EXTERNAL_MEMORY_OPAQUE_WIN32_KMT &&
+       agx_d3dkmt_is_local_allocation_handle((uintptr_t)handle))
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   struct agx_bo *bo = agx_d3dkmt_bo_import_external(
+      &dev->dev, (uintptr_t)handle, external_type,
+      "Win32 memory property query");
+   if (bo == NULL)
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   uint32_t type_bits = 0;
+   for (unsigned t = 0; t < ARRAY_SIZE(pdev->mem_types); t++) {
+      const unsigned flags =
+         hk_memory_type_flags(&pdev->mem_types[t], handleType);
+      if (!(flags & ~bo->flags))
+         type_bits |= (1 << t);
+   }
+   pProperties->memoryTypeBits = type_bits;
+   agx_bo_unreference(&dev->dev, bo);
+
+   return type_bits ? VK_SUCCESS
+                    : vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+}
+#endif
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
                   const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMem)
@@ -410,16 +515,43 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    const VkMemoryPriorityAllocateInfoEXT *priority_info =
       vk_find_struct_const(pAllocateInfo->pNext,
                            MEMORY_PRIORITY_ALLOCATE_INFO_EXT);
+#ifdef _WIN32
+   const VkImportMemoryWin32HandleInfoKHR *win32_info =
+      vk_find_struct_const(pAllocateInfo->pNext,
+                           IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR);
+#endif
    const VkMemoryType *type = &pdev->mem_types[pAllocateInfo->memoryTypeIndex];
    /* The mappings over a host import before its pages are pinned
     * (hk_host_import_track()). */
    enum hk_host_map_class host_maps_before_pin = HK_HOST_MAP_OTHER;
 
-   VkExternalMemoryHandleTypeFlagBits handle_types = 0;
+   VkExternalMemoryHandleTypeFlags handle_types = 0;
    if (export_info != NULL)
       handle_types |= export_info->handleTypes;
    if (fd_info != NULL)
       handle_types |= fd_info->handleType;
+#ifdef _WIN32
+   if (win32_info != NULL)
+      handle_types |= win32_info->handleType;
+
+   const enum agx_d3dkmt_external_memory_type win32_type =
+      hk_d3dkmt_external_type(handle_types);
+   const uintptr_t win32_handle =
+      win32_info != NULL ? (uintptr_t)win32_info->handle : 0;
+   const bool local_allocation =
+      agx_d3dkmt_is_local_allocation_handle(win32_handle);
+   if ((handle_types != 0 && win32_type == AGX_D3DKMT_EXTERNAL_MEMORY_NONE) ||
+       (win32_info != NULL &&
+        (win32_info->handle == NULL || win32_info->name != NULL)) ||
+       (local_allocation &&
+        win32_type != AGX_D3DKMT_EXTERNAL_MEMORY_OPAQUE_WIN32_KMT) ||
+       (win32_info != NULL && fd_info != NULL) ||
+       (win32_info != NULL && export_info != NULL &&
+        export_info->handleTypes != 0 &&
+        export_info->handleTypes != win32_info->handleType)) {
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   }
+#endif
 
    const unsigned flags = hk_memory_type_flags(type, handle_types);
 
@@ -459,6 +591,35 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    mem->map = NULL;
+#ifdef _WIN32
+   if (win32_info != NULL) {
+      if (local_allocation) {
+         mem->bo = agx_d3dkmt_bo_import_local(
+            &dev->dev,
+            agx_d3dkmt_local_allocation_handle(win32_handle), aligned_size,
+            "Borrowed D3DKMT allocation");
+      } else {
+         mem->bo = agx_d3dkmt_bo_import_external(
+            &dev->dev, win32_handle, win32_type,
+            "Imported Win32 memory");
+      }
+      /* For a Win32 import the Vulkan allocationSize is the importing
+       * image's own requirement (and the specification ignores it for
+       * import operations), while the opened KM allocation is 64 KiB
+       * granular (d3dkmt_create_allocation) and so may legitimately be
+       * larger. Refuse only a smaller BO. The borrowed local path keeps
+       * exact equality: its BO size is this very call's rounded request,
+       * so any difference there is a caller bug, not granularity. */
+      if (mem->bo == NULL || mem->bo->size < aligned_size ||
+          (local_allocation && mem->bo->size != aligned_size) ||
+          (flags & ~mem->bo->flags)) {
+         if (mem->bo != NULL)
+            agx_bo_unreference(&dev->dev, mem->bo);
+         result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+         goto fail_alloc;
+      }
+   } else
+#endif
    if (fd_info && fd_info->handleType) {
       assert(
          fd_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
@@ -510,21 +671,21 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       }
       mem->alias_import = access != AGX_HOST_PTR_READ_ONLY;
    } else {
-      enum agx_bo_flags flags = 0;
+      enum agx_bo_flags bo_flags = 0;
       if (handle_types)
-         flags |= AGX_BO_SHAREABLE;
+         bo_flags |= AGX_BO_SHAREABLE;
       /* A failed WSI export must not leave pinned backing in the BO cache.
        * Successful exports already acquire AGX_BO_SHARED. */
       if (dev->dev.chip == AGX_CHIP_G17P &&
           vk_find_struct_const(pAllocateInfo->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA))
-         flags |= AGX_BO_NO_CACHE;
+         bo_flags |= AGX_BO_NO_CACHE;
       if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
-         flags |= AGX_BO_WRITEBACK;
+         bo_flags |= AGX_BO_WRITEBACK;
 
       /* A BO from the cache allocates nothing new. If the kernel purged it
        * meanwhile, one allocation can still pass the check. */
       if (!hk_system_memory_fits(aligned_size) &&
-          !agx_bo_cache_has(&dev->dev, aligned_size, 64 * 1024, flags)) {
+          !agx_bo_cache_has(&dev->dev, aligned_size, 64 * 1024, bo_flags)) {
          result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                             "Not enough free system memory for %" PRIu64
                             " MiB", aligned_size >> 20);
@@ -533,8 +694,17 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
 
       /* D3D12 promises 64 KiB alignment for heap addresses, and this costs
        * only virtual address space. */
-      mem->bo = agx_bo_create(&dev->dev, aligned_size, 64 * 1024, flags,
-                              "App memory");
+#ifdef _WIN32
+      if (win32_type != AGX_D3DKMT_EXTERNAL_MEMORY_NONE) {
+         mem->bo = agx_d3dkmt_bo_create_external(
+            &dev->dev, aligned_size, 64 * 1024, bo_flags, win32_type,
+            "App memory");
+      } else
+#endif
+      {
+         mem->bo = agx_bo_create(&dev->dev, aligned_size, 64 * 1024, bo_flags,
+                                 "App memory");
+      }
       if (!mem->bo) {
          result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
          goto fail_alloc;
@@ -658,6 +828,8 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
 
    return VK_SUCCESS;
 
+fail_bo:
+   agx_bo_unreference(&dev->dev, mem->bo);
 fail_alloc:
    vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
    return result;
@@ -804,6 +976,7 @@ hk_UnmapMemory2KHR(VkDevice device,
       if (pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT) {
          VK_FROM_HANDLE(hk_device, dev, device);
 
+#ifndef _WIN32
          /* Exactly this object's mapping, as below. */
          void *err = mmap(mem->map, mem->map_size, PROT_NONE,
                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -811,6 +984,11 @@ hk_UnmapMemory2KHR(VkDevice device,
             return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
                              "Failed to map over original mapping");
          }
+#else
+         /* VK_EXT_map_memory_placed is not advertised on Windows. */
+         return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                          "VK_MEMORY_UNMAP_RESERVE_BIT_EXT unsupported");
+#endif
       } else {
          agx_bo_unmap_owned(mem->bo, mem->map, mem->map_size);
       }
@@ -830,6 +1008,7 @@ hk_UnmapMemory2KHR(VkDevice device,
    if (pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT) {
       VK_FROM_HANDLE(hk_device, dev, device);
 
+#ifndef _WIN32
       /* Reserve exactly what was mapped. A placed map covers the
        * VkDeviceMemory's allocationSize, not the cached BO's size, and
        * PROT_NONE'ing the difference lands on address space the application
@@ -843,9 +1022,16 @@ hk_UnmapMemory2KHR(VkDevice device,
       }
       mem->bo->_map = NULL;
       mem->bo->_map_size = 0;
+#else
+      /* VK_EXT_map_memory_placed is not advertised on Windows. */
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "VK_MEMORY_UNMAP_RESERVE_BIT_EXT unsupported");
+#endif
    } else {
       if (mem->bo->_map) {
-         munmap(mem->bo->_map, agx_bo_map_size(mem->bo));
+         /* The backend's unmap: munmap(2) on Linux, Unlock2 on D3DKMT. */
+         VK_FROM_HANDLE(hk_device, dev, device);
+         dev->dev.ops.bo_munmap(&dev->dev, mem->bo);
          mem->bo->_map = NULL;
          mem->bo->_map_size = 0;
       }
@@ -900,6 +1086,35 @@ hk_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo,
                        pGetFdInfo->handleType);
    }
 }
+
+#ifdef _WIN32
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetMemoryWin32HandleKHR(
+   VkDevice device,
+   const VkMemoryGetWin32HandleInfoKHR *pGetWin32HandleInfo, HANDLE *pHandle)
+{
+   VK_FROM_HANDLE(hk_device, dev, device);
+   VK_FROM_HANDLE(hk_device_memory, memory,
+                  pGetWin32HandleInfo->memory);
+   const enum agx_d3dkmt_external_memory_type external_type =
+      hk_d3dkmt_external_type(pGetWin32HandleInfo->handleType);
+
+   if (external_type == AGX_D3DKMT_EXTERNAL_MEMORY_NONE || memory == NULL ||
+       !(memory->vk.export_handle_types &
+         pGetWin32HandleInfo->handleType)) {
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   }
+
+   uintptr_t handle = 0;
+   if (agx_d3dkmt_bo_export_external(&dev->dev, memory->bo, external_type,
+                                     &handle) != 0) {
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   }
+
+   *pHandle = (HANDLE)handle;
+   return VK_SUCCESS;
+}
+#endif
 
 VKAPI_ATTR uint64_t VKAPI_CALL
 hk_GetDeviceMemoryOpaqueCaptureAddress(

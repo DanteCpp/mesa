@@ -1103,6 +1103,16 @@ hk_GetPhysicalDeviceImageFormatProperties2(
          ext_mem_props = &hk_dma_buf_mem_props;
          break;
 
+#ifdef _WIN32
+      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT:
+         ext_mem_props = &hk_opaque_win32_mem_props;
+         break;
+
+      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT:
+         ext_mem_props = &hk_opaque_win32_kmt_mem_props;
+         break;
+#endif
+
       default:
          /* From the Vulkan 1.3.256 spec:
           *
@@ -1519,6 +1529,19 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
    const struct VkImageDrmFormatModifierExplicitCreateInfoEXT
       *mod_explicit_info = NULL;
 
+   /* BUILD-STATUS.md stage-2: struct vk_image's `drm_format_mod` field
+    * (src/vulkan/runtime/vk_image.h) only exists under
+    * `#if DETECT_OS_LINUX || DETECT_OS_BSD` -- VK_EXT_drm_format_modifier
+    * is inherently a Linux/BSD DRM-interop extension, so upstream Mesa
+    * never compiles the field in on Windows. VERIFIED (grep) every
+    * `drm_format_mod` reference anywhere under src/asahi/ is local to
+    * this one function, so a local shadow variable is sufficient; the
+    * write-through to `image->vk.drm_format_mod` is kept, guarded, for
+    * the Linux/BSD build where the field is real (unchanged behavior
+    * there).
+    */
+   uint64_t drm_format_mod = DRM_FORMAT_MOD_INVALID;
+
    if (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
       assert(!image->vk.wsi_legacy_scanout);
       mod_explicit_info = vk_find_struct_const(
@@ -1542,8 +1565,11 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
       }
 
       assert(modifier != DRM_FORMAT_MOD_INVALID);
-      assert(image->vk.drm_format_mod == DRM_FORMAT_MOD_INVALID);
+      assert(drm_format_mod == DRM_FORMAT_MOD_INVALID);
+      drm_format_mod = modifier;
+#if DETECT_OS_LINUX || DETECT_OS_BSD
       image->vk.drm_format_mod = modifier;
+#endif
    }
 
    if (mod_explicit_info &&
@@ -1555,7 +1581,7 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
          mod_explicit_info->drmFormatModifierPlaneCount, image->plane_count);
    }
 
-   if (image->vk.drm_format_mod == DRM_FORMAT_MOD_APPLE_INTERCHANGE) {
+   if (drm_format_mod == DRM_FORMAT_MOD_APPLE_INTERCHANGE) {
       if (!hk_interchange_create_info(dev, pCreateInfo))
          return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
                           "interchange modifier on an ineligible image");
@@ -1572,7 +1598,7 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
 
    /* G17P and M5 share compressed colour images only in the shape both sides
     * allocate identically (hk_g17p_shared_compression_eligible()). */
-   if (image->vk.drm_format_mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
+   if (drm_format_mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
        (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
        !(hk_g17p_shared_compression_supported(
             &dev->dev, pCreateInfo->format, pCreateInfo->imageType,
@@ -1604,7 +1630,7 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
             : p_format;
       uint32_t linear_stride_B = 0;
       if (mod_explicit_info &&
-          image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR) {
+          drm_format_mod == DRM_FORMAT_MOD_LINEAR) {
          const uint64_t minimum_stride_B = util_format_get_stride(
             p_format, DIV_ROUND_UP(pCreateInfo->extent.width, width_scale));
          if (!hk_image_explicit_linear_stride(
@@ -1618,12 +1644,12 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
       }
 
       bool compressed =
-         hk_map_compression(dev, pCreateInfo, plane, image->vk.drm_format_mod);
+         hk_map_compression(dev, pCreateInfo, plane, drm_format_mod);
 
       image->planes[plane].layout = (struct ail_layout){
          .policy = ail_layout_policy_for_descriptor_generation(
             agx_chip_descriptor_generation(dev->dev.chip)),
-         .tiling = hk_map_tiling(dev, pCreateInfo, image->vk.drm_format_mod),
+         .tiling = hk_map_tiling(dev, pCreateInfo, drm_format_mod),
          .compressed = compressed,
          .mipmapped_z = pCreateInfo->imageType == VK_IMAGE_TYPE_3D,
          .sparse_residency =

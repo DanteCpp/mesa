@@ -27,7 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <xf86drm.h>
+#include "drm-uapi/drm.h"
 
 #include "agx_bo.h"
 #include "agx_chip.h"
@@ -300,12 +300,12 @@ hk_fa_flush(struct hk_frame_anatomy *fa, struct hk_device *dev, bool wait)
             uint32_t syncobj = rec->syncobj;
             if (wait) {
                uint64_t point = rec->point;
-               drmSyncobjTimelineWait(dev->dev.fd, &syncobj, &point, 1,
-                                      os_time_get_nano() + HK_FA_FINISH_WAIT_NS,
-                                      0, NULL);
+               dev->vk.sync->timeline_wait(
+                  dev->vk.sync, &syncobj, &point, 1,
+                  os_time_get_nano() + HK_FA_FINISH_WAIT_NS, 0, NULL);
             }
             uint64_t value = 0;
-            if (drmSyncobjQuery(dev->dev.fd, &syncobj, &value, 1))
+            if (dev->vk.sync->query(dev->vk.sync, &syncobj, &value, 1, 0))
                value = 0;
             cached_syncobj = rec->syncobj;
             cached_value = value;

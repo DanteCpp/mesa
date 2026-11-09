@@ -9,7 +9,7 @@
 #include "hk_frame_anatomy.h"
 
 #include <errno.h>
-#include <xf86drm.h>
+#include "drm-uapi/drm.h"
 
 #include "agx_compile.h"
 #include "agx_pack.h"
@@ -1132,10 +1132,9 @@ hk_oq_submission_done(struct hk_device *dev, struct hk_query_pool *pool,
       int64_t timeout = wait ? (int64_t)os_time_get_absolute_timeout(100000000)
                              : 0;
       /* WAIT_FOR_SUBMIT: the point is noted just before the submit ioctl. */
-      int ret = drmSyncobjTimelineWait(dev->dev.fd, &syncobj, &point, 1,
-                                       timeout,
-                                       DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
-                                       NULL);
+      int ret = dev->vk.sync->timeline_wait(
+         dev->vk.sync, &syncobj, &point, 1, timeout,
+         DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
       if (ret == 0) {
          hk_queue_note_signalled(queue, point);
          return VK_SUCCESS;
@@ -1171,7 +1170,8 @@ hk_queues_idle(struct hk_device *dev)
       const uint64_t submitted = p_atomic_read(&queue->drm.timeline_value);
       uint64_t point = 0;
       if (!queue->drm.syncobj ||
-          drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &point, 1) ||
+          dev->vk.sync->query(dev->vk.sync, &queue->drm.syncobj, &point, 1,
+                              0) ||
           point < submitted)
          return false;
    }
