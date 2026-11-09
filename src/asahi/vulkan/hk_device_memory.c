@@ -828,8 +828,6 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
 
    return VK_SUCCESS;
 
-fail_bo:
-   agx_bo_unreference(&dev->dev, mem->bo);
 fail_alloc:
    vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
    return result;

@@ -10,6 +10,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+/* Windows has no cgroups: report no process memory limit. */
+bool
+hk_get_cgroup_memory_available(const char *proc_cgroup,
+                               const char *proc_mountinfo,
+                               uint64_t *available)
+{
+   return false;
+}
+#else
+
 /* mountinfo escapes whitespace and backslashes with octal sequences. */
 static void
 unescape(char *s)
@@ -175,3 +186,4 @@ hk_get_cgroup_memory_available(const char *proc_cgroup,
       *available = remaining;
    return limited;
 }
+#endif /* _WIN32 */
