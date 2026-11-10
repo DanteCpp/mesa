@@ -77,6 +77,17 @@ static agx_kmt_handle g_raw_adapter[AGXW_BRIDGE_MAX_DEVICES];
 static volatile LONG g_local_calls[AGXW_BRIDGE_MAX_DEVICES];
 static volatile LONG g_local_closing[AGXW_BRIDGE_MAX_DEVICES];
 static _Thread_local unsigned g_local_depth[AGXW_BRIDGE_MAX_DEVICES];
+/* Context operations serialize translation, callback, and token retirement.
+ * Workers never need the UMD foreground lock. CPU fence waits stay outside. */
+static CRITICAL_SECTION g_context_gate[AGXW_BRIDGE_MAX_DEVICES];
+#define CONTEXT_INVOKE(slot_, call_) \
+   __extension__({ \
+      EnterCriticalSection(&g_context_gate[(slot_)]); \
+      agx_kmt_status _context_status = (call_); \
+      LeaveCriticalSection(&g_context_gate[(slot_)]); \
+      _context_status; \
+   })
+
 
 static bool
 consumer_enter(unsigned slot)
@@ -1451,22 +1462,22 @@ impl_wait_from_gpu(unsigned s, const struct agx_kmt_waitsyncfromgpu *a)
    static agx_kmt_status AGX_KMT_API bt_uva_##N(                              \
       const struct agx_kmt_updategpuva *a)                                     \
    {                                                                           \
-      return CONSUMER_INVOKE((N), impl_update_gpuva((N), a));                                        \
+      return CONSUMER_INVOKE((N), CONTEXT_INVOKE((N), impl_update_gpuva((N), a)));                                        \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_ccv_##N(                              \
       struct agx_kmt_createcontextvirtual *a)                                  \
    {                                                                           \
-      return CONSUMER_INVOKE((N), impl_create_context_virtual((N), a));                             \
+      return CONSUMER_INVOKE((N), CONTEXT_INVOKE((N), impl_create_context_virtual((N), a)));                             \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_dc_##N(                               \
       const struct agx_kmt_destroycontext *a)                                  \
    {                                                                           \
-      return CONSUMER_INVOKE((N), impl_destroy_context((N), a));                                     \
+      return CONSUMER_INVOKE((N), CONTEXT_INVOKE((N), impl_destroy_context((N), a)));                                     \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_sc_##N(                               \
       const struct agx_kmt_submitcommand *a)                                   \
    {                                                                           \
-      return CONSUMER_INVOKE((N), impl_submit_command((N), a));                                      \
+      return CONSUMER_INVOKE((N), CONTEXT_INVOKE((N), impl_submit_command((N), a)));                                      \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_cso2_##N(                             \
       struct agx_kmt_createsyncobj2 *a)                                        \
@@ -1491,17 +1502,17 @@ impl_wait_from_gpu(unsigned s, const struct agx_kmt_waitsyncfromgpu *a)
    static agx_kmt_status AGX_KMT_API bt_sgpu_##N(                             \
       const struct agx_kmt_signalsyncfromgpu *a)                              \
    {                                                                           \
-      return CONSUMER_INVOKE((N), impl_signal_from_gpu((N), a));                                     \
+      return CONSUMER_INVOKE((N), CONTEXT_INVOKE((N), impl_signal_from_gpu((N), a)));                                     \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_wgpu_##N(                             \
       const struct agx_kmt_waitsyncfromgpu *a)                                \
    {                                                                           \
-      return CONSUMER_INVOKE((N), impl_wait_from_gpu((N), a));                                       \
+      return CONSUMER_INVOKE((N), CONTEXT_INVOKE((N), impl_wait_from_gpu((N), a)));                                       \
    }
 
 #define GEN_ESCAPE(N) \
    static agx_kmt_status AGX_KMT_API bt_esc_##N(const struct agx_kmt_escape *a) \
-   { return CONSUMER_INVOKE((N), impl_escape((N), a)); }
+   { return CONSUMER_INVOKE((N), CONTEXT_INVOKE((N), impl_escape((N), a))); }
 
 #define INST(N)                                                                \
    case (N):                                                                   \
@@ -1833,6 +1844,10 @@ agx_d3dkmt_bridge_install(struct agx_d3dkmt_winsys *ws)
 
    AcquireSRWLockExclusive(&g_registry_lock);
    int slot = agxw_bridge_provider_alloc(&g_registry, b.callbacks, b.hRTDevice);
+   if (slot >= 0 && !InitializeCriticalSectionEx(&g_context_gate[slot], 0, 0)) {
+      agxw_bridge_provider_free(&g_registry, (unsigned)slot);
+      slot = -1;
+   }
    if (slot >= 0) {
       g_publisher[slot] = umd;
       g_raw_adapter[slot] = ws->adapter;
@@ -1955,6 +1970,7 @@ agx_d3dkmt_bridge_uninstall(struct agx_d3dkmt_winsys *ws)
       (unsigned long long)summary->sync_destroy_failures);
    ReleaseSRWLockShared(&g_diag_lock[slot]);
 
+   DeleteCriticalSection(&g_context_gate[slot]);
    AcquireSRWLockExclusive(&g_registry_lock);
    HMODULE publisher = g_publisher[slot];
    g_publisher[slot] = NULL;
