@@ -21,7 +21,10 @@ def step(name,expect_failure=False,legacy=False):
  failures=int(m[2]);assert int(m[1])==31
  assert (r['returncode']==1 and failures>0 and 'marker=1 passed=0'in text) if expect_failure else (r['returncode']==0 and failures==0)
  if legacy:assert command([exe,'--legacy-compiler'],d,'legacy')['returncode']==0
- pins={str(p):file(p) for p in [M/'src/asahi/vulkan/hk_shader.c',M/'src/asahi/compiler/agx_nir_lower_interpolation.c',exe,H/'placement.inc']}
+ snapshots=[]
+ for p in [M/'src/asahi/vulkan/hk_shader.c',M/'src/asahi/compiler/agx_nir_lower_interpolation.c',exe]:
+  q=d/p.name;q.write_bytes(p.read_bytes());snapshots.append(q)
+ pins={str(p):file(p) for p in snapshots+[d/'placement.inc']}
  return dict(name=name,passed=True,expected_failure=expect_failure,checks=int(m[1]),failures=failures,build=build,replay=r,files=pins)
 results=[];hk=M/'src/asahi/vulkan/hk_shader.c';lower=M/'src/asahi/compiler/agx_nir_lower_interpolation.c';original={hk:hk.read_bytes(),lower:lower.read_bytes()}
 try:
