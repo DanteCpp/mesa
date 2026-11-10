@@ -916,7 +916,9 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
  * EndCommandBuffer is cheap O(# of control streams) and lets us get away with
  * the sloppiness. On M5 a stream that waits for a render the one before it
  * does not wait for stays separate (hk_sync_merge_delays()): merged, the
- * earlier work would wait for that render too.
+ * earlier work would wait for that render too. An M5 stream that holds its
+ * dispatch never merges: the M5 compute admission takes one dispatch per
+ * stream (hk_m5_dispatch_stream()).
  */
 static void
 merge_control_streams(struct hk_cmd_buffer *cmd)
@@ -932,6 +934,7 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
        * first stream's registers, staging and local size. */
       if (cs->type == HK_CS_CDM && last && last->type == HK_CS_CDM && !g18 &&
           !last->g18_dispatch_sealed && !cs->g18_dispatch_sealed &&
+          !last->m5_dispatch_sealed && !cs->m5_dispatch_sealed &&
           !last->timestamp.end.handle &&
           !(last->timestamp.start.handle && cs->g17p_timestamp_query) &&
           !(last->timestamp.start.handle && cs->timestamp.start.handle) &&
@@ -1069,6 +1072,8 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
        * helper path).  Appending a second terminate makes the stream 52 bytes;
        * the G18 kernel admits at most 48 (one dispatch) and refuses the submit
        * with ENOTSUPP ("G18 compute admission rejected ... stream_bytes=52").
+       * An M5 stream that holds its dispatch (m5_dispatch_sealed) has no
+       * terminator yet and gets it here: 44 + 4 = 48 bytes.
        */
       if (cs->type == HK_CS_CDM && !cs->g18_dispatch_sealed) {
          /* With host_alias.dynamic, every stream holding work ends with the

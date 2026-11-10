@@ -716,6 +716,14 @@ note_last(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 }
 
 void
+hk_sync_stream_follow(struct hk_cs *next, struct hk_cs *prev)
+{
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ] = {0};
+   dep[HK_SYNC_CDM].cut = prev;
+   hk_sync_stream_wait(next, dep);
+}
+
+void
 hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                        struct hk_cs **slot, bool compute)
 {

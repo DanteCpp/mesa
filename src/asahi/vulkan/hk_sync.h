@@ -445,6 +445,11 @@ void hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                             struct hk_cs **slot, bool compute);
 void hk_sync_check_cs(struct hk_cmd_buffer *cmd);
 
+/* M5: `next` takes the dispatch that would have followed `prev`'s in one
+ * stream (hk_m5_dispatch_stream()). It waits for `prev` on the compute
+ * subqueue, so the two run in the order the single stream gave them. */
+void hk_sync_stream_follow(struct hk_cs *next, struct hk_cs *prev);
+
 /* Stage class of work entering the open general compute stream. Keep this
  * equivalent to stream_kind() for &cmd->current_cs.cs. */
 #define hk_sync_general_cs_kind(cmd)                                           \

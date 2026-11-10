@@ -1641,6 +1641,55 @@ hk_m5_compute_resources(struct hk_cs *cs, uint32_t scratch_B,
    util_dynarray_append(&cs->compute_resources, profile);
 }
 
+/*
+ * M5 (J813): one dispatch per compute control stream. The M5 compute
+ * admission (the J813 KMD, as Linux m5 drm.rs M5_COMPUTE_STREAM_BYTES) takes
+ * exactly one 44-byte dispatch record and the 4-byte terminator; a longer
+ * stream is refused. Return the stream the next dispatch record goes into:
+ * `cs` itself while it holds no dispatch, otherwise a new stream in the slot
+ * that holds the newest stream of `cs`'s chain, created where an appended
+ * record would have been (hk_cmd_buffer_get_cs_general()).
+ *
+ * The move happens immediately before a record is written, never when a
+ * stream is only fetched: no stream is left empty, and a barrier recorded
+ * after a dispatch still strengthens (or is elided into) that dispatch's own
+ * barrier word in place, exactly as before (hk_cdm_flush()). Callers that
+ * keep one stream pointer across several dispatches follow m5_successor.
+ */
+static struct hk_cs *
+hk_m5_dispatch_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   while (cs->m5_dispatch_sealed && cs->m5_successor)
+      cs = cs->m5_successor;
+   if (!cs->m5_dispatch_sealed)
+      return cs;
+
+   struct hk_cs **slots[] = {
+      &cmd->current_cs.cs,
+      &cmd->current_cs.pre_gfx,
+      &cmd->current_cs.post_gfx,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(slots); ++i) {
+      if (*slots[i] != cs)
+         continue;
+
+      *slots[i] = NULL;
+      struct hk_cs *next = hk_cmd_buffer_get_cs_general(cmd, slots[i], true);
+      if (!next)
+         return NULL;
+      /* In one stream the dispatches ran in stream order; keep that order
+       * across the two commands (cdm_barrier). */
+      hk_sync_stream_follow(next, cs);
+      cs->m5_successor = next;
+      /* Fetching may record deferred work into the new stream first. */
+      return hk_m5_dispatch_stream(cmd, next);
+   }
+
+   mesa_loge("M5 dispatch into a sealed compute stream no slot holds");
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+   return NULL;
+}
+
 void
 hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
                          enum agx_barrier barrier, enum libagx_program idx,
@@ -1685,6 +1734,9 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
                          : (barrier & AGX_PREGFX) ? &cmd->current_cs.pre_gfx
                                                  : &cmd->current_cs.cs;
    struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
+   if (!cs)
+      return;
+   cs = hk_m5_dispatch_stream(cmd, cs);
    if (!cs)
       return;
 
@@ -1776,6 +1828,7 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       return;
    }
    cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
+   cs->m5_dispatch_sealed = true;
    if (flags == 5) {
       /* M5's strong launch tail has memory scope. */
       cs->strong_flush_end = cs->current;
@@ -1815,6 +1868,13 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       goto refused;
    if (!agx_is_indirect(grid) &&
        (!grid.count[0] || !grid.count[1] || !grid.count[2]))
+      return;
+
+   /* One dispatch per stream: move before anything below writes to `cs`.
+    * The ray-tracing template capture also moves, so the launch the select
+    * kernel's stream links to keeps this stream's resource profile. */
+   cs = hk_m5_dispatch_stream(cmd, cs);
+   if (!cs)
       return;
 
    if (s->b.info.uses_matrix16) {
@@ -2005,6 +2065,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (!appended)
       goto refused;
    cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
+   cs->m5_dispatch_sealed = true;
    cs->weak_barrier_end = cs->current;
    cs->app_dispatch_end = app_dispatch ? cs->current : NULL;
    hk_m5_compute_resources(cs, desc.scratch_size, 0,
@@ -2965,6 +3026,10 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
          return;
    }
    hk_dispatch_with_local_size(cmd, cs, s, grid, local_size);
+   /* M5 may have recorded the dispatch into a new stream
+    * (hk_m5_dispatch_stream()); account it there. */
+   while (cs->m5_successor)
+      cs = cs->m5_successor;
    cs->uses_global_atomics |= s->b.info.uses_global_atomics;
    cs->pack_loops |= s->b.info.has_loops;
    if (agx_is_indirect(grid)) {

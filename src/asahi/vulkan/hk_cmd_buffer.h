@@ -1157,6 +1157,16 @@ struct hk_cs {
     * it, and the submission carries the stream's compute resources. */
    bool g18_dispatch_sealed;
    struct drm_asahi_g18_compute_resources g18_compute_resources;
+   /* M5: this stream holds its one dispatch record, the shape the M5
+    * compute admission takes (a 44-byte dispatch and the 4-byte terminator,
+    * Linux m5 drm.rs M5_COMPUTE_STREAM_BYTES). The next record goes to a new
+    * stream (hk_m5_dispatch_stream()); the dispatch's own barrier word may
+    * still be strengthened in place, hk_EndCommandBuffer appends the
+    * terminator, and merge_control_streams() never concatenates it. */
+   bool m5_dispatch_sealed;
+   /* M5: the stream that took the next dispatch once this one was sealed,
+    * for callers that keep one stream pointer across several dispatches. */
+   struct hk_cs *m5_successor;
 
    /* Whether the sampler heap is required. Although we always must maintain the
     * heap for correctness, it's often not necessary since we can push lots of
