@@ -123,6 +123,26 @@ static_assert((int)AGXW_PRIORITY_REALTIME == (int)DRM_ASAHI_PRIORITY_REALTIME,
               "priority REALTIME");
 
 /* -------------------------------------------------------------------------
+ * Diagnostics.
+ *
+ * Every stderr line this winsys writes is flushed as it is written, so the
+ * line survives a bugcheck that follows it; stderr's buffering is otherwise
+ * whatever the application set (setvbuf). errno is kept for callers that
+ * report it after logging.
+ * ------------------------------------------------------------------------- */
+static void PRINTFLIKE(1, 2)
+d3dkmt_log_flushed(const char *fmt, ...)
+{
+   const int saved_errno = errno;
+   va_list ap;
+   va_start(ap, fmt);
+   vfprintf(stderr, fmt, ap);
+   va_end(ap);
+   fflush(stderr);
+   errno = saved_errno;
+}
+
+/* -------------------------------------------------------------------------
  * Error mapping and waits.
  * ------------------------------------------------------------------------- */
 int
@@ -276,7 +296,7 @@ agx_d3dkmt_create_monitored_fence(struct agx_d3dkmt_winsys *ws,
                                   const char *what)
 {
    if (ws->m5_guard_required && !ws->m5_guard_reserved) {
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "D3DKMT: refusing monitored fence (%s) before the G17 "
               "driver-window guard [0x%llx, 0x%llx) is reserved\n",
               what, (unsigned long long)AGX_M5_DRIVER_BASE,
@@ -298,7 +318,7 @@ agx_d3dkmt_create_monitored_fence(struct agx_d3dkmt_winsys *ws,
       gpu_va >= AGX_M5_DRIVER_BASE &&
       gpu_va - AGX_M5_DRIVER_BASE < AGX_M5_DRIVER_SIZE;
 
-   fprintf(stderr,
+   d3dkmt_log_flushed(
            "D3DKMT: monitored fence (%s) 0x%08x GPU VA 0x%llx%s\n", what,
            (unsigned)create->hSyncObject, (unsigned long long)gpu_va,
            in_driver_window ? " INSIDE the driver window: refused" : "");
@@ -377,7 +397,7 @@ d3dkmt_make_resident(struct agx_d3dkmt_winsys *ws,
        * failed without naming itself, which cost a hardware cycle. A
        * 0xC000000D here for an allocation this winsys did not create is
        * dxgkrnl's per-device handle scoping, not a KMD or VidMm failure. */
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "D3DKMTMakeResident failed status=0x%08x paging_queue=0x%08x "
               "allocation=0x%08x\n",
               (unsigned)st, (unsigned)ws->paging_queue,
@@ -501,7 +521,7 @@ d3dkmt_adopt_allocation(
    enum agx_va_flags va_flags = flags & AGX_BO_LOW_VA ? AGX_VA_USC : 0;
    bo->va = agx_va_alloc(dev, size, bo->align, va_flags, 0);
    if (!bo->va) {
-      fprintf(stderr, "Failed to allocate BO VMA\n");
+      d3dkmt_log_flushed("Failed to allocate BO VMA\n");
       agx_bo_free(dev, bo);
       return NULL;
    }
@@ -542,7 +562,7 @@ d3dkmt_bo_alloc(struct agx_device *dev, size_t size, size_t align,
          : AGX_D3DKMT_EXTERNAL_MEMORY_NONE;
    if (!d3dkmt_create_allocation(ws, size, flags,
                                  external_type, &record)) {
-      fprintf(stderr, "D3DKMTCreateAllocation2 failed\n");
+      d3dkmt_log_flushed("D3DKMTCreateAllocation2 failed\n");
       return NULL;
    }
 
@@ -732,7 +752,7 @@ d3dkmt_external_open(
    free(foreign_blobs);
 
    if (!AGX_KMT_SUCCESS(st)) {
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "D3DKMT external open failed status=0x%08x type=%d "
               "runtime_size=%u resource_driver_size=%u\n",
               (unsigned)st, (int)external_type, sizes.runtime_size,
@@ -854,7 +874,7 @@ agx_d3dkmt_bo_import_external(
        agx_d3dkmt_import_size(&private_data, &kmd, record.allocation,
                               &checked_size) != AGX_D3DKMT_OK ||
        checked_size > SIZE_MAX) {
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "D3DKMT import refused: allocation=0x%08x claimed=%llu "
               "kmd_requested=%llu kmd_size=%llu\n",
               (unsigned)record.allocation,
@@ -902,7 +922,7 @@ agx_d3dkmt_bo_import_local(struct agx_device *dev,
        agx_d3dkmt_borrowed_import_size(size, &kmd, allocation,
                                        &checked_size) != AGX_D3DKMT_OK ||
        checked_size > SIZE_MAX) {
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "borrowed local import refused: allocation=0x%08x claimed=%zu "
               "kmd_size=%llu\n",
               (unsigned)allocation, size,
@@ -913,7 +933,7 @@ agx_d3dkmt_bo_import_local(struct agx_device *dev,
    size = (size_t)checked_size;
 
    if (!d3dkmt_make_resident(ws, allocation)) {
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "borrowed local import: MakeResident refused foreign "
               "allocation=0x%08x errno=%d\n",
               (unsigned)allocation, errno);
@@ -924,7 +944,7 @@ agx_d3dkmt_bo_import_local(struct agx_device *dev,
    struct agx_bo *bo = d3dkmt_adopt_allocation(
       dev, size, AIL_PAGESIZE, flags, &record);
    if (bo == NULL) {
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "borrowed local import: adopt/bind failed for foreign "
               "allocation=0x%08x errno=%d\n",
               (unsigned)allocation, errno);
@@ -1045,6 +1065,7 @@ d3dkmt_gpuva_guard_report(const char *reason, const struct agx_device *dev,
    const DWORD bytes =
       (DWORD)MIN2((size_t)length, sizeof(message) - (size_t)1);
    fputs(message, stderr);
+   fflush(stderr);
    OutputDebugStringA(message);
 
    if (InterlockedCompareExchange(&persisted, 1, 0) != 0)
@@ -1134,7 +1155,7 @@ d3dkmt_va_update_init(struct agx_d3dkmt_winsys *ws)
          .FenceValueCPUVirtualAddress;
    ws->va_fence_next = 0;
    if (enum_log_enabled())
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "NTAGX_ENUM va_update_context=0x%08x fence=0x%08x cpu=%p\n",
               (unsigned)ws->va_context, (unsigned)ws->va_fence,
               (const void *)ws->va_fence_cpu);
@@ -1258,7 +1279,7 @@ d3dkmt_bo_bind(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
    simple_mtx_unlock(&ws->lock);
 
    if (!AGX_KMT_SUCCESS(st)) {
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "D3DKMTUpdateGpuVirtualAddress failed status=0x%08x "
               "device=0x%08x context=0x%08x fence=0x%08x "
               "fence_value=%llu nops=%u flags=0x%08x\n",
@@ -1267,7 +1288,7 @@ d3dkmt_bo_bind(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
               (unsigned long long)update.FenceValue, update.NumOperations,
               update.Flags);
       for (uint32_t i = 0; i < nops; ++i) {
-         fprintf(stderr,
+         d3dkmt_log_flushed(
                  "D3DKMTUpdateGpuVirtualAddress op[%u] type=%d "
                  "base=0x%llx size=0x%llx alloc=0x%08x "
                  "offset=0x%llx alloc_size=0x%llx prot=0x%llx "
@@ -1341,7 +1362,7 @@ d3dkmt_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
       bo->_map = NULL;
       bo->_map_size = 0;
       agx_d3dkmt_fail(st);
-      fprintf(stderr, "D3DKMTLock2 failed: handle=%u\n", bo->uapi_handle);
+      d3dkmt_log_flushed("D3DKMTLock2 failed: handle=%u\n", bo->uapi_handle);
       return;
    }
 
@@ -1950,7 +1971,7 @@ d3dkmt_reserve(struct agx_d3dkmt_winsys *ws, uint64_t base, uint64_t size)
 
    agx_kmt_status st = ws->fns.ReserveGpuVirtualAddress(&reserve);
    if (!AGX_KMT_SUCCESS(st)) {
-      fprintf(stderr, "D3DKMTReserveGpuVirtualAddress(0x%llx, 0x%llx) failed\n",
+      d3dkmt_log_flushed("D3DKMTReserveGpuVirtualAddress(0x%llx, 0x%llx) failed\n",
               (unsigned long long)base, (unsigned long long)size);
       return agx_d3dkmt_fail(st);
    }
@@ -1969,7 +1990,7 @@ d3dkmt_reserve(struct agx_d3dkmt_winsys *ws, uint64_t base, uint64_t size)
     * first reservation is the cheapest possible discovery.
     */
    if (reserve.VirtualAddress != base) {
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "D3DKMTReserveGpuVirtualAddress ignored the base hint "
               "(wanted 0x%llx, got 0x%llx); Honeykrisp's VA layout is fixed\n",
               (unsigned long long)base,
@@ -2024,7 +2045,7 @@ d3dkmt_free_va_range(struct agx_d3dkmt_winsys *ws,
    agx_kmt_status st = ws->fns.FreeGpuVirtualAddress(&free_va);
 
    if (!AGX_KMT_SUCCESS(st)) {
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "D3DKMTFreeGpuVirtualAddress(0x%llx, 0x%llx) failed "
               "status=0x%08x\n",
               (unsigned long long)range->base,
@@ -2147,7 +2168,7 @@ d3dkmt_release_va_lease(struct agx_d3dkmt_winsys *ws)
    lease = *link;
    if (lease == NULL || !d3dkmt_ranges_equal(lease, ws->va, ws->va_count) ||
        lease->references == 0) {
-      fprintf(stderr, "D3DKMT GPUVA lease invariant failure\n");
+      d3dkmt_log_flushed("D3DKMT GPUVA lease invariant failure\n");
       ReleaseSRWLockExclusive(&agx_d3dkmt_va_lease_lock);
       ws->va_count = 0;
       return;
@@ -2213,7 +2234,7 @@ d3dkmt_vm_create(struct agx_device *dev, struct drm_asahi_vm_create *vm)
     * d3dkmt_reserve() refuses both a failed reservation and a moved base.
     */
    if (ws->m5_guard_required != agx_chip_g17_m5(dev->chip)) {
-      fprintf(stderr, "D3DKMT: G17 guard decision disagrees with the chip\n");
+      d3dkmt_log_flushed("D3DKMT: G17 guard decision disagrees with the chip\n");
       errno = EINVAL;
       return -1;
    }
@@ -2221,7 +2242,7 @@ d3dkmt_vm_create(struct agx_device *dev, struct drm_asahi_vm_create *vm)
       const struct agxw_va_layout *l = &ws->policy.layout;
 
       if (p_atomic_read(&ws->monitored_fences_created) != 0) {
-         fprintf(stderr,
+         d3dkmt_log_flushed(
                  "D3DKMT: %u monitored fence(s) exist before the G17 "
                  "driver-window guard; refusing VM_CREATE\n",
                  (unsigned)p_atomic_read(&ws->monitored_fences_created));
@@ -2235,7 +2256,7 @@ d3dkmt_vm_create(struct agx_device *dev, struct drm_asahi_vm_create *vm)
           l->internal_start <= AGX_D3DKMT_M5_GUARD_BASE ||
           l->internal_start >= AGX_D3DKMT_M5_GUARD_END ||
           l->internal_end < AGX_D3DKMT_M5_GUARD_END) {
-         fprintf(stderr,
+         d3dkmt_log_flushed(
                  "D3DKMT: the G17 driver-window guard [0x%llx, 0x%llx) does "
                  "not fit driver range [0x%llx, 0x%llx), user VA [0x%llx, "
                  "0x%llx), KMD range [0x%llx, 0x%llx)\n",
@@ -2268,7 +2289,7 @@ d3dkmt_vm_create(struct agx_device *dev, struct drm_asahi_vm_create *vm)
                                 dev->params.vm_kernel_min_size,
                                 dev->shader_base, vm->kernel_start,
                                 vm->kernel_end, &plan) != AGX_D3DKMT_OK) {
-         fprintf(stderr,
+         d3dkmt_log_flushed(
                  "D3DKMT: the M5 address layout (USC 0x%llx, driver range "
                  "[0x%llx, 0x%llx)) does not fit the adapter's VM [0x%llx, "
                  "0x%llx)\n",
@@ -2281,7 +2302,7 @@ d3dkmt_vm_create(struct agx_device *dev, struct drm_asahi_vm_create *vm)
          return -1;
       }
       for (uint32_t i = 0; i < plan.outside_count; ++i) {
-         fprintf(stderr,
+         d3dkmt_log_flushed(
                  "D3DKMT: Honeykrisp binds [0x%llx, 0x%llx) but the adapter's "
                  "user VA is [0x%llx, 0x%llx); those binds will fail\n",
                  (unsigned long long)plan.outside[i].base,
@@ -2317,7 +2338,7 @@ d3dkmt_vm_create(struct agx_device *dev, struct drm_asahi_vm_create *vm)
 
    if (d3dkmt_acquire_va_lease(ws, ranges, n)) {
       if (guard_count != 0)
-         fprintf(stderr,
+         d3dkmt_log_flushed(
                  "D3DKMT: reserving the G17 driver-window guard and windows "
                  "failed (errno %d); device creation fails\n",
                  errno);
@@ -2327,7 +2348,7 @@ d3dkmt_vm_create(struct agx_device *dev, struct drm_asahi_vm_create *vm)
     * reserved them or another device in the process already had. */
    ws->m5_guard_reserved = guard_count != 0;
    if (guard_count != 0)
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "D3DKMT: G17 driver-window guard [0x%llx, 0x%llx) held\n",
               (unsigned long long)ranges[0].base,
               (unsigned long long)(ranges[0].base + ranges[0].size));
@@ -2482,7 +2503,7 @@ d3dkmt_queue_destroy(struct agx_device *dev, struct drm_asahi_queue_destroy *q)
    struct agx_kmt_destroycontext destroy = {.hContext = local.hContext};
    agx_kmt_status destroy_status = ws->fns.DestroyContext(&destroy);
    if (enum_log_enabled())
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "NTAGX_ENUM destroy_context queue=%u context=0x%08x status=0x%08x\n",
               q->queue_id, (unsigned)local.hContext,
               (unsigned)destroy_status);
@@ -2639,12 +2660,16 @@ d3dkmt_report_unusable(unsigned reason, const char *fmt, ...)
    if (reason >= ARRAY_SIZE(reported) || p_atomic_xchg(&reported[reason], 1u))
       return;
 
+   /* One line in three writes, flushed once it is complete. */
+   const int saved_errno = errno;
    va_list args;
    va_start(args, fmt);
    fprintf(stderr, "honeykrisp: AppleAgxWddm adapter not usable: ");
    vfprintf(stderr, fmt, args);
    fputc('\n', stderr);
    va_end(args);
+   fflush(stderr);
+   errno = saved_errno;
 }
 
 static bool
@@ -2666,7 +2691,7 @@ query_identity(const struct agx_d3dkmt_fns *fns, agx_kmt_handle adapter,
    agx_kmt_status status = fns->QueryAdapterInfo(&query);
    if (!AGX_KMT_SUCCESS(status)) {
       if (enum_log_enabled())
-         fprintf(stderr,
+         d3dkmt_log_flushed(
                  "NTAGX_ENUM identity adapter=0x%08x query=0x%08x\n",
                  (unsigned)adapter, (unsigned)status);
       return false;
@@ -2684,7 +2709,7 @@ query_identity(const struct agx_d3dkmt_fns *fns, agx_kmt_handle adapter,
          (char)blob.gpu_variant, blob.chip_id, AGX_D3DKMT_PARAMS_GLOBAL_SIZE);
    }
    if (enum_log_enabled())
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "NTAGX_ENUM identity adapter=0x%08x query=0x%08x "
               "magic=0x%08x version=%u size=%u chip=0x%04x gen=%u "
               "variant=0x%02x revision=0x%02x contract=%u params=%u "
@@ -2708,14 +2733,14 @@ agx_d3dkmt_enumerate_adapters(struct agx_kmt_luid *out, uint32_t capacity,
 
    if (!agx_d3dkmt_load(&fns)) {
       if (enum_log_enabled())
-         fprintf(stderr, "NTAGX_ENUM load=failed\n");
+         d3dkmt_log_flushed("NTAGX_ENUM load=failed\n");
       return false;
    }
 
    struct agx_kmt_enumadapters2 e = {0};
    agx_kmt_status status = fns.EnumAdapters2(&e);
    if (enum_log_enabled())
-      fprintf(stderr, "NTAGX_ENUM count status=0x%08x adapters=%u\n",
+      d3dkmt_log_flushed("NTAGX_ENUM count status=0x%08x adapters=%u\n",
               (unsigned)status, e.NumAdapters);
    if (!AGX_KMT_SUCCESS(status))
       return false;
@@ -2729,7 +2754,7 @@ agx_d3dkmt_enumerate_adapters(struct agx_kmt_luid *out, uint32_t capacity,
    e.pAdapters = infos;
    status = fns.EnumAdapters2(&e);
    if (enum_log_enabled())
-      fprintf(stderr, "NTAGX_ENUM fill status=0x%08x adapters=%u\n",
+      d3dkmt_log_flushed("NTAGX_ENUM fill status=0x%08x adapters=%u\n",
               (unsigned)status, e.NumAdapters);
    if (!AGX_KMT_SUCCESS(status)) {
       free(infos);
@@ -2741,7 +2766,7 @@ agx_d3dkmt_enumerate_adapters(struct agx_kmt_luid *out, uint32_t capacity,
       struct agxw_adapter_identity id;
 
       if (enum_log_enabled())
-         fprintf(stderr,
+         d3dkmt_log_flushed(
                  "NTAGX_ENUM candidate=%u adapter=0x%08x "
                  "luid=%08x:%08x\n",
                  i, (unsigned)infos[i].hAdapter,
@@ -2761,7 +2786,7 @@ agx_d3dkmt_enumerate_adapters(struct agx_kmt_luid *out, uint32_t capacity,
    free(infos);
    *count = found;
    if (enum_log_enabled())
-      fprintf(stderr, "NTAGX_ENUM accepted=%u capacity=%u\n", found,
+      d3dkmt_log_flushed("NTAGX_ENUM accepted=%u capacity=%u\n", found,
               capacity);
    return true;
 }
@@ -2835,7 +2860,7 @@ d3dkmt_device_lease_release(struct agx_d3dkmt_winsys *ws)
    lease = *link;
    if (lease == NULL || lease->device != ws->device ||
        lease->references == 0) {
-      fprintf(stderr, "D3DKMT device lease invariant failure\n");
+      d3dkmt_log_flushed("D3DKMT device lease invariant failure\n");
       ReleaseSRWLockExclusive(&agx_d3dkmt_device_lease_lock);
       ws->device_lease_held = false;
       return;
@@ -2849,7 +2874,7 @@ d3dkmt_device_lease_release(struct agx_d3dkmt_winsys *ws)
          *link = lease->next;
          free(lease);
       } else {
-         fprintf(stderr, "D3DKMTDestroyDevice failed status=0x%08x\n",
+         d3dkmt_log_flushed("D3DKMTDestroyDevice failed status=0x%08x\n",
                  (unsigned)status);
       }
    }
@@ -2889,7 +2914,7 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
    int params_status =
       d3dkmt_escape(ws, AGXW_ESC_GET_PARAMS, ws->params, ws->params_size);
    if (enum_log_enabled())
-      fprintf(stderr, "NTAGX_ENUM get_params result=%d errno=%d size=%u\n",
+      d3dkmt_log_flushed("NTAGX_ENUM get_params result=%d errno=%d size=%u\n",
               params_status, errno, ws->params_size);
    if (params_status != 0) {
       d3dkmt_report_unusable(
@@ -2956,7 +2981,7 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
 
    bool device_status = d3dkmt_device_lease_acquire(ws);
    if (enum_log_enabled())
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "NTAGX_ENUM create_device status=%u device=0x%08x shared=%u\n",
               device_status ? 0u : 1u, (unsigned)ws->device,
               (unsigned)ws->device_lease_held);
@@ -2966,7 +2991,7 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
    struct agx_kmt_createpagingqueue pq = {.hDevice = ws->device};
    agx_kmt_status paging_status = ws->fns.CreatePagingQueue(&pq);
    if (enum_log_enabled())
-      fprintf(stderr,
+      d3dkmt_log_flushed(
               "NTAGX_ENUM paging_queue status=0x%08x device=0x%08x "
               "queue=0x%08x fence=0x%08x cpu=%p\n",
               (unsigned)paging_status, (unsigned)ws->device,
@@ -2989,7 +3014,7 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
    dev->ops = agx_device_d3dkmt_ops;
    dev->write_set_contract = true;
    if (enum_log_enabled())
-      fprintf(stderr, "NTAGX_ENUM open_device=ready\n");
+      d3dkmt_log_flushed("NTAGX_ENUM open_device=ready\n");
    return true; /* caller then runs agx_open_device() */
 
 fail_device:;
@@ -3017,7 +3042,7 @@ agx_d3dkmt_close_device(struct agx_device *dev)
       struct agx_kmt_destroycontext dc = {.hContext = ws->xfer_ctx};
       agx_kmt_status status = ws->fns.DestroyContext(&dc);
       if (enum_log_enabled())
-         fprintf(stderr,
+         d3dkmt_log_flushed(
                  "NTAGX_ENUM destroy_context xfer context=0x%08x status=0x%08x\n",
                  (unsigned)dc.hContext, (unsigned)status);
       ws->xfer_ctx = 0;
@@ -3030,7 +3055,7 @@ agx_d3dkmt_close_device(struct agx_device *dev)
       struct agx_kmt_destroycontext dc = {.hContext = ws->ctxs[i].hContext};
       agx_kmt_status status = ws->fns.DestroyContext(&dc);
       if (enum_log_enabled())
-         fprintf(stderr,
+         d3dkmt_log_flushed(
                  "NTAGX_ENUM destroy_context close slot=%u context=0x%08x status=0x%08x\n",
                  i, (unsigned)dc.hContext, (unsigned)status);
 
