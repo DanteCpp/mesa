@@ -1491,6 +1491,10 @@ shim_features(void)
       features |= DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
    if (shim_env_on("ASAHI_SHIM_VM_STATUS"))
       features |= DRM_ASAHI_FEATURE_VM_STATUS;
+   /* The feature word the Windows D3DKMT winsys publishes on J813 is
+    * SOFT_FAULTS alone; this lets the G17G identity report the same. */
+   if (shim_env_on("ASAHI_SHIM_SOFT_FAULTS"))
+      features |= DRM_ASAHI_FEATURE_SOFT_FAULTS;
    if (shim_env_on("ASAHI_SHIM_VM_STATUS_MIRROR"))
       features |= DRM_ASAHI_FEATURE_VM_STATUS_MIRROR;
    /* The M6 (G18G) features (bits 31 and 32); only the G18G identity
@@ -1768,7 +1772,7 @@ asahi_ioctl_vm_bind_unlocked(int fd, unsigned long request, void *arg)
  * Set ASAHI_SHIM_SUBMIT_LOG to a path and every submit ioctl is appended to
  * it, one line per command, exactly as the kernel would parse it. */
 static void
-asahi_log_submit(const struct drm_asahi_submit *submit)
+asahi_log_submit(int fd, const struct drm_asahi_submit *submit)
 {
    const char *path = getenv("ASAHI_SHIM_SUBMIT_LOG");
    if (!path)
@@ -1823,6 +1827,27 @@ asahi_log_submit(const struct drm_asahi_submit *submit)
             fprintf(log, "    ts start=%u:%u end=%u:%u\n",
                     compute.ts.start.handle, compute.ts.start.offset,
                     compute.ts.end.handle, compute.ts.end.offset);
+         /* ASAHI_SHIM_SUBMIT_LOG_CDM_BYTES=1: also the control stream the
+          * kernel would read, [cdm_base, cdm_end), as hex on its own line.
+          * Offline stream-shape checks compare these bytes across builds. */
+         const uint64_t cdm_len =
+            compute.cdm_ctrl_stream_end - compute.cdm_ctrl_stream_base;
+         if (shim_env_on("ASAHI_SHIM_SUBMIT_LOG_CDM_BYTES") &&
+             compute.cdm_ctrl_stream_end > compute.cdm_ctrl_stream_base &&
+             cdm_len <= 65536) {
+            uint8_t *bytes = malloc(cdm_len);
+            if (bytes && shim_gpu_read((void *)(intptr_t)fd,
+                                       compute.cdm_ctrl_stream_base, bytes,
+                                       cdm_len)) {
+               fprintf(log, "    cdm_bytes ");
+               for (uint64_t i = 0; i < cdm_len; ++i)
+                  fprintf(log, "%02x", bytes[i]);
+               fprintf(log, "\n");
+            } else {
+               fprintf(log, "    cdm_bytes unreadable\n");
+            }
+            free(bytes);
+         }
          offset += sizeof(header) + header.size;
          continue;
       } else if (header.cmd_type == DRM_ASAHI_CMD_RENDER &&
@@ -2045,7 +2070,10 @@ m5_submit_gate(const struct drm_asahi_submit *submit)
 static int
 asahi_ioctl_submit_unlocked(int fd, unsigned long request, void *arg)
 {
-   if (g17g_compile_only()) {
+   /* ASAHI_SHIM_G17G_ACCEPT_SUBMIT=1: offline stream-shape checks only.
+    * Accept (and drop) the submission so the submit log and dumps see every
+    * command a command buffer produces; nothing is executed or validated. */
+   if (g17g_compile_only() && !getenv("ASAHI_SHIM_G17G_ACCEPT_SUBMIT")) {
       fprintf(stderr, "shim: G17G compiler-only profile rejects GPU submission\n");
       errno = EOPNOTSUPP;
       return -1;
@@ -2063,7 +2091,7 @@ asahi_ioctl_submit_unlocked(int fd, unsigned long request, void *arg)
 
    const struct drm_asahi_submit *submit = arg;
    submit_calls++;
-   asahi_log_submit(submit);
+   asahi_log_submit(fd, submit);
    dump_submit(fd, submit, submit_calls);
 
    if (shim_g15_kernel())
