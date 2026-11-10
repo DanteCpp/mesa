@@ -1526,10 +1526,13 @@ test_vm_status_refused_then_signalled(void)
    CHECK_EQ(esc.status.pad, 0);
    CHECK_EQ(sizeof(esc), sizeof(struct agxw_escape_header) + 16);
 
-   /* Op 3 is also the pending AGX_D3DKMT_ESC_QUERY_ALLOCATION (32-byte
-    * payload). The KMD validator requires each op's exact payload size;
-    * whenever it accepts this 16-byte VM_STATUS blob it must refuse the
-    * 32-byte allocation query, and today it refuses both. */
+   /* Escape numbering: VM_STATUS is op 3, the pending allocation query op 4.
+    * Up to p2 the allocation query was op 3 as well (32-byte payload). The
+    * KMD validator requires each op's exact payload size: whenever it
+    * accepts this 16-byte VM_STATUS blob it must refuse a 32-byte op-3 query
+    * from such a DLL. Today it refuses all three. */
+   CHECK_EQ(AGX_D3DKMT_ESC_VM_STATUS, 3);
+   CHECK_EQ(AGX_D3DKMT_ESC_QUERY_ALLOCATION, 4);
    uint32_t required = 0;
    const int vm_ok =
       agxw_escape_validate(&esc.hdr, (uint32_t)sizeof(esc), &required);
@@ -1538,14 +1541,17 @@ test_vm_status_refused_then_signalled(void)
       struct agx_d3dkmt_allocation_info info;
    } query = {
       .hdr = {.magic = AGXW_ESCAPE_MAGIC, .version = AGXW_ESCAPE_VERSION,
-              .op = AGX_D3DKMT_ESC_QUERY_ALLOCATION,
+              .op = 3, /* as p2 sends it */
               .payload_size = sizeof(struct agx_d3dkmt_allocation_info)},
    };
    uint32_t query_required = 0;
-   const int query_ok = agxw_escape_validate(&query.hdr, (uint32_t)sizeof(query),
-                                             &query_required);
-   CHECK(vm_ok != 0 || (required == 16 && query_ok != 0));
-   CHECK_EQ(AGX_D3DKMT_ESC_VM_STATUS, AGX_D3DKMT_ESC_QUERY_ALLOCATION);
+   const int old_query_ok = agxw_escape_validate(
+      &query.hdr, (uint32_t)sizeof(query), &query_required);
+   CHECK(vm_ok != 0 || (required == 16 && old_query_ok != 0));
+   query.hdr.op = AGX_D3DKMT_ESC_QUERY_ALLOCATION;
+   const int query_ok = agxw_escape_validate(
+      &query.hdr, (uint32_t)sizeof(query), &query_required);
+   CHECK(query_ok != 0 || query_required == sizeof(query.info));
    CHECK(sizeof(struct agx_d3dkmt_vm_status) !=
          sizeof(struct agx_d3dkmt_allocation_info));
 }

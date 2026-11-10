@@ -594,19 +594,22 @@ int agx_d3dkmt_plan_m5_vm(const struct agxw_va_layout *layout,
  * The KMD reports it through one escape, issued on the importing device for
  * an allocation handle that device has opened:
  *
- *    op      = AGX_D3DKMT_ESC_QUERY_ALLOCATION (3)
+ *    op      = AGX_D3DKMT_ESC_QUERY_ALLOCATION (4)
  *    payload = struct agx_d3dkmt_allocation_info (32 bytes)
  *
  * AppleAgxWddm's contract (agxw_contract.h) does not define this escape yet.
- * Until it does, its escape validator refuses op 3 and every external import
- * fails closed. The KMD side must:
+ * Until it does, its escape validator refuses op 4 and every external import
+ * fails closed. Builds up to and including p2 (vulkan_asahi.dll 6d315a6c)
+ * sent it as op 3, which is AGX_D3DKMT_ESC_VM_STATUS below; the KMD's
+ * exact payload size (32 here, 16 there) refuses those queries, so an old
+ * DLL's imports still fail closed. The KMD side must:
  *   - resolve `allocation` with DxgkCbAcquireHandleData(DXGK_HANDLE_ALLOCATION)
  *     in the calling process and refuse a handle it cannot resolve;
  *   - echo `allocation`, and return the allocation plan's `flags`,
  *     `requested_size` and `allocation_size` (the value it reported as
  *     DXGK_ALLOCATIONINFO::Size).
  * ------------------------------------------------------------------------- */
-#define AGX_D3DKMT_ESC_QUERY_ALLOCATION     3u
+#define AGX_D3DKMT_ESC_QUERY_ALLOCATION     4u
 #define AGX_D3DKMT_ALLOCATION_INFO_VERSION  1u
 
 struct agx_d3dkmt_allocation_info {
@@ -649,10 +652,10 @@ _Static_assert(sizeof(struct agx_d3dkmt_allocation_info) == 32,
  * publishes exactly the features it did before and refuses the query, so
  * the escape never reaches a KMD that does not know it.
  *
- * Op 3 is also AGX_D3DKMT_ESC_QUERY_ALLOCATION above (32-byte payload, also
- * pending). The KMD's escape validator requires each op's exact payload
- * size, so the two stay apart only if the KMD keeps that rule for op 3; one
- * of them should move when the KMD defines them.
+ * Op 3 is VM_STATUS alone from this build on. Up to p2 the pending
+ * allocation query (above, now op 4) was op 3 too, with a 32-byte payload:
+ * the KMD must keep requiring op 3's exact 16-byte payload so such a query
+ * from an old DLL is refused rather than answered as a VM status.
  * ------------------------------------------------------------------------- */
 #define AGX_D3DKMT_ESC_VM_STATUS            3u
 #define AGX_D3DKMT_G17_FEATURE_VM_STATUS    (UINT64_C(1) << 1)
@@ -675,12 +678,16 @@ struct agx_d3dkmt_vm_status_escape {
 static_assert(sizeof(struct agx_d3dkmt_vm_status) == 16, "VM status payload");
 static_assert(sizeof(struct agx_d3dkmt_vm_status) !=
                  sizeof(struct agx_d3dkmt_allocation_info),
-              "op 3 payloads must differ in size");
+              "p2 sent both as op 3: payload sizes must differ");
+static_assert(AGX_D3DKMT_ESC_VM_STATUS != AGX_D3DKMT_ESC_QUERY_ALLOCATION,
+              "distinct escape ops");
 #else
 _Static_assert(sizeof(struct agx_d3dkmt_vm_status) == 16, "VM status payload");
 _Static_assert(sizeof(struct agx_d3dkmt_vm_status) !=
                   sizeof(struct agx_d3dkmt_allocation_info),
-               "op 3 payloads must differ in size");
+               "p2 sent both as op 3: payload sizes must differ");
+_Static_assert(AGX_D3DKMT_ESC_VM_STATUS != AGX_D3DKMT_ESC_QUERY_ALLOCATION,
+               "distinct escape ops");
 #endif
 
 /* The GET_PARAMS features word the winsys publishes for the KMD's: the bits
