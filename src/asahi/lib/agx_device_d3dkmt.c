@@ -1,3 +1,5 @@
+#include "agx_d3dkmt_bridge.h"
+#include "agx_bridge_vma.h"
 /*
  * Copyright 2026 the Asahi Linux contributors
  * SPDX-License-Identifier: MIT
@@ -1722,6 +1724,13 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
               struct agx_submit_virt *virt)
 {
    struct agx_d3dkmt_winsys *ws = agx_d3dkmt_ws(dev);
+   if (!agx_bridge_vma_winsys_healthy(ws)) {
+      simple_mtx_lock(&ws->lock);
+      agx_d3dkmt_mark_device_lost(ws, NULL);
+      simple_mtx_unlock(&ws->lock);
+      errno = EIO;
+      return -1;
+   }
    const struct drm_asahi_sync *syncs =
       (const struct drm_asahi_sync *)(uintptr_t)submit->syncs;
    agx_kmt_handle *waits = NULL;
@@ -2965,6 +2974,14 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
     * from the same params agx_open_device() derives dev->chip from;
     * d3dkmt_vm_create() refuses if the two ever disagree. */
    ws->m5_guard_required = agx_chip_g17_m5(agx_chip_from_params(params));
+   /* This current-Mesa runtime port audits the J813/M5 layout. Native AGX3
+    * has mutable fixed context/low-slot aliases requiring a distinct lifetime
+    * contract, so it must not inherit the legacy content-defined alias model. */
+   if (agx_d3dkmt_bridge_enabled() &&
+       (!ws->m5_guard_required || identity.chip_id != 0x8142 ||
+        identity.gpu_generation != 17 || identity.gpu_variant != 'G'))
+      goto fail_params;
+
 
    /* Hide every feature whose interface this winsys does not translate, so
     * the driver takes the paths that only need the verbatim command stream.
@@ -2979,7 +2996,9 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
     * (d3dkmt_submit() places them exactly where the ioctl carries
     * them). The winsys neither splits nor rewrites the stream. */
 
-   bool device_status = d3dkmt_device_lease_acquire(ws);
+   bool device_status = agx_d3dkmt_bridge_enabled()
+                           ? agx_d3dkmt_bridge_install(ws)
+                           : d3dkmt_device_lease_acquire(ws);
    if (enum_log_enabled())
       d3dkmt_log_flushed(
               "NTAGX_ENUM create_device status=%u device=0x%08x shared=%u\n",
@@ -3018,6 +3037,7 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
    return true; /* caller then runs agx_open_device() */
 
 fail_device:;
+   agx_d3dkmt_bridge_uninstall(ws);
    d3dkmt_device_lease_release(ws);
 fail_params:
    free(ws->params);
@@ -3085,6 +3105,7 @@ agx_d3dkmt_close_device(struct agx_device *dev)
    struct agx_kmt_destroypagingqueue dpq = {.hPagingQueue = ws->paging_queue};
    ws->fns.DestroyPagingQueue(&dpq);
 
+   agx_d3dkmt_bridge_uninstall(ws);
    d3dkmt_device_lease_release(ws);
 
    struct agx_kmt_closeadapter ca = {.hAdapter = ws->adapter};

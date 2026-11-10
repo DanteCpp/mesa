@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#include "asahi/lib/agx_bridge_vma.h"
+#endif
 /*
  * Copyright 2024 Valve Corporation
  * Copyright 2024 Alyssa Rosenzweig
@@ -1484,6 +1487,9 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    if (!dev)
       return;
+#ifdef _WIN32
+   agx_bridge_vma_wait_teardown(&dev->dev);
+#endif
 
    /* Its thread and kicks use the queues and the device's kernels. */
    hk_compute_kick_stop(dev);

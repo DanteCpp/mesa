@@ -37,3 +37,11 @@ extension and conformance checks as additional evidence of correctness.
 ## To be expanded
 
 Build, test and review conventions for this repository will go here.
+
+## J813 testing workflow
+
+- Never write unit tests after writing the implementation.
+- Prefer E2E tests for complex features and retain a verifiable, repeatable artifact.
+- If isolation is necessary, write the failure model before writing code.
+- Preserve existing isolated tests that catch real bugs not exercised by E2E; remove low-signal duplicates only after establishing that coverage.
+- Use Context Mode whenever practical to keep large tool output out of chat.

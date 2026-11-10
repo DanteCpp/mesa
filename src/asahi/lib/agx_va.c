@@ -5,6 +5,9 @@
 
 #include "agx_bo.h"
 #include "agx_device.h"
+#ifdef _WIN32
+#include "agx_bridge_vma.h"
+#endif
 
 static struct util_vma_heap *
 agx_vma_heap(struct agx_device *dev, enum agx_va_flags flags)
@@ -47,6 +50,11 @@ agx_va_alloc(struct agx_device *dev, uint64_t size_B, uint64_t align_B,
 
    uint64_t addr = 0;
 
+#ifdef _WIN32
+   if (agx_bridge_vma_registered(dev))
+      addr = agx_bridge_vma_alloc(dev, size_B, align_B, flags, fixed_va);
+   else
+#endif
    {
       struct util_vma_heap *heap = agx_vma_heap(dev, flags);
       simple_mtx_lock(&dev->vma_lock);
@@ -107,6 +115,11 @@ agx_va_free(struct agx_device *dev, struct agx_va *va, bool unbind)
          return;
    }
 
+#ifdef _WIN32
+   if (agx_bridge_vma_registered(dev))
+      agx_bridge_vma_free(dev, va->addr, va->size_B, va->flags);
+   else
+#endif
    {
       struct util_vma_heap *heap = agx_vma_heap(dev, va->flags);
       simple_mtx_lock(&dev->vma_lock);

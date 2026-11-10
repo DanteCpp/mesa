@@ -6,6 +6,9 @@
  */
 
 #include "agx_device.h"
+#ifdef _WIN32
+#include "agx_bridge_vma.h"
+#endif
 #include "agx_g17p_bind0.h"
 #include "agx_linker.h"
 #include "agx_m5_va.h"
@@ -976,7 +979,21 @@ agx_create_fixed_bo(struct agx_device *dev, size_t size,
    if (bo == NULL)
       return NULL;
 
-   if (agx_bo_bind(dev, bo, address, size, 0, bind_flags) != 0) {
+#ifdef _WIN32
+   if (agx_bridge_vma_registered(dev) && address == AGX_ZERO_PAGE_ADDRESS) {
+      void *zero = agx_bo_map(bo);
+      if (zero == NULL) {
+         agx_bo_free(dev, bo);
+         return NULL;
+      }
+      memset(zero, 0, size);
+   }
+   int bind_ret = agx_bridge_vma_bootstrap_bind(dev, bo, address, size, 0,
+                                               bind_flags, label);
+#else
+   int bind_ret = agx_bo_bind(dev, bo, address, size, 0, bind_flags);
+#endif
+   if (bind_ret != 0) {
       agx_bo_free(dev, bo);
       return NULL;
    }
@@ -1000,6 +1017,10 @@ enum agx_device_init_stage {
 static void
 agx_cleanup_partial_device(struct agx_device *dev, unsigned initialized)
 {
+#ifdef _WIN32
+   agx_bridge_vma_wait_teardown(dev);
+   agx_bridge_vma_bootstrap_unbind_all(dev);
+#endif
    if (initialized & AGX_INIT_GLSL) {
       if (initialized & AGX_INIT_CONTEXT_SLOTS)
          agx_g17p_unbind_render_context_low_slots(
@@ -1015,6 +1036,9 @@ agx_cleanup_partial_device(struct agx_device *dev, unsigned initialized)
       glsl_type_singleton_decref();
    }
 
+#ifdef _WIN32
+   agx_bridge_vma_unregister(dev);
+#endif
    if (dev->replay_heap_initialized)
       util_vma_heap_finish(&dev->replay_heap);
    if (initialized & AGX_INIT_ALIAS_HEAP)
@@ -1534,6 +1558,12 @@ agx_open_device(void *memctx, struct agx_device *dev)
       }
    }
 
+#ifdef _WIN32
+   if (!agx_bridge_vma_register(dev, user_start, user_size, dev->shader_base,
+                                shader_size))
+      goto fail;
+#endif
+
    dev->vm_id = vm_create.vm_id;
 
    glsl_type_singleton_init_or_ref();
@@ -1684,9 +1714,17 @@ agx_open_device(void *memctx, struct agx_device *dev)
          goto fail;
       }
 
-      struct agx_bo *usc_base = agx_create_fixed_bo(
-         dev, usc_base_size, AGX_BO_WRITEBACK, dev->shader_base,
-         DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE, "G17P USC window base");
+      struct agx_bo *usc_base;
+#ifdef _WIN32
+      const bool bridge_usc = agx_bridge_vma_registered(dev);
+      if (bridge_usc)
+         usc_base = agx_bo_create(dev, usc_base_size, 0, AGX_BO_WRITEBACK,
+                                  "G17P USC window base");
+      else
+#endif
+         usc_base = agx_create_fixed_bo(
+            dev, usc_base_size, AGX_BO_WRITEBACK, dev->shader_base,
+            DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE, "G17P USC window base");
       if (usc_base == NULL) {
          fprintf(stderr, "Failed to bind the USC window base page\n");
          goto fail;
@@ -1714,6 +1752,14 @@ agx_open_device(void *memctx, struct agx_device *dev)
                                   dev->params.num_clusters_total);
       }
       agx_bo_assert_range(usc_base, 0, usc_base_size);
+#ifdef _WIN32
+      /* Claim only a fully initialized backing: a concurrent sibling may
+       * immediately use or inherit the fixed process-root alias. */
+      if (bridge_usc && agx_bridge_vma_bootstrap_bind(
+             dev, usc_base, dev->shader_base, usc_base_size, 0,
+             DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE, "USC stage helpers"))
+         goto fail;
+#endif
 
    }
 
@@ -1728,6 +1774,10 @@ fail:
 void
 agx_close_device(struct agx_device *dev)
 {
+#ifdef _WIN32
+   agx_bridge_vma_wait_teardown(dev);
+   agx_bridge_vma_bootstrap_unbind_all(dev);
+#endif
    agx_bo_cache_stop_idle_trim(dev);
    agx_bo_unreference(dev, dev->printf.bo);
    agx_bo_unreference(dev, dev->usc_base_bo);
@@ -1743,6 +1793,9 @@ agx_close_device(struct agx_device *dev)
    util_sparse_array_finish(&dev->bo_map);
    agxdecode_destroy_context(dev->agxdecode);
 
+#ifdef _WIN32
+   agx_bridge_vma_unregister(dev);
+#endif
    if (dev->replay_heap_initialized)
       util_vma_heap_finish(&dev->replay_heap);
    util_vma_heap_finish(&dev->main_heap);

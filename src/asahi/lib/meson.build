@@ -130,6 +130,11 @@ if host_machine.system() == 'windows'
     'agx_d3dkmt_core.h',
     'agx_d3dkmt_priv.h',
     'agx_device_d3dkmt.c',
+    'agx_d3dkmt_bridge.c',
+    'agxw_bridge_core.c',
+    'agxw_bridge_escape.c',
+    'agx_bridge_vma.c',
+    'agx_bridge_vma_core.c',
     'agx_device_d3dkmt.h',
     'agx_sync_d3dkmt.c',
   )

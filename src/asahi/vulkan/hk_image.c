@@ -31,6 +31,9 @@
 #include "hk_physical_device.h"
 
 #include "vk_format.h"
+#ifdef _WIN32
+#include "asahi/lib/agx_d3dkmt_bridge.h"
+#endif
 
 #include <inttypes.h>
 
@@ -1178,8 +1181,18 @@ hk_GetPhysicalDeviceImageFormatProperties2(
           *
           * This is true if and only if ext_mem_props == NULL
           */
-         if (ext_mem_props != NULL)
+         if (ext_mem_props != NULL) {
             p->externalMemoryProperties = *ext_mem_props;
+#ifdef _WIN32
+            if (external_info != NULL && agx_d3dkmt_bridge_enabled() &&
+                (external_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
+                 external_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT)) {
+               p->externalMemoryProperties.externalMemoryFeatures &=
+                  ~VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT;
+               p->externalMemoryProperties.exportFromImportedHandleTypes = 0;
+            }
+#endif
+         }
          break;
       }
       case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES: {

@@ -25,6 +25,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include "asahi/lib/agx_device_d3dkmt.h"
+#include "asahi/lib/agx_bridge_vma.h"
 #endif
 
 #include <errno.h>
@@ -524,6 +525,15 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    /* The mappings over a host import before its pages are pinned
     * (hk_host_import_track()). */
    enum hk_host_map_class host_maps_before_pin = HK_HOST_MAP_OTHER;
+#ifdef _WIN32
+   /* Private DXVK/Triton ownership handoff. The runtime owns sharing and its
+    * hRTResource; this tag never supplies trusted allocation geometry. */
+   bool aurora_runtime_resource = false;
+   for (const VkBaseInStructure *bs = pAllocateInfo->pNext; bs; bs = bs->pNext)
+      if ((unsigned)bs->sType == 0x7ff84159u)
+         aurora_runtime_resource = true;
+#endif
+
 
    VkExternalMemoryHandleTypeFlags handle_types = 0;
    if (export_info != NULL)
@@ -695,9 +705,16 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       /* D3D12 promises 64 KiB alignment for heap addresses, and this costs
        * only virtual address space. */
 #ifdef _WIN32
-      if (win32_type != AGX_D3DKMT_EXTERNAL_MEMORY_NONE) {
+      enum agx_d3dkmt_external_memory_type create_type = win32_type;
+      if (aurora_runtime_resource && agx_bridge_vma_registered(&dev->dev)) {
+         create_type = AGX_D3DKMT_EXTERNAL_MEMORY_OPAQUE_WIN32;
+         bo_flags |= AGX_BO_SHAREABLE;
+      }
+      /* The winsys and KMD retain their generation-specific shared/primary
+       * admission rules. Ownership handoff is not permission to bypass them. */
+      if (create_type != AGX_D3DKMT_EXTERNAL_MEMORY_NONE) {
          mem->bo = agx_d3dkmt_bo_create_external(
-            &dev->dev, aligned_size, 64 * 1024, bo_flags, win32_type,
+            &dev->dev, aligned_size, 64 * 1024, bo_flags, create_type,
             "App memory");
       } else
 #endif
