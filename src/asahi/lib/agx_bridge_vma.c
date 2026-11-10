@@ -413,7 +413,7 @@ void
 agx_bridge_vma_wait_teardown(struct agx_device *dev)
 {
    if (dev && dev->ops.simple_ioctl == agx_device_d3dkmt_ops.simple_ioctl)
-      agx_d3dkmt_bridge_wait_teardown(agx_d3dkmt_ws(dev));
+      agx_d3dkmt_bridge_wait_teardown(dev->hdev);
    struct agx_bridge_arena *a = arena_of(dev);
    if (!a)
       return;
