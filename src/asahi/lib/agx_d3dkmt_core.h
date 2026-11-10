@@ -66,7 +66,9 @@ extern "C" {
  * DRM_IOCTL_ASAHI_GET_PARAMS parameter group (VM_STATUS, its mirror, queue
  * limits), a sync type (cumulative signals), a per-command sync layout or a
  * bind flag this winsys does not translate. Anything outside this mask is
- * dropped from the params the driver sees. */
+ * dropped from the params the driver sees. VM_STATUS alone is carried on G17
+ * when the KMD advertises it (agx_d3dkmt_published_features, "VM status"
+ * below). */
 #define AGX_D3DKMT_SUPPORTED_FEATURES UINT64_C(0x1) /* SOFT_FAULTS */
 
 /* D3DDDI_RESERVEGPUVIRTUALADDRESS is a Windows UMD ABI rather than an AGX
@@ -623,6 +625,89 @@ static_assert(sizeof(struct agx_d3dkmt_allocation_info) == 32,
 _Static_assert(sizeof(struct agx_d3dkmt_allocation_info) == 32,
                "allocation info payload width");
 #endif
+
+/* -------------------------------------------------------------------------
+ * VM status. PENDING KMD SIDE: AppleAgxWddm defines neither the escape nor
+ * the feature bit yet (core/agxw_contract.h, CONTRACT.md SS8;
+ * core/agxw_g17_params.c sets features = SOFT_FAULTS).
+ *
+ * A G17 submit the KMD refuses inside its DDI still lets dxgkrnl retire the
+ * packet and run the signal queued behind it, so the application's fence
+ * signals for work that never ran. The KMD side to come stores the refusal
+ * as a sticky per-device error and reports it through one escape, issued on
+ * the device (Escape.hDevice):
+ *
+ *    op      = AGX_D3DKMT_ESC_VM_STATUS (3)       -- AGXW_ESC_VM_STATUS
+ *    payload = struct agx_d3dkmt_vm_status (16 bytes, drm_asahi_vm_status)
+ *
+ * and advertises it with AGX_D3DKMT_G17_FEATURE_VM_STATUS (bit 1) in the
+ * GET_PARAMS features word -- AGXW_G17_FEATURE_VM_STATUS, which
+ * core/agxw_g17_params.h already names for this bit. It equals
+ * DRM_ASAHI_FEATURE_VM_STATUS, so the driver's existing consumer
+ * (hk_check_status after every fence wait) asks GET_PARAMS group VM_STATUS,
+ * which the winsys answers through this escape. Without the bit the winsys
+ * publishes exactly the features it did before and refuses the query, so
+ * the escape never reaches a KMD that does not know it.
+ *
+ * Op 3 is also AGX_D3DKMT_ESC_QUERY_ALLOCATION above (32-byte payload, also
+ * pending). The KMD's escape validator requires each op's exact payload
+ * size, so the two stay apart only if the KMD keeps that rule for op 3; one
+ * of them should move when the KMD defines them.
+ * ------------------------------------------------------------------------- */
+#define AGX_D3DKMT_ESC_VM_STATUS            3u
+#define AGX_D3DKMT_G17_FEATURE_VM_STATUS    (UINT64_C(1) << 1)
+/* DRM_ASAHI_PARAM_GROUP_VM_STATUS (agx_device_d3dkmt.c static_asserts it). */
+#define AGX_D3DKMT_PARAM_GROUP_VM_STATUS    1u
+
+struct agx_d3dkmt_vm_status {
+   uint32_t vm_id; /* in: the VM asked about; out: as the KMD returns it */
+   uint32_t flags; /* MBZ */
+   int32_t error;  /* out: 0, or the device's sticky error (negative errno) */
+   uint32_t pad;   /* MBZ */
+};
+
+struct agx_d3dkmt_vm_status_escape {
+   struct agxw_escape_header hdr;
+   struct agx_d3dkmt_vm_status status;
+};
+
+#ifdef __cplusplus
+static_assert(sizeof(struct agx_d3dkmt_vm_status) == 16, "VM status payload");
+static_assert(sizeof(struct agx_d3dkmt_vm_status) !=
+                 sizeof(struct agx_d3dkmt_allocation_info),
+              "op 3 payloads must differ in size");
+#else
+_Static_assert(sizeof(struct agx_d3dkmt_vm_status) == 16, "VM status payload");
+_Static_assert(sizeof(struct agx_d3dkmt_vm_status) !=
+                  sizeof(struct agx_d3dkmt_allocation_info),
+               "op 3 payloads must differ in size");
+#endif
+
+/* The GET_PARAMS features word the winsys publishes for the KMD's: the bits
+ * in AGX_D3DKMT_SUPPORTED_FEATURES, plus VM_STATUS when a G17 KMD advertises
+ * it. Every other bit is dropped. */
+uint64_t agx_d3dkmt_published_features(uint64_t kmd_features, bool g17);
+
+/* Zero the escape and set its header and vm_id. */
+void agx_d3dkmt_vm_status_escape_init(struct agx_d3dkmt_vm_status_escape *esc,
+                                      uint32_t vm_id);
+
+/* Issue `size` bytes at `blob` as an escape on the winsys device. Returns 0
+ * when the thunk succeeded, else a negative errno. */
+typedef int (*agx_d3dkmt_escape_fn)(void *ctx, void *blob, uint32_t size);
+
+/*
+ * DRM_IOCTL_ASAHI_GET_PARAMS for `group` with a `size`-byte reply at
+ * `pointer` (a struct drm_asahi_vm_status). Only group VM_STATUS, only when
+ * `published_features` carries AGX_D3DKMT_G17_FEATURE_VM_STATUS, only a
+ * 16-byte reply: otherwise AGX_D3DKMT_ERR_INVAL without any escape. Issues
+ * one VM_STATUS escape through `escape`; returns AGX_D3DKMT_OK with the
+ * reply copied out, the escape's negative errno, or the reply header's
+ * nonzero status (a negative errno).
+ */
+int agx_d3dkmt_query_vm_status(uint64_t published_features, uint32_t group,
+                               uint64_t size, void *pointer,
+                               agx_d3dkmt_escape_fn escape, void *ctx);
 
 /*
  * Size a resource-backed import (OPAQUE_WIN32 / OPAQUE_WIN32_KMT).

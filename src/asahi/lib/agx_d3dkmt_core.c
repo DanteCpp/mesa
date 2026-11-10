@@ -978,3 +978,54 @@ agx_d3dkmt_plan_m5_vm(const struct agxw_va_layout *layout,
 
    return AGX_D3DKMT_OK;
 }
+
+/* -------------------------------------------------------------------------
+ * VM status (pending KMD side; see agx_d3dkmt_core.h).
+ * ------------------------------------------------------------------------- */
+uint64_t
+agx_d3dkmt_published_features(uint64_t kmd_features, bool g17)
+{
+   const uint64_t carried =
+      AGX_D3DKMT_SUPPORTED_FEATURES |
+      (g17 ? AGX_D3DKMT_G17_FEATURE_VM_STATUS : 0);
+   return kmd_features & carried;
+}
+
+void
+agx_d3dkmt_vm_status_escape_init(struct agx_d3dkmt_vm_status_escape *esc,
+                                 uint32_t vm_id)
+{
+   memset(esc, 0, sizeof(*esc));
+   esc->hdr.magic = AGXW_ESCAPE_MAGIC;
+   esc->hdr.version = AGXW_ESCAPE_VERSION;
+   esc->hdr.op = AGX_D3DKMT_ESC_VM_STATUS;
+   esc->hdr.payload_size = (uint32_t)sizeof(esc->status);
+   esc->status.vm_id = vm_id;
+}
+
+int
+agx_d3dkmt_query_vm_status(uint64_t published_features, uint32_t group,
+                           uint64_t size, void *pointer,
+                           agx_d3dkmt_escape_fn escape, void *ctx)
+{
+   struct agx_d3dkmt_vm_status request;
+
+   if (!(published_features & AGX_D3DKMT_G17_FEATURE_VM_STATUS) ||
+       group != AGX_D3DKMT_PARAM_GROUP_VM_STATUS ||
+       size != sizeof(request) || pointer == NULL || escape == NULL)
+      return AGX_D3DKMT_ERR_INVAL;
+
+   memcpy(&request, pointer, sizeof(request));
+
+   struct agx_d3dkmt_vm_status_escape esc;
+   agx_d3dkmt_vm_status_escape_init(&esc, request.vm_id);
+
+   int ret = escape(ctx, &esc, (uint32_t)sizeof(esc));
+   if (ret != 0)
+      return ret < 0 ? ret : AGX_D3DKMT_ERR_INVAL;
+   if (esc.hdr.status != 0)
+      return esc.hdr.status < 0 ? esc.hdr.status : AGX_D3DKMT_ERR_INVAL;
+
+   memcpy(pointer, &esc.status, sizeof(esc.status));
+   return AGX_D3DKMT_OK;
+}

@@ -92,6 +92,21 @@ static_assert(AGX_D3DKMT_PARAMS_GLOBAL_SIZE ==
               "GET_PARAMS escape payload size");
 static_assert(AGX_D3DKMT_SUPPORTED_FEATURES == DRM_ASAHI_FEATURE_SOFT_FAULTS,
               "features the D3DKMT winsys carries");
+static_assert(AGX_D3DKMT_G17_FEATURE_VM_STATUS == DRM_ASAHI_FEATURE_VM_STATUS,
+              "G17 VM_STATUS feature bit");
+static_assert(AGX_D3DKMT_PARAM_GROUP_VM_STATUS ==
+                 DRM_ASAHI_PARAM_GROUP_VM_STATUS,
+              "GET_PARAMS group VM_STATUS");
+static_assert(sizeof(struct agx_d3dkmt_vm_status) ==
+                 sizeof(struct drm_asahi_vm_status),
+              "VM status escape payload is drm_asahi_vm_status");
+static_assert(offsetof(struct agx_d3dkmt_vm_status, vm_id) ==
+                 offsetof(struct drm_asahi_vm_status, vm_id) &&
+              offsetof(struct agx_d3dkmt_vm_status, flags) ==
+                 offsetof(struct drm_asahi_vm_status, flags) &&
+              offsetof(struct agx_d3dkmt_vm_status, error) ==
+                 offsetof(struct drm_asahi_vm_status, error),
+              "VM status escape payload layout");
 static_assert(AGX_D3DKMT_BO_SCANOUT_DONOR == AGX_BO_SCANOUT_DONOR,
               "BO_SCANOUT_DONOR");
 static_assert(AGXW_GET_TIME_SIZE == sizeof(struct drm_asahi_get_time),
@@ -2501,6 +2516,46 @@ d3dkmt_get_time(struct agx_device *dev, struct drm_asahi_get_time *t)
    return d3dkmt_escape(ws, AGXW_ESC_GET_TIME, t, AGXW_GET_TIME_SIZE);
 }
 
+/*
+ * GET_PARAMS group VM_STATUS (pending KMD side; agx_d3dkmt_core.h "VM
+ * status"). The sticky error is per device, so the escape names ws->device
+ * as well as the adapter. Reached only when the KMD advertised the feature
+ * bit: hk_check_status asks only then, and agx_d3dkmt_query_vm_status
+ * refuses otherwise without issuing anything.
+ */
+static int
+d3dkmt_vm_status_escape(void *ctx, void *blob, uint32_t size)
+{
+   struct agx_d3dkmt_winsys *ws = ctx;
+   struct agx_kmt_escape escape = {
+      .hAdapter = ws->adapter,
+      .hDevice = ws->device,
+      .pPrivateDriverData = blob,
+      .PrivateDriverDataSize = size,
+   };
+
+   agx_kmt_status st = ws->fns.Escape(&escape);
+   if (!AGX_KMT_SUCCESS(st)) {
+      agx_d3dkmt_fail(st);
+      return -errno;
+   }
+   return 0;
+}
+
+static int
+d3dkmt_get_params_group(struct agx_device *dev, struct drm_asahi_get_params *gp)
+{
+   int ret = agx_d3dkmt_query_vm_status(
+      dev->params.features, gp->param_group, gp->size,
+      (void *)(uintptr_t)gp->pointer, d3dkmt_vm_status_escape,
+      agx_d3dkmt_ws(dev));
+   if (ret != AGX_D3DKMT_OK) {
+      errno = ret == AGX_D3DKMT_ERR_INVAL ? EINVAL : -ret;
+      return -1;
+   }
+   return 0;
+}
+
 static int
 d3dkmt_simple_ioctl(struct agx_device *dev, unsigned cmd, void *req)
 {
@@ -2530,6 +2585,8 @@ d3dkmt_simple_ioctl(struct agx_device *dev, unsigned cmd, void *req)
       return d3dkmt_queue_destroy(dev, req);
    case DRM_IOCTL_ASAHI_GET_TIME:
       return d3dkmt_get_time(dev, req);
+   case DRM_IOCTL_ASAHI_GET_PARAMS:
+      return d3dkmt_get_params_group(dev, req);
    default:
       errno = EINVAL;
       return -1;
@@ -2885,8 +2942,11 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
    ws->m5_guard_required = agx_chip_g17_m5(agx_chip_from_params(params));
 
    /* Hide every feature whose interface this winsys does not translate, so
-    * the driver takes the paths that only need the verbatim command stream. */
-   params->features &= AGX_D3DKMT_SUPPORTED_FEATURES;
+    * the driver takes the paths that only need the verbatim command stream.
+    * VM_STATUS stays when a G17 KMD advertises it: d3dkmt_simple_ioctl
+    * answers its GET_PARAMS group through the VM_STATUS escape. */
+   params->features =
+      agx_d3dkmt_published_features(params->features, ws->m5_guard_required);
    /* max_commands_per_submission is the KMD's, unmodified: like the M5
     * Linux kernel, the G17 KMD publishes 1, and hk's queue_submit_looped()
     * then issues one SubmitCommand per hardware command in stream order,

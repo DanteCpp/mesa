@@ -15,6 +15,10 @@ either prints the per-submit shape table or compares two runs byte for byte.
   compare DIR_A DIR_B CHIP...   measured submit logs byte-equal per case
   split OLD_DIR NEW_DIR CHIP    each new 48-byte stream equals its transfer's
                           44 bytes inside the old fused stream + terminator
+  vm-status --probe --icd --shim --out [--chip]
+                          vkWaitForFences after a submit whose fence signals:
+                          VK_SUCCESS, or VK_ERROR_DEVICE_LOST once the shim
+                          publishes a sticky VM error (the drm winsys path)
 
 Nothing executes on a GPU; the shim accepts and drops the submits.
 """
@@ -188,9 +192,51 @@ def cmd_split(args):
     return 1 if bad else 0
 
 
+def cmd_vm_status(args):
+    """vkWaitForFences on a submit whose fence signals: VK_SUCCESS without
+    VM_STATUS and with a clean status, VK_ERROR_DEVICE_LOST (-4) once a
+    sticky VM error is published at that submit."""
+    cases = [("no-vm-status", {}, 0),
+             ("vm-status-clean", {"ASAHI_SHIM_VM_STATUS": "1"}, 0),
+             ("vm-status-error", {"ASAHI_SHIM_VM_STATUS": "1",
+                                  "HK_CDM_VM_ERROR": "-5"}, -4)]
+    bad = 0
+    for name, extra, want in cases:
+        d = os.path.join(args.out, name)
+        os.makedirs(d, exist_ok=True)
+        env = {"PATH": "/usr/bin:/bin", "HOME": "/tmp",
+               "LD_PRELOAD": args.shim, "ASAHI_SHIM_CHIP": args.chip,
+               "MESA_SHADER_CACHE_DISABLE": "true",
+               "ASAHI_SHIM_SUBMIT_LOG": os.path.join(d, "measured.log"),
+               "HK_CDM_SETUP_LOG": os.path.join(d, "setup.log"),
+               "HK_CDM_FENCE_WAIT": "1"}
+        env.update(chip_env(args.chip))
+        env.update(extra)
+        r = subprocess.run([args.probe, args.icd, "F", "nobarrier"], env=env,
+                           capture_output=True, text=True, timeout=300)
+        open(os.path.join(d, "stdout.txt"), "w").write(r.stdout)
+        open(os.path.join(d, "stderr.txt"), "w").write(r.stderr)
+        got = None
+        for line in r.stdout.splitlines():
+            if line.startswith("WAIT result="):
+                got = int(line.split("=")[1])
+        ok = r.returncode == 0 and got == want
+        bad += not ok
+        print(f"  {'ok  ' if ok else 'FAIL'} {name:16} vkWaitForFences={got} "
+              f"(want {want}) rc={r.returncode}")
+    print(f"vm-status {args.chip}: {'PASS' if not bad else 'FAIL'}")
+    return 1 if bad else 0
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
+    v = sub.add_parser("vm-status")
+    v.add_argument("--probe", required=True)
+    v.add_argument("--icd", required=True)
+    v.add_argument("--shim", required=True)
+    v.add_argument("--out", required=True)
+    v.add_argument("--chip", default="g17g-compile-only")
     r = sub.add_parser("run")
     r.add_argument("--probe", required=True)
     r.add_argument("--icd", required=True)
@@ -215,7 +261,8 @@ def main():
     x.add_argument("chip")
     args = p.parse_args()
     return {"run": cmd_run, "table": cmd_table, "check-sealed": cmd_check_sealed,
-            "compare": cmd_compare, "split": cmd_split}[args.cmd](args) or 0
+            "compare": cmd_compare, "split": cmd_split,
+            "vm-status": cmd_vm_status}[args.cmd](args) or 0
 
 
 if __name__ == "__main__":

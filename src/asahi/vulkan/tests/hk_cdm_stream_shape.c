@@ -331,6 +331,12 @@ main(int argc, char **argv)
       };
       VkFence fence;
       CHECK(CreateFence(device, &fci, NULL, &fence));
+      /* HK_CDM_VM_ERROR=<errno>: the shim publishes that sticky VM error
+       * from this submit on, as a kernel that refused it and still
+       * signalled its fence would (setup above ran without it). */
+      const char *vm_error = getenv("HK_CDM_VM_ERROR");
+      if (vm_error)
+         setenv("ASAHI_SHIM_VM_STATUS_ERROR", vm_error, 1);
       CHECK(QueueSubmit(queue, 1, &si, fence));
       const VkResult waited =
          WaitForFences(device, 1, &fence, VK_TRUE, 5000000000ull);

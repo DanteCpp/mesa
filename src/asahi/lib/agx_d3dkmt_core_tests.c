@@ -17,6 +17,7 @@
 
 #include "agx_d3dkmt_core.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <sched.h>
@@ -1318,6 +1319,237 @@ test_import_size_is_kmd_bounded(void)
             AGX_D3DKMT_ERR_INVAL);
 }
 
+/* ------------------------------------------------------------------------ */
+/*
+ * VM_STATUS (pending KMD side). A G17 submit the KMD refuses inside its DDI
+ * still lets dxgkrnl retire the packet and run the signal queued behind it,
+ * so the application's fence signals. The KMD side to come keeps the refusal
+ * as a sticky per-device error, answers it through AGX_D3DKMT_ESC_VM_STATUS
+ * on the device and advertises AGX_D3DKMT_G17_FEATURE_VM_STATUS. This fake
+ * KMD does exactly that; with the bit cleared it is today's 0.19.17.0 KMD,
+ * whose escape validator refuses op 3.
+ */
+#define MODEL_VK_SUCCESS            0
+#define MODEL_VK_ERROR_DEVICE_LOST (-4) /* VkResult VK_ERROR_DEVICE_LOST */
+
+struct fake_g17_kmd {
+   uint64_t features;  /* GET_PARAMS features word */
+   int32_t sticky;     /* the device's sticky submit error */
+   int32_t reply_status; /* escape header status the KMD answers with */
+   uint32_t device;    /* the device handle the winsys opened */
+   unsigned escapes;
+   uint32_t last_device;
+};
+
+static int
+fake_g17_kmd_escape(void *ctx, uint32_t device, void *blob, uint32_t size)
+{
+   struct fake_g17_kmd *kmd = ctx;
+   kmd->escapes++;
+   kmd->last_device = device;
+
+   struct agxw_escape_header hdr;
+   if (size < sizeof(hdr))
+      return -EINVAL;
+   memcpy(&hdr, blob, sizeof(hdr));
+   /* The KMD side adds op 3 with exactly this payload, answered for the
+    * device the escape names. Without the bit it is today's KMD. */
+   const bool vm_status =
+      (kmd->features & AGX_D3DKMT_G17_FEATURE_VM_STATUS) &&
+      hdr.magic == AGXW_ESCAPE_MAGIC && hdr.version == AGXW_ESCAPE_VERSION &&
+      hdr.op == AGX_D3DKMT_ESC_VM_STATUS && hdr.reserved == 0 &&
+      hdr.payload_size == sizeof(struct agx_d3dkmt_vm_status) &&
+      size == sizeof(struct agx_d3dkmt_vm_status_escape);
+   if (!vm_status || device == 0 || device != kmd->device)
+      return -EINVAL; /* STATUS_INVALID_PARAMETER from the thunk */
+
+   struct agx_d3dkmt_vm_status status;
+   memcpy(&status, (uint8_t *)blob + sizeof(hdr), sizeof(status));
+   status.error = kmd->sticky;
+   hdr.status = kmd->reply_status;
+   memcpy((uint8_t *)blob + sizeof(hdr), &status, sizeof(status));
+   memcpy(blob, &hdr, sizeof(hdr));
+   return 0;
+}
+
+static int
+fake_g17_winsys_escape(void *ctx, void *blob, uint32_t size)
+{
+   struct fake_g17_kmd *kmd = ctx;
+   return fake_g17_kmd_escape(kmd, kmd->device, blob, size);
+}
+
+/*
+ * One vkWaitForFences on a fence the refused submit's queued signal wrote:
+ * the winsys CPU wait (agx_sync_d3dkmt.c d3dkmt_wait_common, whose decision
+ * is agx_d3dkmt_cpu_wait_probe), then vk_fence.c:287-289 calls
+ * hk_check_status, whose D3DKMT branch is hk_device.c:532-546: query
+ * GET_PARAMS group VM_STATUS only when the published features carry the
+ * bit; a failed query or a nonzero error loses the device. The query goes
+ * through agx_d3dkmt_query_vm_status, the function d3dkmt_simple_ioctl
+ * routes it to.
+ */
+static int
+model_wait_for_fence(uint64_t published, struct fake_g17_kmd *kmd,
+                     const volatile uint64_t *fence, uint64_t value)
+{
+   const volatile uint64_t *current[1] = {fence};
+   const uint64_t wanted[1] = {value};
+   if (agx_d3dkmt_cpu_wait_probe(current, wanted, 1, false, NULL) !=
+       AGX_D3DKMT_CPU_WAIT_SATISFIED)
+      return 1; /* would block: not this scenario */
+
+   if (!(published & AGX_D3DKMT_G17_FEATURE_VM_STATUS))
+      return MODEL_VK_SUCCESS;
+   struct agx_d3dkmt_vm_status status = {.vm_id = 1};
+   if (agx_d3dkmt_query_vm_status(published, AGX_D3DKMT_PARAM_GROUP_VM_STATUS,
+                                  sizeof(status), &status,
+                                  fake_g17_winsys_escape, kmd) != 0)
+      return MODEL_VK_ERROR_DEVICE_LOST;
+   return status.error ? MODEL_VK_ERROR_DEVICE_LOST : MODEL_VK_SUCCESS;
+}
+
+static void
+test_vm_status_refused_then_signalled(void)
+{
+   const uint64_t soft_faults = UINT64_C(1) << 0;
+   const uint64_t mirror = UINT64_C(1) << 11;
+
+   /* Published features: exactly today's word unless a G17 KMD sets bit 1. */
+   for (unsigned bit = 0; bit < 64; ++bit) {
+      const uint64_t kmd = UINT64_C(1) << bit;
+      CHECK_EQ(agx_d3dkmt_published_features(kmd, false),
+               kmd & AGX_D3DKMT_SUPPORTED_FEATURES);
+      CHECK_EQ(agx_d3dkmt_published_features(kmd, true),
+               kmd & (AGX_D3DKMT_SUPPORTED_FEATURES |
+                      AGX_D3DKMT_G17_FEATURE_VM_STATUS));
+   }
+   CHECK_EQ(agx_d3dkmt_published_features(UINT64_MAX, true),
+            soft_faults | AGX_D3DKMT_G17_FEATURE_VM_STATUS);
+   CHECK_EQ(agx_d3dkmt_published_features(soft_faults | mirror, true),
+            soft_faults);
+
+   for (unsigned advertised = 0; advertised < 2; ++advertised) {
+      struct fake_g17_kmd kmd = {
+         .features = soft_faults |
+                     (advertised ? AGX_D3DKMT_G17_FEATURE_VM_STATUS : 0),
+         .device = 0x40000a42u,
+      };
+      const uint64_t published =
+         agx_d3dkmt_published_features(kmd.features, true);
+      CHECK_EQ(published, kmd.features);
+
+      /* Fence N = 7 of the render context. */
+      volatile uint64_t fence = 6;
+      CHECK_EQ(model_wait_for_fence(published, &kmd, &fence, 7), 1);
+
+      /* The KMD refuses the submit in its DDI and records the refusal;
+       * dxgkrnl retires packet 7 anyway and runs the queued signal. */
+      kmd.sticky = -5; /* -EIO */
+      fence = 7;
+
+      const int result = model_wait_for_fence(published, &kmd, &fence, 7);
+      if (advertised) {
+         CHECK_EQ(result, MODEL_VK_ERROR_DEVICE_LOST);
+         CHECK_EQ(kmd.escapes, 1);
+         CHECK_EQ(kmd.last_device, kmd.device);
+      } else {
+         /* Today's behaviour: the wait succeeds, nothing is asked. */
+         CHECK_EQ(result, MODEL_VK_SUCCESS);
+         CHECK_EQ(kmd.escapes, 0);
+         struct agx_d3dkmt_vm_status status = {.vm_id = 1};
+         CHECK_EQ(agx_d3dkmt_query_vm_status(published,
+                                             AGX_D3DKMT_PARAM_GROUP_VM_STATUS,
+                                             sizeof(status), &status,
+                                             fake_g17_winsys_escape, &kmd),
+                  AGX_D3DKMT_ERR_INVAL);
+         CHECK_EQ(kmd.escapes, 0);
+      }
+   }
+
+   /* With the bit and no refusal the wait is a plain success. */
+   struct fake_g17_kmd clean = {
+      .features = soft_faults | AGX_D3DKMT_G17_FEATURE_VM_STATUS,
+      .device = 7,
+   };
+   volatile uint64_t fence = 3;
+   CHECK_EQ(model_wait_for_fence(clean.features, &clean, &fence, 3),
+            MODEL_VK_SUCCESS);
+   CHECK_EQ(clean.escapes, 1);
+
+   /* A KMD that answers with an error status, or a thunk that fails, loses
+    * the device (hk_check_status: "VM status query failed"). */
+   clean.reply_status = -19; /* -ENODEV */
+   CHECK_EQ(model_wait_for_fence(clean.features, &clean, &fence, 3),
+            MODEL_VK_ERROR_DEVICE_LOST);
+   clean.reply_status = 0;
+   clean.device = 0; /* the escape now names the wrong device */
+   struct agx_d3dkmt_vm_status status = {.vm_id = 1};
+   CHECK(agx_d3dkmt_query_vm_status(clean.features,
+                                    AGX_D3DKMT_PARAM_GROUP_VM_STATUS,
+                                    sizeof(status), &status,
+                                    fake_g17_winsys_escape, &clean) < 0);
+
+   /* The request shape the winsys checks before any escape. */
+   clean.device = 7;
+   const unsigned before = clean.escapes;
+   CHECK_EQ(agx_d3dkmt_query_vm_status(clean.features,
+                                       AGX_D3DKMT_PARAM_GROUP_VM_STATUS + 1,
+                                       sizeof(status), &status,
+                                       fake_g17_winsys_escape, &clean),
+            AGX_D3DKMT_ERR_INVAL);
+   CHECK_EQ(agx_d3dkmt_query_vm_status(clean.features,
+                                       AGX_D3DKMT_PARAM_GROUP_VM_STATUS,
+                                       sizeof(status) - 4, &status,
+                                       fake_g17_winsys_escape, &clean),
+            AGX_D3DKMT_ERR_INVAL);
+   CHECK_EQ(agx_d3dkmt_query_vm_status(clean.features,
+                                       AGX_D3DKMT_PARAM_GROUP_VM_STATUS,
+                                       sizeof(status), NULL,
+                                       fake_g17_winsys_escape, &clean),
+            AGX_D3DKMT_ERR_INVAL);
+   CHECK_EQ(clean.escapes, before);
+
+   /* The blob: zeroed, header set, vm_id carried, 16-byte payload. */
+   struct agx_d3dkmt_vm_status_escape esc;
+   memset(&esc, 0xa5, sizeof(esc));
+   agx_d3dkmt_vm_status_escape_init(&esc, 42);
+   CHECK_EQ(esc.hdr.magic, AGXW_ESCAPE_MAGIC);
+   CHECK_EQ(esc.hdr.version, AGXW_ESCAPE_VERSION);
+   CHECK_EQ(esc.hdr.op, AGX_D3DKMT_ESC_VM_STATUS);
+   CHECK_EQ(esc.hdr.payload_size, 16);
+   CHECK_EQ(esc.hdr.status, 0);
+   CHECK_EQ(esc.hdr.reserved, 0);
+   CHECK_EQ(esc.status.vm_id, 42);
+   CHECK_EQ(esc.status.flags, 0);
+   CHECK_EQ(esc.status.error, 0);
+   CHECK_EQ(esc.status.pad, 0);
+   CHECK_EQ(sizeof(esc), sizeof(struct agxw_escape_header) + 16);
+
+   /* Op 3 is also the pending AGX_D3DKMT_ESC_QUERY_ALLOCATION (32-byte
+    * payload). The KMD validator requires each op's exact payload size;
+    * whenever it accepts this 16-byte VM_STATUS blob it must refuse the
+    * 32-byte allocation query, and today it refuses both. */
+   uint32_t required = 0;
+   const int vm_ok =
+      agxw_escape_validate(&esc.hdr, (uint32_t)sizeof(esc), &required);
+   struct {
+      struct agxw_escape_header hdr;
+      struct agx_d3dkmt_allocation_info info;
+   } query = {
+      .hdr = {.magic = AGXW_ESCAPE_MAGIC, .version = AGXW_ESCAPE_VERSION,
+              .op = AGX_D3DKMT_ESC_QUERY_ALLOCATION,
+              .payload_size = sizeof(struct agx_d3dkmt_allocation_info)},
+   };
+   uint32_t query_required = 0;
+   const int query_ok = agxw_escape_validate(&query.hdr, (uint32_t)sizeof(query),
+                                             &query_required);
+   CHECK(vm_ok != 0 || (required == 16 && query_ok != 0));
+   CHECK_EQ(AGX_D3DKMT_ESC_VM_STATUS, AGX_D3DKMT_ESC_QUERY_ALLOCATION);
+   CHECK(sizeof(struct agx_d3dkmt_vm_status) !=
+         sizeof(struct agx_d3dkmt_allocation_info));
+}
+
 int
 main(void)
 {
@@ -1343,6 +1575,7 @@ main(void)
    test_read_range_canonicalization();
    test_contract_blobs_we_emit();
    test_import_size_is_kmd_bounded();
+   test_vm_status_refused_then_signalled();
 
    if (failures) {
       fprintf(stderr, "agx_d3dkmt_core: %d/%d checks FAILED\n", failures,
