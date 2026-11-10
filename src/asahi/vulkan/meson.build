@@ -168,6 +168,10 @@ if with_tests
     files('tests/test-hk-host-alias.c', 'hk_host_alias.c'),
     include_directories : include_directories('.')),
     suite : ['asahi'])
+  test('hk_empty_submit', executable('hk_empty_submit_test',
+    files('tests/test-hk-empty-submit.c'),
+    include_directories : include_directories('.')),
+    suite : ['asahi'])
   test(
     'hk_barrier',
     executable(

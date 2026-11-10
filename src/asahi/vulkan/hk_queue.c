@@ -52,6 +52,7 @@
 #include "vulkan/vulkan_core.h"
 
 #include "hk_private.h"
+#include "hk_queue_empty.h"
 #include "layout.h"
 #include "vk_common_entrypoints.h"
 #include "vk_drm_syncobj.h"
@@ -87,6 +88,50 @@ queue_signal_timeline(struct hk_device *dev, struct hk_queue *queue,
    return VK_SUCCESS;
 }
 
+#ifdef _WIN32
+/* A signal-only empty submit is DXVK's D3D11 fence completion boundary.
+ * A WDDM GPU wait/signal pair on a context with no DMA buffer is not an
+ * execution guarantee: the callbacks succeed while the output fence never
+ * advances. Prior work on this queue is already submitted, so wait for the
+ * queue point on the CPU and publish the outputs through the provider's
+ * CPU signal path. A binary output carries API value 0 and needs the
+ * binary signal: timeline_signal(0) is a no-op that deadlocks a later
+ * epoch-one wait. */
+static VkResult
+queue_signal_empty_on_cpu(struct hk_device *dev, struct hk_queue *queue,
+                          struct vk_queue_submit *submit)
+{
+   uint32_t queue_syncobj = queue->drm.syncobj;
+   uint64_t queue_point = queue->drm.timeline_value;
+
+   if (dev->vk.sync->timeline_wait(
+          dev->vk.sync, &queue_syncobj, &queue_point, 1, INT64_MAX,
+          DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
+             DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+          NULL))
+      return vk_error(dev, VK_ERROR_DEVICE_LOST);
+
+   for (unsigned i = 0; i < submit->signal_count; ++i) {
+      struct vk_sync_signal *signal = &submit->signals[i];
+      assert(vk_sync_type_is_drm_syncobj(signal->sync->type));
+      uint32_t output = vk_sync_as_drm_syncobj(signal->sync)->syncobj;
+      int ret;
+
+      if (signal->sync->flags & VK_SYNC_IS_TIMELINE) {
+         uint64_t point = signal->signal_value;
+         ret = dev->vk.sync->timeline_signal(dev->vk.sync, &output, &point,
+                                             1);
+      } else {
+         ret = dev->vk.sync->signal(dev->vk.sync, &output, 1);
+      }
+      if (ret)
+         return vk_error(dev, VK_ERROR_DEVICE_LOST);
+   }
+
+   return VK_SUCCESS;
+}
+#endif
+
 /*
  * We need to specially handle submits with no control streams. The kernel
  * can't accept empty submits, but we can end up here in Vulkan for
@@ -98,43 +143,27 @@ queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
                    struct vk_queue_submit *submit)
 {
 #ifdef _WIN32
-   /* A signal-only empty submit is DXVK's D3D11 fence completion boundary.
-    * A WDDM GPU wait/signal pair on a context with no DMA buffer is not an
-    * execution guarantee: the callbacks succeed while the output fence never
-    * advances. Prior work on this queue is already submitted, so wait for the
-    * queue point on the CPU and publish the outputs through the provider's
-    * CPU signal path. A binary output carries API value 0 and needs the
-    * binary signal: timeline_signal(0) is a no-op that deadlocks a later
-    * epoch-one wait. */
-   if (submit->wait_count == 0 && submit->signal_count != 0) {
-      uint32_t queue_syncobj = queue->drm.syncobj;
-      uint64_t queue_point = queue->drm.timeline_value;
+   switch (hk_empty_submit_path(true, submit->wait_count,
+                                submit->signal_count)) {
+   case HK_EMPTY_SUBMIT_CPU_SIGNAL:
+      return queue_signal_empty_on_cpu(dev, queue, submit);
 
-      if (dev->vk.sync->timeline_wait(
-             dev->vk.sync, &queue_syncobj, &queue_point, 1, INT64_MAX,
-             DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
-                DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
-             NULL))
+   case HK_EMPTY_SUBMIT_CPU_WAIT:
+   case HK_EMPTY_SUBMIT_CPU_WAIT_SIGNAL:
+      /* An empty submit with waits (a present's semaphore waits, a D3D12
+       * queue Wait) has the same problem: its waits would become the same
+       * GPU wait/signal pair. Wait for them on the CPU, then publish any
+       * outputs as the signal-only submit does. A wait whose signal this
+       * thread has yet to submit blocks here. */
+      if (vk_sync_wait_many(&dev->vk, submit->wait_count, submit->waits,
+                            VK_SYNC_WAIT_COMPLETE, UINT64_MAX) != VK_SUCCESS)
          return vk_error(dev, VK_ERROR_DEVICE_LOST);
+      if (submit->signal_count == 0)
+         return VK_SUCCESS;
+      return queue_signal_empty_on_cpu(dev, queue, submit);
 
-      for (unsigned i = 0; i < submit->signal_count; ++i) {
-         struct vk_sync_signal *signal = &submit->signals[i];
-         assert(vk_sync_type_is_drm_syncobj(signal->sync->type));
-         uint32_t output = vk_sync_as_drm_syncobj(signal->sync)->syncobj;
-         int ret;
-
-         if (signal->sync->flags & VK_SYNC_IS_TIMELINE) {
-            uint64_t point = signal->signal_value;
-            ret = dev->vk.sync->timeline_signal(dev->vk.sync, &output, &point,
-                                                1);
-         } else {
-            ret = dev->vk.sync->signal(dev->vk.sync, &output, 1);
-         }
-         if (ret)
-            return vk_error(dev, VK_ERROR_DEVICE_LOST);
-      }
-
-      return VK_SUCCESS;
+   case HK_EMPTY_SUBMIT_TIMELINE:
+      break;
    }
 #endif
 
