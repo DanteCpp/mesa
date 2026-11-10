@@ -7935,6 +7935,7 @@ compile_vs_g17g(const char *name, nir_shader *nir, enum agx_isa_encoding enc,
 {
    struct agx_shader_key key = {
       .dev.encoding = enc,
+      .dev.chip = enc == AGX_ISA_ENCODING_AGX3C ? AGX_CHIP_G17G : AGX_CHIP_G17P,
       .no_preamble = true,
    };
    struct agx_shader_part part = {0};
@@ -7972,6 +7973,7 @@ compile_fs_g17g(const char *name, nir_shader *nir, bool expect_ok,
 {
    struct agx_shader_key key = {
       .dev.encoding = AGX_ISA_ENCODING_AGX3C,
+      .dev.chip = AGX_CHIP_G17G,
       .fs.ignore_tib_dependencies = true,
       .no_preamble = true,
    };

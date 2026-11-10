@@ -5225,6 +5225,10 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * layer on this generation. */
       NIR_PASS(_, nir, agx_nir_lower_interpolation,
                agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip));
+      /* G17G's generic perspective path must bypass reciprocal-W for native
+       * constant planes, whose C coefficient is already unprojected. */
+      if (dev->dev.chip == AGX_CHIP_G17G)
+         NIR_PASS(_, nir, agx_nir_fix_g17g_constant_interpolation);
       if (agx_native_graphics(&dev->dev)) {
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                   hk_g17p_lower_is_first_fan,

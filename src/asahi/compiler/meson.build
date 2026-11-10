@@ -927,3 +927,18 @@ if with_tests
     suite : ['asahi'],
   )
 endif
+
+# Explicit offline compiler workflow; also available in tools-only native builds.
+if with_tools.contains('asahi')
+  executable(
+    'g17g_constant_interpolation_e2e',
+    files('test/test-g17g-constant-interpolation.c'),
+    libagx[1],
+    include_directories : inc_asahi,
+    c_args : [c_msvc_compat_args, no_override_init_args],
+    gnu_symbol_visibility : 'hidden',
+    dependencies : [idep_nir, idep_mesautil, idep_libpoly],
+    link_with : [libasahi_compiler, libpoly_nir],
+  )
+
+endif

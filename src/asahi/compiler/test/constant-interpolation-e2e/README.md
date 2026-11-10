@@ -1,0 +1,13 @@
+# G17G constant interpolation workflow
+
+Actual J813 boot127 varying64 completed naturally with a healthy fence/journal but every1625 foreground pixel was wrong. The entire4096-pixel capture matches the diagnostic `color / interpolated(1/W)` model; that diagnosis does not change the semantic oracle. Honeykrisp omitted the existing G17G constant-plane pass. Its dormant legacy low-bit predicate also differed from the native marker already used for explicit offset interpolation.
+
+This candidate calls that pass only for G17G, selecting unprojected C for native markers and preserving the original generic interpolation for ordinary planes. It does not change the generic backend, Gallium, G17P/G18G, noperspective, or shader/reference bytes. Pixel/centroid fp16/fp32 selection is replayed; centroid compiler acceptance after lowering is not hardware qualification. Sample mode and genuinely spatially varying coefficients need physical coverage beyond the constant-per-face failing profile.
+
+The workflow extracts the exact production Honeykrisp interpolation block and its owning chip selector. The device fixture contains only the accessed chip field. It invokes the actual NIR pass, folds explicit modeled coefficient inputs, and compiles through the actual AGX compiler with chip G17G. It is not a full Vulkan device or an ISA emulator. The Windows build separately compiles the complete Honeykrisp source.
+
+Run `python3 -I -B prepare.py`, configure a native Meson tools=asahi build with the locally installed dependencies, then `python3 -I -B run.py --build <native-build> --out <fresh-output> --mutations`. The result binds source, extracted placement, output ISA, compiler logs and legacy compiler regression. Each of31 checks is required; three mutations must compile successfully but fail numerical assertions: omitted actual caller, old predicate, wrong chip guard. The final step restores exact production bytes and replays them. Never run mutation mode concurrently with a build or source edit.
+
+The old `compile_vs_g17g`/`compile_fs_g17g` helpers now set the actual chip key instead of relying on an encoding-only default. Their complete existing graphics-compiler regression passes. No fixture binary expectations were changed.
+
+Before the fix, baseline-01 fails12 numerical selections plus two centroid compiler cases. The initial e2e-01 harness stopped on a nonunique mutation anchor and restored source; e2e-02 fixes the anchor and passes31 checks plus3 targeted mutations and the legacy regression. Prior failures remain in the build evidence. Hardware qualification remains false until the unchanged strict semantic profiles pass on a future exact-pinned ICD.
