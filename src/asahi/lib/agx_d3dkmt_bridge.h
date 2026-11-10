@@ -62,6 +62,10 @@ uint64_t agx_d3dkmt_pool_free_bytes(struct agx_device *dev);
  * clear its context-token table. Touches no other device's slot. Safe to call
  * when ws is not a bridge device. */
 void agx_d3dkmt_bridge_uninstall(struct agx_d3dkmt_winsys *ws);
+/* Call before any device cleanup. A destructor reentered from an admitted
+ * callback preserves its stack/object indefinitely; it never returns into
+ * frees. Normal non-reentrant calls leave cleanup admission unchanged. */
+void agx_d3dkmt_bridge_wait_teardown(const struct agx_d3dkmt_winsys *ws);
 
 /* The runtime device handle a bridge winsys is installed on, or NULL if ws is
  * not a bridge device. This is callback/provider identity, not GPU-VA-root

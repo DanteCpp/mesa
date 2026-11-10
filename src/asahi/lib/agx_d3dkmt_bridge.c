@@ -76,6 +76,7 @@ static agx_kmt_handle g_raw_adapter[AGXW_BRIDGE_MAX_DEVICES];
 /* Consumer lifetime includes post-callback context/resource bookkeeping. */
 static volatile LONG g_local_calls[AGXW_BRIDGE_MAX_DEVICES];
 static volatile LONG g_local_closing[AGXW_BRIDGE_MAX_DEVICES];
+static _Thread_local unsigned g_local_depth[AGXW_BRIDGE_MAX_DEVICES];
 
 static bool
 consumer_enter(unsigned slot)
@@ -86,18 +87,37 @@ consumer_enter(unsigned slot)
       InterlockedDecrement(&g_local_calls[slot]);
       return false;
    }
+   ++g_local_depth[slot];
    return true;
 }
 
 static void
 consumer_leave(unsigned slot)
 {
+   assert(g_local_depth[slot] != 0);
+   --g_local_depth[slot];
    InterlockedDecrement(&g_local_calls[slot]);
+}
+
+/* A void device destructor cannot safely report a deferred destruction to its
+ * caller. Preserve its active stack instead of returning into object frees. */
+static void
+consumer_preserve_reentrant(unsigned slot)
+{
+   if (g_local_depth[slot] == 0)
+      return;
+   InterlockedExchange(&g_local_closing[slot], 1);
+   fprintf(stderr, "agx bridge: preserving reentrant consumer teardown; "
+                   "process cleanup required\n");
+   fflush(stderr);
+   for (;;)
+      Sleep(1000);
 }
 
 static void
 consumer_close(unsigned slot)
 {
+   consumer_preserve_reentrant(slot);
    InterlockedExchange(&g_local_closing[slot], 1);
    while (InterlockedCompareExchange(&g_local_calls[slot], 0, 0) != 0)
       Sleep(1);
@@ -1846,6 +1866,16 @@ agx_d3dkmt_bridge_install(struct agx_d3dkmt_winsys *ws)
            b.hRTDevice, slot, agxw_bridge_provider_count(&g_registry),
            b.callbacks);
    return true;
+}
+
+void
+agx_d3dkmt_bridge_wait_teardown(const struct agx_d3dkmt_winsys *ws)
+{
+   if (ws == NULL || !agxw_bridge_is_sentinel(ws->device))
+      return;
+   unsigned slot = agxw_bridge_slot_of_sentinel(ws->device);
+   if (slot < AGXW_BRIDGE_MAX_DEVICES)
+      consumer_preserve_reentrant(slot);
 }
 
 void

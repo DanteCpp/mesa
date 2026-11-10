@@ -53,6 +53,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include "asahi/lib/agx_device_d3dkmt.h"
+#include "asahi/lib/agx_bridge_vma.h"
 #include "asahi/lib/agx_device_win.h"
 #endif
 
@@ -2722,6 +2723,9 @@ hk_physical_device_destroy(struct vk_physical_device *vk_pdev)
    struct hk_physical_device *pdev =
       container_of(vk_pdev, struct hk_physical_device, vk);
 
+#ifdef _WIN32
+   agx_bridge_vma_wait_teardown(&pdev->dev);
+#endif
    hk_finish_wsi(pdev);
 
    if (pdev->master_fd >= 0)

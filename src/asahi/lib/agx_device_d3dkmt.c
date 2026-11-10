@@ -3037,6 +3037,7 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
    return true; /* caller then runs agx_open_device() */
 
 fail_device:;
+   agx_d3dkmt_bridge_wait_teardown(ws);
    agx_d3dkmt_bridge_uninstall(ws);
    d3dkmt_device_lease_release(ws);
 fail_params:
@@ -3055,6 +3056,8 @@ agx_d3dkmt_close_device(struct agx_device *dev)
    struct agx_d3dkmt_winsys *ws = agx_d3dkmt_ws(dev);
    if (ws == NULL)
       return;
+
+   agx_d3dkmt_bridge_wait_teardown(ws);
 
    /* Adapter teardown is the forced-retirement boundary for a transfer
     * context or render context whose completion became unknowable. */
