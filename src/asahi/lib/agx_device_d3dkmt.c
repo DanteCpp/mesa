@@ -54,7 +54,7 @@
  */
 struct agx_d3dkmt_va_lease {
    struct agx_kmt_luid luid;
-   struct agx_d3dkmt_va_range ranges[AGX_D3DKMT_MAX_VM_RESERVATIONS];
+   struct agx_d3dkmt_va_range ranges[AGX_D3DKMT_MAX_VA_LEASE_RANGES];
    uint32_t range_count;
    uint32_t reserved_mask;
    uint32_t references;
@@ -242,6 +242,60 @@ agx_d3dkmt_wait_paging(struct agx_d3dkmt_winsys *ws, uint64_t value)
    return agx_d3dkmt_wait_fence(ws, ws->paging_fence, ws->paging_fence_cpu,
                                 value,
                                 AGX_D3DKMT_INFINITE);
+}
+
+/* -------------------------------------------------------------------------
+ * Monitored fences.
+ *
+ * VidMm maps each monitored fence's value page into the process GPU VA at an
+ * address it picks itself (FenceValueGPUVirtualAddress), at the first free
+ * address it finds. On G17 that must never be the driver window
+ * [0x10_0000_0000, 0x18_0000_0000): the KMD reserves all of it per process
+ * except the 32 MiB head, which d3dkmt_vm_create() reserves before any fence
+ * exists (the guard). The KMD paging guard stays the enforcement; this is the
+ * winsys's own fail-closed check and its log of where every page went.
+ * ------------------------------------------------------------------------- */
+int
+agx_d3dkmt_create_monitored_fence(struct agx_d3dkmt_winsys *ws,
+                                  struct agx_kmt_createsyncobj2 *create,
+                                  const char *what)
+{
+   if (ws->m5_guard_required && !ws->m5_guard_reserved) {
+      fprintf(stderr,
+              "D3DKMT: refusing monitored fence (%s) before the G17 "
+              "driver-window guard [0x%llx, 0x%llx) is reserved\n",
+              what, (unsigned long long)AGX_M5_DRIVER_BASE,
+              (unsigned long long)AGX_D3DKMT_M5_GUARD_END);
+      errno = EINVAL;
+      return -1;
+   }
+
+   agx_kmt_status st = ws->fns.CreateSynchronizationObject2(create);
+   if (!AGX_KMT_SUCCESS(st))
+      return agx_d3dkmt_fail(st);
+
+   p_atomic_inc(&ws->monitored_fences_created);
+   if (!ws->m5_guard_required)
+      return 0;
+
+   const uint64_t gpu_va = create->Info.MonitoredFence.FenceValueGPUVirtualAddress;
+   const bool in_driver_window =
+      gpu_va >= AGX_M5_DRIVER_BASE &&
+      gpu_va - AGX_M5_DRIVER_BASE < AGX_M5_DRIVER_SIZE;
+
+   fprintf(stderr,
+           "D3DKMT: monitored fence (%s) 0x%08x GPU VA 0x%llx%s\n", what,
+           (unsigned)create->hSyncObject, (unsigned long long)gpu_va,
+           in_driver_window ? " INSIDE the driver window: refused" : "");
+   if (in_driver_window) {
+      struct agx_kmt_destroysyncobj d = {.hSyncObject = create->hSyncObject};
+      ws->fns.DestroySynchronizationObject(&d);
+      create->hSyncObject = 0;
+      errno = EFAULT;
+      return -1;
+   }
+
+   return 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -1021,9 +1075,8 @@ d3dkmt_va_update_init(struct agx_d3dkmt_winsys *ws)
          },
       },
    };
-   agx_kmt_status st = ws->fns.CreateSynchronizationObject2(&fence);
-   if (!AGX_KMT_SUCCESS(st))
-      return agx_d3dkmt_fail(st);
+   if (agx_d3dkmt_create_monitored_fence(ws, &fence, "VA interlock") != 0)
+      return -1;
 
    struct agxw_context_private priv = {
       .version = AGXW_CONTEXT_PRIVATE_VERSION,
@@ -1052,7 +1105,7 @@ d3dkmt_va_update_init(struct agx_d3dkmt_winsys *ws)
       .pPrivateDriverData = &priv,
       .PrivateDriverDataSize = sizeof(priv),
    };
-   st = ws->fns.CreateContextVirtual(&create);
+   agx_kmt_status st = ws->fns.CreateContextVirtual(&create);
    if (!AGX_KMT_SUCCESS(st)) {
       struct agx_kmt_destroysyncobj d = {.hSyncObject = fence.hSyncObject};
       ws->fns.DestroySynchronizationObject(&d);
@@ -1906,6 +1959,15 @@ d3dkmt_reserve(struct agx_d3dkmt_winsys *ws, uint64_t base, uint64_t size)
               "(wanted 0x%llx, got 0x%llx); Honeykrisp's VA layout is fixed\n",
               (unsigned long long)base,
               (unsigned long long)reserve.VirtualAddress);
+      /* Do not leave the misplaced reservation behind: the caller's rollback
+       * only knows the ranges it asked for. */
+      struct agx_kmt_freegpuva misplaced = {
+         .hAdapter = ws->adapter,
+         .BaseAddress = reserve.VirtualAddress,
+         .Size = size,
+      };
+      if (reserve.VirtualAddress != 0)
+         ws->fns.FreeGpuVirtualAddress(&misplaced);
       errno = ENOTSUP;
       return -1;
    }
@@ -2115,8 +2177,68 @@ d3dkmt_vm_create(struct agx_device *dev, struct drm_asahi_vm_create *vm)
     * CONTRACT.md SS4.2), so they are advisory here and only the window below
     * kernel_start is claimed.
     */
-   struct agx_d3dkmt_va_range ranges[AGX_D3DKMT_MAX_VM_RESERVATIONS];
+   struct agx_d3dkmt_va_range ranges[AGX_D3DKMT_MAX_VA_LEASE_RANGES];
    uint32_t n;
+   uint32_t guard_count = 0;
+
+   /*
+    * G17: reserve the head of the driver window, [0x10_0000_0000,
+    * 0x10_0200_0000), NO_ACCESS, as the FIRST range of the lease -- the first
+    * address-space action after the D3DKMT device and the paging queue exist,
+    * ahead of the three binding windows and of every monitored fence and
+    * context. VidMm places a monitored fence's value page at the first free
+    * address it finds; on boot 105 that was 0x10_0029_0000, just past the
+    * triangle client's reservations. The KMD reserves the rest of the driver
+    * window per process ([0x10_0200_0000, 0x18_0000_0000)), so with this the
+    * whole window is closed to VidMm. Nothing maps here: it is not a binding
+    * window, and Honeykrisp's heaps all lie in the plan's windows.
+    *
+    * Fail closed, no fallback: a fence that already exists may already sit in
+    * the head, the layout must be the one the guard was derived from, and
+    * d3dkmt_reserve() refuses both a failed reservation and a moved base.
+    */
+   if (ws->m5_guard_required != agx_chip_g17_m5(dev->chip)) {
+      fprintf(stderr, "D3DKMT: G17 guard decision disagrees with the chip\n");
+      errno = EINVAL;
+      return -1;
+   }
+   if (ws->m5_guard_required) {
+      const struct agxw_va_layout *l = &ws->policy.layout;
+
+      if (p_atomic_read(&ws->monitored_fences_created) != 0) {
+         fprintf(stderr,
+                 "D3DKMT: %u monitored fence(s) exist before the G17 "
+                 "driver-window guard; refusing VM_CREATE\n",
+                 (unsigned)p_atomic_read(&ws->monitored_fences_created));
+         errno = EBUSY;
+         return -1;
+      }
+      if (vm->kernel_start != AGX_D3DKMT_M5_GUARD_BASE ||
+          vm->kernel_end < AGX_D3DKMT_M5_GUARD_END ||
+          l->user_start > AGX_D3DKMT_M5_GUARD_BASE ||
+          l->user_end < AGX_D3DKMT_M5_GUARD_END ||
+          l->internal_start <= AGX_D3DKMT_M5_GUARD_BASE ||
+          l->internal_start >= AGX_D3DKMT_M5_GUARD_END ||
+          l->internal_end < AGX_D3DKMT_M5_GUARD_END) {
+         fprintf(stderr,
+                 "D3DKMT: the G17 driver-window guard [0x%llx, 0x%llx) does "
+                 "not fit driver range [0x%llx, 0x%llx), user VA [0x%llx, "
+                 "0x%llx), KMD range [0x%llx, 0x%llx)\n",
+                 (unsigned long long)AGX_D3DKMT_M5_GUARD_BASE,
+                 (unsigned long long)AGX_D3DKMT_M5_GUARD_END,
+                 (unsigned long long)vm->kernel_start,
+                 (unsigned long long)vm->kernel_end,
+                 (unsigned long long)l->user_start,
+                 (unsigned long long)l->user_end,
+                 (unsigned long long)l->internal_start,
+                 (unsigned long long)l->internal_end);
+         errno = EINVAL;
+         return -1;
+      }
+      ranges[0].base = AGX_D3DKMT_M5_GUARD_BASE;
+      ranges[0].size = AGX_D3DKMT_M5_GUARD_END - AGX_D3DKMT_M5_GUARD_BASE;
+      guard_count = 1;
+   }
 
    if (agx_chip_g17_m5(dev->chip) || dev->chip == AGX_CHIP_G18G) {
       /*
@@ -2153,8 +2275,9 @@ d3dkmt_vm_create(struct agx_device *dev, struct drm_asahi_vm_create *vm)
                  (unsigned long long)ws->policy.layout.user_start,
                  (unsigned long long)ws->policy.layout.user_end);
       }
-      memcpy(ranges, plan.ranges, plan.count * sizeof(ranges[0]));
-      n = plan.count;
+      memcpy(ranges + guard_count, plan.ranges,
+             plan.count * sizeof(ranges[0]));
+      n = guard_count + plan.count;
    } else {
       uint64_t base = dev->params.vm_start;
       uint64_t end = vm->kernel_start;
@@ -2177,8 +2300,22 @@ d3dkmt_vm_create(struct agx_device *dev, struct drm_asahi_vm_create *vm)
       }
    }
 
-   if (d3dkmt_acquire_va_lease(ws, ranges, n))
+   if (d3dkmt_acquire_va_lease(ws, ranges, n)) {
+      if (guard_count != 0)
+         fprintf(stderr,
+                 "D3DKMT: reserving the G17 driver-window guard and windows "
+                 "failed (errno %d); device creation fails\n",
+                 errno);
       return -1;
+   }
+   /* The lease holds exactly `ranges`, guard first, whether this call
+    * reserved them or another device in the process already had. */
+   ws->m5_guard_reserved = guard_count != 0;
+   if (guard_count != 0)
+      fprintf(stderr,
+              "D3DKMT: G17 driver-window guard [0x%llx, 0x%llx) held\n",
+              (unsigned long long)ranges[0].base,
+              (unsigned long long)(ranges[0].base + ranges[0].size));
 
    /*
     * CONTRACT.md SS3.3: AGX_BO_EXEC is a MAPPING protection, not an
@@ -2196,15 +2333,13 @@ d3dkmt_vm_create(struct agx_device *dev, struct drm_asahi_vm_create *vm)
     * and USC policy exist, but before agx_open_device() performs its first
     * zero-page bind. */
    if (d3dkmt_va_update_init(ws) != 0) {
-      for (uint32_t i = 0; i < n; ++i) {
-         struct agx_kmt_freegpuva f = {
-            .hAdapter = ws->adapter,
-            .BaseAddress = ranges[i].base,
-            .Size = ranges[i].size,
-         };
-         ws->fns.FreeGpuVirtualAddress(&f);
-      }
-      ws->va_count = 0;
+      /* Drop only this device's reference: another device in the process
+       * may hold the same lease, and freeing the ranges directly would pull
+       * its reservations (and the guard) out from under it. */
+      int saved_errno = errno;
+      d3dkmt_release_va_lease(ws);
+      ws->m5_guard_reserved = false;
+      errno = saved_errno;
       return -1;
    }
 
@@ -2252,11 +2387,9 @@ d3dkmt_queue_create(struct agx_device *dev, struct drm_asahi_queue_create *q)
       .hDevice = ws->device,
       .Info = {.Type = AGX_KMT_SYNC_MONITORED_FENCE},
    };
-   agx_kmt_status st = ws->fns.CreateSynchronizationObject2(&fence);
-   if (!AGX_KMT_SUCCESS(st)) {
-      ret = agx_d3dkmt_fail(st);
+   if (agx_d3dkmt_create_monitored_fence(ws, &fence, "queue context") != 0)
       goto out;
-   }
+   agx_kmt_status st;
 
    struct agxw_context_private priv = {
       .version = AGXW_CONTEXT_PRIVATE_VERSION,
@@ -2744,6 +2877,12 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
       errno = ENODEV;
       goto fail_params;
    }
+
+   /* G17: no monitored fence before VM_CREATE has reserved the driver-window
+    * guard (agx_d3dkmt_create_monitored_fence, d3dkmt_vm_create). Decided
+    * from the same params agx_open_device() derives dev->chip from;
+    * d3dkmt_vm_create() refuses if the two ever disagree. */
+   ws->m5_guard_required = agx_chip_g17_m5(agx_chip_from_params(params));
 
    /* Hide every feature whose interface this winsys does not translate, so
     * the driver takes the paths that only need the verbatim command stream. */

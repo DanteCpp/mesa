@@ -121,9 +121,8 @@ d3dkmt_syncobj_create(struct util_sync_provider *p, uint32_t flags,
          },
    };
 
-   agx_kmt_status st = ws->fns.CreateSynchronizationObject2(&create);
-   if (!AGX_KMT_SUCCESS(st))
-      return agx_d3dkmt_fail(st);
+   if (agx_d3dkmt_create_monitored_fence(ws, &create, "sync object") != 0)
+      return -1;
 
    simple_mtx_lock(&ws->lock);
    uint32_t h = ws->device_lost

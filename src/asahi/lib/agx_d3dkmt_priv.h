@@ -16,6 +16,7 @@
 
 #include "agx_d3dkmt.h"
 #include "agx_d3dkmt_core.h"
+#include "agx_m5_va.h"
 
 /*
  * Staging ring for AGX command buffers.
@@ -29,6 +30,18 @@
  * fence proves the previous submission that used it has retired.
  */
 #define AGX_D3DKMT_STAGING_RING 2
+
+/* The process VA lease: the M5 plan's windows plus, on G17, the
+ * driver-window guard reserved ahead of them. */
+#define AGX_D3DKMT_MAX_VA_LEASE_RANGES (AGX_D3DKMT_MAX_VM_RESERVATIONS + 1u)
+
+/* G17 driver-window guard: the 32 MiB head of the M5 driver window below
+ * the range the KMD reserves per process (AppleAgxWddmProcess.c
+ * AgxwG17ReserveDriverRange: [0x10_0200_0000, 0x18_0000_0000)). The head
+ * holds user VA [0x10_0000_0000, 0x10_0040_0000) and the start of the KMD's
+ * internal range, which the KMD only guards in its paging path. */
+#define AGX_D3DKMT_M5_GUARD_BASE AGX_M5_DRIVER_BASE
+#define AGX_D3DKMT_M5_GUARD_END UINT64_C(0x1002000000)
 
 struct agx_d3dkmt_ctx {
    agx_kmt_handle hContext; /* 0 = free slot */
@@ -89,9 +102,19 @@ struct agx_d3dkmt_winsys {
 
    /* The user GPU VA window, reserved at VM_CREATE time. Up to two ranges:
     * CONTRACT.md SS4.2 puts a 16 KiB kernel/firmware carve-out page in the
-    * MIDDLE of the window, so it is not one contiguous reservation. */
-   struct agx_d3dkmt_va_range va[AGX_D3DKMT_MAX_VM_RESERVATIONS];
+    * MIDDLE of the window, so it is not one contiguous reservation. On G17
+    * the driver-window guard comes first, then the M5 plan's windows. */
+   struct agx_d3dkmt_va_range va[AGX_D3DKMT_MAX_VA_LEASE_RANGES];
    uint32_t va_count;
+
+   /* G17 only (agx_chip_g17_m5): the head of the driver window,
+    * [0x10_0000_0000, 0x10_0200_0000), is reserved NO_ACCESS before any
+    * monitored fence exists, so VidMm places no fence page in the driver
+    * window. Monitored fences are refused until this winsys holds the guard,
+    * and VM_CREATE is refused once one exists without it. */
+   bool m5_guard_required;
+   bool m5_guard_reserved;
+   uint32_t monitored_fences_created;
 
    /* KMTQAITYPE_UMDRIVERPRIVATE payload: the AGX params blob verbatim. */
    void *params;
@@ -143,6 +166,16 @@ int agx_d3dkmt_poll_cpu_fences(
 
 /* Wait for a paging-queue operation identified by `value` to complete. */
 int agx_d3dkmt_wait_paging(struct agx_d3dkmt_winsys *ws, uint64_t value);
+
+/* Every monitored fence the winsys creates goes through here. `create` is
+ * filled in by the caller (hDevice, Info); on success it holds the handle
+ * and both fence-value addresses. On G17 the fence is refused before this
+ * winsys holds the driver-window guard, its FenceValueGPUVirtualAddress is
+ * logged, and a GPU address inside the M5 driver window destroys the fence
+ * and fails the call. Returns 0, or -1 with errno set. */
+int agx_d3dkmt_create_monitored_fence(struct agx_d3dkmt_winsys *ws,
+                                      struct agx_kmt_createsyncobj2 *create,
+                                      const char *what);
 
 /* Map an NTSTATUS onto the errno a drmIoctl() caller would have seen, and
  * store it in errno. Returns -1 so call sites can `return
