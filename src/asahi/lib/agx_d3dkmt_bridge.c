@@ -73,6 +73,46 @@ static struct agxw_bridge_registry g_registry;
 static HMODULE g_publisher[AGXW_BRIDGE_MAX_DEVICES];
 static agxw_bridge_raw_escape g_raw_escape[AGXW_BRIDGE_MAX_DEVICES];
 static agx_kmt_handle g_raw_adapter[AGXW_BRIDGE_MAX_DEVICES];
+/* Consumer lifetime includes post-callback context/resource bookkeeping. */
+static volatile LONG g_local_calls[AGXW_BRIDGE_MAX_DEVICES];
+static volatile LONG g_local_closing[AGXW_BRIDGE_MAX_DEVICES];
+
+static bool
+consumer_enter(unsigned slot)
+{
+   InterlockedIncrement(&g_local_calls[slot]);
+   if (InterlockedCompareExchange(&g_local_closing[slot], 0, 0) != 0 ||
+       !g_registry.prov[slot].in_use) {
+      InterlockedDecrement(&g_local_calls[slot]);
+      return false;
+   }
+   return true;
+}
+
+static void
+consumer_leave(unsigned slot)
+{
+   InterlockedDecrement(&g_local_calls[slot]);
+}
+
+static void
+consumer_close(unsigned slot)
+{
+   InterlockedExchange(&g_local_closing[slot], 1);
+   while (InterlockedCompareExchange(&g_local_calls[slot], 0, 0) != 0)
+      Sleep(1);
+}
+
+#define CONSUMER_INVOKE(slot_, call_) \
+   __extension__({ \
+      agx_kmt_status _ci_status = AGXW_STATUS_DEVICE_REMOVED; \
+      if (consumer_enter(slot_)) { \
+         _ci_status = (call_); \
+         consumer_leave(slot_); \
+      } \
+      _ci_status; \
+   })
+
 static SRWLOCK g_ctx_lock[AGXW_BRIDGE_MAX_DEVICES];
 static SRWLOCK g_resource_lock[AGXW_BRIDGE_MAX_DEVICES];
 
@@ -1335,113 +1375,113 @@ impl_wait_from_gpu(unsigned s, const struct agx_kmt_waitsyncfromgpu *a)
    static agx_kmt_status AGX_KMT_API bt_cpq_##N(                               \
       struct agx_kmt_createpagingqueue *a)                                     \
    {                                                                           \
-      return impl_create_paging_queue((N), a);                                 \
+      return CONSUMER_INVOKE((N), impl_create_paging_queue((N), a));                                 \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_dpq_##N(                               \
       struct agx_kmt_destroypagingqueue *a)                                    \
    {                                                                           \
-      return impl_destroy_paging_queue((N), a);                                \
+      return CONSUMER_INVOKE((N), impl_destroy_paging_queue((N), a));                                \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_ca2_##N(                               \
       struct agx_kmt_createallocation *a)                                      \
    {                                                                           \
-      return impl_create_allocation2((N), a);                                  \
+      return CONSUMER_INVOKE((N), impl_create_allocation2((N), a));                                  \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_da2_##N(                               \
       const struct agx_kmt_destroyallocation2 *a)                              \
    {                                                                           \
-      return impl_destroy_allocation2((N), a);                                 \
+      return CONSUMER_INVOKE((N), impl_destroy_allocation2((N), a));                                 \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_mr_##N(struct agx_kmt_makeresident *a) \
    {                                                                           \
-      return impl_make_resident((N), a);                                       \
+      return CONSUMER_INVOKE((N), impl_make_resident((N), a));                                       \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_ev_##N(struct agx_kmt_evict *a)        \
    {                                                                           \
-      return impl_evict((N), a);                                               \
+      return CONSUMER_INVOKE((N), impl_evict((N), a));                                               \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_l2_##N(struct agx_kmt_lock2 *a)        \
    {                                                                           \
-      return impl_lock2((N), a);                                               \
+      return CONSUMER_INVOKE((N), impl_lock2((N), a));                                               \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_u2_##N(                               \
       const struct agx_kmt_unlock2 *a)                                         \
    {                                                                           \
-      return impl_unlock2((N), a);                                             \
+      return CONSUMER_INVOKE((N), impl_unlock2((N), a));                                             \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_ic_##N(                               \
       const struct agx_kmt_invalidatecache *a)                                 \
    {                                                                           \
-      return impl_invalidate_cache((N), a);                                    \
+      return CONSUMER_INVOKE((N), impl_invalidate_cache((N), a));                                    \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_rva_##N(                              \
       struct agx_kmt_reservegpuva *a)                                          \
    {                                                                           \
-      return impl_reserve_gpuva((N), a);                                       \
+      return CONSUMER_INVOKE((N), impl_reserve_gpuva((N), a));                                       \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_mva_##N(struct agx_kmt_mapgpuva *a)    \
    {                                                                           \
-      return impl_map_gpuva((N), a);                                           \
+      return CONSUMER_INVOKE((N), impl_map_gpuva((N), a));                                           \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_fva_##N(                              \
       const struct agx_kmt_freegpuva *a)                                       \
    {                                                                           \
-      return impl_free_gpuva((N), a);                                          \
+      return CONSUMER_INVOKE((N), impl_free_gpuva((N), a));                                          \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_uva_##N(                              \
       const struct agx_kmt_updategpuva *a)                                     \
    {                                                                           \
-      return impl_update_gpuva((N), a);                                        \
+      return CONSUMER_INVOKE((N), impl_update_gpuva((N), a));                                        \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_ccv_##N(                              \
       struct agx_kmt_createcontextvirtual *a)                                  \
    {                                                                           \
-      return impl_create_context_virtual((N), a);                             \
+      return CONSUMER_INVOKE((N), impl_create_context_virtual((N), a));                             \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_dc_##N(                               \
       const struct agx_kmt_destroycontext *a)                                  \
    {                                                                           \
-      return impl_destroy_context((N), a);                                     \
+      return CONSUMER_INVOKE((N), impl_destroy_context((N), a));                                     \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_sc_##N(                               \
       const struct agx_kmt_submitcommand *a)                                   \
    {                                                                           \
-      return impl_submit_command((N), a);                                      \
+      return CONSUMER_INVOKE((N), impl_submit_command((N), a));                                      \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_cso2_##N(                             \
       struct agx_kmt_createsyncobj2 *a)                                        \
    {                                                                           \
-      return impl_create_syncobj2((N), a);                                     \
+      return CONSUMER_INVOKE((N), impl_create_syncobj2((N), a));                                     \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_dso_##N(                              \
       const struct agx_kmt_destroysyncobj *a)                                  \
    {                                                                           \
-      return impl_destroy_syncobj((N), a);                                     \
+      return CONSUMER_INVOKE((N), impl_destroy_syncobj((N), a));                                     \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_scpu_##N(                             \
       const struct agx_kmt_signalsyncfromcpu *a)                              \
    {                                                                           \
-      return impl_signal_from_cpu((N), a);                                     \
+      return CONSUMER_INVOKE((N), impl_signal_from_cpu((N), a));                                     \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_wcpu_##N(                             \
       const struct agx_kmt_waitsyncfromcpu *a)                                \
    {                                                                           \
-      return impl_wait_from_cpu((N), a);                                       \
+      return CONSUMER_INVOKE((N), impl_wait_from_cpu((N), a));                                       \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_sgpu_##N(                             \
       const struct agx_kmt_signalsyncfromgpu *a)                              \
    {                                                                           \
-      return impl_signal_from_gpu((N), a);                                     \
+      return CONSUMER_INVOKE((N), impl_signal_from_gpu((N), a));                                     \
    }                                                                           \
    static agx_kmt_status AGX_KMT_API bt_wgpu_##N(                             \
       const struct agx_kmt_waitsyncfromgpu *a)                                \
    {                                                                           \
-      return impl_wait_from_gpu((N), a);                                       \
+      return CONSUMER_INVOKE((N), impl_wait_from_gpu((N), a));                                       \
    }
 
 #define GEN_ESCAPE(N) \
    static agx_kmt_status AGX_KMT_API bt_esc_##N(const struct agx_kmt_escape *a) \
-   { return impl_escape((N), a); }
+   { return CONSUMER_INVOKE((N), impl_escape((N), a)); }
 
 #define INST(N)                                                                \
    case (N):                                                                   \
@@ -1781,6 +1821,7 @@ agx_d3dkmt_bridge_install(struct agx_d3dkmt_winsys *ws)
       g_registry.prov[slot].alive = (const void *)b.alive;
       g_registry.prov[slot].alive_value = (uint64_t)b.alive_value;
       g_registry.prov[slot].in_flight = (const void *)b.in_flight;
+      InterlockedExchange(&g_local_closing[slot], 0);
    }
    ReleaseSRWLockExclusive(&g_registry_lock);
    if (slot < 0) {
@@ -1815,6 +1856,9 @@ agx_d3dkmt_bridge_uninstall(struct agx_d3dkmt_winsys *ws)
    unsigned slot = agxw_bridge_slot_of_sentinel(ws->device);
    if (slot >= AGXW_BRIDGE_MAX_DEVICES)
       return;
+
+   /* No registry/context lock held: entered callbacks may still need them. */
+   consumer_close(slot);
 
    AcquireSRWLockShared(&g_registry_lock);
    const struct agxw_bridge_provider_core *provider =
