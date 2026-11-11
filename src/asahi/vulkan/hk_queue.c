@@ -566,6 +566,7 @@ asahi_append_fragment_attachments(struct hk_device *dev,
 static inline unsigned
 max_commands_per_submit(struct hk_device *dev)
 {
+   if (dev->dev.primary_write_contract) return 1;
    return hk_drm_submit_command_limit(
       dev->dev.chip != AGX_CHIP_G13X && !HK_PERF(dev, NOBATCH),
       dev->dev.params.max_commands_per_submission);
@@ -573,7 +574,8 @@ max_commands_per_submit(struct hk_device *dev)
 
 static VkResult
 queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
-                    unsigned ring_idx, struct hk_cmd_pending *pending)
+                    unsigned ring_idx, struct hk_cmd_pending *pending,
+                    const struct agx_primary_write_set *writes)
 {
    /* Give each ioctl an independent binary completion fence. API signals
     * may be signalled on the CPU during error unwinding; timeline lookup
@@ -593,7 +595,7 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
       pinned.out_sync_count++;
       submit = &pinned;
    }
-   struct agx_submit_virt virt = {.ring_idx = ring_idx};
+   struct agx_submit_virt virt = {.ring_idx = ring_idx, .primary_writes = writes};
 
    /* Complete the cache cleans of CPU-cached descriptor writes
     * (hk_descriptor_set_publish()) before the GPU can read them. */
@@ -640,7 +642,8 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
                     unsigned ring_idx, const uint64_t prior_base[2],
                     bool chunk_timelines, uint64_t first_chunk_point,
                     struct hk_frame_anatomy_submit *anatomy,
-                    struct hk_cmd_pending *pending)
+                    struct hk_cmd_pending *pending,
+                    const struct agx_primary_write_set *writes)
 {
    uint8_t *cmdbuf = (uint8_t *)(uintptr_t)submit->cmdbuf;
    uint32_t offs = 0;
@@ -759,7 +762,8 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
 
       if (chunk_timelines)
          last_attempted_point = chunk_signal->timeline_value;
-      VkResult result = queue_submit_single(dev, &submit_ioctl, ring_idx, pending);
+      VkResult result = queue_submit_single(dev, &submit_ioctl, ring_idx, pending,
+            writes ? &writes[chunk_index] : NULL);
       if (result != VK_SUCCESS) {
          if (chunk_timelines)
             queue->drm.timeline_value = last_attempted_point;
@@ -1869,6 +1873,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
    /* Now setup the command structs */
    struct util_dynarray payload = UTIL_DYNARRAY_INIT;
+   struct util_dynarray primary_sets = UTIL_DYNARRAY_INIT;
 
    /* A small submit otherwise grows the heap allocation once for its
     * header and again for the command. Keep those payloads on the stack;
@@ -1908,6 +1913,10 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
          header.size = sizeof(cmd);
       util_dynarray_append(&payload, header);
       util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
+      if (dev->dev.primary_write_contract) {
+         const struct agx_primary_write_set empty = {.observed = true};
+         util_dynarray_append(&primary_sets, empty);
+      }
       nr_cdm++;
    }
 
@@ -1941,6 +1950,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                           !(dev->dev.params.features &
                             DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS),
                           completed, queue->sync_resolved.data)) {
+      util_dynarray_fini(&primary_sets);
       util_dynarray_fini(&payload);
       if (unlikely(anatomy))
          hk_frame_anatomy_end_submit(anatomy, dev, queue, VK_ERROR_DEVICE_LOST);
@@ -1999,6 +2009,16 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
          if (resolved)
             hk_sync_load_resolved(cs, resolved++);
+         if (dev->dev.primary_write_contract) {
+            if (!cs->primary_writes.observed || cs->primary_writes.incomplete) {
+               util_dynarray_fini(&primary_sets);
+               util_dynarray_fini(&payload);
+               hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
+               return vk_device_set_lost(&dev->vk,
+                        "Untracked primary write: shader/descriptor/meta operation refused");
+            }
+            util_dynarray_append(&primary_sets, cs->primary_writes);
+         }
          struct drm_asahi_cmd_header header =
             agx_cmd_header(cs->type == HK_CS_CDM, cs->sync.barrier[HK_SYNC_VDM],
                            cs->sync.barrier[HK_SYNC_CDM]);
@@ -2022,6 +2042,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
          if (queue->sync.serialize &&
              !hk_drm_serialize_prefix(&header, command_prior, nr_vdm, nr_cdm,
                                        prior_base, queue->sync.exact_prior)) {
+            util_dynarray_fini(&primary_sets);
             util_dynarray_fini(&payload);
             hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
             return vk_device_set_lost(&dev->vk,
@@ -2059,6 +2080,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                 (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) {
                /* The header size is 16 bits; never let it truncate. */
                if (cs->compute_resources.size > UINT16_MAX) {
+                  util_dynarray_fini(&primary_sets);
                   util_dynarray_fini(&payload);
                   if (unlikely(anatomy))
                      hk_frame_anatomy_end_submit(anatomy, dev, queue,
@@ -2154,6 +2176,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                   v2 ? sizeof(tile) : sizeof(cs->tile_resources);
                /* The header size is 16 bits; never let it truncate. */
                if (cs->render_resources.size + tile_bytes > UINT16_MAX) {
+                  util_dynarray_fini(&primary_sets);
                   util_dynarray_fini(&payload);
                   if (unlikely(anatomy))
                      hk_frame_anatomy_end_submit(anatomy, dev, queue,
@@ -2386,17 +2409,26 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
    if (unlikely(anatomy))
       hk_frame_anatomy_prepare(anatomy, dev, payload.data, payload.size);
 
+   if (dev->dev.primary_write_contract &&
+       util_dynarray_num_elements(&primary_sets, struct agx_primary_write_set) != command_count) {
+      util_dynarray_fini(&primary_sets);
+      util_dynarray_fini(&payload);
+      hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
+      return vk_device_set_lost(&dev->vk, "Primary write/command identity mismatch");
+   }
    VkResult result;
    if (command_count <= max_commands_per_submit(dev)) {
       if (unlikely(anatomy))
          hk_frame_anatomy_note_barriers(anatomy, payload.data, 0, payload.size);
       result =
-         queue_submit_single(dev, &submit_ioctl, queue->drm.virt_ring_idx, pending);
+         queue_submit_single(dev, &submit_ioctl, queue->drm.virt_ring_idx, pending,
+              dev->dev.primary_write_contract ? util_dynarray_begin(&primary_sets) : NULL);
    } else {
       result = queue_submit_looped(dev, queue, &submit_ioctl, command_count,
                                    queue->drm.virt_ring_idx, kq_base,
                                    chunk_timelines, first_chunk_point, anatomy,
-                                   pending);
+                                   pending,
+          dev->dev.primary_write_contract ? util_dynarray_begin(&primary_sets) : NULL);
    }
    hk_cmd_pending_end(dev, pending, queue, result);
    if (queue->sib.count > 1 && result == VK_SUCCESS) {
@@ -2416,6 +2448,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
          result = signal_result;
    }
 
+   util_dynarray_fini(&primary_sets);
    util_dynarray_fini(&payload);
 
    if (unlikely(anatomy))

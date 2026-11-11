@@ -1739,6 +1739,7 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    cs = hk_m5_dispatch_stream(cmd, cs);
    if (!cs)
       return;
+   hk_primary_note_compute(cmd, cs);
 
    struct agx_ptr uploaded = hk_pool_alloc(cmd, uploaded_size, 4);
    if (!uploaded.cpu) {
@@ -1876,6 +1877,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs = hk_m5_dispatch_stream(cmd, cs);
    if (!cs)
       return;
+   hk_primary_note_compute(cmd, cs);
 
    if (s->b.info.uses_matrix16) {
       if (!(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX))

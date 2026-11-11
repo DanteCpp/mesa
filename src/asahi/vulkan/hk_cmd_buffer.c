@@ -4307,7 +4307,7 @@ hk_apply_conditional_rendering(struct hk_cmd_buffer *cmd, uint64_t source,
 static void
 hk_cs_capture_fragment_attachments(const struct hk_device *dev,
                                    const struct hk_rendering_state *render,
-                                   struct hk_cs *cs)
+                                   struct hk_drm_attachment_set *set, bool primary)
 {
    /* Retain the image allocation spans now. A command buffer may contain
     * several VDM commands with different render state, while queue submission
@@ -4365,24 +4365,44 @@ hk_cs_capture_fragment_attachments(const struct hk_device *dev,
 
       struct hk_image *image =
          container_of(view->vk.image, struct hk_image, vk);
+      if (primary && hk_primary_image_ambiguous(image)) {
+         set->complete = false;
+         continue;
+      }
       const uint8_t image_plane =
          views[i].aspect == VK_IMAGE_ASPECT_COLOR_BIT
             ? view->planes[0].image_plane
             : hk_image_aspects_to_plane(image, views[i].aspect);
       if (image_plane >= image->plane_count) {
-         cs->fragment_attachments.complete = false;
+         set->complete = false;
          continue;
       }
 
       const struct hk_image_plane *plane = &image->planes[image_plane];
       const uint64_t size = plane->layout.size_B;
       if (!plane->addr || !size) {
-         cs->fragment_attachments.complete = false;
+         set->complete = false;
          continue;
       }
 
-      hk_drm_attachment_set_add(&cs->fragment_attachments, plane->addr, size);
+      hk_drm_attachment_set_add(set, plane->addr, size);
    }
+}
+
+void
+hk_primary_note_render(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!dev->dev.primary_write_contract) return;
+   struct hk_drm_attachment_set set;
+   hk_drm_attachment_set_init(&set);
+   hk_cs_capture_fragment_attachments(dev, &cmd->state.gfx.render, &set, true);
+   cs->primary_writes.observed = true;
+   if (!set.complete || cs->m5_shader_writes_memory ||
+       cmd->state.gfx.shaders_write_memory || cmd->state.gfx.xfb_enabled)
+      cs->primary_writes.incomplete = true;
+   for (unsigned i = 0; i < set.count; i++)
+      agx_primary_write_add(&cs->primary_writes, set.list[i].pointer, set.list[i].size);
 }
 
 bool
@@ -4399,12 +4419,13 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       return false;
 
    hk_drm_attachment_set_init(&cs->fragment_attachments);
+   hk_primary_note_render(cmd, cs);
 
    /* Only the native AGX3 path submits the spans (hk_queue.c). G18G
     * submits them too, as it did before the paths were split. */
    const bool g18g = dev->dev.chip == AGX_CHIP_G18G;
    if (agx_native_graphics(&dev->dev) || g18g)
-      hk_cs_capture_fragment_attachments(dev, render, cs);
+      hk_cs_capture_fragment_attachments(dev, render, &cs->fragment_attachments, false);
 
    if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
        g18g) {
@@ -4727,8 +4748,17 @@ clear_attachment_as_image(struct hk_cmd_buffer *cmd,
    }
 
    struct hk_image *image = container_of(view->vk.image, struct hk_image, vk);
+   const bool primary = hk_cmd_buffer_device(cmd)->dev.primary_write_contract;
+   if (primary) {
+      uint64_t lo, hi;
+      hk_image_va_range(image, &lo, &hi);
+      hk_sync_xfer_begin_dst(cmd, lo, hi,
+         hk_cmd_buffer_device(cmd)->dev.primary_write_contract &&
+         hk_primary_image_ambiguous(image));
+   }
    hk_clear_image(cmd, image, vk_format_to_pipe_format(format),
                   att->clear_colour, &range, false /* partially clear 3D */);
+   if (primary) hk_sync_xfer_end(cmd);
 }
 
 bool
@@ -5034,7 +5064,15 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
          colour[2] = colour[3] = 0;
       }
 
-      hk_sync_xfer_begin(cmd);
+      if (dev->dev.primary_write_contract) {
+         uint64_t lo, hi;
+         hk_image_va_range(e->image, &lo, &hi);
+         hk_sync_xfer_begin_dst(cmd, lo, hi,
+         hk_cmd_buffer_device(cmd)->dev.primary_write_contract &&
+         hk_primary_image_ambiguous(e->image));
+      } else {
+         hk_sync_xfer_begin(cmd);
+      }
       hk_clear_image(cmd, e->image, PIPE_FORMAT_NONE, colour, &range, true);
       hk_sync_xfer_end(cmd);
    }

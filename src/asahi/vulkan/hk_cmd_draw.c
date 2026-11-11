@@ -1777,6 +1777,7 @@ hk_m5_note_render_resources(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       hk_m5_accumulate_shader_writes(&cs->m5_shader_writes_memory,
                                      object->info.writes_external_memory);
    }
+   hk_primary_note_render(cmd, cs);
    if (cs->m5_shader_writes_memory || gfx->xfb_enabled ||
        gfx->render.m5_attachments_reach_memory)
       hk_sync_note_memory_write(cmd, cs);

@@ -29,6 +29,7 @@
 #include "agx_pack.h"
 #include "decode.h"
 #include "layout.h"
+#include "agx_primary_write.h"
 #include "libagx_dgc.h"
 
 /*
@@ -118,6 +119,7 @@ struct agx_submit_virt {
    uint32_t extres_count;
    struct asahi_ccmd_submit_res *extres;
    uint32_t ring_idx;
+   const struct agx_primary_write_set *primary_writes;
 };
 
 typedef struct {
@@ -198,6 +200,7 @@ struct agx_device {
    bool render_rsrc_spec_hi;
    /* The D3DKMT winsys enforces an exact GPU write set per submit. */
    bool write_set_contract;
+   bool primary_write_contract;
    agx_device_ops_t ops;
 
    /* vdrm device */

@@ -1741,7 +1741,13 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    uint32_t priv_size = 0;
    int ret = -1;
 
-   (void)virt; /* no vdrm concept here, same as the Linux drm backend */
+   const struct agx_primary_write_set *primary = virt ? virt->primary_writes : NULL;
+   if (dev->primary_write_contract &&
+       (!primary || !primary->observed || primary->incomplete ||
+        primary->count > AGX_PRIMARY_WRITE_RANGES)) {
+      errno = ENOTSUP;
+      return -1;
+   }
 
    const uint32_t n_in = submit->in_sync_count;
    const uint32_t n_out = submit->out_sync_count;
@@ -1814,7 +1820,8 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
           submit->cmdbuf_size);
 
    const size_t priv_capacity = sizeof(*priv) +
-      AGXW_MAX_READ_RANGES_PER_SUBMIT *
+      (AGXW_MAX_READ_RANGES_PER_SUBMIT +
+       (dev->primary_write_contract ? AGXW_MAX_PRIMARY_WRITE_RANGES : 0)) *
          sizeof(struct agxw_submit_read_range);
    priv = calloc(1, priv_capacity);
    if (priv == NULL) {
@@ -1840,6 +1847,22 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
           ? AGXW_SUBMIT_WRITE_SET_COMPLETE : 0);
    priv_size = (uint32_t)sizeof(*priv) +
       priv->read_range_count * sizeof(*read_ranges);
+   if (dev->primary_write_contract) {
+      static_assert(sizeof(struct agxw_submit_private_v3) ==
+                    sizeof(struct agxw_submit_private_v6), "v6 vector offset");
+      static_assert(AGX_PRIMARY_WRITE_RANGES == AGXW_MAX_PRIMARY_WRITE_RANGES,
+                    "primary write capacity");
+      struct agxw_submit_private_v6 *v6 = (void *)priv;
+      v6->base.version = AGXW_SUBMIT_PRIVATE_VERSION_V6;
+      v6->base.flags = AGXW_SUBMIT_READ_SET_COMPLETE |
+                       AGXW_SUBMIT_PRIMARY_WRITE_SET_COMPLETE;
+      v6->primary_write_range_count = primary->count;
+      struct agxw_submit_read_range *writes = read_ranges + v6->read_range_count;
+      for (unsigned i = 0; i < primary->count; i++)
+         writes[i] = (struct agxw_submit_read_range){
+            primary->ranges[i].address, primary->ranges[i].size};
+      priv_size += primary->count * sizeof(*writes);
+   }
    if (agxw_submit_private_validate_layout(&priv->base, priv_size,
                                            &ws->policy.layout) != 0) {
       errno = EINVAL;
@@ -3032,6 +3055,9 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
    dev->is_virtio = false;
    dev->ops = agx_device_d3dkmt_ops;
    dev->write_set_contract = true;
+   dev->primary_write_contract = identity.chip_id == 0x8142 &&
+      identity.gpu_generation == 17 && identity.gpu_variant == 'G' &&
+      identity.submit_private_max_version == AGXW_SUBMIT_PRIVATE_VERSION_V6;
    if (enum_log_enabled())
       d3dkmt_log_flushed("NTAGX_ENUM open_device=ready\n");
    return true; /* caller then runs agx_open_device() */

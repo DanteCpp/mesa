@@ -228,7 +228,9 @@ hk_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage _image,
     * class for every recorded dependency. */
    uint64_t lo, hi;
    hk_image_va_range(image, &lo, &hi);
-   hk_sync_xfer_begin_dst(cmd, lo, hi, false);
+   hk_sync_xfer_begin_dst(cmd, lo, hi,
+         hk_cmd_buffer_device(cmd)->dev.primary_write_contract &&
+         hk_primary_image_ambiguous(image));
    hk_xfer_clearcolorimage(commandBuffer, _image, imageLayout, pColor, rangeCount, pRanges);
    hk_sync_xfer_end(cmd);
 }
@@ -253,7 +255,9 @@ hk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage _image,
     * class for every recorded dependency. */
    uint64_t lo, hi;
    hk_image_va_range(image, &lo, &hi);
-   hk_sync_xfer_begin_dst(cmd, lo, hi, false);
+   hk_sync_xfer_begin_dst(cmd, lo, hi,
+         hk_cmd_buffer_device(cmd)->dev.primary_write_contract &&
+         hk_primary_image_ambiguous(image));
    hk_xfer_cleardepthstencilimage(commandBuffer, _image, imageLayout, pDepthStencil, rangeCount, pRanges);
    hk_sync_xfer_end(cmd);
 }

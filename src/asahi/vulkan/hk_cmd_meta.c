@@ -5200,7 +5200,9 @@ hk_xfer_begin_image(struct hk_cmd_buffer *cmd, VkImage _image)
    VK_FROM_HANDLE(hk_image, image, _image);
    uint64_t lo, hi;
    hk_image_va_range(image, &lo, &hi);
-   hk_sync_xfer_begin_dst(cmd, lo, hi, false);
+   hk_sync_xfer_begin_dst(cmd, lo, hi,
+         hk_cmd_buffer_device(cmd)->dev.primary_write_contract &&
+         hk_primary_image_ambiguous(image));
 }
 
 static void

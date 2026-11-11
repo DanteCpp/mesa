@@ -1391,6 +1391,7 @@ struct hk_cs {
 
    /* Recorded dependencies, see hk_sync.h. */
    struct hk_sync_stream sync;
+   struct agx_primary_write_set primary_writes;
 
    /* Writable destinations known while recording meta compute dispatches. */
    struct hk_drm_attachment_set compute_attachments;
@@ -1588,6 +1589,7 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
                                 attachment->pointer, attachment->size);
    }
    a->compute_attachments.complete &= b->compute_attachments.complete;
+   agx_primary_write_merge(&a->primary_writes, &b->primary_writes);
 
    /* The merged command ends where b ended. It starts where a started; a
     * start stamp b carried was a top-of-pipe write, which any earlier value
@@ -1994,6 +1996,24 @@ hk_sync_xfer_end(struct hk_cmd_buffer *cmd)
    if (--cmd->sync.xfer_depth == 0)
       cmd->sync.xfer_dst = (struct hk_sync_xfer_dst){0};
 }
+
+/* Called at the actual M5 dispatch recording boundary, after selecting the
+ * successor stream. API transfers supply the owning destination scope; an
+ * ordinary shader dispatch or unknown internal helper cannot claim one. */
+static inline void
+hk_primary_note_compute(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   if (!hk_cmd_buffer_device(cmd)->dev.primary_write_contract) return;
+   const struct hk_sync_xfer_dst *d = &cmd->sync.xfer_dst;
+   cs->primary_writes.observed = true;
+   if (!cmd->sync.xfer_depth || !d->valid || d->device_address || d->lo >= d->hi) {
+      cs->primary_writes.incomplete = true;
+      return;
+   }
+   agx_primary_write_add(&cs->primary_writes, d->lo, d->hi - d->lo);
+}
+
+void hk_primary_note_render(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 /*
  * One reservation inside the Ioto arena: where the program is to be composed,
