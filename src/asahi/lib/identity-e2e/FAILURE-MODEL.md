@@ -1,0 +1,13 @@
+# Native193 adapter identity admission — pre-code failure model
+
+Actual boot137/run193 naturally exited4 before any numerical workload. The probe selected the exact Apple adapter LUID00000000:0018005c and logged two Microsoft Basic Render adapters (DXGI flags0 and2). The exact6ed ICD emitted only the combined runtime/raw identity refusal. That saved output does not identify the failing branch; DXGI flags must not be substituted for KMT ADAPTERTYPE. Original193 remains STOP.
+
+The actual compiled agx_d3dkmt.h defines SoftwareDevice as bit3 and DisplaySupported as bit4. Pinned Windows SDK26100.6584 d3dkmthk.h1985–1996 defines RenderSupported bit0, DisplaySupported bit1, SoftwareDevice bit2, PostDevice bit3 and HybridDiscrete bit4. This is a concrete ABI bug independent of whether it was the first failed193 condition. Existing adapter replay uses the same wrong portable constants to generate its model values, so it cannot detect it.
+
+Before implementation, the focused E2E will compile the real SDK bitfields to ARM64 and x64 LLVMIR and extract their actual values. It will exercise the existing actual production bridge_adapter_matches and actual identity parser, supplying those independently derived classification values. Old constants must fail the healthy hardware+render-capable software case. PostDevice hardware must still require full private identity; an unknown render hardware adapter remains fatal.
+
+Failure cases: callback nonzero or revoked provider; raw query failure/malformed bytes/mismatch; missing, oversized, failed or growing enumeration; duplicate/zero handles; classification query failure; unparseable unknown hardware; multiple Aurora adapters; own LUID mismatch; close failure. A successful bounded enumeration owns each nonzero distinct handle exactly once; no callback/raw handle substitution or invented cleanup of uncertain error outputs. Current identity/call/lifetime admission remains exact.
+
+Only the two SDK-correct masks change acceptance. Additional diagnostics are failure-only, bounded to statuses, index/count/type/LUID and identity mismatch fields. No success chatter with agx_d3dkmt_bridge prefix: the strict runtime oracle still requires exactly the two physical/logical installed events and no refusal/preserved teardown. No registry, activation, output oracle or numerical scope change.
+
+The resulting .23.2 native package must preserve old .23.0 SYS and current UMD/DXVK bytes, rebuild probe identity for the new ICD while retaining both CRT/Win32 opt-in views and two-consumer oracle, and use a fresh source-bound catalog/install/runtime path. .25 target lifecycle stays separate. All hardware, alias publication, signing authority and actual Windows trust/install/runtime execution remain root-owned.

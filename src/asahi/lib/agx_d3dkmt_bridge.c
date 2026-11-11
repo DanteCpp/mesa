@@ -1693,29 +1693,60 @@ bridge_adapter_matches(struct agx_d3dkmt_winsys *ws, const AuroraGpuBridge *b)
    if (*(const volatile LONG *)b->alive == (LONG)b->alive_value)
       status = query(b->hRTAdapter, &rq);
    InterlockedDecrement((volatile LONG *)b->in_flight);
-   if (status != 0 || ws->fns.QueryAdapterInfo(&raw) != 0 ||
-       agx_d3dkmt_parse_identity(&runtime_id, sizeof(runtime_id), &policy, &parsed) != 0 ||
-       agx_d3dkmt_parse_identity(&raw_id, sizeof(raw_id), &policy, &parsed) != 0 ||
-       memcmp(&runtime_id, &raw_id, sizeof(raw_id)) != 0)
+   if (status != 0) {
+      fprintf(stderr, "agx_d3dkmt_bridge: identity callback status=0x%08x\n", (unsigned)status);
       return false;
+   }
+   status = ws->fns.QueryAdapterInfo(&raw);
+   if (status != 0) {
+      fprintf(stderr, "agx_d3dkmt_bridge: identity raw status=0x%08x\n", (unsigned)status);
+      return false;
+   }
+   if (agx_d3dkmt_parse_identity(&runtime_id, sizeof(runtime_id), &policy, &parsed) != 0) {
+      fprintf(stderr, "agx_d3dkmt_bridge: identity runtime payload invalid\n");
+      return false;
+   }
+   if (agx_d3dkmt_parse_identity(&raw_id, sizeof(raw_id), &policy, &parsed) != 0) {
+      fprintf(stderr, "agx_d3dkmt_bridge: identity raw payload invalid\n");
+      return false;
+   }
+   if (memcmp(&runtime_id, &raw_id, sizeof(raw_id)) != 0) {
+      fprintf(stderr, "agx_d3dkmt_bridge: identity runtime/raw payload mismatch\n");
+      return false;
+   }
 
    struct agx_kmt_adapterinfo adapters[64] = {0};
    struct agx_kmt_enumadapters2 e = {0};
-   if (ws->fns.EnumAdapters2(&e) != 0 || e.NumAdapters == 0 || e.NumAdapters > 64)
+   status = ws->fns.EnumAdapters2(&e);
+   if (status != 0 || e.NumAdapters == 0 || e.NumAdapters > 64) {
+      fprintf(stderr, "agx_d3dkmt_bridge: identity enumerate count status=0x%08x count=%u\n",
+              (unsigned)status, e.NumAdapters);
       return false;
+   }
    const uint32_t capacity = e.NumAdapters;
    e.pAdapters = adapters;
    agx_kmt_status enum_status = ws->fns.EnumAdapters2(&e);
    /* NumAdapters and partial outputs have no ownership guarantee on error.
     * Refuse without sending unproven handles into CloseAdapter. An impossible
     * successful count is likewise not a proved, bounded output list. */
-   if (enum_status != 0 || e.NumAdapters > capacity)
+   if (enum_status != 0 || e.NumAdapters > capacity) {
+      fprintf(stderr, "agx_d3dkmt_bridge: identity enumerate list status=0x%08x count=%u capacity=%u\n",
+              (unsigned)enum_status, e.NumAdapters, capacity);
       return false;
+   }
    bool valid = e.NumAdapters > 0;
+   if (!valid)
+      fprintf(stderr, "agx_d3dkmt_bridge: identity empty adapter list\n");
    for (uint32_t i = 0; i < e.NumAdapters; ++i) {
-      if (adapters[i].hAdapter == 0) valid = false;
+      if (adapters[i].hAdapter == 0) {
+         fprintf(stderr, "agx_d3dkmt_bridge: identity null handle index=%u\n", i);
+         valid = false;
+      }
       for (uint32_t j = 0; j < i; ++j)
-         if (adapters[i].hAdapter == adapters[j].hAdapter) valid = false;
+         if (adapters[i].hAdapter == adapters[j].hAdapter) {
+            fprintf(stderr, "agx_d3dkmt_bridge: identity duplicate handle index=%u previous=%u\n", i, j);
+            valid = false;
+         }
    }
    unsigned qualifying = 0;
    bool own_luid = false;
@@ -1726,7 +1757,11 @@ bridge_adapter_matches(struct agx_d3dkmt_winsys *ws, const AuroraGpuBridge *b)
          .hAdapter = adapters[i].hAdapter, .Type = AGX_KMT_QAITYPE_ADAPTERTYPE,
          .pPrivateDriverData = &type, .PrivateDriverDataSize = sizeof(type),
       };
-      if (ws->fns.QueryAdapterInfo(&type_q) != 0) { valid = false; break; }
+      status = ws->fns.QueryAdapterInfo(&type_q);
+      if (status != 0) {
+         fprintf(stderr, "agx_d3dkmt_bridge: identity adapter type index=%u status=0x%08x\n", i, (unsigned)status);
+         valid = false; break;
+      }
       /* An independently classified software/display-only adapter cannot
        * own this hardware runtime root. Unknown render adapters are never
        * silently skipped as proof of uniqueness. */
@@ -1738,8 +1773,17 @@ bridge_adapter_matches(struct agx_d3dkmt_winsys *ws, const AuroraGpuBridge *b)
          .hAdapter = adapters[i].hAdapter, .Type = AGX_KMT_QAITYPE_UMDRIVERPRIVATE,
          .pPrivateDriverData = &id, .PrivateDriverDataSize = sizeof(id),
       };
-      if (ws->fns.QueryAdapterInfo(&q) != 0 ||
-          agx_d3dkmt_parse_identity(&id, sizeof(id), &policy, &parsed) != 0) {
+      status = ws->fns.QueryAdapterInfo(&q);
+      if (status != 0) {
+         fprintf(stderr, "agx_d3dkmt_bridge: identity render private index=%u type=0x%08x luid=%08x:%08x status=0x%08x\n",
+                 i, type.Value, (unsigned)adapters[i].AdapterLuid.HighPart,
+                 adapters[i].AdapterLuid.LowPart, (unsigned)status);
+         valid = false; break;
+      }
+      if (agx_d3dkmt_parse_identity(&id, sizeof(id), &policy, &parsed) != 0) {
+         fprintf(stderr, "agx_d3dkmt_bridge: identity render payload index=%u type=0x%08x luid=%08x:%08x invalid\n",
+                 i, type.Value, (unsigned)adapters[i].AdapterLuid.HighPart,
+                 adapters[i].AdapterLuid.LowPart);
          valid = false; break;
       }
       qualifying++;
@@ -1755,10 +1799,16 @@ bridge_adapter_matches(struct agx_d3dkmt_winsys *ws, const AuroraGpuBridge *b)
          duplicate |= adapters[i].hAdapter == adapters[j].hAdapter;
       if (adapters[i].hAdapter != 0 && !duplicate) {
          struct agx_kmt_closeadapter close = {.hAdapter = adapters[i].hAdapter};
-         if (ws->fns.CloseAdapter(&close) != 0)
+         status = ws->fns.CloseAdapter(&close);
+         if (status != 0) {
+            fprintf(stderr, "agx_d3dkmt_bridge: identity close index=%u status=0x%08x\n", i, (unsigned)status);
             valid = false;
+         }
       }
    }
+   if (valid && (qualifying != 1 || !own_luid))
+      fprintf(stderr, "agx_d3dkmt_bridge: identity uniqueness count=%u own_luid=%u expected=%08x:%08x\n",
+              qualifying, own_luid, (unsigned)ws->luid.HighPart, ws->luid.LowPart);
    return valid && qualifying == 1 && own_luid;
 }
 

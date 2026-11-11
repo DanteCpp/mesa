@@ -128,8 +128,8 @@ struct agx_kmt_adaptertype { /* D3DKMT_ADAPTERTYPE, bitfield block */
    uint32_t Value;
 };
 #define AGX_KMT_ADAPTERTYPE_RENDERSUPPORTED (1u << 0)
-#define AGX_KMT_ADAPTERTYPE_DISPLAYSUPPORTED (1u << 4)
-#define AGX_KMT_ADAPTERTYPE_SOFTWAREDEVICE (1u << 3)
+#define AGX_KMT_ADAPTERTYPE_DISPLAYSUPPORTED (1u << 1)
+#define AGX_KMT_ADAPTERTYPE_SOFTWAREDEVICE (1u << 2)
 
 /* -------------------------------------------------------------------------
  * Device.

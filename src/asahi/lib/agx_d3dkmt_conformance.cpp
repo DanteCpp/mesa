@@ -88,6 +88,11 @@ static_assert(KMTQAITYPE_UMDRIVERPRIVATE == AGX_KMT_QAITYPE_UMDRIVERPRIVATE,
 static_assert(KMTQAITYPE_ADAPTERTYPE == AGX_KMT_QAITYPE_ADAPTERTYPE,
               "KMTQAITYPE_ADAPTERTYPE");
 CHECK_SIZE(D3DKMT_ADAPTERTYPE, agx_kmt_adaptertype);
+/* The identity E2E also compiles the owning SDK bitfields to constants on
+ * ARM64 and x64; sizeof alone cannot detect incorrect bit positions. */
+static_assert(AGX_KMT_ADAPTERTYPE_RENDERSUPPORTED == 1u, "RenderSupported bit");
+static_assert(AGX_KMT_ADAPTERTYPE_DISPLAYSUPPORTED == 2u, "DisplaySupported bit");
+static_assert(AGX_KMT_ADAPTERTYPE_SOFTWAREDEVICE == 4u, "SoftwareDevice bit");
 
 /* Device. */
 CHECK_SIZE(D3DKMT_CREATEDEVICE, agx_kmt_createdevice);
