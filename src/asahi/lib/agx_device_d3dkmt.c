@@ -888,6 +888,8 @@ agx_d3dkmt_bo_import_external(
       return NULL;
    }
    const size_t size = (size_t)checked_size;
+   record.cpu_mapping_forbidden =
+      (kmd.flags & AGXW_ALLOC_NO_CPU_MAP) != 0;
 
    struct agx_bo *bo =
       d3dkmt_adopt_allocation(dev, size, AIL_PAGESIZE, flags, &record);
@@ -910,7 +912,7 @@ agx_d3dkmt_bo_import_local(struct agx_device *dev,
    }
 
    struct agx_d3dkmt_winsys *ws = agx_d3dkmt_ws(dev);
-   const struct agx_d3dkmt_allocation_record record = {
+   struct agx_d3dkmt_allocation_record record = {
       .allocation = allocation,
       .external_type = AGX_D3DKMT_EXTERNAL_MEMORY_OPAQUE_WIN32_KMT,
       .borrowed = true,
@@ -933,6 +935,8 @@ agx_d3dkmt_bo_import_local(struct agx_device *dev,
       return NULL;
    }
    size = (size_t)checked_size;
+   record.cpu_mapping_forbidden =
+      (kmd.flags & AGXW_ALLOC_NO_CPU_MAP) != 0;
 
    if (!d3dkmt_make_resident(ws, allocation)) {
       d3dkmt_log_flushed(
@@ -1344,6 +1348,20 @@ d3dkmt_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
    assert(fixed_addr == NULL &&
           "placed maps need VK_EXT_map_memory_placed, disabled on Windows");
    (void)fixed_addr;
+
+   struct agx_d3dkmt_allocation_record record;
+   simple_mtx_lock(&ws->lock);
+   const bool found =
+      agx_d3dkmt_pool_get_record(&ws->pool, bo->handle, &record);
+   simple_mtx_unlock(&ws->lock);
+   if (!found || record.allocation != bo->uapi_handle ||
+       record.cpu_mapping_forbidden) {
+      bo->_map = NULL;
+      bo->_map_size = 0;
+      errno = found && record.allocation == bo->uapi_handle
+                 ? EACCES : EINVAL;
+      return;
+   }
 
    /* Lock2 always maps the whole allocation, so a shorter request is
     * satisfied by it and a longer one cannot be. */

@@ -199,6 +199,8 @@ struct agx_d3dkmt_allocation_record {
    agx_kmt_handle global_share;
    enum agx_d3dkmt_external_memory_type external_type;
    bool borrowed;
+   /* Validated KMD metadata, never an importer-provided mapping hint. */
+   bool cpu_mapping_forbidden;
 };
 
 struct agx_d3dkmt_handle_pool {
