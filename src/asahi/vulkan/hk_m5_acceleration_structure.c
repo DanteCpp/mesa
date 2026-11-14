@@ -24,6 +24,7 @@
 #include "util/u_atomic.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "hk_buffer.h"
@@ -1388,25 +1389,45 @@ static void
 hk_m5_rq_dump_image(const char *prefix, const char *what, const void *data)
 {
    char path[4096];
-   if (snprintf(path, sizeof(path), "%s.%s.bin", prefix, what) >= (int)sizeof(path))
-      return;
-   const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-   if (fd < 0) {
-      mesa_logw("M5 query runtime: cannot create %s", path);
+   const int length = snprintf(path, sizeof(path), "%s.%s.bin", prefix, what);
+   if (length < 0 || length >= (int)sizeof(path)) {
+      mesa_logw("M5 query runtime: %s image dump path is too long", what);
       return;
    }
+   const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+   if (fd < 0) {
+      mesa_logw("M5 query runtime: cannot create %s: %s", path, strerror(errno));
+      return;
+   }
+   /* A partial image is removed rather than left to be compared. */
    const uint8_t *p = data;
    size_t left = HK_M5_RT_IMAGE_SIZE;
+   bool written = true;
    while (left) {
       const ssize_t n = write(fd, p, left);
-      if (n <= 0) {
+      if (n < 0 && errno == EINTR)
+         continue;
+      if (n < 0) {
+         mesa_logw("M5 query runtime: cannot write %s: %s", path, strerror(errno));
+         written = false;
+         break;
+      }
+      if (n == 0) {
          mesa_logw("M5 query runtime: short write to %s", path);
+         written = false;
          break;
       }
       p += n;
       left -= (size_t)n;
    }
-   close(fd);
+   /* Linux releases the descriptor even when close() fails, so it is not
+    * retried; the data may not have reached the file. */
+   if (close(fd) && written) {
+      mesa_logw("M5 query runtime: cannot close %s: %s", path, strerror(errno));
+      written = false;
+   }
+   if (!written)
+      unlink(path);
 }
 
 static bool
