@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "asahi/compiler/agx3_compose/agx3_compose.h"
+#include "util/simple_mtx.h"
 
 enum { HK_M5_RT_ZERO = 0, HK_M5_RT_ROW = 1, HK_M5_RT_RAW = 2 };
 
@@ -135,4 +136,38 @@ hk_m5_rt_build_user_image(uint8_t *dst)
    return hk_m5_rt_build(hk_m5_rt_user_lz, hk_m5_rt_user_lz_size,
                          hk_m5_rt_user_stream_size, dst, false,
                          hk_m5_rt_user_digest);
+}
+
+/* Building both images takes about 0.1 s, so each is built once per process,
+ * on first use, and kept for the life of the process. A failed build is not
+ * kept, so the next call tries again. */
+static simple_mtx_t hk_m5_rt_image_lock = SIMPLE_MTX_INITIALIZER;
+static const uint8_t *hk_m5_rt_code_cache, *hk_m5_rt_user_cache;
+
+static const uint8_t *
+hk_m5_rt_cached(const uint8_t **cache, bool (*build)(uint8_t *))
+{
+   simple_mtx_lock(&hk_m5_rt_image_lock);
+   if (!*cache) {
+      uint8_t *image = malloc(HK_M5_RT_IMAGE_SIZE);
+      if (image && build(image))
+         *cache = image;
+      else
+         free(image);
+   }
+   const uint8_t *image = *cache;
+   simple_mtx_unlock(&hk_m5_rt_image_lock);
+   return image;
+}
+
+const uint8_t *
+hk_m5_rt_code_image(void)
+{
+   return hk_m5_rt_cached(&hk_m5_rt_code_cache, hk_m5_rt_build_code);
+}
+
+const uint8_t *
+hk_m5_rt_user_image(void)
+{
+   return hk_m5_rt_cached(&hk_m5_rt_user_cache, hk_m5_rt_build_user_image);
 }

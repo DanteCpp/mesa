@@ -1454,11 +1454,16 @@ hk_m5_rq_init(struct hk_device *dev)
    if (!dev->m5_rq_user_image)
       return hk_m5_rq_init_fail(dev, "user-image-allocation", image_error);
    /* Every instruction of the code image is composed with agx3c_table
-    * (hk_m5_rt_runtime.h); the user image and uniforms are generated data. */
-   if (!hk_m5_rt_build_code(agx_bo_map(dev->m5_rq_code)))
+    * (hk_m5_rt_runtime.h); the user image and uniforms are generated data.
+    * Both images are built once per process; each device copies them. */
+   const uint8_t *code = hk_m5_rt_code_image();
+   if (!code)
       return hk_m5_rq_init_fail(dev, "generated-code", 0);
-   if (!hk_m5_rt_build_user_image(dev->m5_rq_user_image))
+   const uint8_t *user = hk_m5_rt_user_image();
+   if (!user)
       return hk_m5_rq_init_fail(dev, "generated-user-image", 0);
+   memcpy(agx_bo_map(dev->m5_rq_code), code, HK_M5_RT_IMAGE_SIZE);
+   memcpy(dev->m5_rq_user_image, user, HK_M5_RT_IMAGE_SIZE);
    static_assert(sizeof(dev->m5_rq_uniforms) == sizeof(hk_m5_rt_instance_uniforms),
                  "M5 query uniforms");
    memset(dev->m5_rq_uniforms, 0, sizeof(dev->m5_rq_uniforms));
@@ -1466,9 +1471,9 @@ hk_m5_rq_init(struct hk_device *dev)
    if (dev->m5_rq_instances)
       memcpy(dev->m5_rq_uniforms, hk_m5_rt_instance_uniforms,
              sizeof(hk_m5_rt_instance_uniforms));
-   /* ASAHI_M5_RQ_IMAGE_DUMP=<prefix> writes the images this device built to
-    * new files <prefix>.code.bin and <prefix>.user.bin (never in a setuid
-    * process, never over an existing file or through a symlink). */
+   /* ASAHI_M5_RQ_IMAGE_DUMP=<prefix> writes this device's copies of the
+    * images to new files <prefix>.code.bin and <prefix>.user.bin (never in a
+    * setuid process, never over an existing file or through a symlink). */
    const char *gen_dump = os_get_option_secure("ASAHI_M5_RQ_IMAGE_DUMP");
    if (gen_dump) {
       hk_m5_rq_dump_image(gen_dump, "code", agx_bo_map(dev->m5_rq_code));

@@ -46,3 +46,10 @@ bool hk_m5_rt_build_code(uint8_t *dst);
 /* Fill dst (HK_M5_RT_IMAGE_SIZE bytes) with the user image; false as above,
  * against hk_m5_rt_user_digest. */
 bool hk_m5_rt_build_user_image(uint8_t *dst);
+
+/* The code and user images (HK_M5_RT_IMAGE_SIZE bytes each), built with the
+ * functions above on first use and kept for the life of the process, so
+ * devices copy them instead of building them again. NULL if the image does
+ * not build; a later call tries again. Thread-safe. */
+const uint8_t *hk_m5_rt_code_image(void);
+const uint8_t *hk_m5_rt_user_image(void);
