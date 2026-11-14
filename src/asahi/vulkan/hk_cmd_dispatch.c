@@ -49,8 +49,6 @@
 DEBUG_GET_ONCE_BOOL_OPTION(m5_launch_debug, "ASAHI_M5_LAUNCH_DEBUG", false)
 DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_compute_loader,
                            "AGX_M5_VERIFY_COMPUTE_LOADER", false)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_rq_candidate_api, "ASAHI_M5_RQ_CANDIDATE_API",
-                           false)
 
 /* EXP-G1b's native access::write argument is a PBE pointer followed by a
  * pointer to this control descriptor, including when it follows a sampled
@@ -1885,7 +1883,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        * different sections; neither is the shader's ordinary spill buffer. */
       struct agx_scs_layout_gen2 scs;
       const uint64_t packed = dev->m5_rq_instances
-         ? (debug_get_option_m5_rq_candidate_api()
+         ? (dev->m5_rq_candidate_api
                      ? UINT64_C(0x01140000600100e8) /* 276-entry IFT50 tail */
                      : UINT64_C(0x00480000600100e8)) : UINT64_C(0x0028000060000070);
       if (!agx_scs_layout_gen2_init(packed, &scs))
@@ -1977,7 +1975,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             memcpy((uint8_t *)uniforms.cpu + 52*2, &layout, 8);
             memcpy((uint8_t *)uniforms.cpu + 56*2, &driver, 8);
          }
-         if (debug_get_option_m5_rq_candidate_api()) {
+         if (dev->m5_rq_candidate_api) {
             /* The query-once payload at u110..113, bound separately because
              * the ordinary profile uses u140 for its per-clique state. */
             uint64_t query_payload = UINT64_C(0x3fffffff00008000);

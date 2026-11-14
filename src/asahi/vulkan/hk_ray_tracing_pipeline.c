@@ -340,6 +340,8 @@ struct hk_rt_compiler {
    bool position_fetch;
    bool native_agx;
    bool native_m5;
+   /* The device's ASAHI_M5_RQ_CANDIDATE_API profile (hk_m5_rt_profile). */
+   bool m5_candidate_api;
    /* M5 compiles one kernel per ray-generation group and shares a stage's
     * call site between the groups naming it. Other chips keep the single
     * megakernel with one call site per group. */
@@ -1564,7 +1566,7 @@ hk_trace_ray_m5(nir_builder *b, struct hk_rt_compiler *compiler,
    nir_rq_initialize(b, q, as, query_flags, mask, origin, tmin, dir, tmax);
    nir_push_loop(b);
    nir_break_if(b, nir_inot(b, nir_rq_proceed(b, 1, q)));
-   if (debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_API", false)) {
+   if (compiler->m5_candidate_api) {
       /* The native query API internally commits opaque hits. Each returned
        * triangle is nonopaque and must run the selected any-hit stage before
        * confirmation. Rejected candidates leave traversal uncommitted. */
@@ -3787,6 +3789,7 @@ hk_compile_rt_kernel(
       .position_fetch = dev->vk.enabled_features.rayTracingPositionFetch,
       .native_agx = dev->gen1_native_rq && dev->gen1_rq_instances,
       .native_m5 = dev->m5_native_rq && dev->m5_rq_instances,
+      .m5_candidate_api = dev->m5_rq_candidate_api,
       .m5 = agx_chip_g17_m5(dev->dev.chip),
       .callable_dispatch = hk_callable_dispatch_needed(pipeline),
       .max_depth = create_info->maxPipelineRayRecursionDepth,

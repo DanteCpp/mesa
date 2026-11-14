@@ -1995,6 +1995,21 @@ hk_get_sysmem_heap_available(struct hk_physical_device *pdev)
    return total_used < pdev->sysmem ? pdev->sysmem - total_used : 0;
 }
 
+static void
+hk_read_m5_rt_profile(struct hk_physical_device *pdev)
+{
+   struct hk_m5_rt_profile *profile = &pdev->m5_rt;
+   profile->native_as = agx_chip_g17_m5(pdev->dev.chip) &&
+                        debug_get_bool_option("ASAHI_M5_NATIVE_AS", false);
+   if (!profile->native_as)
+      return;
+   profile->native_rt = debug_get_bool_option("ASAHI_M5_NATIVE_RT", false);
+   profile->rq_instances =
+      debug_get_bool_option("ASAHI_M5_RQ_INSTANCES", false);
+   profile->rq_candidate_api =
+      debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_API", false);
+}
+
 VkResult
 hk_create_drm_physical_device(struct vk_instance *_instance,
                               drmDevicePtr drm_device,
@@ -2088,8 +2103,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    /* Explicit bring-up profile: the native M5 acceleration structure builder
     * and ray queries through the hardware intersector, which runs the
     * generated intersection runtime (hk_m5_rt_runtime.h). */
-   if (agx_chip_g17_m5(pdev->dev.chip) &&
-       debug_get_bool_option("ASAHI_M5_NATIVE_AS", false)) {
+   hk_read_m5_rt_profile(pdev);
+   if (pdev->m5_rt.native_as) {
       supported_extensions.KHR_acceleration_structure = true;
       supported_extensions.KHR_deferred_host_operations = true;
       /* Ray queries only in the configuration they are qualified in: on
@@ -2099,11 +2114,10 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.KHR_ray_query =
          pdev->dev.chip == AGX_CHIP_G17S &&
          (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2) &&
-         debug_get_bool_option("ASAHI_M5_RQ_INSTANCES", false) &&
-         debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_API", false);
+         pdev->m5_rt.rq_instances && pdev->m5_rt.rq_candidate_api;
       /* Explicit pipeline qualification profile; the default remains gated. */
       bool native_rt = supported_extensions.KHR_ray_query &&
-         debug_get_bool_option("ASAHI_M5_NATIVE_RT", false);
+         pdev->m5_rt.native_rt;
       supported_extensions.KHR_ray_tracing_pipeline = native_rt;
       supported_extensions.KHR_ray_tracing_maintenance1 = native_rt;
       /* Graphics pipeline libraries need VK_KHR_pipeline_library whether or

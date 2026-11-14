@@ -1811,7 +1811,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             } else if (cs->m5_native_rq) {
                header.size = sizeof(cmd);
                cmd.scs_layout = dev->m5_rq_instances
-                  ? (debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_API", false)
+                  ? (dev->m5_rq_candidate_api
                      ? UINT64_C(0x01140000600100e8) /* 276-entry IFT50 tail */
                      : UINT64_C(0x00480000600100e8))
                   : UINT64_C(0x0028000060000070);

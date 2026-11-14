@@ -212,7 +212,9 @@ struct hk_device {
    /* Native ray queries through the hardware intersector, which runs the
     * generated intersection runtime (hk_m5_rt_runtime.h). */
    bool m5_native_rq;
+   /* From the physical device's profile (hk_m5_rt_profile). */
    bool m5_rq_instances;
+   bool m5_rq_candidate_api;
    simple_mtx_t m5_as_lock;
    struct util_dynarray m5_ases;
    /* Stable native AS-ID -> address table. VA is reserved once; backing

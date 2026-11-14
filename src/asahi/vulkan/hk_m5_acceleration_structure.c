@@ -1412,7 +1412,9 @@ hk_m5_rq_dump_image(const char *prefix, const char *what, const void *data)
 static bool
 hk_m5_rq_init(struct hk_device *dev)
 {
-   dev->m5_rq_instances = debug_get_bool_option("ASAHI_M5_RQ_INSTANCES", false);
+   const struct hk_m5_rt_profile *profile = &hk_device_physical(dev)->m5_rt;
+   dev->m5_rq_instances = profile->rq_instances;
+   dev->m5_rq_candidate_api = profile->rq_candidate_api;
    const uint64_t alias = UINT64_C(0x10010000000);
    dev->m5_rq_code_alias = agx_va_alloc(&dev->dev, 0x800000, 0x4000,
                                         AGX_VA_USC | AGX_VA_FIXED, alias);
@@ -1475,8 +1477,7 @@ hk_m5_rq_init(struct hk_device *dev)
 VkResult
 hk_m5_backend_device_init_accel_struct_state(struct hk_device *dev)
 {
-   dev->m5_native_as = agx_chip_g17_m5(dev->dev.chip) &&
-      debug_get_bool_option("ASAHI_M5_NATIVE_AS", false);
+   dev->m5_native_as = hk_device_physical(dev)->m5_rt.native_as;
    dev->accel_struct_args = (struct vk_acceleration_structure_build_args){
       .subgroup_size = 32,
       .bvh_bounds_offset = dev->m5_native_as ? 0x50 :
