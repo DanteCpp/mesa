@@ -14,6 +14,7 @@
 #include "asahi/lib/agx_abi.h"
 #include "asahi/lib/agx_nir_lower_vbo.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_instr_set.h"
 #include "compiler/nir/nir_range_analysis.h"
 #include "util/bitset.h"
 #include "util/glheader.h"
@@ -1876,6 +1877,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
    enum agx_format fmt = agx_format_for_pipe(nir_intrinsic_format(instr));
    unsigned shift = nir_intrinsic_base(instr);
    const bool index_bytes = shift & AGX_NIR_MEMORY_INDEX_BYTES;
+   const bool unpack_w8_word = shift & AGX_NIR_MEMORY_UNPACK_W8_WORD;
    assert(!index_bytes || b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2);
    const unsigned packed_count = (shift & AGX_NIR_MEMORY_PACKED_COUNT_MASK) >>
                                  AGX_NIR_MEMORY_PACKED_COUNT_SHIFT;
@@ -1886,7 +1888,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
    assert(!byte_offset ||
           b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C);
    shift &= ~(AGX_NIR_MEMORY_INDEX_BYTES | AGX_NIR_MEMORY_PACKED_COUNT_MASK |
-              AGX_NIR_MEMORY_BYTE_OFFSET_MASK);
+              AGX_NIR_MEMORY_UNPACK_W8_WORD | AGX_NIR_MEMORY_BYTE_OFFSET_MASK);
 
    assert(shift <= 3);
 
@@ -1970,6 +1972,33 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
       load->memory_byte_offset = byte_offset;
       agx_unpack_rgb10a2_agx3_to(b, dest, packed)->format = fmt;
       agx_emit_cached_split(b, dest, 3);
+      return;
+   }
+
+   /* Keep the original W8 transaction after folding the unsigned widenings.
+    * Extract from its packed word so a useful operation can carry the wait.
+    */
+   if (unpack_w8_word) {
+      assert(b->shader->key->dev.chip == AGX_CHIP_G17P &&
+             b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+             b->shader->stage == MESA_SHADER_COMPUTE && !b->shader->is_preamble &&
+             fmt == AGX_FORMAT_I8 && dest.size == AGX_SIZE_32 &&
+             instr->def.num_components == 4 && packed_count == 0);
+      agx_index packed = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *load = agx_device_load_to(b, packed, addr, offset, fmt,
+                                           0xf, shift, nir_is_coherent(instr));
+      load->memory_index_is_bytes = index_bytes;
+      load->memory_byte_offset = byte_offset;
+      load->memory_is_packed = true;
+
+      agx_index channels[4];
+      for (unsigned i = 0; i < ARRAY_SIZE(channels); ++i) {
+         agx_index shifted = i ? agx_ushr(b, packed, agx_immediate(8 * i))
+                               : packed;
+         channels[i] = i == 3 ? shifted
+                              : agx_and(b, shifted, agx_immediate(0xff));
+      }
+      agx_emit_collect_to(b, dest, ARRAY_SIZE(channels), channels);
       return;
    }
 
@@ -12678,6 +12707,48 @@ agx_nir_fragment_output_temporaries(nir_shader *nir)
    return true;
 }
 
+/* Fold 8-to-32 unsigned conversion into the selected result type. The
+ * four-byte transaction is still determined by the format and lane count.
+ */
+static bool
+g17p_fold_w8_word_unpack(nir_builder *b, nir_intrinsic_instr *load,
+                         UNUSED void *data)
+{
+   if (b->impl->function->is_preamble ||
+       (load->intrinsic != nir_intrinsic_load_agx &&
+        load->intrinsic != nir_intrinsic_load_constant_agx) ||
+       load->def.bit_size != 8 || load->def.num_components != 4 ||
+       nir_intrinsic_format(load) != PIPE_FORMAT_R8_UINT ||
+       (nir_intrinsic_base(load) & (AGX_NIR_MEMORY_PACKED_COUNT_MASK |
+                                   AGX_NIR_MEMORY_UNPACK_W8_WORD)) ||
+       nir_is_coherent(load))
+      return false;
+
+   bool used = false;
+   nir_foreach_use_including_if(use, &load->def) {
+      if (nir_src_is_if(use))
+         return false;
+      nir_instr *parent = nir_src_use_instr(use);
+      if (parent->type != nir_instr_type_alu)
+         return false;
+      const nir_alu_instr *alu = nir_instr_as_alu(parent);
+      if (alu->op != nir_op_u2u32 || alu->def.bit_size != 32 ||
+          alu->def.num_components != 1 || alu->src[0].swizzle[0] >= 4)
+         return false;
+      used = true;
+   }
+   if (!used)
+      return false;
+
+   load->def.bit_size = 32;
+   nir_intrinsic_set_base(load, nir_intrinsic_base(load) |
+                               AGX_NIR_MEMORY_UNPACK_W8_WORD);
+   nir_foreach_use(use, &load->def)
+      nir_instr_as_alu(nir_src_use_instr(use))->op = nir_op_mov;
+
+   return true;
+}
+
 /* This pass runs after all NIR speculation and movement. The actual global
  * load is introduced only within its valid arm, and cannot be speculated or
  * reordered. The frontend predicate retains its original overflow semantics. */
@@ -15675,6 +15746,113 @@ agx_fs_takes_derivatives(nir_shader *nir)
    return false;
 }
 
+/* The boundary is a workgroup-wide rendezvous and shared-memory fence.
+ * Divergence is an additional refusal; correctness uses the barrier's
+ * workgroup execution scope on a valid shader. */
+static bool
+g17p_shared_phase_boundary(nir_block *block, bool entry)
+{
+   if (!block || block->divergent)
+      return false;
+
+   nir_instr *instr = entry ? nir_block_last_instr(block)
+                            : nir_block_first_instr(block);
+   if (!instr || instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *barrier = nir_instr_as_intrinsic(instr);
+   return barrier->intrinsic == nir_intrinsic_barrier &&
+          nir_intrinsic_execution_scope(barrier) == SCOPE_WORKGROUP &&
+          nir_intrinsic_memory_scope(barrier) == SCOPE_DEVICE &&
+          nir_intrinsic_memory_modes(barrier) == nir_var_mem_shared &&
+          nir_intrinsic_memory_semantics(barrier) == NIR_MEMORY_ACQ_REL;
+}
+
+static bool
+g17p_shared_phase_load(const nir_intrinsic_instr *intrin, UNUSED const void *data)
+{
+   return intrin->intrinsic == nir_intrinsic_load_shared &&
+          nir_intrinsic_access(intrin) == 0 && intrin->def.bit_size == 32 &&
+          intrin->def.num_components == 1;
+}
+
+/* Check the entire structured phase for writes, not just the candidate
+ * block. Two workgroup rendezvous exclude stores from peers outside it. */
+static bool
+g17p_shared_phase_readonly(nir_loop *loop)
+{
+   if (!g17p_shared_phase_boundary(nir_loop_predecessor_block(loop), true) ||
+       !g17p_shared_phase_boundary(nir_loop_successor_block(loop), false))
+      return false;
+
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      nir_foreach_instr(instr, block) {
+         switch (instr->type) {
+         case nir_instr_type_phi:
+         case nir_instr_type_load_const:
+         case nir_instr_type_alu:
+            break;
+         case nir_instr_type_intrinsic:
+            if (!g17p_shared_phase_load(nir_instr_as_intrinsic(instr), NULL))
+               return false;
+            break;
+         case nir_instr_type_jump: {
+            nir_jump_instr *jump = nir_instr_as_jump(instr);
+            if (jump->type != nir_jump_break && jump->type != nir_jump_continue)
+               return false;
+            break;
+         }
+         default:
+            return false;
+         }
+      }
+   }
+   return true;
+}
+
+static bool
+g17p_cse_shared_reads_in_phases(nir_shader *nir)
+{
+   bool any = false;
+
+   nir_divergence_analysis(nir);
+   nir_foreach_function_impl(impl, nir) {
+      if (impl->function->is_preamble)
+         continue;
+
+      bool progress = false;
+      nir_foreach_block(pre, impl) {
+         nir_loop *loop = nir_block_get_following_loop(pre);
+         if (!loop || !g17p_shared_phase_readonly(loop))
+            continue;
+
+         nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+            struct set loads = {0};
+            nir_foreach_instr_safe(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               if (!loads.table)
+                  nir_instr_set_init(&loads, NULL);
+
+               /* Keep the first read in place. Do not mark it globally
+                * reorderable or reuse it across a dynamic iteration. */
+               if (nir_instr_set_add_or_rewrite(&loads, instr,
+                                                g17p_shared_phase_load,
+                                                NULL, NULL)) {
+                  nir_instr_remove(instr);
+                  progress = true;
+               }
+            }
+            if (loads.table)
+               nir_instr_set_fini(&loads);
+         }
+      }
+      any |= nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+
+   return any;
+}
+
 bool
 agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                        struct agx_shader_part *out)
@@ -16098,6 +16276,17 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
          NIR_PASS(_, nir, nir_opt_cse);
          NIR_PASS(_, nir, nir_opt_dce);
       }
+   }
+
+   if (key->dev.chip == AGX_CHIP_G17P &&
+       key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+       nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
+       !key->secondary) {
+      if (nir->info.shared_size)
+         NIR_PASS(_, nir, g17p_cse_shared_reads_in_phases);
+
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, g17p_fold_w8_word_unpack,
+               nir_metadata_control_flow, NULL);
    }
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
