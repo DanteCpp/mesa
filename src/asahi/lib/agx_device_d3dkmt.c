@@ -2588,7 +2588,7 @@ d3dkmt_get_time(struct agx_device *dev, struct drm_asahi_get_time *t)
 }
 
 /*
- * GET_PARAMS group VM_STATUS (pending KMD side; agx_d3dkmt_core.h "VM
+ * GET_PARAMS group VM_STATUS (KMD side: escape op 3; agx_d3dkmt_core.h "VM
  * status"). The sticky error is per device, so the escape names ws->device
  * as well as the adapter. Reached only when the KMD advertised the feature
  * bit: hk_check_status asks only then, and agx_d3dkmt_query_vm_status

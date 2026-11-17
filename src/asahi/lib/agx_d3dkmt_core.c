@@ -980,7 +980,8 @@ agx_d3dkmt_plan_m5_vm(const struct agxw_va_layout *layout,
 }
 
 /* -------------------------------------------------------------------------
- * VM status (pending KMD side; see agx_d3dkmt_core.h).
+ * VM status (KMD side: AppleAgxWddm codex/j813-unified-fences; see
+ * agx_d3dkmt_core.h).
  * ------------------------------------------------------------------------- */
 uint64_t
 agx_d3dkmt_published_features(uint64_t kmd_features, bool g17)

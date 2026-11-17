@@ -632,9 +632,11 @@ _Static_assert(sizeof(struct agx_d3dkmt_allocation_info) == 32,
 #endif
 
 /* -------------------------------------------------------------------------
- * VM status. PENDING KMD SIDE: AppleAgxWddm defines neither the escape nor
- * the feature bit yet (core/agxw_contract.h, CONTRACT.md SS8;
- * core/agxw_g17_params.c sets features = SOFT_FAULTS).
+ * VM status. KMD side: AppleAgxWddm codex/j813-unified-fences (2026-11-17)
+ * defines AGXW_ESC_VM_STATUS (3), struct agxw_escape_vm_status (16 bytes,
+ * AGXW_VM_STATUS_SIZE) and sets AGXW_G17_FEATURE_VM_STATUS in the G17
+ * features word. Older AppleAgxWddm trees define neither; the asserts below
+ * check the two layouts only when the contract header carries them.
  *
  * A G17 submit the KMD refuses inside its DDI still lets dxgkrnl retire the
  * packet and run the signal queued behind it, so the application's fence
@@ -690,6 +692,39 @@ _Static_assert(sizeof(struct agx_d3dkmt_vm_status) !=
                "p2 sent both as op 3: payload sizes must differ");
 _Static_assert(AGX_D3DKMT_ESC_VM_STATUS != AGX_D3DKMT_ESC_QUERY_ALLOCATION,
                "distinct escape ops");
+#endif
+
+#ifdef AGXW_VM_STATUS_SIZE
+/* The KMD's contract (agxw_contract.h) carries VM_STATUS: one wire format. */
+#ifdef __cplusplus
+static_assert(AGX_D3DKMT_ESC_VM_STATUS == AGXW_ESC_VM_STATUS, "VM_STATUS op");
+static_assert(sizeof(struct agx_d3dkmt_vm_status) == AGXW_VM_STATUS_SIZE &&
+                 sizeof(struct agxw_escape_vm_status) == AGXW_VM_STATUS_SIZE,
+              "VM_STATUS payload size");
+static_assert(offsetof(struct agx_d3dkmt_vm_status, vm_id) ==
+                    offsetof(struct agxw_escape_vm_status, vm_id) &&
+                 offsetof(struct agx_d3dkmt_vm_status, flags) ==
+                    offsetof(struct agxw_escape_vm_status, flags) &&
+                 offsetof(struct agx_d3dkmt_vm_status, error) ==
+                    offsetof(struct agxw_escape_vm_status, error) &&
+                 offsetof(struct agx_d3dkmt_vm_status, pad) ==
+                    offsetof(struct agxw_escape_vm_status, pad),
+              "VM_STATUS payload layout");
+#else
+_Static_assert(AGX_D3DKMT_ESC_VM_STATUS == AGXW_ESC_VM_STATUS, "VM_STATUS op");
+_Static_assert(sizeof(struct agx_d3dkmt_vm_status) == AGXW_VM_STATUS_SIZE &&
+                  sizeof(struct agxw_escape_vm_status) == AGXW_VM_STATUS_SIZE,
+               "VM_STATUS payload size");
+_Static_assert(offsetof(struct agx_d3dkmt_vm_status, vm_id) ==
+                     offsetof(struct agxw_escape_vm_status, vm_id) &&
+                  offsetof(struct agx_d3dkmt_vm_status, flags) ==
+                     offsetof(struct agxw_escape_vm_status, flags) &&
+                  offsetof(struct agx_d3dkmt_vm_status, error) ==
+                     offsetof(struct agxw_escape_vm_status, error) &&
+                  offsetof(struct agx_d3dkmt_vm_status, pad) ==
+                     offsetof(struct agxw_escape_vm_status, pad),
+               "VM_STATUS payload layout");
+#endif
 #endif
 
 /* The GET_PARAMS features word the winsys publishes for the KMD's: the bits

@@ -96,7 +96,16 @@ queue_signal_timeline(struct hk_device *dev, struct hk_queue *queue,
  * queue point on the CPU and publish the outputs through the provider's
  * CPU signal path. A binary output carries API value 0 and needs the
  * binary signal: timeline_signal(0) is a no-op that deadlocks a later
- * epoch-one wait. */
+ * epoch-one wait.
+ *
+ * The queue point is also reached for work the KMD refused: dxgkrnl retires
+ * a refused packet and runs the signals queued behind it. So the device
+ * status (VM_STATUS, which the KMD sets inside the refusing DDI, before that
+ * retirement) is asked after the wait and before any output is published.
+ * On loss this returns VK_ERROR_DEVICE_LOST without signalling; the runtime
+ * then signals the outputs as dropped (vk_queue_submit_signal_dropped), so
+ * no waiter hangs and every waiter sees the loss through check_status
+ * (AppleAgxWddm FAILURE-MODES-refused-fence.md M). */
 static VkResult
 queue_signal_empty_on_cpu(struct hk_device *dev, struct hk_queue *queue,
                           struct vk_queue_submit *submit)
@@ -110,6 +119,10 @@ queue_signal_empty_on_cpu(struct hk_device *dev, struct hk_queue *queue,
              DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
           NULL))
       return vk_error(dev, VK_ERROR_DEVICE_LOST);
+
+   VkResult status = vk_device_check_status(&dev->vk);
+   if (status != VK_SUCCESS)
+      return status;
 
    for (unsigned i = 0; i < submit->signal_count; ++i) {
       struct vk_sync_signal *signal = &submit->signals[i];
@@ -158,8 +171,11 @@ queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
       if (vk_sync_wait_many(&dev->vk, submit->wait_count, submit->waits,
                             VK_SYNC_WAIT_COMPLETE, UINT64_MAX) != VK_SUCCESS)
          return vk_error(dev, VK_ERROR_DEVICE_LOST);
-      if (submit->signal_count == 0)
-         return VK_SUCCESS;
+      if (submit->signal_count == 0) {
+         /* A wait satisfied by a refused submit's retirement is a refusal
+          * too; the signalling path asks after its own wait. */
+         return vk_device_check_status(&dev->vk);
+      }
       return queue_signal_empty_on_cpu(dev, queue, submit);
 
    case HK_EMPTY_SUBMIT_TIMELINE:
