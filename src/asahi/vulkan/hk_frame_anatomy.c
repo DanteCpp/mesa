@@ -375,8 +375,9 @@ hk_frame_anatomy_init(struct hk_device *dev)
       fa->ts_mode = HK_FA_TS_NONE;
    else if (ts && *ts && strcmp(ts, "all"))
       mesa_logw("HK_FRAME_ANATOMY_TS=%s unknown; using all", ts);
-   /* A kernel that publishes no timestamps is asked for none. */
-   if (!hk_stamps_published(dev))
+   /* Where queries hold the device's own time, the kernel publishes no
+    * timestamps and is asked for none (hk_own_timestamps()). */
+   if (hk_own_timestamps(dev))
       fa->ts_mode = HK_FA_TS_NONE;
 
    if (!strcmp(path, "-") || !strcmp(path, "stderr")) {

@@ -649,10 +649,10 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
       }
 
       /* Timestamp buffers must be explicitly bound as such before we can use
-       * them. A kernel that publishes no timestamps is never asked for one
-       * (hk_CmdWriteTimestamp2()), so nothing is bound.
+       * them. Where queries hold the device's own time (hk_own_timestamps())
+       * the kernel is never asked for one, so nothing is bound.
        */
-      if (timestamp && hk_stamps_published(dev)) {
+      if (timestamp && !hk_own_timestamps(dev)) {
          int ret = agx_bind_timestamps(&dev->dev, pool->bo, &pool->handle);
          if (ret) {
             hk_DestroyQueryPool(device, hk_query_pool_to_handle(pool),
@@ -666,7 +666,7 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
       }
 
       /* Without a binding, every query end keeps the queued store. */
-      if (stamped && hk_stamps_published(dev) &&
+      if (stamped && !hk_own_timestamps(dev) &&
           agx_bind_timestamps(&dev->dev, pool->bo, &pool->handle))
          pool->handle = 0;
    }
@@ -806,7 +806,7 @@ hk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
                                cmd->current_cs.gfx != NULL);
    }
 
-   if (!hk_stamps_published(dev)) {
+   if (hk_own_timestamps(dev)) {
       /* The kernel publishes no timestamps, so none is asked for. The value
        * is the device's own time, put in this cell at each submit
        * (hk_query_note_submit()); a GPU copy in stream order stores it, so
@@ -1117,8 +1117,9 @@ hk_query_note_submit(struct hk_cmd_buffer *cmd, struct hk_queue *queue,
     * GET_TIME for all of them, before the kernel sees the submission. A
     * command buffer submitted again while pending shares its cells between
     * the two executions. */
-   if (util_dynarray_num_elements(&cmd->soft_stamps, uint64_t *)) {
-      struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (hk_own_timestamps(dev) &&
+       util_dynarray_num_elements(&cmd->soft_stamps, uint64_t *)) {
       const uint64_t now = agx_get_gpu_timestamp(&dev->dev);
       const bool clean = hk_g17p_cached_cmd_memory(&dev->dev);
       util_dynarray_foreach(&cmd->soft_stamps, uint64_t *, cell) {

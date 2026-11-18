@@ -658,6 +658,15 @@ hk_GetSemaphoreCounterValue(VkDevice device, VkSemaphore semaphore,
    return status == VK_SUCCESS ? result : status;
 }
 
+/* The winsys is a run-time property: one Windows build carries the D3DKMT
+ * winsys and the private AGXKMD backend, and enumeration picks one per
+ * physical device (hk_physical_device.d3dkmt). */
+bool
+hk_own_timestamps(struct hk_device *dev)
+{
+   return hk_device_physical(dev)->d3dkmt && !hk_stamps_published(dev);
+}
+
 static VkResult
 hk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
 {
@@ -665,7 +674,9 @@ hk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
    const uint64_t now = agx_get_gpu_timestamp(&dev->dev);
    /* Never below a timestamp query value already handed out
     * (hk_soft_timestamp_next()), which may run a few ns ahead of the clock. */
-   *timestamp = MAX2(now, p_atomic_read(&dev->soft_ts_last));
+   *timestamp = hk_own_timestamps(dev)
+                   ? MAX2(now, p_atomic_read(&dev->soft_ts_last))
+                   : now;
    return VK_SUCCESS;
 }
 

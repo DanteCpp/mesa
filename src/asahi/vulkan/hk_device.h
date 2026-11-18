@@ -655,10 +655,9 @@ void hk_submit_patch_alias_sites(struct hk_device *dev,
                                  struct vk_command_buffer *const *cmds,
                                  unsigned count);
 
-/* Does the kernel write timestamps into query memory? Fixed for the device's
- * life: GET_PARAMS is read once at open. When it does not, no command asks for
- * a timestamp and a timestamp query holds the device's own time
- * (hk_CmdWriteTimestamp2()). */
+/* Does the J813 Windows kernel declare that it writes timestamps into query
+ * memory? Fixed for the device's life: GET_PARAMS is read once at open. Only
+ * hk_own_timestamps() reads it. */
 static inline bool
 hk_stamps_published(const struct hk_device *dev)
 {
@@ -671,6 +670,14 @@ hk_device_physical(struct hk_device *dev)
 {
    return (struct hk_physical_device *)dev->vk.physical;
 }
+
+/* Do timestamp queries hold the device's own time instead of GPU-written
+ * timestamps? Only on the Windows D3DKMT winsys (the J813 Windows line) while
+ * its kernel publishes none; every other device model asks the kernel for
+ * timestamps as before, whatever the feature bit says. Used by every site of
+ * that path: the pool binds, hk_CmdWriteTimestamp2(), the fill at submit
+ * (hk_query_note_submit()), hk_get_timestamp() and the profiler's claims. */
+bool hk_own_timestamps(struct hk_device *dev);
 
 VkResult hk_device_init_meta(struct hk_device *dev);
 void hk_device_finish_meta(struct hk_device *dev);
