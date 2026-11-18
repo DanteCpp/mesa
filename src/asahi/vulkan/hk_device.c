@@ -662,7 +662,10 @@ static VkResult
 hk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
 {
    struct hk_device *dev = container_of(device, struct hk_device, vk);
-   *timestamp = agx_get_gpu_timestamp(&dev->dev);
+   const uint64_t now = agx_get_gpu_timestamp(&dev->dev);
+   /* Never below a timestamp query value already handed out
+    * (hk_soft_timestamp_next()), which may run a few ns ahead of the clock. */
+   *timestamp = MAX2(now, p_atomic_read(&dev->soft_ts_last));
    return VK_SUCCESS;
 }
 

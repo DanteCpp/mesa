@@ -201,6 +201,10 @@ struct hk_device {
     * hk_compute_kick_ms set. */
    struct hk_compute_kick *compute_kick;
 
+   /* The last timestamp query value handed out while the kernel does not
+    * publish GPU-written timestamps (hk_soft_timestamp_next()), atomic. */
+   uint64_t soft_ts_last;
+
    struct hk_descriptor_table occlusion_queries;
    struct hk_sampler_heap samplers;
 
@@ -650,6 +654,17 @@ hk_device_va_alias_put(struct hk_device *dev)
 void hk_submit_patch_alias_sites(struct hk_device *dev,
                                  struct vk_command_buffer *const *cmds,
                                  unsigned count);
+
+/* Does the kernel write timestamps into query memory? Fixed for the device's
+ * life: GET_PARAMS is read once at open. When it does not, no command asks for
+ * a timestamp and a timestamp query holds the device's own time
+ * (hk_CmdWriteTimestamp2()). */
+static inline bool
+hk_stamps_published(const struct hk_device *dev)
+{
+   return (dev->dev.params.features &
+           DRM_ASAHI_FEATURE_GPU_TIMESTAMPS_PUBLISHED) != 0;
+}
 
 static inline struct hk_physical_device *
 hk_device_physical(struct hk_device *dev)

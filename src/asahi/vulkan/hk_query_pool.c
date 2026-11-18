@@ -649,9 +649,10 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
       }
 
       /* Timestamp buffers must be explicitly bound as such before we can use
-       * them.
+       * them. A kernel that publishes no timestamps is never asked for one
+       * (hk_CmdWriteTimestamp2()), so nothing is bound.
        */
-      if (timestamp) {
+      if (timestamp && hk_stamps_published(dev)) {
          int ret = agx_bind_timestamps(&dev->dev, pool->bo, &pool->handle);
          if (ret) {
             hk_DestroyQueryPool(device, hk_query_pool_to_handle(pool),
@@ -665,7 +666,8 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
       }
 
       /* Without a binding, every query end keeps the queued store. */
-      if (stamped && agx_bind_timestamps(&dev->dev, pool->bo, &pool->handle))
+      if (stamped && hk_stamps_published(dev) &&
+          agx_bind_timestamps(&dev->dev, pool->bo, &pool->handle))
          pool->handle = 0;
    }
 
@@ -771,6 +773,22 @@ hk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                         HK_SYNC_ALL);
 }
 
+/* The next timestamp query value while the kernel publishes none: strictly
+ * above every value handed out before on this device, in submission order,
+ * across queues and threads. */
+static uint64_t
+hk_soft_timestamp_next(struct hk_device *dev, uint64_t now)
+{
+   uint64_t last = p_atomic_read(&dev->soft_ts_last);
+   for (;;) {
+      const uint64_t v = MAX2(now, last + 1);
+      const uint64_t prev = p_atomic_cmpxchg(&dev->soft_ts_last, last, v);
+      if (prev == last)
+         return v;
+      last = prev;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
                       VkPipelineStageFlags2 stage, VkQueryPool queryPool,
@@ -788,15 +806,35 @@ hk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
                                cmd->current_cs.gfx != NULL);
    }
 
-   const struct agx_timestamp_req req = {
-      .addr = hk_query_report_addr(dev, pool, query),
-      .handle = pool->handle,
-      .offset_B = hk_query_offset(pool, query),
-   };
+   if (!hk_stamps_published(dev)) {
+      /* The kernel publishes no timestamps, so none is asked for. The value
+       * is the device's own time, put in this cell at each submit
+       * (hk_query_note_submit()); a GPU copy in stream order stores it, so
+       * the query still becomes available only when the GPU gets here.
+       * Inside a render the copy runs after it, as a second end stamp's copy
+       * does (hk_sync_write_timestamp()). */
+      struct agx_ptr cell =
+         hk_pool_alloc(cmd, sizeof(uint64_t), sizeof(uint64_t));
+      if (!cell.cpu)
+         return;
 
-   /* The stamp rides on a command's native start or end timestamp; which
-    * command, and what it must wait on, follows from the stage. */
-   hk_sync_write_timestamp(cmd, stage, req);
+      util_dynarray_append(&cmd->soft_stamps, (uint64_t *)cell.cpu);
+      const bool in_render = cmd->sync.in_pass && cmd->current_cs.gfx;
+      libagx_copy_timestamp(cmd, agx_1d(1),
+                            in_render ? AGX_BARRIER_ALL | AGX_POSTGFX
+                                      : AGX_BARRIER_ALL,
+                            hk_query_report_addr(dev, pool, query), cell.gpu);
+   } else {
+      const struct agx_timestamp_req req = {
+         .addr = hk_query_report_addr(dev, pool, query),
+         .handle = pool->handle,
+         .offset_B = hk_query_offset(pool, query),
+      };
+
+      /* The stamp rides on a command's native start or end timestamp; which
+       * command, and what it must wait on, follows from the stage. */
+      hk_sync_write_timestamp(cmd, stage, req);
+   }
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
 
@@ -1073,6 +1111,25 @@ hk_query_note_submit(struct hk_cmd_buffer *cmd, struct hk_queue *queue,
       p_atomic_set(&s->point, 0);
       p_atomic_set(&s->queue, queue);
       p_atomic_set(&s->point, point);
+   }
+
+   /* Values for this submission's timestamps (hk_CmdWriteTimestamp2()), one
+    * GET_TIME for all of them, before the kernel sees the submission. A
+    * command buffer submitted again while pending shares its cells between
+    * the two executions. */
+   if (util_dynarray_num_elements(&cmd->soft_stamps, uint64_t *)) {
+      struct hk_device *dev = hk_cmd_buffer_device(cmd);
+      const uint64_t now = agx_get_gpu_timestamp(&dev->dev);
+      const bool clean = hk_g17p_cached_cmd_memory(&dev->dev);
+      util_dynarray_foreach(&cmd->soft_stamps, uint64_t *, cell) {
+         **cell = hk_soft_timestamp_next(dev, now);
+         /* CPU-cached command memory was cleaned once, at End
+          * (hk_cmd_buffer_publish_cached_uploads()), before this store;
+          * queue_submit_single() fences this clean before the kernel
+          * submit. */
+         if (clean)
+            util_flush_range_no_fence(*cell, sizeof(**cell));
+      }
    }
 }
 

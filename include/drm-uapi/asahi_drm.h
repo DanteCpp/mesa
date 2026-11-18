@@ -454,6 +454,16 @@ enum drm_asahi_feature {
  */
 #define DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT ((1ULL) << 38)
 
+/*
+ * DRM_ASAHI_FEATURE_GPU_TIMESTAMPS_PUBLISHED: J813 Windows kernel, a private
+ * reservation of that driver line (its contract names the same bit
+ * AGXW_G17_FEATURE_GPU_TIMESTAMPS_PUBLISHED): GPU-written timestamps are
+ * published to the {handle, offset} targets of a command, in nanoseconds, in
+ * the DRM_IOCTL_ASAHI_GET_TIME domain. Without it userspace asks for no
+ * timestamp.
+ */
+#define DRM_ASAHI_FEATURE_GPU_TIMESTAMPS_PUBLISHED ((1ULL) << 63)
+
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR 3

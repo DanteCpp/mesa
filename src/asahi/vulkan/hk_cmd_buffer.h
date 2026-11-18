@@ -1861,6 +1861,11 @@ struct hk_cmd_buffer {
    /* struct hk_oq_end for every occlusion query this command buffer ends. */
    struct util_dynarray oq_ends;
 
+   /* uint64_t * to the value cell of every timestamp this command buffer
+    * writes while the kernel publishes none, in recording order; filled at
+    * each submit (hk_query_note_submit()). */
+   struct util_dynarray soft_stamps;
+
    /* Are we currently inside a vk_meta operation? This alters sample location
     * behaviour.
     */
