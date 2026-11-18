@@ -226,6 +226,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .KHR_vulkan_memory_model = true,
       .KHR_workgroup_memory_explicit_layout = true,
       .KHR_zero_initialize_workgroup_memory = true,
+      .AMD_shader_core_properties2 = true,
       .EXT_4444_formats = true,
       .EXT_attachment_feedback_loop_layout = true,
       /* Qualified on G17P; the draw-time selection is shared with M5. */
@@ -1545,6 +1546,9 @@ hk_get_device_properties(const struct agx_device *dev,
       /* Vulkan 1.4 properties */
       .dynamicRenderingLocalReadDepthStencilAttachments = false,
       .dynamicRenderingLocalReadMultisampledAttachments = true,
+
+      /* VK_AMD_shader_core_properties2 */
+      .activeComputeUnitCount = agx_get_num_cores(dev),
 
       /* VK_KHR_push_descriptor */
       .maxPushDescriptors = HK_MAX_PUSH_DESCRIPTORS,
