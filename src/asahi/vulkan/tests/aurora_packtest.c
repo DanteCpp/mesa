@@ -81,6 +81,7 @@ enum op_kind {
    OP_HOSTBAR,  /* all writes -> host read */
    OP_HEAVY,    /* OP_MIX iterated HEAVY_ROUNDS times */
    OP_ATOM,     /* slot b[l & 63] += (slot a[l] ^ salt) & 0xff, atomically */
+   OP_MIXB,     /* OP_MIX through the second GPU address of the same memory */
 };
 
 #define HEAVY_ROUNDS 20000u
@@ -122,6 +123,11 @@ static struct {
    VkDescriptorSetLayout dsl;
    VkDescriptorPool dpool;
    VkDescriptorSet set;
+   /* Alias cases: a buffer with its own GPU address (capture/replay) over
+    * the same memory, and its descriptor set. */
+   VkBuffer buf2;
+   VkDescriptorSet set2;
+   bool want_alias, alias;
    VkQueryPool qp;
    VkEvent event;
    VkImage img;
@@ -155,13 +161,18 @@ static void
 make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer *b, VkDeviceMemory *m,
             void **map)
 {
+   const bool address = usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
    const VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                                   .size = size, .usage = usage};
    CHECK(vkCreateBuffer(g.dev, &bi, NULL, b));
    VkMemoryRequirements r;
    vkGetBufferMemoryRequirements(g.dev, *b, &r);
+   const VkMemoryAllocateFlagsInfo fi = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+      .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
    const VkMemoryAllocateInfo ai = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = r.size,
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = address ? &fi : NULL,
+      .allocationSize = r.size,
       .memoryTypeIndex = memtype(r.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
    CHECK(vkAllocateMemory(g.dev, &ai, NULL, m));
@@ -226,12 +237,16 @@ setup(void)
    g.hostreset = f12.hostQueryReset;
    g.sync2 = f13.synchronization2;
    g.dynrender = f13.dynamicRendering;
+   g.alias = g.want_alias && f12.bufferDeviceAddress &&
+             f12.bufferDeviceAddressCaptureReplay;
    VkPhysicalDeviceVulkan13Features e13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
                                            .synchronization2 = g.sync2,
                                            .dynamicRendering = g.dynrender};
    VkPhysicalDeviceVulkan12Features e12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                            .pNext = &e13, .timelineSemaphore = g.timeline,
-                                           .hostQueryReset = g.hostreset};
+                                           .hostQueryReset = g.hostreset,
+                                           .bufferDeviceAddress = g.alias,
+                                           .bufferDeviceAddressCaptureReplay = g.alias};
    VkPhysicalDeviceFeatures2 e2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &e12};
    const float prio = 1.0f;
    const VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -241,8 +256,8 @@ setup(void)
                                    .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci};
    CHECK(vkCreateDevice(g.pdev, &dci, NULL, &g.dev));
    vkGetDeviceQueue(g.dev, g.qfam, 0, &g.queue);
-   printf("FEATURES timeline=%d sync2=%d dynrender=%d hostreset=%d\n", g.timeline, g.sync2,
-          g.dynrender, g.hostreset);
+   printf("FEATURES timeline=%d sync2=%d dynrender=%d hostreset=%d alias=%d\n", g.timeline,
+          g.sync2, g.dynrender, g.hostreset, g.alias);
 
    const VkCommandPoolCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -251,8 +266,30 @@ setup(void)
 
    g.size = ((VkDeviceSize)MAX_SLOTS * LANES + GUARD) * 4;
    make_buffer(g.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                          (g.alias ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
                &g.buf, &g.mem, (void **)&g.words);
+   if (g.alias) {
+      /* The driver gives a capture/replay buffer its own GPU address and maps
+       * the bound memory there: the same memory at two addresses. */
+      const VkBufferCreateInfo bi = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .flags = VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT, .size = g.size,
+         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
+      CHECK(vkCreateBuffer(g.dev, &bi, NULL, &g.buf2));
+      CHECK(vkBindBufferMemory(g.dev, g.buf2, g.mem, 0));
+      const VkBufferDeviceAddressInfo a1 = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = g.buf};
+      const VkBufferDeviceAddressInfo a2 = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = g.buf2};
+      const VkDeviceAddress va1 = vkGetBufferDeviceAddress(g.dev, &a1);
+      const VkDeviceAddress va2 = vkGetBufferDeviceAddress(g.dev, &a2);
+      printf("ALIAS buffer 0x%" PRIx64 " alias 0x%" PRIx64 "%s\n", (uint64_t)va1,
+             (uint64_t)va2, va1 == va2 ? " (same address: no alias)" : "");
+      if (va1 == va2)
+         g.alias = false;
+   }
    uint32_t *ind;
    make_buffer(16, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, &g.ind, &g.ind_mem, (void **)&ind);
    ind[0] = LANES / 64, ind[1] = 1, ind[2] = 1;
@@ -274,9 +311,9 @@ setup(void)
    g.pipe = make_pipe(packtest_mix, sizeof(packtest_mix));
    g.heavy = make_pipe(packtest_heavy, sizeof(packtest_heavy));
    g.atom = make_pipe(packtest_atom, sizeof(packtest_atom));
-   const VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+   const VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
    const VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                                           .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
+                                           .maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &ps};
    CHECK(vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool));
    const VkDescriptorSetAllocateInfo dai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                             .descriptorPool = g.dpool, .descriptorSetCount = 1,
@@ -288,6 +325,15 @@ setup(void)
                                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                    .pBufferInfo = &dbi};
    vkUpdateDescriptorSets(g.dev, 1, &w, 0, NULL);
+   if (g.alias) {
+      CHECK(vkAllocateDescriptorSets(g.dev, &dai, &g.set2));
+      const VkDescriptorBufferInfo dbi2 = {g.buf2, 0, VK_WHOLE_SIZE};
+      const VkWriteDescriptorSet w2 = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                       .dstSet = g.set2, .descriptorCount = 1,
+                                       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                       .pBufferInfo = &dbi2};
+      vkUpdateDescriptorSets(g.dev, 1, &w2, 0, NULL);
+   }
 
    const VkQueryPoolCreateInfo qpi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
                                       .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 4};
@@ -333,6 +379,7 @@ record_op(VkCommandBuffer cb, const struct op *o)
                              o->kind == OP_HEAVY ? HEAVY_ROUNDS : 1};
    switch (o->kind) {
    case OP_MIX:
+   case OP_MIXB:
    case OP_HEAVY:
    case OP_ATOM:
    case OP_INDIRECT:
@@ -340,7 +387,8 @@ record_op(VkCommandBuffer cb, const struct op *o)
                         o->kind == OP_ATOM    ? g.atom
                         : o->kind == OP_HEAVY ? g.heavy
                                               : g.pipe);
-      vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.layout, 0, 1, &g.set, 0, NULL);
+      vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.layout, 0, 1,
+                              o->kind == OP_MIXB ? &g.set2 : &g.set, 0, NULL);
       vkCmdPushConstants(cb, g.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
       if (o->kind != OP_INDIRECT)
          vkCmdDispatch(cb, LANES / 64, 1, 1);
@@ -419,6 +467,7 @@ model(const struct testcase *t, uint32_t *ref)
          uint32_t *src = ref + o->a * LANES, *dst = ref + o->b * LANES;
          switch (o->kind) {
          case OP_MIX:
+         case OP_MIXB:
          case OP_INDIRECT:
             for (unsigned l = 0; l < LANES; ++l)
                dst[l] = mix(src[l], o->salt);
@@ -503,6 +552,20 @@ build(const char *name)
       }
    } else if (!strcmp(name, "chain-all")) {
       chain(0, 64, 0, OP_BAR);
+   } else if (!strcmp(name, "alias-chain")) {
+      /* Each command buffer reads, through one GPU address, what the one
+       * before it wrote through the other. */
+      for (unsigned c = 0; c < 64; ++c) {
+         add(c, c & 1 ? OP_MIXB : OP_MIX, c, c + 1, c * 41u + 9u);
+         add(c, OP_BARC, 0, 0, 0);
+      }
+   } else if (!strcmp(name, "alias-instream")) {
+      /* The same within one stream: the exposure in-stream dependencies
+       * already had, as a control. */
+      for (unsigned k = 0; k < 64; ++k) {
+         add(0, k & 1 ? OP_MIXB : OP_MIX, k, k + 1, k * 41u + 9u);
+         add(0, OP_BARC, 0, 0, 0);
+      }
    } else if (!strcmp(name, "multi")) {
       /* 40 command buffers of 7 dependent dispatches: 280 launches. */
       unsigned s = 0;
@@ -661,7 +724,7 @@ needs_feature(const struct testcase *t)
       for (unsigned k = 0; k < t->cb[i].nops; ++k) {
          const enum op_kind kd = t->cb[i].ops[k].kind;
          if ((kd == OP_RENDER && !g.dynrender) || (kd == OP_TS && !g.hostreset) ||
-             (kd == OP_ATOM && !g.atom))
+             (kd == OP_ATOM && !g.atom) || (kd == OP_MIXB && !g.alias))
             return true;
       }
    return t->semaphore && !g.timeline;
@@ -956,7 +1019,8 @@ must_pack(const char *name)
 {
    static const char *const dispatch_ended[] = {"multi-tail", "disjoint"};
    static const char *const barrier_ended[] = {"chain242", "chain300", "loops",
-                                               "chain-all", "multi"};
+                                               "chain-all", "multi",
+                                               "alias-chain"};
    if (listed(name, dispatch_ended, ARRAY_LEN(dispatch_ended)))
       return true;
    if (!listed(name, barrier_ended, ARRAY_LEN(barrier_ended)))
@@ -1018,6 +1082,10 @@ main(int argc, char **argv)
    trace_begin();
    if (argc < 2)
       die("usage: aurora-packtest ITERATIONS [CASE...]");
+   /* The alias cases enable capture/replay buffer addresses, which change
+    * what the driver assumes about memory: only when asked for. */
+   for (int i = 2; i < argc; ++i)
+      g.want_alias |= !strncmp(argv[i], "alias-", 6);
    setup();
    const unsigned iterations = (unsigned)strtoul(argv[1], NULL, 10);
    int fails = 0;
