@@ -3691,14 +3691,10 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
  * Compressed multisample targets are at most eight bytes, so all eight fit
  * the 4x sample budget (64 bytes) and do not spill when allocated first.
  *
- * G17P cannot spill a compressed target at all (no decompression program),
- * and compresses multisample colour only at 2x on M4 Pro. A 2x tile holds
- * 64 bytes a sample (32 KiB over 16x16 pixels), so allocated first they fit
- * too.
- *
- * A multiview pass has an eight-byte budget, so over that it would spill one:
- * 2x colour is not compressed on a device with the multiview feature
- * (hk_g17p_multiview_spill_risk()). */
+ * G17P has no decompression program either. Its compressed multisample
+ * colour targets (2x/4x, hk_g17p_color_msaa_compression_eligible()) are
+ * allocated first so that as many as fit stay resident; a target that still
+ * spills gets plain transient backing for the pass (hk_g17p_spill.h). */
 static uint8_t
 hk_resident_attachments(const struct hk_device *dev,
                         const struct hk_rendering_state *render)
@@ -5181,8 +5177,7 @@ hk_begin_rendering_internal(VkCommandBuffer commandBuffer,
             continue;
 
          struct hk_image_view *view = render->color_att[i].iview;
-         if (view && (!hk_g17p_transient_spill_device(dev->dev.chip,
-                                                       dev->dev.params.chip_id) ||
+         if (view && (!hk_g17p_transient_spill_device(dev->dev.chip) ||
                       render->tilebuffer.spilled[i])) {
             if (!view->planes[0].emrt_pbe_valid) {
                vk_command_buffer_set_error(&cmd->vk,
@@ -5203,13 +5198,11 @@ hk_begin_rendering_internal(VkCommandBuffer commandBuffer,
 
                perf_debug(cmd, "Decompressing in-place");
 
-               /* libagx_decompress has no G17P binary. T8140 gives spilled
-                * targets plain transient backing, and the remaining G17P
-                * compressed colour targets (1-8 bytes, single-sample or 2x on
-                * M4 Pro, not with multiview) stay in the tilebuffer
-                * (hk_resident_attachments()), so this is unreachable; fail
-                * closed with a diagnostic for any unsupported spill
-                * configuration rather than a NULL program. */
+               /* libagx_decompress has no G17P binary. G17P gives spilled
+                * targets plain transient backing (hk_g17p_spill.h), so this
+                * is unreachable; fail closed with a diagnostic for any
+                * unsupported spill configuration rather than a NULL
+                * program. */
                if (dev->dev.chip == AGX_CHIP_G17P) {
                   mesa_loge_once("G17P: spilled render pass with a compressed "
                                  "attachment (%s) is unsupported",
@@ -5507,8 +5500,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *info)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!hk_g17p_transient_spill_device(dev->dev.chip,
-                                        dev->dev.params.chip_id) || cmd->in_meta) {
+   if (!hk_g17p_transient_spill_device(dev->dev.chip) || cmd->in_meta) {
       hk_begin_rendering_internal(commandBuffer, info);
       return;
    }
@@ -5532,8 +5524,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *info)
       dev, formats, sizeof(formats[0]), info->colorAttachmentCount, samples,
       !hk_agx3_g17p_single_layer_rendering(info->viewMask, layers),
       samples > 1 && reload, 0);
-   unsigned mask = hk_g17p_transient_spill_mask(dev->dev.chip,
-                                                  dev->dev.params.chip_id, &tib);
+   unsigned mask = hk_g17p_transient_spill_mask(dev->dev.chip, &tib);
    /* Aliasing and feedback need the application-visible storage during the
     * pass. Their plain images retain the existing direct eMRT path. Do not
     * silently redirect a compressed input-feedback attachment: that protocol
@@ -5713,7 +5704,7 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
 
    bool has_transient_spill = false;
    const struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (hk_g17p_transient_spill_device(dev->dev.chip, dev->dev.params.chip_id)) {
+   if (hk_g17p_transient_spill_device(dev->dev.chip)) {
       for (unsigned rt = 0; rt < render->color_att_count; ++rt)
          has_transient_spill |= render->spill_original[rt] != NULL;
    }

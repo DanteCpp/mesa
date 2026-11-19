@@ -69,8 +69,7 @@ compresses(VkFormat format, unsigned samples)
       .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
    };
    return hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &info) ||
-          hk_g17p_color_msaa_compression_eligible(AGX_CHIP_G17P, 0x8140, 0,
-                                                   &info);
+          hk_g17p_color_msaa_compression_eligible(AGX_CHIP_G17P, 0, &info);
 }
 
 static void
@@ -146,11 +145,10 @@ check_layout(const enum pipe_format *formats, unsigned count,
             CHECK(tib.tile_size * samples <= 2048);
             if (agx_tilebuffer_spills(&tib)) {
                ++spilling[s][reload];
-               CHECK(hk_g17p_transient_spill_mask(AGX_CHIP_G17P, 0x8140, &tib) ==
+               CHECK(hk_g17p_transient_spill_mask(AGX_CHIP_G17P, &tib) ==
                      spill_mask(&tib));
-               CHECK(!hk_g17p_transient_spill_mask(AGX_CHIP_G13G, 0x8140, &tib));
-               CHECK(!hk_g17p_transient_spill_mask(AGX_CHIP_G14G, 0x8140, &tib));
-               CHECK(!hk_g17p_transient_spill_mask(AGX_CHIP_G17P, 0x6040, &tib));
+               CHECK(!hk_g17p_transient_spill_mask(AGX_CHIP_G13G, &tib));
+               CHECK(!hk_g17p_transient_spill_mask(AGX_CHIP_G14G, &tib));
                for (unsigned rt = 0; rt < count; ++rt) {
                   /* Compression is per image and no longer excludes a
                    * footprint merely because this pass spills. */
@@ -255,7 +253,7 @@ probe(int argc, char **argv)
    printf("samples=%u mode=%s layered=%u sample_bytes=%u tile_pixels=%u "
           "spill_mask=0x%02x transient_mask=0x%02x\n",
           samples, argv[3], layered, tib.sample_size_B, tib.tile_size,
-          spill_mask(&tib), hk_g17p_transient_spill_mask(AGX_CHIP_G17P, 0x8140, &tib));
+          spill_mask(&tib), hk_g17p_transient_spill_mask(AGX_CHIP_G17P, &tib));
    for (int rt = 0; rt < argc - 5; ++rt)
       printf("slot=%d format=%s spilled=%u\n", rt,
              util_format_name(formats[rt]), tib.spilled[rt]);
@@ -296,7 +294,7 @@ main(int argc, char **argv)
       }
    }
    struct agx_tilebuffer_layout unproven = {.nr_samples = 8, .spilled = {true}};
-   CHECK(!hk_g17p_transient_spill_mask(AGX_CHIP_G17P, 0x8140, &unproven));
+   CHECK(!hk_g17p_transient_spill_mask(AGX_CHIP_G17P, &unproven));
    enum pipe_format formats[AGX_MAX_RENDER_TARGETS] = {0};
    unsigned ids[AGX_MAX_RENDER_TARGETS] = {0};
    matrix(formats, ids, 0, ~0u);

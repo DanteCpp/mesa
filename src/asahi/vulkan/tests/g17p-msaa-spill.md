@@ -1,4 +1,4 @@
-# T8140 colour MSAA transient spill backing
+# G17P colour MSAA transient spill backing
 
 This ports the transient eMRT work from draft Mesa PR #72 onto `aurora-wip`.
 The three original commits were `6e3cd8d48a6`, `96b08ee73ba` and `075a4102f9b`.
@@ -6,7 +6,7 @@ The base already has HAL200 array/MSAA descriptor packing, including the
 T6040 changes in `33f2bf125e5`. It does not enable compressed T8140 MSAA
 allocations or supply transient spill storage.
 
-The new allocation helper admits only physical T8140, 2x/4x, one-mip colour
+The new allocation helper admits every G17P part, 2x/4x, one-mip colour
 images with ordinary 2D/array storage. It normalizes sample/layer count before
 calling the existing conservative policy, preserving its format, flag, usage,
 sharing and extension-chain exclusions. Existing depth/stencil, cube, 3D,
@@ -15,11 +15,14 @@ Colour plus input-attachment usage stays plain because application descriptors
 would otherwise bypass the backing. Other generic compression checks still
 apply, including format/store compatibility and the compression debug opt-out.
 
-T6040/M4 Pro uses `AGX_CHIP_G17P` internally. Both admission and render redirection
-therefore require `chip_id == 0x8140` in addition to the architecture enum.
-T6040 keeps its HAL200 policy and direct eMRT path. Other products retain theirs.
+Admission and render redirection are selected by `AGX_CHIP_G17P` alone, so
+T8140, T6040 and T6041 share them. This helper is the only multisampled colour
+admission on G17P: the HAL200 policy no longer admits T6040's 2x single-layer
+colour attachments separately, and the multiview exclusion that kept them plain
+is gone because a spilled target now has backing. Other products retain their
+paths.
 
-Every ordinary private spilled T8140 target receives a command-buffer-owned
+Every ordinary private spilled G17P target receives a command-buffer-owned
 plain allocation using the existing AIL tiled sample layout. The allocation
 covers the view's mip extent and pass layers, uses one level, and has no
 compression metadata. Each pixel's samples remain adjacent. The eMRT texture
@@ -62,7 +65,8 @@ meson test -C build hk_g17p_color_msaa_compression hk_g17p_msaa_spill \
 The new compression test exercises 46 admitted colour formats, all sample
 counts through 64, zero through eight layers, product/plane identity, flags,
 usage and runtime extension chains. Its checks survive `NDEBUG`. The existing
-T8140 conservative-policy and T6040 policy tests remain separate controls.
+Neo conservative-policy and T6040 policy tests remain separate controls; the
+T6040 test checks the combined admission.
 
 The spill test calls the production tilebuffer allocator and backing-mask
 helper. It discovers every AIL colour-renderable tile size/alignment class,
@@ -72,7 +76,7 @@ preserved; permutations across alignments and holes rename allocator outputs.
 Witnesses move a small target through every slot and cover a compressed
 resident target beside spills. Both normal and eight-byte LOAD/multiview
 limits are covered. Region checks verify mip/layer/rectangle translation.
-T6040, AGX2 and 8x are explicit backing-mask negative controls.
+AGX2 and 8x are explicit backing-mask negative controls.
 
 The same executable can inspect an individual layout without a GPU:
 

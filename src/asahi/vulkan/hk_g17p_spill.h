@@ -5,22 +5,22 @@
 #include "asahi/lib/agx_tilebuffer.h"
 #include "vulkan/vulkan_core.h"
 
-/* T6040 uses the same architecture enum as T8140. Device admission checks
- * the kernel contract; retain the physical product gate here as well. */
+/* Every G17P part (T8140, T6040, T6041) gives spilled colour targets plain
+ * transient backing. */
 static inline bool
-hk_g17p_transient_spill_device(enum agx_chip chip, unsigned chip_id)
+hk_g17p_transient_spill_device(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17P && chip_id == 0x8140;
+   return chip == AGX_CHIP_G17P;
 }
 
 /* Candidate backing mask for ordinary private 2D attachments, including
  * plain images. The caller retains direct storage for alias/input/feedback.
  * Keep the legacy path on AGX2 and leave 8x unproven. */
 static inline unsigned
-hk_g17p_transient_spill_mask(enum agx_chip chip, unsigned chip_id,
+hk_g17p_transient_spill_mask(enum agx_chip chip,
                             const struct agx_tilebuffer_layout *tib)
 {
-   if (!hk_g17p_transient_spill_device(chip, chip_id) ||
+   if (!hk_g17p_transient_spill_device(chip) ||
        (tib->nr_samples != 1 && tib->nr_samples != 2 && tib->nr_samples != 4))
       return 0;
 
