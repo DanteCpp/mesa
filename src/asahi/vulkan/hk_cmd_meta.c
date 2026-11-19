@@ -7,6 +7,7 @@
 #include "asahi/compiler/agx_nir_texture.h"
 #include "util/format/u_format.h"
 #include "util/format/u_formats.h"
+#include "util/u_atomic.h"
 #include "util/u_math.h"
 #include "vulkan/vulkan_core.h"
 #include "agx_pack.h"
@@ -36,6 +37,21 @@
  */
 #define TILE_WIDTH  32
 #define TILE_HEIGHT 32
+
+/* The block-based copy kernel stages the destination tile in the workgroup
+ * imageblock (st_tile). G18G has no compute imageblock encoding, so it copies
+ * through plain image stores; only non-1D, single-sample images qualify
+ * either way. */
+static bool
+hk_meta_copy_block_based(struct vk_command_buffer *vk_cmd,
+                         const struct vk_image *image)
+{
+   struct hk_cmd_buffer *cmd = container_of(vk_cmd, struct hk_cmd_buffer, vk);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   return dev->dev.chip != AGX_CHIP_G18G &&
+          image->image_type != VK_IMAGE_TYPE_1D && image->samples == 1;
+}
 
 static VkResult
 hk_cmd_bind_map_buffer(struct vk_command_buffer *vk_cmd,
@@ -67,11 +83,11 @@ hk_device_init_meta(struct hk_device *dev)
    dev->meta.use_layer_output = true;
    dev->meta.use_view_relative_3d_layer = agx_native_graphics(&dev->dev);
    dev->meta.specialize_single_layer_buffer_upload = agx_is_m4_pro(&dev->dev);
-   /* G17P has ordinary fixed-function stencil testing/updates, but its
-    * fragment stencil-export operand is not part of the grounded AGX3B ABI.
-    * Let common meta lower a stencil blit to eight bit-selective discard
-    * passes instead of compiling an unencodable stencil-export shader. */
-   dev->meta.use_stencil_export = !agx_native_graphics(&dev->dev);
+   /* Other native chips lower a stencil blit to eight bit-selective discard
+    * passes. G17P exports stencil in one draw, which also resolves depth and
+    * stencil together: 1.50 to 0.48 ms for a 2x D32S8 at 3456x2234. */
+   dev->meta.use_stencil_export = !agx_native_graphics(&dev->dev) ||
+                                  dev->dev.chip == AGX_CHIP_G17P;
    /* A scaled image is read through an exact integer descriptor or a
     * filterable normalized one depending on whether the sampler filters, so
     * a blit source has to arrive together with its sampler for the driver to
@@ -115,6 +131,7 @@ hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
 {
    struct hk_descriptor_state *desc = hk_get_descriptors_state(cmd, bind_point);
    save->in_meta = cmd->in_meta;
+   save->pipeline_shader_stages = cmd->vk.pipeline_shader_stages;
 
    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
       save->dynamic = cmd->vk.dynamic_graphics_state;
@@ -141,6 +158,9 @@ hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
    save->desc0 = desc->sets[0];
    save->has_push_desc0 = desc->push[0];
    save->push_active0 = !!(desc->push_active & BITFIELD_BIT(0));
+   save->buffer_active0 = !!(desc->buffer_active & BITFIELD_BIT(0));
+   save->buffer_set0 = desc->root.sets[0];
+   save->buffer_set_size0 = desc->set_sizes[0];
    if (save->has_push_desc0)
       hk_copy_push_descriptor_set(&save->push_desc0, desc->push[0]);
 
@@ -178,7 +198,20 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
    struct hk_descriptor_state *desc = hk_get_descriptors_state(cmd, bind_point);
    desc->root_dirty = true;
 
-   if (save->desc0) {
+   desc->buffer_active &= ~BITFIELD_BIT(0);
+   if (save->buffer_active0) {
+      /* Set 0 came from a descriptor buffer: rebind its address. A push
+       * descriptor set the application pushed earlier stays inactive. */
+      if (save->has_push_desc0)
+         hk_copy_push_descriptor_set(desc->push[0], &save->push_desc0);
+      desc->sets[0] = NULL;
+      desc->root.sets[0] = save->buffer_set0;
+      desc->set_sizes[0] = save->buffer_set_size0;
+      desc->sets_dirty |= BITFIELD_BIT(0);
+      desc->push_dirty &= ~BITFIELD_BIT(0);
+      desc->push_active &= ~BITFIELD_BIT(0);
+      desc->buffer_active |= BITFIELD_BIT(0);
+   } else if (save->desc0) {
       desc->sets[0] = save->desc0;
       desc->root.sets[0] = hk_descriptor_set_addr(save->desc0);
       desc->sets_dirty |= BITFIELD_BIT(0);
@@ -235,6 +268,13 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
 
    memcpy(desc->root.push, save->push, sizeof(save->push));
    cmd->in_meta = save->in_meta;
+
+   /* The meta pipeline's bind recorded every stage it bound as bound from a
+    * pipeline. The state restored above is the application's, so restore
+    * that record too: otherwise the application's next vkCmdBindShadersEXT,
+    * even of only the task and mesh stages, unbinds the "pipeline" and with
+    * it every graphics shader object restored here. */
+   cmd->vk.pipeline_shader_stages = save->pipeline_shader_stages;
 }
 
 void
@@ -283,6 +323,8 @@ enum hk_meta_object_key_type {
    HK_META_OBJECT_KEY_BLOCK_COPY,
    HK_META_OBJECT_KEY_G17P_MIP,
    HK_META_OBJECT_KEY_G17P_BUFFER_FILL_PBE,
+   HK_META_OBJECT_KEY_G17P_TILED_UPLOAD,
+   HK_META_OBJECT_KEY_BUFFER_COPY_BATCH,
 };
 
 struct hk_meta_event_wait_info {
@@ -827,6 +869,20 @@ struct vk_meta_image_copy_key {
    bool block_based;
 };
 
+/* Texels each thread of an image-to-buffer copy moves. At one 4-byte texel a
+ * thread the copy costs per thread, not per byte (1280x720 RGBA8 on G17P:
+ * 72 us; the same bytes as 16-byte texels: 25 us). A thread takes texels a
+ * tile width apart, so each store of a SIMD group stays one contiguous run.
+ */
+static unsigned
+copy_texels_per_thread(const struct vk_meta_image_copy_key *key)
+{
+   return key->type == IMG2BUF && key->block_size <= 4 &&
+                key->nr_samples == 1 && !key->block_based
+             ? 4
+             : 1;
+}
+
 static nir_def *
 linearize_coords(nir_builder *b, nir_def *coord,
                  const struct vk_meta_image_copy_key *key)
@@ -937,7 +993,7 @@ load_store_formatted(nir_builder *b, nir_def *base, nir_def *index,
 
 static nir_shader *
 build_image_copy_shader(const struct vk_meta_image_copy_key *key,
-                        bool native_formatted_memory)
+                        bool native_formatted_memory, bool g18g)
 {
    nir_builder build =
       nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL, "hk-meta-copy");
@@ -968,7 +1024,14 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key,
 
    image->data.descriptor_set = 0;
    image->data.binding = BINDING_OUTPUT;
-   /* Partial tile copies read the destination before preserving its pixels. */
+   /* Partial tile copies read the destination before preserving its pixels.
+    *
+    * The block-based variant reads the destination back (the else branch's
+    * nir_image_deref_load). Declaring the image write-only makes nir_opt_access
+    * stamp ACCESS_NON_READABLE on that load, which the G17P/G18G indexed-image
+    * lowering declines by design (agx_nir_lower_g17p_combined_sampler.c,
+    * g17p_indexed_image_fetch_shape); the pass is all-or-nothing per shader, so
+    * the load kept its AGX2 bindless handle and the packer refused it. */
    image->data.access = key->block_based ? 0 : ACCESS_NON_READABLE;
 
    /* Multisampled stores use a linear PBE view. AGX2's address lowering
@@ -994,7 +1057,15 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key,
       b, 2, 32, nir_imm_int(b, offsetof(struct vk_meta_push_data, grid_el)));
 
    /* We're done setting up variables, do the copy */
-   nir_def *coord = nir_load_global_invocation_id(b, 32);
+   unsigned tpt = copy_texels_per_thread(key);
+   nir_def *coord0 = nir_load_global_invocation_id(b, 32);
+   if (tpt > 1) {
+      /* A group covers tpt tiles along x: wg.x * TILE_WIDTH * tpt + lid.x */
+      nir_def *x = nir_channel(b, coord0, 0);
+      nir_def *lx = nir_channel(b, nir_load_local_invocation_id(b), 0);
+      x = nir_iadd(b, nir_imul_imm(b, nir_isub(b, x, lx), tpt), lx);
+      coord0 = nir_vector_insert_imm(b, coord0, x, 0);
+   }
 
    /* The destination format is already canonical, convert to an ISA format */
    enum pipe_format isa_format = PIPE_FORMAT_NONE;
@@ -1008,95 +1079,107 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key,
    nir_def *lid = nir_trim_vector(b, nir_load_local_invocation_id(b), 2);
    lid = nir_u2u16(b, lid);
 
-   nir_def *src_coord = src_is_buf ? coord : nir_iadd(b, coord, src_offset_el);
-   nir_def *dst_coord = dst_is_buf ? coord : nir_iadd(b, coord, dst_offset_el);
-
    nir_def *image_deref = &nir_build_deref_var(b, image)->def;
+   nir_def *dst_coord = NULL;
 
-   nir_def *coord_2d_el = nir_trim_vector(b, coord, 2);
-   nir_def *in_bounds;
-   if (key->block_based) {
-      nir_def *offset_in_block_el =
-         nir_umod_imm(b, nir_trim_vector(b, dst_offset_el, 2), TILE_WIDTH);
+   for (unsigned t = 0; t < tpt; ++t) {
+      nir_def *coord =
+         t ? nir_iadd(b, coord0, nir_imm_ivec3(b, TILE_WIDTH * t, 0, 0))
+           : coord0;
+      nir_def *src_coord =
+         src_is_buf ? coord : nir_iadd(b, coord, src_offset_el);
+      dst_coord = dst_is_buf ? coord : nir_iadd(b, coord, dst_offset_el);
 
-      dst_coord =
-         nir_vector_insert_imm(b, nir_isub(b, dst_coord, offset_in_block_el),
-                               nir_channel(b, dst_coord, 2), 2);
+      nir_def *coord_2d_el = nir_trim_vector(b, coord, 2);
+      nir_def *in_bounds;
+      if (key->block_based) {
+         nir_def *offset_in_block_el =
+            nir_umod_imm(b, nir_trim_vector(b, dst_offset_el, 2), TILE_WIDTH);
 
-      src_coord =
-         nir_vector_insert_imm(b, nir_isub(b, src_coord, offset_in_block_el),
-                               nir_channel(b, src_coord, 2), 2);
+         dst_coord =
+            nir_vector_insert_imm(b, nir_isub(b, dst_coord, offset_in_block_el),
+                                  nir_channel(b, dst_coord, 2), 2);
 
-      in_bounds = nir_uge(b, coord_2d_el, offset_in_block_el);
-      in_bounds = nir_iand(
-         b, in_bounds,
-         nir_ult(b, coord_2d_el, nir_iadd(b, offset_in_block_el, grid_2d_el)));
-   } else {
-      in_bounds = nir_ult(b, coord_2d_el, grid_2d_el);
-   }
+         src_coord =
+            nir_vector_insert_imm(b, nir_isub(b, src_coord, offset_in_block_el),
+                                  nir_channel(b, src_coord, 2), 2);
 
-   /* Special case handle buffer indexing */
-   if (dst_is_buf) {
-      assert(!key->block_based);
-      dst_coord = linearize_coords(b, dst_coord, key);
-   } else if (src_is_buf) {
-      src_coord = linearize_coords(b, src_coord, key);
-   }
+         in_bounds = nir_uge(b, coord_2d_el, offset_in_block_el);
+         in_bounds = nir_iand(
+            b, in_bounds,
+            nir_ult(b, coord_2d_el, nir_iadd(b, offset_in_block_el, grid_2d_el)));
+      } else {
+         in_bounds = nir_ult(b, coord_2d_el, grid_2d_el);
+      }
 
-   for (unsigned s = 0; s < key->nr_samples; ++s) {
-      nir_def *ms_index = nir_imm_int(b, s);
-      nir_def *value1 = NULL, *value2 = NULL;
+      /* Special case handle buffer indexing */
+      if (dst_is_buf) {
+         assert(!key->block_based);
+         dst_coord = linearize_coords(b, dst_coord, key);
+      } else if (src_is_buf) {
+         src_coord = linearize_coords(b, src_coord, key);
+      }
 
-      nir_push_if(b, nir_ball(b, in_bounds));
-      {
-         /* Copy formatted texel from texture to storage image */
-         nir_deref_instr *deref = nir_build_deref_var(b, texture);
+      for (unsigned s = 0; s < key->nr_samples; ++s) {
+         nir_def *ms_index = nir_imm_int(b, s);
+         nir_def *value1 = NULL, *value2 = NULL;
 
-         if (src_is_buf) {
-            value1 = load_store_formatted(b, get_push(b, buffer), src_coord,
-                                          NULL, key->dst_format, native_formatted_memory);
-         } else {
-            value1 = nir_txf(b, src_coord, .texture_deref = deref,
-                             .ms_index = msaa ? ms_index : NULL);
-            nir_def_as_tex(value1)->backend_flags = AGX_TEXTURE_FLAG_NO_CLAMP;
+         nir_push_if(b, nir_ball(b, in_bounds));
+         {
+            /* Copy formatted texel from texture to storage image */
+            nir_deref_instr *deref = nir_build_deref_var(b, texture);
 
-            /* Munge according to the implicit conversions so we get a bit copy */
-            if (key->src_format != key->dst_format) {
-               nir_def *packed =
-                  nir_format_pack_rgba(b, key->src_format, value1);
+            if (src_is_buf) {
+               value1 = load_store_formatted(b, get_push(b, buffer), src_coord,
+                                             NULL, key->dst_format, native_formatted_memory);
+            } else {
+               value1 = nir_txf(b, src_coord, .texture_deref = deref,
+                                .ms_index = msaa ? ms_index : NULL);
+               nir_def_as_tex(value1)->backend_flags = AGX_TEXTURE_FLAG_NO_CLAMP;
 
-               value1 = nir_format_unpack_rgba(b, packed, key->dst_format);
+               /* Munge according to the implicit conversions so we get a bit copy */
+               if (key->src_format != key->dst_format) {
+                  nir_def *packed =
+                     nir_format_pack_rgba(b, key->src_format, value1);
+
+                  value1 = nir_format_unpack_rgba(b, packed, key->dst_format);
+               }
+            }
+
+            if (dst_is_buf) {
+               load_store_formatted(b, get_push(b, buffer), dst_coord, value1,
+                                    key->dst_format, native_formatted_memory);
+            } else if (!key->block_based) {
+               nir_image_deref_store(b, image_deref, nir_pad_vec4(b, dst_coord),
+                                     ms_index, value1, nir_imm_int(b, 0),
+                                     .image_dim = dim_dst,
+                                     .image_array = !dst_is_buf,
+                                     /* G18G derives the imgwci format from the
+                                      * stored type; this kernel always writes
+                                      * the canonical 4x32 uint texel. */
+                                     .src_type = g18g ? nir_type_uint
+                                                      : nir_type_invalid);
             }
          }
-
-         if (dst_is_buf) {
-            load_store_formatted(b, get_push(b, buffer), dst_coord, value1,
-                                 key->dst_format, native_formatted_memory);
-         } else if (!key->block_based) {
-            nir_image_deref_store(b, image_deref, nir_pad_vec4(b, dst_coord),
-                                  ms_index, value1, nir_imm_int(b, 0),
-                                  .image_dim = dim_dst,
-                                  .image_array = !dst_is_buf);
+         nir_push_else(b, NULL);
+         if (key->block_based) {
+            /* Copy back the existing destination content */
+            value2 = nir_image_deref_load(b, 4, 32, image_deref,
+                                          nir_pad_vec4(b, dst_coord), ms_index,
+                                          nir_imm_int(b, 0), .image_dim = dim_dst,
+                                          .image_array = !dst_is_buf);
          }
-      }
-      nir_push_else(b, NULL);
-      if (key->block_based) {
-         /* Copy back the existing destination content */
-         value2 = nir_image_deref_load(b, 4, 32, image_deref,
-                                       nir_pad_vec4(b, dst_coord), ms_index,
-                                       nir_imm_int(b, 0), .image_dim = dim_dst,
-                                       .image_array = !dst_is_buf);
-      }
-      nir_pop_if(b, NULL);
+         nir_pop_if(b, NULL);
 
-      if (key->block_based) {
-         /* Must define the phi first so we validate. */
-         nir_def *phi = nir_if_phi(b, value1, value2);
-         nir_def *mask = nir_imm_intN_t(b, 1 << s, 16);
+         if (key->block_based) {
+            /* Must define the phi first so we validate. */
+            nir_def *phi = nir_if_phi(b, value1, value2);
+            nir_def *mask = nir_imm_intN_t(b, 1 << s, 16);
 
-         nir_store_local_pixel_agx(b, phi, mask, lid, .base = 0,
-                                   .write_mask = 0xf, .format = isa_format,
-                                   .explicit_coord = true);
+            nir_store_local_pixel_agx(b, phi, mask, lid, .base = 0,
+                                      .write_mask = 0xf, .format = isa_format,
+                                      .explicit_coord = true);
+         }
       }
    }
 
@@ -1147,7 +1230,17 @@ get_image_copy_descriptor_set_layout(struct vk_device *device,
       },
       {
          .binding = BINDING_INPUT,
-         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
+         /* Image sources are written as SAMPLED_IMAGE. On G18G a sampled
+          * image binding keeps its heap index at +68, a texel buffer one at
+          * +4, and the shader addresses the binding by this declared type:
+          * declaring a texel buffer made image-source copies fetch through a
+          * garbage heap index (correct only for a 64-texel-wide image). */
+         .descriptorType =
+            container_of(device, struct hk_device, vk)->dev.chip ==
+                     AGX_CHIP_G18G &&
+                  type != BUF2IMG
+               ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+               : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
          .descriptorCount = 1,
          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
       },
@@ -1223,7 +1316,11 @@ get_image_copy_pipeline(struct vk_device *device, struct vk_meta_device *meta,
       .nir = build_image_copy_shader(key,
          !agx_native_graphics(&container_of(device, struct hk_device, vk)->dev) &&
          !agx_chip_g17_m5(container_of(device, struct hk_device, vk)->dev.chip) &&
-         container_of(device, struct hk_device, vk)->dev.chip != AGX_CHIP_G16G),
+         container_of(device, struct hk_device, vk)->dev.chip != AGX_CHIP_G16G &&
+         /* G18G (AGX3) stores raw packed bytes too. */
+         container_of(device, struct hk_device, vk)->dev.chip != AGX_CHIP_G18G,
+         container_of(device, struct hk_device, vk)->dev.chip ==
+            AGX_CHIP_G18G),
    };
    const VkPipelineShaderStageCreateInfo cs_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -1436,7 +1533,8 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
                                 sizeof(push), &push);
 
          disp->CmdDispatch(vk_command_buffer_to_handle(cmd),
-                           DIV_ROUND_UP(push.grid_el[0], 32),
+                           DIV_ROUND_UP(push.grid_el[0],
+                                        32 * copy_texels_per_thread(&key)),
                            DIV_ROUND_UP(push.grid_el[1], 32), push.grid_el[2]);
       }
    }
@@ -1448,7 +1546,8 @@ hk_meta_dispatch_to_image(struct vk_command_buffer *cmd,
                           VkPipelineLayout pipeline_layout,
                           struct vk_meta_push_data *push, VkOffset3D offset,
                           VkExtent3D extent, bool per_layer, unsigned layers,
-                          enum pipe_format p_dst_fmt, enum pipe_format p_format)
+                          enum pipe_format p_dst_fmt, enum pipe_format p_format,
+                          bool block_based)
 {
    push->dst_offset_el[0] = util_format_get_nblocksx(p_dst_fmt, offset.x);
    push->dst_offset_el[1] = util_format_get_nblocksy(p_dst_fmt, offset.y);
@@ -1457,6 +1556,21 @@ hk_meta_dispatch_to_image(struct vk_command_buffer *cmd,
    push->grid_el[0] = util_format_get_nblocksx(p_format, extent.width);
    push->grid_el[1] = util_format_get_nblocksy(p_format, extent.height);
    push->grid_el[2] = per_layer ? 1 : layers;
+
+   if (!block_based &&
+       hk_cmd_buffer_device(container_of(cmd, struct hk_cmd_buffer, vk))
+             ->dev.chip == AGX_CHIP_G18G) {
+      /* Plain image stores index the destination by global invocation id plus
+       * dst_offset_el in the kernel: no tile expansion, just cover the grid. */
+      disp->CmdPushConstants(vk_command_buffer_to_handle(cmd), pipeline_layout,
+                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*push),
+                             push);
+      disp->CmdDispatch(vk_command_buffer_to_handle(cmd),
+                        DIV_ROUND_UP(push->grid_el[0], TILE_WIDTH),
+                        DIV_ROUND_UP(push->grid_el[1], TILE_HEIGHT),
+                        push->grid_el[2]);
+      return;
+   }
 
    unsigned w_el = util_format_get_nblocksx(p_format, extent.width);
    unsigned h_el = util_format_get_nblocksy(p_format, extent.height);
@@ -1524,8 +1638,7 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
             .dst_format = hk_format_to_pipe_format(canonical),
 
             /* TODO: MSAA path */
-            .block_based =
-               (image->image_type != VK_IMAGE_TYPE_1D) && image->samples == 1,
+            .block_based = hk_meta_copy_block_based(cmd, image),
          };
 
          VkPipelineLayout pipeline_layout;
@@ -1627,7 +1740,8 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
 
          hk_meta_dispatch_to_image(cmd, disp, pipeline_layout, &push,
                                    region->imageOffset, region->imageExtent,
-                                   per_layer, layers, p_format, p_format);
+                                   per_layer, layers, p_format, p_format,
+                                   key.block_based);
       }
    }
 }
@@ -1692,8 +1806,7 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
                   device, aspect_format(dst_image->format, dst_aspect_mask))),
 
                /* TODO: MSAA path */
-               .block_based = (dst_image->image_type != VK_IMAGE_TYPE_1D) &&
-                              dst_image->samples == 1,
+               .block_based = hk_meta_copy_block_based(cmd, dst_image),
             };
 
             assert(key.nr_samples == src_image->samples);
@@ -1831,7 +1944,8 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
 
             hk_meta_dispatch_to_image(cmd, disp, pipeline_layout, &push,
                                       region->dstOffset, region->extent,
-                                      per_layer, layers, p_dst_fmt, p_format);
+                                      per_layer, layers, p_dst_fmt, p_format,
+                                      key.block_based);
          }
       }
    }
@@ -1869,11 +1983,13 @@ hk_meta_copy_get_image_properties(struct hk_image *img, struct hk_device *dev,
    /* A split depth/stencil image has separate depth and stencil planes. The
     * interleaved R32G32_UINT alias below is a colour view, which selects
     * image plane 0 (the depth plane) for both aspects, so on M5 copy each
-    * plane through its own raw alias at every sample count. */
+    * plane through its own raw alias at every sample count. So does a
+    * compressed depth plane (2x on M4 Pro): the alias is a different
+    * compression class. */
    const bool aspect_views =
       g17p && hk_split_depth_stencil(img->vk.format) &&
       (img->vk.samples == VK_SAMPLE_COUNT_1_BIT ||
-       msaa_depth_stencil_aspect_views);
+       msaa_depth_stencil_aspect_views || img->planes[0].layout.compressed);
    /* Keep the existing multisample render-target formats: G17P's native
     * multisample tile path does not support these integer aliases yet. */
    g17p &= img->vk.samples == VK_SAMPLE_COUNT_1_BIT;
@@ -2895,6 +3011,226 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
    }
 }
 
+/* Several regions of one vkCmdCopyBuffer in one dispatch (G17P only, the
+ * chip it was measured on). vk_meta_copy_buffer_addresses() issues one
+ * dispatch per region; each costs ~1.2-1.6 us of GPU time beyond its bytes
+ * (80 regions of 4 KiB take ~100 us, the same bytes as one region ~6 us).
+ * Workgroup row y copies region y; rows shorter than the widest region end
+ * early. No source region of a copy command may overlap a destination region
+ * (VUID-VkCopyBufferInfo2-pRegions-00117) and overlapping destinations go to
+ * separate dispatches, so any order of a batch's chunks writes the same
+ * bytes. */
+#define HK_COPY_BATCH_REGIONS 10
+
+struct hk_meta_copy_batch_key {
+   enum hk_meta_object_key_type key_type;
+   uint32_t chunk_size;
+};
+
+struct hk_meta_copy_batch_info {
+   uint64_t src_addr[HK_COPY_BATCH_REGIONS];
+   uint64_t dst_addr[HK_COPY_BATCH_REGIONS];
+   uint32_t size[HK_COPY_BATCH_REGIONS];
+};
+static_assert(sizeof(struct hk_meta_copy_batch_info) <= HK_MAX_PUSH_SIZE,
+              "copy batch push data must fit the push constants");
+
+static nir_shader *
+build_copy_batch_shader(const struct hk_device *dev,
+                        const struct hk_meta_copy_batch_key *key)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL,
+                                                  "hk-meta-copy-batch");
+
+   b.shader->info.workgroup_size[0] =
+      vk_meta_buffer_access_wg_size(&dev->meta, key->chunk_size);
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   assert(util_is_power_of_two_nonzero(key->chunk_size));
+   const uint32_t bit_size = key->chunk_size <= 4 ? key->chunk_size * 8 : 32;
+   const uint32_t components = key->chunk_size <= 4 ? 1 : key->chunk_size / 4;
+
+   nir_def *global_id = nir_load_global_invocation_id(&b, 32);
+   nir_def *region = nir_channel(&b, nir_load_workgroup_id(&b), 1);
+   nir_def *offset32 =
+      nir_imul_imm(&b, nir_channel(&b, global_id, 0), key->chunk_size);
+   nir_def *size = nir_load_push_constant(
+      &b, 1, 32, nir_imul_imm(&b, region, sizeof(uint32_t)),
+      .base = offsetof(struct hk_meta_copy_batch_info, size));
+
+   nir_push_if(&b, nir_ult(&b, offset32, size));
+   {
+      nir_def *addr_offset = nir_imul_imm(&b, region, sizeof(uint64_t));
+      nir_def *src_addr = nir_load_push_constant(
+         &b, 1, 64, addr_offset,
+         .base = offsetof(struct hk_meta_copy_batch_info, src_addr));
+      nir_def *dst_addr = nir_load_push_constant(
+         &b, 1, 64, addr_offset,
+         .base = offsetof(struct hk_meta_copy_batch_info, dst_addr));
+      nir_def *offset = nir_u2u64(&b, offset32);
+      nir_def *data = nir_load_global(&b, components, bit_size,
+                                      nir_iadd(&b, src_addr, offset),
+                                      .align_mul = key->chunk_size);
+      nir_store_global(&b, data, nir_iadd(&b, dst_addr, offset),
+                       .align_mul = key->chunk_size);
+   }
+   nir_pop_if(&b, NULL);
+   return b.shader;
+}
+
+static VkResult
+get_copy_batch_pipeline(struct hk_device *dev,
+                        const struct hk_meta_copy_batch_key *key,
+                        VkPipelineLayout *layout_out, VkPipeline *pipeline_out)
+{
+   const VkPushConstantRange push_range = {
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      .offset = 0,
+      .size = sizeof(struct hk_meta_copy_batch_info),
+   };
+   VkResult result = vk_meta_get_pipeline_layout(
+      &dev->vk, &dev->meta, NULL, &push_range, key, sizeof(*key), layout_out);
+   if (unlikely(result != VK_SUCCESS))
+      return result;
+
+   VkPipeline cached = vk_meta_lookup_pipeline(&dev->meta, key, sizeof(*key));
+   if (cached != VK_NULL_HANDLE) {
+      *pipeline_out = cached;
+      return VK_SUCCESS;
+   }
+
+   const VkPipelineShaderStageNirCreateInfoMESA nir_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
+      .nir = build_copy_batch_shader(dev, key),
+   };
+   const VkComputePipelineCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .stage = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .pNext = &nir_info,
+         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+         .pName = "main",
+      },
+      .layout = *layout_out,
+   };
+
+   result = vk_meta_create_compute_pipeline(&dev->vk, &dev->meta, &info, key,
+                                            sizeof(*key), pipeline_out);
+   ralloc_free(nir_info.nir);
+   return result;
+}
+
+struct hk_copy_batch {
+   struct hk_meta_copy_batch_info info;
+   uint32_t count;
+   uint32_t chunk_size;
+   uint32_t max_groups;
+   uint64_t groups;
+};
+
+static uint32_t
+hk_copy_chunk_size(uint64_t src, uint64_t dst, uint64_t size)
+{
+   /* As vk_meta_copy_buffer_addresses(): the largest power of two dividing
+    * both addresses and the size, at most a uvec4. */
+   return MIN2(16, 1u << (ffsll(src | dst | size) - 1));
+}
+
+static void
+hk_copy_batch_flush(struct hk_cmd_buffer *cmd, struct hk_copy_batch *batch)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (batch->count == 1) {
+      vk_meta_copy_buffer_addresses(&cmd->vk, &dev->meta,
+                                    batch->info.src_addr[0],
+                                    batch->info.dst_addr[0],
+                                    batch->info.size[0]);
+   } else if (batch->count > 1) {
+      const struct hk_meta_copy_batch_key key = {
+         .key_type = HK_META_OBJECT_KEY_BUFFER_COPY_BATCH,
+         .chunk_size = batch->chunk_size,
+      };
+      VkPipelineLayout layout;
+      VkPipeline pipeline;
+      VkResult result = get_copy_batch_pipeline(dev, &key, &layout, &pipeline);
+      if (unlikely(result != VK_SUCCESS)) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+      } else {
+         const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+         VkCommandBuffer command_buffer = vk_command_buffer_to_handle(&cmd->vk);
+         disp->CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                               pipeline);
+         disp->CmdPushConstants(command_buffer, layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                sizeof(batch->info), &batch->info);
+         disp->CmdDispatch(command_buffer, batch->max_groups, batch->count, 1);
+      }
+   }
+   batch->count = 0;
+   batch->max_groups = 0;
+   batch->groups = 0;
+}
+
+static bool
+hk_copy_batch_overlaps_dst(const struct hk_copy_batch *batch, uint64_t dst,
+                           uint64_t size)
+{
+   for (unsigned i = 0; i < batch->count; i++) {
+      if (dst < batch->info.dst_addr[i] + batch->info.size[i] &&
+          batch->info.dst_addr[i] < dst + size)
+         return true;
+   }
+   return false;
+}
+
+/* Queues one region. A region joins the open batch when it has the batch's
+ * chunk size, does not overlap a queued destination (so overlapping
+ * destinations keep their order) and the batch stays dense: the launched
+ * workgroups (widest region times the rows) at most twice the ones that copy,
+ * plus one 64-group row of slack (empty groups cost ~2 ns each). */
+static void
+hk_copy_batch_add(struct hk_cmd_buffer *cmd, struct hk_copy_batch *batch,
+                  uint64_t src, uint64_t dst, uint64_t size)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (!size)
+      return;
+
+   if (dev->dev.chip != AGX_CHIP_G17P || size > (1ull << 30)) {
+      /* Other chips are unmeasured. Large regions gain nothing from batching
+       * and keep the shader's 32-bit offsets far from wrapping: vk_meta
+       * copies them (in several dispatches if needed). */
+      hk_copy_batch_flush(cmd, batch);
+      vk_meta_copy_buffer_addresses(&cmd->vk, &dev->meta, src, dst, size);
+      return;
+   }
+
+   const uint32_t chunk_size = hk_copy_chunk_size(src, dst, size);
+   const uint64_t bytes_per_group =
+      vk_meta_buffer_access_wg_size(&dev->meta, chunk_size) * chunk_size;
+   const uint64_t groups = DIV_ROUND_UP(size, bytes_per_group);
+
+   if (batch->count) {
+      const uint64_t max_groups = MAX2(batch->max_groups, groups);
+      if (chunk_size != batch->chunk_size ||
+          batch->count == HK_COPY_BATCH_REGIONS ||
+          max_groups * (batch->count + 1) > 2 * (batch->groups + groups) + 64 ||
+          hk_copy_batch_overlaps_dst(batch, dst, size))
+         hk_copy_batch_flush(cmd, batch);
+   }
+
+   const uint32_t i = batch->count++;
+   batch->chunk_size = chunk_size;
+   batch->info.src_addr[i] = src;
+   batch->info.dst_addr[i] = dst;
+   batch->info.size[i] = size;
+   batch->max_groups = MAX2(batch->max_groups, groups);
+   batch->groups += groups;
+}
+
 static void
 hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info)
 {
@@ -2905,6 +3241,7 @@ hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info
        agx_chip_g17_m5(dev->dev.chip)) {
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+      struct hk_copy_batch batch = {0};
       /* Retain the aligned 16-byte bulk path even when the original
        * region has a scalar tail, as hk_cmd_copy does for libagx. */
       for (unsigned i = 0; i < info->regionCount; i++) {
@@ -2921,8 +3258,7 @@ hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info
                hk_g17p_sparse_buffer_copy(cmd, src_buffer, src, dst,
                                           region.size);
             else
-               vk_meta_copy_buffer_addresses(&cmd->vk, &dev->meta, src, dst,
-                                             region.size);
+               hk_copy_batch_add(cmd, &batch, src, dst, region.size);
             src += region.size;
             dst += region.size;
             region.size = tail;
@@ -2930,9 +3266,9 @@ hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info
          if (src_buffer->sparse_map)
             hk_g17p_sparse_buffer_copy(cmd, src_buffer, src, dst, region.size);
          else
-            vk_meta_copy_buffer_addresses(&cmd->vk, &dev->meta, src, dst,
-                                          region.size);
+            hk_copy_batch_add(cmd, &batch, src, dst, region.size);
       }
+      hk_copy_batch_flush(cmd, &batch);
       hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       return;
    }
@@ -3485,6 +3821,225 @@ hk_g17p_copy_padded_rgb_buffer_image(
    return true;
 }
 
+/* G17P uploads into a plain GPU-tiled image walk the destination in memory
+ * (Morton) order instead of libagx_copy_image's row-major byte loop. Each
+ * workgroup of 64 covers one run of 64 * elements_per_thread consecutive
+ * elements of one tile, so every store instruction of a SIMD group writes 32
+ * adjacent elements, whole 128-byte lines from 4-byte elements up, and each
+ * element moves as a single load and store of its full size. On the A18 Pro
+ * this cuts a 4096x4096 RGBA8 upload by about 35 %, close to a plain
+ * buffer-to-buffer copy of the same size. Tiles that are neither square nor
+ * twice as wide as tall, or smaller than 64 elements, keep libagx_copy_image.
+ */
+#define HK_G17P_TILED_UPLOAD_ELEMENTS_PER_THREAD 4
+
+struct hk_g17p_tiled_upload_key {
+   uint32_t object;
+   uint32_t block_B;
+   uint32_t elements_per_thread;
+};
+
+struct hk_g17p_tiled_upload_push {
+   uint64_t src, dst;
+   uint32_t src_pitch_B;
+   uint32_t x0, y0, width, height;
+   uint32_t tiles_per_row;
+   uint32_t tile_x0, tile_y0;
+   uint32_t tile_w_log2, tile_h_log2;
+};
+static_assert(sizeof(struct hk_g17p_tiled_upload_push) == 56,
+              "packed push data");
+
+#define tiled_upload_push(b, field)                                            \
+   nir_load_push_constant(                                                     \
+      b, 1, sizeof(((struct hk_g17p_tiled_upload_push *)0)->field) * 8,        \
+      nir_imm_int(b, offsetof(struct hk_g17p_tiled_upload_push, field)))
+
+/* The even bits of the low 16 bits of v, packed. */
+static nir_def *
+hk_g17p_compact_even16(nir_builder *b, nir_def *v)
+{
+   v = nir_iand_imm(b, v, 0x5555);
+   v = nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 1)), 0x3333);
+   v = nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 2)), 0x0f0f);
+   return nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 4)), 0x00ff);
+}
+
+static nir_shader *
+hk_g17p_build_tiled_upload(const struct hk_g17p_tiled_upload_key *key)
+{
+   nir_builder build = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, NULL, "hk-meta-g17p-tiled-upload");
+   nir_builder *b = &build;
+   b->shader->info.workgroup_size[0] = 64;
+   b->shader->info.workgroup_size[1] = 1;
+   b->shader->info.workgroup_size[2] = 1;
+
+   const unsigned bits = MIN2(key->block_B, 4) * 8;
+   const unsigned comps = MAX2(key->block_B / 4, 1);
+
+   nir_def *lid = nir_channel(b, nir_load_local_invocation_id(b), 0);
+   nir_def *wg = nir_load_workgroup_id(b);
+   nir_def *twl = tiled_upload_push(b, tile_w_log2);
+   nir_def *thl = tiled_upload_push(b, tile_h_log2);
+   nir_def *tile_x =
+      nir_iadd(b, tiled_upload_push(b, tile_x0), nir_channel(b, wg, 1));
+   nir_def *tile_y =
+      nir_iadd(b, tiled_upload_push(b, tile_y0), nir_channel(b, wg, 2));
+   nir_def *tile_el = nir_ishl(
+      b,
+      nir_iadd(b, nir_imul(b, tile_y, tiled_upload_push(b, tiles_per_row)),
+               tile_x),
+      nir_iadd(b, twl, thl));
+   nir_def *origin_x = nir_ishl(b, tile_x, twl);
+   nir_def *origin_y = nir_ishl(b, tile_y, thl);
+   /* Morton order: X in the even bits, Y in the odd bits. */
+   nir_def *lane_x = hk_g17p_compact_even16(b, lid);
+   nir_def *lane_y = hk_g17p_compact_even16(b, nir_ushr_imm(b, lid, 1));
+   nir_def *x0 = tiled_upload_push(b, x0), *y0 = tiled_upload_push(b, y0);
+   nir_def *width = tiled_upload_push(b, width);
+   nir_def *height = tiled_upload_push(b, height);
+   nir_def *pitch = tiled_upload_push(b, src_pitch_B);
+   nir_def *src = tiled_upload_push(b, src), *dst = tiled_upload_push(b, dst);
+
+   for (unsigned j = 0; j < key->elements_per_thread; ++j) {
+      /* The index of this 64-element run within the tile. */
+      nir_def *run = nir_iadd_imm(
+         b, nir_imul_imm(b, nir_channel(b, wg, 0), key->elements_per_thread),
+         j);
+      nir_def *m = nir_ior(b, nir_ishl_imm(b, run, 6), lid);
+      nir_def *x = nir_ior(
+         b, origin_x,
+         nir_ior(b, nir_ishl_imm(b, hk_g17p_compact_even16(b, run), 3),
+                 lane_x));
+      nir_def *y = nir_ior(
+         b, origin_y,
+         nir_ior(b,
+                 nir_ishl_imm(b, hk_g17p_compact_even16(
+                                    b, nir_ushr_imm(b, run, 1)), 3),
+                 lane_y));
+      nir_def *rx = nir_isub(b, x, x0), *ry = nir_isub(b, y, y0);
+      nir_push_if(b, nir_iand(b, nir_ult(b, rx, width), nir_ult(b, ry, height)));
+      nir_def *src_off = nir_iadd(b, nir_imul(b, ry, pitch),
+                                  nir_imul_imm(b, rx, key->block_B));
+      nir_def *data =
+         nir_load_global(b, comps, bits, nir_iadd(b, src, nir_u2u64(b, src_off)),
+                         .align_mul = key->block_B,
+                         .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+      nir_def *dst_off =
+         nir_imul_imm(b, nir_iadd(b, tile_el, m), key->block_B);
+      nir_store_global(b, data, nir_iadd(b, dst, nir_u2u64(b, dst_off)),
+                       .align_mul = key->block_B);
+      nir_pop_if(b, NULL);
+   }
+
+   return b->shader;
+}
+
+/* Whether this upload takes hk_g17p_tiled_upload(), and its shape. */
+static bool
+hk_g17p_tiled_upload_shape(const struct hk_device *dev, bool dest_tiled,
+                           const struct hk_g17p_tile_address_config *tile,
+                           const struct hk_g17p_uncompressed_copy_plan *plan,
+                           struct hk_g17p_tiled_upload_key *key,
+                           uint32_t groups[3])
+{
+   if (dev->dev.chip != AGX_CHIP_G17P || !dest_tiled || !plan->width_el ||
+       !plan->height_el)
+      return false;
+
+   /* Morton order is dense only for square tiles or tiles twice as wide. */
+   const uint32_t twl = tile->tile_width_log2, thl = tile->tile_height_log2;
+   const uint32_t area_log2 = twl + thl;
+   if ((twl != thl && twl != thl + 1) || area_log2 < 6)
+      return false;
+
+   const uint32_t per_thread =
+      MIN2(HK_G17P_TILED_UPLOAD_ELEMENTS_PER_THREAD, 1u << (area_log2 - 6));
+   const uint32_t tx0 = plan->base_x_el >> twl;
+   const uint32_t ty0 = plan->base_y_el >> thl;
+   const uint64_t x1 = (uint64_t)plan->base_x_el + plan->width_el - 1;
+   const uint64_t y1 = (uint64_t)plan->base_y_el + plan->height_el - 1;
+   const struct vk_physical_device *pdev = dev->vk.physical;
+   groups[0] = 1u << (area_log2 - 6 - util_logbase2(per_thread));
+   groups[1] = (x1 >> twl) - tx0 + 1;
+   groups[2] = (y1 >> thl) - ty0 + 1;
+   for (unsigned i = 0; i < 3; ++i) {
+      if (groups[i] > pdev->properties.maxComputeWorkGroupCount[i])
+         return false;
+   }
+
+   /* The shader addresses source and destination with 32-bit offsets. */
+   const uint64_t src_span = (uint64_t)(plan->height_el - 1) *
+                                plan->buffer_row_stride_B +
+                             (uint64_t)plan->width_el * plan->block_size_B;
+   const uint64_t dst_end =
+      (((uint64_t)(y1 >> thl) * tile->tiles_per_row + (x1 >> twl) + 1)
+       << area_log2) * plan->block_size_B;
+   if (src_span > UINT32_MAX || dst_end > UINT32_MAX ||
+       plan->buffer_row_stride_B > UINT32_MAX)
+      return false;
+
+   *key = (struct hk_g17p_tiled_upload_key){
+      .object = HK_META_OBJECT_KEY_G17P_TILED_UPLOAD,
+      .block_B = plan->block_size_B,
+      .elements_per_thread = per_thread,
+   };
+   return true;
+}
+
+static void
+hk_g17p_tiled_upload(struct hk_cmd_buffer *cmd,
+                     const struct hk_g17p_tiled_upload_key *key,
+                     const uint32_t groups[3],
+                     const struct hk_g17p_tiled_upload_push *push)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const VkPushConstantRange push_range = {
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      .size = sizeof(*push),
+   };
+   VkPipelineLayout layout;
+   VkResult result = vk_meta_get_pipeline_layout(
+      &dev->vk, &dev->meta, NULL, &push_range, key, sizeof(*key), &layout);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return;
+   }
+
+   VkPipeline pipeline = vk_meta_lookup_pipeline(&dev->meta, key, sizeof(*key));
+   if (pipeline == VK_NULL_HANDLE) {
+      const VkPipelineShaderStageNirCreateInfoMESA nir_info = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
+         .nir = hk_g17p_build_tiled_upload(key),
+      };
+      const VkComputePipelineCreateInfo info = {
+         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+         .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = &nir_info,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .pName = "main",
+         },
+         .layout = layout,
+      };
+      result = vk_meta_create_compute_pipeline(
+         &dev->vk, &dev->meta, &info, key, sizeof(*key), &pipeline);
+      ralloc_free(nir_info.nir);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         return;
+      }
+   }
+
+   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+   VkCommandBuffer cb = vk_command_buffer_to_handle(&cmd->vk);
+   disp->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+   disp->CmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                          sizeof(*push), push);
+   disp->CmdDispatch(cb, groups[0], groups[1], groups[2]);
+}
+
 static bool
 hk_g17p_copy_uncompressed_buffer_to_image_supported(
    struct hk_device *dev, const struct hk_buffer *buffer,
@@ -3577,6 +4132,10 @@ hk_g17p_copy_uncompressed_buffer_to_image(
          .dest_tiled = dest_tiled,
          .src_tiled = false,
       };
+      struct hk_g17p_tiled_upload_key tiled_key;
+      uint32_t tiled_groups[3];
+      const bool tiled = hk_g17p_tiled_upload_shape(
+         dev, dest_tiled, &tile_config, &plan, &tiled_key, tiled_groups);
 
       for (uint32_t slice = 0; slice < plan.slice_count; ++slice) {
          struct libagx_copy_image_args args = args_template;
@@ -3584,6 +4143,27 @@ hk_g17p_copy_uncompressed_buffer_to_image(
                      ail_get_layer_level_B(layout, plan.first_slice + slice,
                                            level);
          args.src = base_src + slice * plan.buffer_slice_stride_B;
+
+         if (tiled) {
+            const struct hk_g17p_tiled_upload_push push = {
+               .src = args.src,
+               .dst = args.dest,
+               .src_pitch_B = plan.buffer_row_stride_B,
+               .x0 = plan.base_x_el,
+               .y0 = plan.base_y_el,
+               .width = plan.width_el,
+               .height = plan.height_el,
+               .tiles_per_row = tile_config.tiles_per_row,
+               .tile_x0 = plan.base_x_el >> tile_config.tile_width_log2,
+               .tile_y0 = plan.base_y_el >> tile_config.tile_height_log2,
+               .tile_w_log2 = tile_config.tile_width_log2,
+               .tile_h_log2 = tile_config.tile_height_log2,
+            };
+            hk_g17p_tiled_upload(cmd, &tiled_key, tiled_groups, &push);
+            if (vk_command_buffer_has_error(&cmd->vk))
+               return;
+            continue;
+         }
 
          /* Upload regions and layers are independent.  The consumer's
           * transfer barrier supplies ordering before mip generation or
@@ -3594,6 +4174,12 @@ hk_g17p_copy_uncompressed_buffer_to_image(
          if (vk_command_buffer_has_error(&cmd->vk))
             return;
       }
+
+      /* Declare the tiled upload's writes as the other compute meta copies
+       * do, for kernels that pass compute attachments on as write ranges. */
+      if (tiled && cmd->current_cs.cs)
+         hk_drm_attachment_set_add(&cmd->current_cs.cs->compute_attachments,
+                                   base_dst, layout->size_B);
    }
 }
 
@@ -4023,7 +4609,11 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
       return;
    }
 
-   bool gfx = hk_copy_requires_gfx(dst_image);
+   /* On G18G the compute upload's bindless image store compiled but wrote
+    * nothing when tested (with the 64-byte storage-image descriptor; the
+    * cause was not isolated). Its draws work, so upload through the common
+    * graphics copy. */
+   bool gfx = hk_copy_requires_gfx(dst_image) || dev->dev.chip == AGX_CHIP_G18G;
    if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
       uint8_t plane;
       VkFormat format;
@@ -4096,14 +4686,22 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
 
    if (gfx) {
       /* M5 reaches this graphics upload only for a destination the raw
-       * upload above refuses, such as a compressed depth plane. A split
-       * depth/stencil destination needs the per-plane aspect views here as
-       * well: the interleaved R32G32_UINT alias is a view of plane 0 alone. */
-      const bool m5_split_zs = agx_chip_g17_m5(dev->dev.chip) &&
-                               hk_split_depth_stencil(dst_image->vk.format);
+       * upload above refuses, such as a compressed depth plane or colour
+       * image. A split depth/stencil destination needs the per-plane aspect
+       * views here as well: the interleaved R32G32_UINT alias is a view of
+       * plane 0 alone. A colour destination is written through the same
+       * integer alias image copies and readbacks use: through its own
+       * format, a normalized view would canonicalize the bits it copies
+       * (SNORM -1.0 has two encodings). */
+      const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+      const bool m5_split_zs =
+         m5 && hk_split_depth_stencil(dst_image->vk.format);
+      const bool m5_color =
+         m5 && !vk_format_is_depth_or_stencil(dst_image->vk.format);
       struct vk_meta_copy_image_properties dst_props =
          hk_meta_copy_get_image_properties(
-            dst_image, dev, agx_native_graphics(&dev->dev) || m5_split_zs,
+            dst_image, dev,
+            agx_native_graphics(&dev->dev) || m5_split_zs || m5_color,
             m5_split_zs);
 
       if (agx_native_graphics(&dev->dev)) {
@@ -4355,6 +4953,7 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
     * reinterpretation without the AGX2 compute imageblock protocol. */
    bool gfx = agx_native_graphics(&dev->dev) ||
               agx_chip_g17_m5(dev->dev.chip) ||
+              dev->dev.chip == AGX_CHIP_G18G || /* see the upload above */
               hk_copy_requires_gfx(dst_image);
    VkPipelineBindPoint bind_point = hk_bind_point(gfx);
 
@@ -4364,11 +4963,17 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
    if (gfx) {
       const bool native = agx_native_graphics(&dev->dev) ||
                           agx_chip_g17_m5(dev->dev.chip);
-      const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+      /* Both sides of a depth/stencil copy use the same views: per-plane
+       * aliases when either depth plane is compressed. */
+      const bool zs_planes =
+         agx_chip_g17_m5(dev->dev.chip) ||
+         (hk_split_depth_stencil(src_image->vk.format) &&
+          (src_image->planes[0].layout.compressed ||
+           dst_image->planes[0].layout.compressed));
       struct vk_meta_copy_image_properties src_props =
-         hk_meta_copy_get_image_properties(src_image, dev, native, m5);
+         hk_meta_copy_get_image_properties(src_image, dev, native, zs_planes);
       struct vk_meta_copy_image_properties dst_props =
-         hk_meta_copy_get_image_properties(dst_image, dev, native, m5);
+         hk_meta_copy_get_image_properties(dst_image, dev, native, zs_planes);
 
       if (agx_native_graphics(&dev->dev)) {
          /* The qualified HAL200 BG/EOT contract is single-layer.  Preserve
@@ -4451,10 +5056,19 @@ hk_g17p_fill_buffer_pbe(struct hk_cmd_buffer *cmd, VkBuffer buffer,
       .bindingCount = 1,
       .pBindings = &binding,
    };
+   /* Alternate the sweep direction from one recorded fill to the next. When
+    * consecutive fills cover the same lines, such as a buffer cleared or
+    * filled again and again, each fill then starts on the lines the previous
+    * one wrote last, which the system-level cache still holds: on the A18 Pro
+    * that takes about 24 % off a repeated 64 MiB fill. Sweeping from the end
+    * costs the same as from the start, so other fills see no difference. The
+    * counter is the device's rather than the command buffer's so that fills
+    * recorded one per command buffer alternate too. */
    const struct {
       uint32_t elements;
       uint32_t data;
-   } push = {size / 16, data};
+      uint32_t reverse;
+   } push = {size / 16, data, p_atomic_inc_return(&dev->g17p_fills) & 1};
    const VkPushConstantRange push_range = {
       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
       .size = sizeof(push),
@@ -4485,9 +5099,14 @@ hk_g17p_fill_buffer_pbe(struct hk_cmd_buffer *cmd, VkBuffer buffer,
       nir_def *index = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
       nir_def *elements = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0));
       nir_def *value = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4));
+      nir_def *reverse = nir_ine_imm(
+         &b, nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8)), 0);
       nir_push_if(&b, nir_ult(&b, index, elements));
+      nir_def *texel = nir_bcsel(
+         &b, reverse, nir_isub(&b, nir_iadd_imm(&b, elements, -1), index),
+         index);
       nir_image_deref_store(
-         &b, &nir_build_deref_var(&b, image)->def, nir_pad_vec4(&b, index),
+         &b, &nir_build_deref_var(&b, image)->def, nir_pad_vec4(&b, texel),
          nir_imm_int(&b, 0), nir_replicate(&b, value, 4), nir_imm_int(&b, 0),
          .image_dim = GLSL_SAMPLER_DIM_BUF, .image_array = false,
          .format = PIPE_FORMAT_R32G32B32A32_UINT, .src_type = nir_type_uint32);

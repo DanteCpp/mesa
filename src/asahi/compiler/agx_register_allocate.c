@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,19 @@ DEBUG_GET_ONCE_BOOL_OPTION(m5_wide_scalar_sources,
 #include "agx_debug.h"
 #include "agx_opcodes.h"
 #include "shader_enums.h"
+
+/* The eight scalars collected into an operand of a 16x16x16 matrix
+ * multiply-accumulate, as the phi webs they belong to. The instruction takes
+ * each operand from an aligned run of registers, so the webs want consecutive
+ * registers of one such run: then the collect, the phis around it and the
+ * copy into the accumulator the instruction overwrites are all in place.
+ */
+struct matrix_group {
+   uint32_t root[8];
+
+   /* Registers (16-bit halves) of each member */
+   uint8_t size;
+};
 
 /* SSA-based register allocator */
 struct phi_web_node {
@@ -114,6 +128,12 @@ struct ra_ctx {
    agx_instr **src_to_collect_phi;
    BITSET_WORD *early_scalar_export;
    struct phi_web_node *phi_web;
+
+   /* Matrix operand groups, and for each phi web root its group plus one
+    * (zero for none).
+    */
+   const struct matrix_group *matrix_groups;
+   const uint16_t *web_matrix_group;
 
    /* If bit i of used_regs is set, and register i is the first consecutive
     * register holding an SSA value, then reg_to_ssa[i] is the SSA index of the
@@ -398,14 +418,18 @@ dest_limit(const struct ra_ctx *rctx, const agx_instr *I, unsigned d)
     * reads as for texture reads. Coordinate and other staged sources are
     * bounded separately through texture_gpr below. AGX3C's destination is
     * eight bits: G17G samples and reads land at halves 148 and 174 under
-    * register pressure (port/rawit k_tex_hi, k_read_hi). */
-   if (rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+    * register pressure (port/rawit k_tex_hi, k_read_hi). G18G keeps the
+    * seven-bit bound its mixed descriptor samples were qualified with. */
+   if ((rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+        agx_is_g18g(&rctx->shader->key->dev)) &&
        (I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
         I->op == AGX_OPCODE_TEXTURE_LOAD || I->op == AGX_OPCODE_IMAGE_LOAD))
       limit = MIN2(limit, 128);
-   /* A move from the uniform file packs to a G17P COPY, which names a
-    * seven-bit destination like the half COPY. */
-   if (rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+   /* A move from the uniform file packs to a compact COPY on G17P and
+    * G18G, which names a seven-bit destination like the half COPY. Other
+    * instructions can still allocate the full register file. */
+   if ((rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+        agx_is_g18g(&rctx->shader->key->dev)) &&
        I->op == AGX_OPCODE_MOV && I->src[0].type == AGX_INDEX_UNIFORM)
       limit = MIN2(limit, AGX3_COPY_REG16_DEST_HALVES);
    if (rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
@@ -416,6 +440,13 @@ dest_limit(const struct ra_ctx *rctx, const agx_instr *I, unsigned d)
        ra_class_for_index(I->dest[d]) == RA_GPR &&
        BITSET_TEST(rctx->texture_gpr, I->dest[d].value))
       limit = MIN2(limit, 128);
+   /* The G18G stream packer accepts direct coordinate bases through half
+    * 60. Keep the complete coordinate vector in the low bank, including
+    * after an overlapping TEX destination evicts a still-live value. */
+   if (agx_is_g18g(&rctx->shader->key->dev) &&
+       ra_class_for_index(I->dest[d]) == RA_GPR &&
+       BITSET_TEST(rctx->texture_gpr, I->dest[d].value))
+      limit = MIN2(limit, 64);
    if (rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
        ra_class_for_index(I->dest[d]) == RA_GPR &&
        (I->op == AGX_OPCODE_LOG2 ||
@@ -649,6 +680,18 @@ find_best_region_to_evict(struct ra_ctx *rctx, unsigned size,
       rctx->shader->ra_failed = true;
       base = find_best_region_to_evict_impl(rctx, size, already_evicted, ~0u, 0,
                                             false, false);
+   }
+
+   /* Every region was already evicted for this value: there is nothing left
+    * to finish the allocation with. Leave RA now (agx_ra_impl() frees its
+    * state); the caller sees ra_failed and recompiles with a smaller spill
+    * budget. Continuing used to assert here in debug builds and index out of
+    * bounds in release builds (geometry shader of
+    * spirv_assembly.instruction.graphics.16bit_storage.struct_mixed_types.uniform_geom
+    * on M5: 248 registers, every 2-aligned region evicted). */
+   if (base == ~0u && rctx->shader->ra_abort) {
+      assert(rctx->shader->ra_failed);
+      longjmp(*(jmp_buf *)rctx->shader->ra_abort, 1);
    }
 
    assert(base < rctx->bound[RA_GPR] &&
@@ -1278,6 +1321,34 @@ reserve_live_in(struct ra_ctx *rctx)
    }
 }
 
+/* The first web of a matrix operand to get a register picks the run of
+ * registers for all eight (see struct matrix_group).
+ */
+static void
+place_matrix_group(struct ra_ctx *rctx, unsigned root, unsigned minimum,
+                   unsigned limit)
+{
+   if (!rctx->web_matrix_group || !rctx->web_matrix_group[root] ||
+       rctx->phi_web[root].assigned)
+      return;
+
+   const struct matrix_group *group =
+      &rctx->matrix_groups[rctx->web_matrix_group[root] - 1];
+   const unsigned run = 8 * group->size;
+   unsigned base;
+
+   if (!find_regs_simple(rctx, RA_GPR, run, run, minimum, limit, &base))
+      return;
+
+   for (unsigned k = 0; k < 8; ++k) {
+      struct phi_web_node *node = &rctx->phi_web[group->root[k]];
+      if (!node->assigned) {
+         node->reg = base + k * group->size;
+         node->assigned = true;
+      }
+   }
+}
+
 static void
 assign_regs(struct ra_ctx *rctx, agx_index v, unsigned reg)
 {
@@ -1296,9 +1367,17 @@ assign_regs(struct ra_ctx *rctx, agx_index v, unsigned reg)
 
    BITSET_SET_COUNT(rctx->used_regs[cls], reg, nr);
 
-   /* Phi webs need to remember which register they're assigned to */
-   struct phi_web_node *node =
-      &rctx->phi_web[phi_web_find(rctx->phi_web, v.value)];
+   /* Phi webs need to remember which register they're assigned to. A web of a
+    * matrix operand remembers its place in the operand's run instead, if one
+    * is free: this value may be elsewhere (a component of a vector load, in
+    * place), but the phis it reaches then gather the operand where the
+    * instruction wants it.
+    */
+   const unsigned root = phi_web_find(rctx->phi_web, v.value);
+   struct phi_web_node *node = &rctx->phi_web[root];
+
+   if (cls == RA_GPR)
+      place_matrix_group(rctx, root, 0, rctx->bound[cls]);
 
    if (!node->assigned) {
       node->reg = reg;
@@ -1424,8 +1503,8 @@ pick_collect_affinity(struct ra_ctx *rctx, agx_instr *I, unsigned d,
  * RGBA8 payload, `collect(fltnorm, fltnorm)` whose halves already sit in an
  * aligned pair inside the bank, that forced a parallel copy: one extra MOV in
  * front of every LSTCOL, on the fragment's critical tail. Apple's G17P
- * fragments store the FLTNORM pair directly (fs-apple.bin +0x198/+0x1a8:
- * fltnorm r2h, pixwait, lstcol r2).
+ * fragments store the FLTNORM pair directly: FLTNORM writes one half of the
+ * payload pair in place, then PIXWAIT, then LSTCOL stores the pair, no MOV.
  *
  * Try the ordinary collect/move affinity first, but accept it only when the
  * whole region is free, aligned, and inside [dest_minimum, dest_limit). This
@@ -1660,6 +1739,12 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
 
    /* Try to allocate entire phi webs compatibly */
    unsigned phi_idx = phi_web_find(rctx->phi_web, idx.value);
+
+   if (cls == RA_GPR) {
+      place_matrix_group(rctx, phi_idx, dest_minimum(rctx, I, d),
+                         dest_limit(rctx, I, d));
+   }
+
    if (rctx->phi_web[phi_idx].assigned) {
       unsigned reg = rctx->phi_web[phi_idx].reg;
       if ((reg % align) == 0 && reg + align < rctx->bound[cls] &&
@@ -2248,7 +2333,24 @@ agx_ra_assign_local(struct ra_ctx *rctx)
       /* Optimization: if a split contains the last use of a vector, the split
        * can be removed by assigning the destinations overlapping the source.
        */
-      if (I->op == AGX_OPCODE_SPLIT && I->src[0].kill) {
+      /* A killed vector may live above a sampler operand's register bank.
+       * A channel used by that sampler must take the regular parallel-copy
+       * path if it cannot inherit the vector's physical register. */
+      bool coalesce_split = I->op == AGX_OPCODE_SPLIT && I->src[0].kill;
+      if (coalesce_split &&
+          rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
+         const unsigned base = ssa_to_reg[I->src[0].value];
+         const unsigned width = agx_size_align_16(agx_split_width(I));
+         agx_foreach_ssa_dest(I, d) {
+            const unsigned reg = base + d * width;
+            if (reg < dest_minimum(rctx, I, d) ||
+                reg + width > dest_limit(rctx, I, d)) {
+               coalesce_split = false;
+               break;
+            }
+         }
+      }
+      if (coalesce_split) {
          assert(ra_class_for_index(I->src[0]) == RA_GPR);
          unsigned reg = ssa_to_reg[I->src[0].value];
          unsigned width = agx_size_align_16(agx_split_width(I));
@@ -2895,6 +2997,21 @@ pair_peer_publication_consumed_early(agx_context *ctx, unsigned value)
    return found;
 }
 
+/* Vectors need whole aligned slots for live range splitting, so the usable
+ * register file is a multiple of the largest vector, at least 8 halves.
+ */
+static unsigned
+ra_file_alignment(agx_context *ctx)
+{
+   unsigned alignment = 8;
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_dest(I, d)
+         alignment = MAX2(alignment,
+                          util_next_power_of_two(agx_index_size_16(I->dest[d])));
+   }
+   return alignment;
+}
+
 static void
 agx_ra_impl(agx_context *ctx, bool disable_remat)
 {
@@ -2953,20 +3070,31 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
       max_possible_regs = MIN2(max_possible_regs, AGX3B_NUM_REGS);
 
+   /* G18G's eight-bit operand fields also encode r126/r127, but those names
+    * do not behave as ordinary data registers. Physical scalar readbacks
+    * from r124/r125 succeed while stores from r126/r127 leave their output
+    * untouched; a vec4 spanning them loses the entire store. Native G18G
+    * pressure kernels reach r125 and spill the remaining live values.
+    * Keep the unavailable halves out of allocation, including spill temps.
+    * G18G uses the G17G allocator before the final AGX3D transcode.
+    */
+   if (ctx->key->dev.emit_agx3d) {
+      /* Round before deciding whether to spill. Rounding only at assignment
+       * could leave demand above the aligned file after the spill pass. */
+      max_possible_regs = MIN2(max_possible_regs,
+                               ROUND_DOWN_TO(AGX3D_NUM_REGS,
+                                             ra_file_alignment(ctx)));
+   }
+
    /* Native G17G pressure shaders spill at 126 dwords. Direct M5 tests of
     * IADD/EXTR followed by STDEV agree: pair 250 works, pair 252 does not.
     * Align the usable file before spilling as live-range splitting requires
     * whole vector slots; rounding only at final assignment is too late.
     */
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
-      unsigned alignment = 8;
-      agx_foreach_instr_global(ctx, I) {
-         agx_foreach_ssa_dest(I, d)
-            alignment = MAX2(alignment,
-                             util_next_power_of_two(agx_index_size_16(I->dest[d])));
-      }
       max_possible_regs = MIN2(max_possible_regs,
-                               ROUND_DOWN_TO(AGX3C_NUM_REGS, alignment));
+                               ROUND_DOWN_TO(AGX3C_NUM_REGS,
+                                             ra_file_alignment(ctx)));
    }
 
    /* Large native-query kernels benefit from leaving registers available for
@@ -3087,11 +3215,19 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
       const unsigned remat_slack =
          4 + MAX2(2, agx_reserved_registers(ctx));
       if ((effective_demand_remat + remat_slack) < effective_demand) {
-         unsigned l = agx_round_registers(
-            align(agx_round_registers(effective_demand_remat + remat_slack), 16));
+         /* Assignment rounds the file down to the vector alignment, so the
+          * target must already be aligned. Aligning to 16 regardless never
+          * reached the 104-half (1024-thread) or 136-half occupancy steps.
+          */
+         unsigned alignment = ra_file_alignment(ctx);
+         unsigned l = ROUND_DOWN_TO(
+            agx_round_registers(
+               ALIGN_POT(effective_demand_remat + remat_slack, alignment)),
+            alignment);
 
          /* Only rematerialize if it actually lets us save a wave */
-         if (l < agx_round_registers(effective_demand)) {
+         if (agx_round_registers(l) <
+             agx_round_registers(ALIGN_POT(effective_demand, alignment))) {
             remat = true;
             max_possible_regs = MIN2(l, max_possible_regs);
          }
@@ -3105,20 +3241,48 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
       agx_spill(ctx, max_possible_regs, remat);
 
-      if (remat && ctx->remat_fallback_spilled) {
-         /* The wave-saving remat-only pass could not meet its estimated
-          * budget and spilled to scratch; finish under the full budget. */
-         max_possible_regs = full_budget;
-         remat = false;
-         spilling = true;
+      if (agx_is_g18g(&ctx->key->dev)) {
+         /* Rematerialization changes instruction lifetimes. Measure the
+          * actual result before deciding whether the optional wave-saving
+          * budget held.
+          */
          agx_compute_liveness(ctx);
-         if (agx_calc_register_demand(ctx, false) > max_possible_regs)
-            agx_spill(ctx, max_possible_regs, false);
-      }
+         effective_demand = agx_calc_register_demand(ctx, false);
 
-      /* After spilling, recalculate liveness and demand */
-      agx_compute_liveness(ctx);
-      effective_demand = agx_calc_register_demand(ctx, false);
+         if (remat && (ctx->remat_fallback_spilled ||
+                       effective_demand > max_possible_regs)) {
+            /* The reduced budget is only an occupancy optimization.
+             * Constants reintroduced at their uses can exceed that estimate
+             * even without a scratch spill. Retain the rematerialized
+             * program and allocate under the original hardware budget,
+             * spilling only if needed.
+             */
+            max_possible_regs = full_budget;
+            remat = false;
+            spilling = ctx->remat_fallback_spilled ||
+                       effective_demand > max_possible_regs;
+            if (effective_demand > max_possible_regs) {
+               agx_spill(ctx, max_possible_regs, false);
+               agx_compute_liveness(ctx);
+               effective_demand = agx_calc_register_demand(ctx, false);
+            }
+         }
+      } else {
+         if (remat && ctx->remat_fallback_spilled) {
+            /* The wave-saving remat-only pass could not meet its estimated
+             * budget and spilled to scratch; finish under the full budget. */
+            max_possible_regs = full_budget;
+            remat = false;
+            spilling = true;
+            agx_compute_liveness(ctx);
+            if (agx_calc_register_demand(ctx, false) > max_possible_regs)
+               agx_spill(ctx, max_possible_regs, false);
+         }
+
+         /* After spilling, recalculate liveness and demand */
+         agx_compute_liveness(ctx);
+         effective_demand = agx_calc_register_demand(ctx, false);
+      }
 
       /* The resulting program can now be assigned registers */
       assert(effective_demand <= max_possible_regs && "spiller post-condition");
@@ -3169,6 +3333,72 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
       }
    }
 
+   /* Group the phi webs that make up the operands of matrix multiplies */
+   struct util_dynarray matrix_groups;
+   util_dynarray_init(&matrix_groups, NULL);
+   uint16_t *web_matrix_group = NULL;
+   bool any_matrix = false;
+   agx_foreach_instr_global(ctx, I)
+      any_matrix |= I->op == AGX_OPCODE_MATMAD16_AGX3;
+
+   if (any_matrix) {
+      agx_instr **defs = calloc(ctx->alloc, sizeof(*defs));
+      web_matrix_group = calloc(ctx->alloc, sizeof(*web_matrix_group));
+
+      agx_foreach_instr_global(ctx, I) {
+         agx_foreach_ssa_dest(I, d)
+            defs[I->dest[d].value] = I;
+      }
+
+      agx_foreach_instr_global(ctx, I) {
+         if (I->op != AGX_OPCODE_MATMAD16_AGX3)
+            continue;
+
+         agx_foreach_ssa_src(I, s) {
+            /* The accumulator is a copy (agx_lower_agx3_matrix_sources) */
+            agx_instr *def = defs[I->src[s].value];
+            if (def && def->op == AGX_OPCODE_MOV &&
+                def->src[0].type == AGX_INDEX_NORMAL)
+               def = defs[def->src[0].value];
+
+            if (!def || def->op != AGX_OPCODE_COLLECT || def->nr_srcs != 8)
+               continue;
+
+            struct matrix_group group = {0};
+            bool valid = true;
+            for (unsigned k = 0; k < 8 && valid; ++k) {
+               const agx_index src = def->src[k];
+               valid = src.type == AGX_INDEX_NORMAL && !src.memory &&
+                       agx_channels(src) == 1 &&
+                       src.size == def->src[0].size &&
+                       (src.size == AGX_SIZE_16 || src.size == AGX_SIZE_32);
+               if (!valid)
+                  break;
+
+               group.root[k] = phi_web_find(phi_web, src.value);
+               valid = !web_matrix_group[group.root[k]];
+               for (unsigned j = 0; j < k; ++j)
+                  valid &= group.root[j] != group.root[k];
+            }
+            if (!valid)
+               continue;
+
+            group.size = agx_size_align_16(def->src[0].size);
+            util_dynarray_append(&matrix_groups, group);
+            const unsigned id = util_dynarray_num_elements(
+               &matrix_groups, struct matrix_group);
+            if (id > UINT16_MAX) {
+               (void)util_dynarray_pop(&matrix_groups, struct matrix_group);
+               continue;
+            }
+            for (unsigned k = 0; k < 8; ++k)
+               web_matrix_group[group.root[k]] = id;
+         }
+      }
+
+      free(defs);
+   }
+
    uint8_t *ncomps = calloc(ctx->alloc, sizeof(uint8_t));
    uint8_t *ncomps_unrounded = calloc(ctx->alloc, sizeof(uint8_t));
    enum ra_class *classes = calloc(ctx->alloc, sizeof(enum ra_class));
@@ -3208,8 +3438,12 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
            I->op == AGX_OPCODE_DFDX || I->op == AGX_OPCODE_DFDY)) ||
           (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
            I->op == AGX_OPCODE_SINC_AGX3)) {
-         agx_foreach_ssa_src(I, s)
+         agx_foreach_ssa_src(I, s) {
             BITSET_SET(texture_gpr, I->src[s].value);
+            /* A split channel takes its vector's register. */
+            if (split_source[I->src[s].value])
+               BITSET_SET(texture_gpr, split_source[I->src[s].value] - 1);
+         }
          agx_foreach_ssa_dest(I, d)
             BITSET_SET(texture_gpr, I->dest[d].value);
       }
@@ -3252,6 +3486,16 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
          }
       }
 
+      /* G18G has its own direct-coordinate bound. Mark the SSA web so a
+       * low TEX destination cannot relocate its still-live coordinates
+       * into an unencodable high bank. Other operands keep their limits. */
+      if (agx_is_g18g(&ctx->key->dev) &&
+          (I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+           I->op == AGX_OPCODE_TEXTURE_LOAD ||
+           I->op == AGX_OPCODE_IMAGE_LOAD) &&
+          I->src[0].type == AGX_INDEX_NORMAL)
+         BITSET_SET(texture_gpr, I->src[0].value);
+
       /* Other sampled coordinates and CEM retain their low-bank source
        * constraints. Gradient scalars and shadow references also remain
        * within the existing qualified range. */
@@ -3275,7 +3519,9 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
             BITSET_SET(texture_gpr, I->src[7].value);
 
          if (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
-             I->lod_mode == AGX_LOD_MODE_LOD_GRAD &&
+             (I->lod_mode == AGX_LOD_MODE_LOD_GRAD ||
+              I->lod_mode == AGX_LOD_MODE_LOD_GRAD_MIN ||
+              I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS_MIN) &&
              I->src[1].type == AGX_INDEX_NORMAL)
             BITSET_SET(texture_gpr, I->src[1].value);
 
@@ -3480,6 +3726,16 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
     */
    BITSET_WORD *dest_read = agx_values_read(ctx);
 
+   /* Everything assign_local reads below was allocated above, and nothing the
+    * cleanup reads is changed after this point, so it survives a longjmp. */
+   jmp_buf ra_abort;
+   if (setjmp(ra_abort)) {
+      ctx->ra_abort = NULL;
+      free(dest_read);
+      goto cleanup;
+   }
+   ctx->ra_abort = &ra_abort;
+
    agx_foreach_block(ctx, block) {
       agx_ra_assign_local(&(struct ra_ctx){
          .shader = ctx,
@@ -3488,6 +3744,8 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
          .src_to_collect_phi = src_to_collect_phi,
          .early_scalar_export = early_scalar_export,
          .phi_web = phi_web,
+         .matrix_groups = matrix_groups.data,
+         .web_matrix_group = web_matrix_group,
          .ncomps = ncomps,
          .ncomps_unrounded = ncomps_unrounded,
          .sizes = sizes,
@@ -3506,6 +3764,7 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
       });
    }
 
+   ctx->ra_abort = NULL;
    free(dest_read);
 
    ctx->max_reg = reg_count ? (reg_count - 1) : 0;
@@ -3651,6 +3910,7 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    if (spilling)
       agx_lower_spill(ctx);
 
+cleanup:
    agx_foreach_block(ctx, block) {
       for (unsigned i = 0; i < ARRAY_SIZE(block->reg_to_ssa_out); ++i) {
          free(block->reg_to_ssa_out[i]);
@@ -3659,6 +3919,8 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    }
 
    free(phi_web);
+   util_dynarray_fini(&matrix_groups);
+   free(web_matrix_group);
    free(low_gpr);
    free(split_source);
    free(texture_gpr);

@@ -24,6 +24,30 @@ def declare_options():
         B("hk_fake_minmax", False,
           "Fake support for min/max filtering",
           c_name="fake_minmax"),
+        B("hk_sparse_strict_residency", False,
+          "Report sparseResidencyNonResidentStrict on G13, G14 and G17P, "
+          "where a write to an unbound page can still be read back",
+          c_name="sparse_strict_residency"),
+        B("hk_host_memory_read_only", False,
+          "Import host memory the kernel can only pin for reading (a "
+          "read-only file mapping) and bind it read-only for the GPU, "
+          "instead of failing the allocation. A GPU write to such memory is "
+          "not performed: it is discarded, or faults the job on a kernel "
+          "without soft faults",
+          c_name="host_memory_read_only"),
+        B("hk_host_memory_import_read_only", False,
+          "Accept a host import only for a range the kernel cannot pin for "
+          "writing (a read-only file mapping, say), bound read-only for the "
+          "GPU, and refuse a range it pins for writing, also when "
+          "hk_host_memory_read_only is set. The application may still write "
+          "the same pages through another mapping, but the GPU writes "
+          "through no host import, so on the M5 the extension does not keep "
+          "compute barriers from skipping the write-back to memory",
+          c_name="host_memory_import_read_only"),
+        B("hk_d3d_nearest_mip", False,
+          "Round a nearest mip selection halfway between levels up, as "
+          "Direct3D does, rather than down, as Vulkan does",
+          c_name="d3d_nearest_mip"),
         B("hk_image_view_min_lod", False,
           "Emulate VK_EXT_image_view_min_lod (conformant but slower)",
           c_name="image_view_min_lod"),
@@ -35,6 +59,18 @@ def declare_options():
           "list is only viewed as itself or its sRGB/UNORM twin, so that it "
           "can be compressed",
           c_name="mutable_format_srgb_pair"),
+        drirc_gen.DrircInt("hk_compute_kick_ms", 10, 0, 1000,
+          "M5 Max: once a queue's compute work has completed nothing for "
+          "50 ms, submit a small compute job on a second queue every this "
+          "many ms until it does, which lets other applications' compute "
+          "work and rendering run meanwhile (0: off)",
+          c_name="compute_kick_ms"),
+        drirc_gen.DrircInt("hk_compute_timeout_ms", 0, 0, 3600000,
+          "Watchdog allowance of each compute command on the device's "
+          "queues, in ms (0: the kernel's default). The kernel clamps the "
+          "request. It is an allowance, not a deadline: the kernel's "
+          "watchdog may let a command run longer before it fails it",
+          c_name="compute_timeout_ms"),
         B("hk_report_honeykrisp_driver_id", False,
           "Report VK_DRIVER_ID_MESA_HONEYKRISP instead of the Borealis ID, "
           "for translation layers that do not know the Borealis ID yet",

@@ -22,8 +22,10 @@
 #include "agx_vdm_hal200_bind_tail_core.h"
 #include "decode.h"
 #include "hk_cmd_buffer.h"
+#include "hk_compute_kick.h"
 #include "hk_frame_anatomy.h"
 #include "hk_device.h"
+#include "hk_entrypoints.h"
 #include "hk_drm_render_core.h"
 #include "hk_drm_prior_core.h"
 #include "hk_execution_allowance.h"
@@ -50,6 +52,7 @@
 
 #include "hk_private.h"
 #include "layout.h"
+#include "vk_common_entrypoints.h"
 #include "vk_drm_syncobj.h"
 #include "vk_sync.h"
 
@@ -117,14 +120,43 @@ queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
    return queue_signal_timeline(dev, queue, submit);
 }
 
+/* The ray-query stage state of a G17P render whose vertex or fragment
+ * programs trace rays; the stages that trace none stay zero. */
+static void
+hk_gen1_render_ray_query_stages(struct hk_device *dev, const struct hk_cs *cs,
+                                struct drm_asahi_render_ray_query_stage rq[2])
+{
+   for (unsigned stage = 0; stage < 2; ++stage) {
+      if (!(stage ? cs->gen1_native_fragment_rq : cs->gen1_native_vertex_rq))
+         continue;
+      struct drm_asahi_render_ray_query_stage *rt = &rq[stage];
+      rt->scs_layout = hk_gen1_ray_query_scs_layout(dev);
+      rt->intersection_pool = dev->gen1_rq_ift->va->addr;
+      rt->intersection_pool_bytes = 0x4000;
+      rt->intersection_first = 1;
+      rt->intersection_count = 112;
+      rt->intersection_default = UINT64_C(0x10010020000);
+      rt->intersection_default_control = UINT64_C(0x16000000000);
+   }
+}
+
 static void
 asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
                        struct drm_asahi_cmd_compute *cmd)
 {
-   size_t len = cs->stream_linked ? 65536 /* XXX */ : (cs->current - cs->start);
+   /* A linked stream leaves its root through a link record, so the root
+    * allocation bounds the part the kernel is given. */
+   size_t len =
+      cs->stream_linked ? cs->root_size : (cs->current - cs->start);
 
    *cmd = (struct drm_asahi_cmd_compute){
-      .flags = cs->m5_matrix_ops ? DRM_ASAHI_COMPUTE_USES_MATRIX : 0,
+      .flags = (cs->m5_matrix_ops ? DRM_ASAHI_COMPUTE_USES_MATRIX : 0) |
+               (!cs->query_access &&
+                      (dev->dev.params.features &
+                       DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
+                   ? DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS
+                   : 0) |
+               (cs->visible_completion ? DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION : 0),
       .cdm_ctrl_stream_base = cs->addr,
       .cdm_ctrl_stream_end = cs->addr + len,
 
@@ -134,7 +166,7 @@ asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
       .ts.end.offset = cs->timestamp.end.offset_B,
    };
 
-   if (cs->uses_sampler_heap) {
+   if (cs->uses_sampler_heap && !agx_stream_sampler_state(&dev->dev)) {
       cmd->sampler_heap = dev->samplers.table.bo->va->addr;
       cmd->sampler_count = dev->samplers.table.alloc;
    }
@@ -204,14 +236,21 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
       c->height_px = MIN2(c->height_px, cs->area_y1);
    }
 
+   /* An attachmentless pass takes its size from the render area, which can be
+    * empty, and the kernel refuses a zero dimension. */
+   c->width_px = MAX2(c->width_px, 1);
+   c->height_px = MAX2(c->height_px, 1);
+
    c->isp_bgobjdepth = cs->cr.isp_bgobjdepth;
    c->isp_bgobjvals = cs->cr.isp_bgobjvals;
 
    static_assert(sizeof(c->zls_ctrl) == sizeof(cs->cr.zls_control));
    memcpy(&c->zls_ctrl, &cs->cr.zls_control, sizeof(cs->cr.zls_control));
 
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
-      c->isp_zls_pixels = agx_chip_g17_m5(dev->dev.chip)
+   const bool g18g = dev->dev.chip == AGX_CHIP_G18G;
+   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
+       g18g) {
+      c->isp_zls_pixels = agx_chip_g17_m5(dev->dev.chip) || g18g
          ? hk_drm_m5_zls_pixels(
               cs->cr.zls_width, cs->cr.zls_height, cs->cr.depth.buffer,
               cs->cr.depth.meta, cs->cr.stencil.buffer, cs->cr.stencil.meta)
@@ -251,6 +290,13 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
        cs->g17p_primitive_bound <= 4) {
       c->flags |= DRM_ASAHI_RENDER_FEW_PRIMITIVES;
    }
+
+   /* The A18 Pro loses the vertex output of the mesh workgroup in flight when
+    * the tiler heap runs out mid-draw. Ask the kernel to size the heap for
+    * mesh output before the render. */
+   if ((dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT) &&
+       cs->g17p_mesh_output)
+      c->flags |= DRM_ASAHI_RENDER_MESH_OUTPUT;
 
    if (agx_chip_g17_m5(dev->dev.chip))
       c->flags |= hk_m5_shader_write_class_flags(dev->dev.params.features,
@@ -304,7 +350,7 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
    c->isp_scissor_base = cs->uploaded_scissor;
    c->isp_dbias_base = cs->uploaded_zbias;
 
-   if (cs->uses_sampler_heap) {
+   if (cs->uses_sampler_heap && !agx_stream_sampler_state(&dev->dev)) {
       c->sampler_heap = dev->samplers.table.bo->va->addr;
       c->sampler_count = dev->samplers.table.alloc;
    }
@@ -313,6 +359,14 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
 
    if (cs->cr.process_empty_tiles)
       c->flags |= DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
+
+   /* Only a render that is its whole API pass: the streams hk splits one
+    * pass into carry no barrier between them and rely on the kernel's
+    * attachment ordering. */
+   if (cs->cr.whole_attachments && cs->g17p_pass_begins &&
+       cs->g17p_pass_ends && !cs->m5_continued_pass &&
+       (dev->dev.params.features & DRM_ASAHI_FEATURE_WHOLE_ATTACHMENT_RENDERS))
+      c->flags |= DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS;
 
    if (cs->scratch.vs.main || cs->scratch.vs.preamble) {
       c->flags |= DRM_ASAHI_RENDER_VERTEX_SCRATCH;
@@ -381,8 +435,9 @@ asahi_append_compute_attachments(struct hk_device *dev,
                                  const struct hk_cs *cs)
 {
    /* Attachment spans are hints for the native AGX3 firmware interface.
-    * AGX2 has never sent them, so G13 and G14 keep that submission. */
-   if (!agx_native_graphics(&dev->dev))
+    * AGX2 has never sent them, so G13 and G14 keep that submission. G18G
+    * (M6) sends them as well. */
+   if (!agx_native_graphics(&dev->dev) && dev->dev.chip != AGX_CHIP_G18G)
       return;
 
    const struct hk_drm_attachment_set *set = &cs->compute_attachments;
@@ -406,7 +461,7 @@ asahi_append_fragment_attachments(struct hk_device *dev,
                                   const struct hk_cs *cs)
 {
    /* See asahi_append_compute_attachments(). */
-   if (!agx_native_graphics(&dev->dev))
+   if (!agx_native_graphics(&dev->dev) && dev->dev.chip != AGX_CHIP_G18G)
       return;
 
    const struct hk_drm_attachment_set *set = &cs->fragment_attachments;
@@ -448,8 +503,26 @@ max_commands_per_submit(struct hk_device *dev)
 
 static VkResult
 queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
-                    unsigned ring_idx)
+                    unsigned ring_idx, struct hk_cmd_pending *pending)
 {
+   /* Give each ioctl an independent binary completion fence. API signals
+    * may be signalled on the CPU during error unwinding; timeline lookup
+    * can prune a completed error fence. Neither is a safe retirement token. */
+   struct drm_asahi_submit pinned = *submit;
+   if (pending) {
+      const unsigned count = submit->in_sync_count + submit->out_sync_count;
+      struct drm_asahi_sync *syncs =
+         alloca((count + 1) * sizeof(*syncs));
+      if (count)
+         memcpy(syncs, (void *)(uintptr_t)submit->syncs, count * sizeof(*syncs));
+      syncs[count] = (struct drm_asahi_sync) {
+         .sync_type = DRM_ASAHI_SYNC_SYNCOBJ,
+         .handle = hk_cmd_pending_signal(pending),
+      };
+      pinned.syncs = (uintptr_t)syncs;
+      pinned.out_sync_count++;
+      submit = &pinned;
+   }
    struct agx_submit_virt virt = {.ring_idx = ring_idx};
 
    /* Complete the cache cleans of CPU-cached descriptor writes
@@ -515,7 +588,8 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
                     struct drm_asahi_submit *submit, unsigned command_count,
                     unsigned ring_idx, const uint64_t prior_base[2],
                     bool chunk_timelines, uint64_t first_chunk_point,
-                    struct hk_frame_anatomy_submit *anatomy)
+                    struct hk_frame_anatomy_submit *anatomy,
+                    struct hk_cmd_pending *pending)
 {
    uint8_t *cmdbuf = (uint8_t *)(uintptr_t)submit->cmdbuf;
    uint32_t offs = 0;
@@ -563,6 +637,7 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
       }
 
       /* We need to fix up the barriers since barriers are ioctl-relative */
+      uint16_t slice_before[2] = {0, 0};
       for (unsigned scan = base_offs; scan < offs;) {
          struct drm_asahi_cmd_header *cmd = (void *)(cmdbuf + scan);
          scan += sizeof(*cmd) + cmd->size;
@@ -570,6 +645,16 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
          if (cmd->cmd_type != DRM_ASAHI_CMD_RENDER &&
              cmd->cmd_type != DRM_ASAHI_CMD_COMPUTE)
             continue;
+
+         /* A serialized command waits for every earlier one: the commands
+          * before it in this ioctl, or with none, all earlier ioctls (0).
+          * Its whole-submit index may not fit in 16 bits. */
+         if (queue->sync.serialize && !queue->sync.exact_prior) {
+            cmd->vdm_barrier = slice_before[0];
+            cmd->cdm_barrier = slice_before[1];
+            slice_before[cmd->cmd_type == DRM_ASAHI_CMD_COMPUTE]++;
+            continue;
+         }
 
          if (!hk_drm_rebase_prior(cmd, cmd + 1, submitted_vdm,
                                   submitted_cdm, prior_base,
@@ -623,7 +708,7 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
 
       if (chunk_timelines)
          last_attempted_point = chunk_signal->timeline_value;
-      VkResult result = queue_submit_single(dev, &submit_ioctl, ring_idx);
+      VkResult result = queue_submit_single(dev, &submit_ioctl, ring_idx, pending);
       if (result != VK_SUCCESS) {
          if (chunk_timelines)
             queue->drm.timeline_value = last_attempted_point;
@@ -689,9 +774,15 @@ hk_flush_bind(struct hk_bind_builder *b)
     * so we don't leave a gap.
     */
    struct drm_asahi_gem_bind_op op;
-   if (!b->mem) {
+   if (!b->mem && b->buffer && hk_sparse_buffer_unmapped(&b->dev->dev)) {
       op = (struct drm_asahi_gem_bind_op){
-         .handle = b->dev->dev.scratch_bo->uapi_handle,
+         .flags = DRM_ASAHI_BIND_UNBIND,
+         .addr = va_addr,
+         .range = b->size,
+      };
+   } else if (!b->mem) {
+      op = (struct drm_asahi_gem_bind_op){
+         .handle = b->dev->sparse_fill->uapi_handle,
          .flags = DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE |
                   agx_fill_bind_flags(&b->dev->dev),
          .addr = b->va->addr + b->resourceOffset,
@@ -715,6 +806,7 @@ hk_flush_bind(struct hk_bind_builder *b)
 
    if (!b->mem) {
       op.handle = b->dev->dev.zero_bo->uapi_handle;
+      op.flags = DRM_ASAHI_BIND_READ | agx_fill_bind_flags(&b->dev->dev);
    }
 
    util_dynarray_append(&b->binds, op);
@@ -725,12 +817,13 @@ hk_flush_bind(struct hk_bind_builder *b)
 static VkResult
 hk_sparse_buffer_map_commit(struct hk_bind_builder *b)
 {
-   if (!b->buffer || !b->buffer->sparse_map)
+   if (!b->buffer || (!b->buffer->sparse_map &&
+                      !hk_buffer_in_physical_sparse_map(b->dev, b->buffer)))
       return VK_SUCCESS;
 
    struct hk_sparse_buffer_map_header *header =
-      agx_bo_map(b->buffer->sparse_map);
-   uint32_t *map = (uint32_t *)(header + 1);
+      b->buffer->sparse_map ? agx_bo_map(b->buffer->sparse_map) : NULL;
+   uint32_t *map = header ? (uint32_t *)(header + 1) : NULL;
    struct drm_asahi_gem_bind_op *ops = b->binds.data;
    const unsigned count = util_dynarray_num_elements(
       &b->binds, struct drm_asahi_gem_bind_op);
@@ -742,14 +835,15 @@ hk_sparse_buffer_map_commit(struct hk_bind_builder *b)
       const uint64_t first = (op->addr - b->va->addr) / AIL_PAGESIZE;
       const uint64_t pages = DIV_ROUND_UP(op->range, AIL_PAGESIZE);
       const bool resident =
-         op->handle != b->dev->dev.scratch_bo->uapi_handle;
+         op->handle != b->dev->sparse_fill->uapi_handle &&
+         !(op->flags & DRM_ASAHI_BIND_UNBIND);
 
       VkResult result = hk_update_physical_sparse_map(
          b->dev, op->addr, op->range, !resident);
       if (result != VK_SUCCESS)
          return result;
 
-      for (uint64_t page = 0; page < pages; ++page) {
+      for (uint64_t page = 0; map && page < pages; ++page) {
          if (first + page >= b->buffer->sparse_map_entries)
             break;
 
@@ -762,8 +856,9 @@ hk_sparse_buffer_map_commit(struct hk_bind_builder *b)
       }
    }
 
-   agx_bo_assert_range(b->buffer->sparse_map, 0,
-                              b->buffer->sparse_map->size);
+   if (b->buffer->sparse_map)
+      agx_bo_assert_range(b->buffer->sparse_map, 0,
+                          b->buffer->sparse_map->size);
 
    return VK_SUCCESS;
 }
@@ -793,7 +888,7 @@ hk_sparse_image_map_commit(struct hk_bind_builder *b)
       const uint64_t resource_offset = op->addr - b->va->addr;
       const uint64_t size_page = ail_bytes_to_pages(op->range);
       const bool enabled =
-         op->handle != b->dev->dev.scratch_bo->uapi_handle;
+         op->handle != b->dev->sparse_fill->uapi_handle;
 
       for (uint64_t offs_page = 0; offs_page < size_page; ++offs_page) {
          const uint64_t target_page =
@@ -1062,11 +1157,36 @@ hk_sparse_image_bind_memory(struct hk_device *device,
    return hk_bind_builder_finish(&b);
 }
 
-static VkResult
+VkResult
 hk_queue_submit_bind_sparse_memory(struct hk_device *device,
                                    struct vk_queue_submit *submission)
 {
    assert(submission->command_buffer_count == 0);
+
+   /* VM_BIND and residency metadata updates execute on the CPU. The common
+    * queue runtime only waits for input fences to be submitted; passing those
+    * fences to a later GPU submit cannot order these host updates. On M5,
+    * wait for completion before changing any mapping: no GPU work there waits
+    * on the host (event waits don't poll, see hk_event_wait_polls), so inputs
+    * that are already submitted complete without host action. Where the GPU
+    * polls for a host vkSetEvent (G17P), this wait could block the thread
+    * that would set it. Bound each wait so device loss can cancel it even
+    * when a semaphore will never become signalled.
+    */
+   while (agx_chip_g17_m5(device->dev.chip)) {
+      VkResult result = vk_device_check_status(&device->vk);
+      if (result != VK_SUCCESS)
+         return result;
+
+      result = vk_sync_wait_many(&device->vk, submission->wait_count,
+                                 submission->waits, VK_SYNC_WAIT_COMPLETE,
+                                 os_time_get_absolute_timeout(100000000));
+      if (result == VK_TIMEOUT)
+         continue;
+      if (result != VK_SUCCESS)
+         return result;
+      break;
+   }
 
    for (uint32_t i = 0; i < submission->buffer_bind_count; ++i) {
       VkResult result =
@@ -1112,22 +1232,106 @@ hk_sparse_submission_updates_sstt(const struct vk_queue_submit *submission)
    return false;
 }
 
-static VkResult
-hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue)
+/* The render stages (HK_RENDER_RQ_*) in which a command buffer runs ray
+ * queries, each of which needs its render ray-query scratch reservation.
+ */
+static unsigned
+hk_cmd_buffer_needs_render_rq(struct hk_cmd_buffer *cmdbuf)
 {
-   if (queue->drm.id != UINT32_MAX)
-      return VK_SUCCESS;
+   unsigned stages = 0;
 
-   /* The common queue submit path serializes submissions to this queue.
-    * A logical queue, including one used only for host synchronization, does
-    * not need a kernel scheduling context until it actually submits work. */
-   const uint64_t layouts[2] = {
-      dev->gen1_native_graphics_rq ? hk_gen1_ray_query_scs_layout(dev) : 0,
-      dev->gen1_native_fragment_rq ? hk_gen1_ray_query_scs_layout(dev) : 0};
-   queue->drm.id = agx_create_command_queue_with_render_scs(
-      &dev->dev, (enum drm_asahi_priority)(queue->drm.virt_ring_idx - 1), layouts);
-   if (queue->drm.id != UINT32_MAX)
+   list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+      if (cs->type != HK_CS_VDM)
+         continue;
+      if (cs->gen1_native_vertex_rq)
+         stages |= HK_RENDER_RQ_VERTEX;
+      if (cs->gen1_native_fragment_rq)
+         stages |= HK_RENDER_RQ_FRAGMENT;
+   }
+
+   return stages;
+}
+
+static unsigned
+hk_submit_needs_render_rq(const struct vk_queue_submit *submit)
+{
+   unsigned stages = 0;
+
+   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
+      stages |= hk_cmd_buffer_needs_render_rq(
+         (struct hk_cmd_buffer *)submit->command_buffers[i]);
+   }
+
+   return stages;
+}
+
+/* Create the kernel queue for the first GPU submission, or replace it with
+ * one that reserves render ray-query scratch when the first render using ray
+ * queries in a stage the queue does not reserve yet arrives. Only the stages
+ * used so far are reserved: on a 40-core G17P both stages together need a
+ * contiguous ~359 MiB render free list, which the kernel's lower window may
+ * not hold, while one stage needs ~203 MiB. *replaced says whether a kernel
+ * queue was replaced: the caller then orders the submission after every
+ * earlier one on the queue timeline, and queue-local command ordinals start
+ * again.
+ */
+static void hk_queue_restart_sync(struct hk_queue *queue);
+
+static VkResult
+hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
+                    unsigned render_rq, bool *replaced)
+{
+   *replaced = false;
+   if (!dev->gen1_native_graphics_rq)
+      render_rq &= ~HK_RENDER_RQ_VERTEX;
+   if (!dev->gen1_native_fragment_rq)
+      render_rq &= ~HK_RENDER_RQ_FRAGMENT;
+   if (queue->drm.id != UINT32_MAX && !(render_rq & ~queue->drm.render_rq))
       return VK_SUCCESS;
+   /* A replacement keeps every stage the queue reserved. */
+   render_rq |= queue->drm.render_rq;
+
+   /* Destroy the kernel queue being replaced before creating the new one,
+    * once its submitted work is complete. Until then the kernel keeps its
+    * compute pool and render free list, and on a 40-core G17P the lower
+    * window cannot also hold the new queue's: the submission that needs the
+    * new reservation would wait in the kernel for memory only this queue's
+    * destruction frees. This waits at most once per stage the queue adds.
+    */
+   const bool had_queue = queue->drm.id != UINT32_MAX;
+   if (had_queue) {
+      if (drmSyncobjTimelineWait(dev->dev.fd, &queue->drm.syncobj,
+                                 &queue->drm.timeline_value, 1, INT64_MAX,
+                                 DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL))
+         return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
+                          "Waiting for the replaced kernel queue failed: %s",
+                          strerror(errno));
+      agx_destroy_command_queue(&dev->dev, queue->drm.id);
+      queue->drm.id = UINT32_MAX;
+   }
+
+   /* M5 and G17P admit GPU work at the API entrypoint, before semaphore
+    * payloads move (hk_queue_admits_at_entry). Other devices retain admission
+    * in the serialized driver callback. Host-only synchronization does not
+    * need a kernel scheduling context. */
+   const uint64_t layouts[2] = {
+      (render_rq & HK_RENDER_RQ_VERTEX) ? hk_gen1_ray_query_scs_layout(dev) : 0,
+      (render_rq & HK_RENDER_RQ_FRAGMENT) ? hk_gen1_ray_query_scs_layout(dev) : 0};
+   const uint32_t id = agx_create_command_queue_with_render_scs(
+      &dev->dev, (enum drm_asahi_priority)(queue->drm.virt_ring_idx - 1), layouts);
+   if (id != UINT32_MAX) {
+      *replaced = had_queue;
+      queue->drm.id = id;
+      queue->drm.render_rq = render_rq;
+      return VK_SUCCESS;
+   }
+
+   /* The replaced queue's work is complete, so a later queue starts like a
+    * first one. Keep the stages it reserved for that queue. */
+   if (had_queue) {
+      queue->drm.render_rq = render_rq;
+      hk_queue_restart_sync(queue);
+   }
 
    const int error = errno;
    const VkResult result =
@@ -1137,6 +1341,218 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue)
       VK_ERROR_INITIALIZATION_FAILED;
    return vk_errorf(dev, result, "DRM_IOCTL_ASAHI_QUEUE_CREATE failed: %s",
                     strerror(error));
+}
+
+/* Queue-local ordering state restarts with a new kernel queue. The
+ * submission that starts it waits for every earlier submission, so nothing
+ * recorded before it can still be pending.
+ */
+static void
+hk_queue_restart_sync(struct hk_queue *queue)
+{
+   const struct hk_sync_queue old = queue->sync;
+   memset(&queue->sync, 0, sizeof(queue->sync));
+   queue->sync.exact_prior = old.exact_prior;
+   queue->sync.serialize = old.serialize;
+   queue->sync.stage_overlap = old.stage_overlap;
+   queue->sync.precise_tile_evictions = old.precise_tile_evictions;
+   queue->sync.direct_single_footprints = old.direct_single_footprints;
+   /* The submission that starts it waits for all sibling work too. */
+   memset(queue->sib.submitted[0], 0, sizeof(queue->sib.submitted[0]));
+   queue->sib.used = false;
+}
+
+/* Kernel queues come from a machine-wide pool shared by every client, so
+ * creating one can be refused while other clients hold the pool.
+ */
+static bool
+hk_queue_admits_at_entry(const struct hk_device *dev)
+{
+   return agx_chip_g17_m5(dev->dev.chip) || dev->dev.chip == AGX_CHIP_G17P;
+}
+
+/* Admission must precede the common runtime's semaphore payload moves and
+ * the first submission of a batch. Failing inside driver_submit is too late
+ * to return a retryable allocation error. Keep admission lazy so unused Vulkan
+ * queues do not consume the device-wide pool of kernel contexts.
+ */
+static VkResult
+hk_queue_admit(struct hk_queue *queue, unsigned render_rq)
+{
+   /* Admission and callbacks must use the same backing queue and lock. */
+   if (queue->vk.real_queue)
+      queue = container_of(queue->vk.real_queue, struct hk_queue, vk);
+   simple_mtx_lock(&queue->vk.lock);
+   /* Admission only creates a missing kernel queue, with the render ray-query
+    * scratch the call needs (G17P), so a first submission that needs it does
+    * not create a queue only to replace it. Replacing an existing queue
+    * stays in the driver callback, which orders the new queue after the old
+    * one's work. M5 renders never reserve ray-query scratch.
+    */
+   bool replaced;
+   VkResult result = hk_queue_ensure_drm(
+      hk_queue_device(queue), queue,
+      queue->drm.id == UINT32_MAX ? render_rq : 0, &replaced);
+   assert(!replaced);
+   /* Only allocation errors are retryable here. Keep the existing lost-device
+    * behavior for other failures; device-creation errors such as NOT_PERMITTED
+    * and INITIALIZATION_FAILED are not valid QueueSubmit return values.
+    */
+   if (result != VK_SUCCESS && result != VK_ERROR_OUT_OF_HOST_MEMORY &&
+       result != VK_ERROR_OUT_OF_DEVICE_MEMORY)
+      result = vk_queue_set_lost(&queue->vk, "Kernel queue admission failed");
+   simple_mtx_unlock(&queue->vk.lock);
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
+                const VkSubmitInfo2 *pSubmits, VkFence fence)
+{
+   VK_FROM_HANDLE(vk_queue, vk_queue, _queue);
+   struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
+   struct hk_device *dev = hk_queue_device(queue);
+
+   if (hk_queue_admits_at_entry(dev)) {
+      if (vk_device_is_lost(&dev->vk))
+         return VK_ERROR_DEVICE_LOST;
+
+      const bool rq_capable =
+         dev->gen1_native_graphics_rq || dev->gen1_native_fragment_rq;
+      bool needs_queue = false;
+      unsigned render_rq = 0;
+      for (uint32_t i = 0; i < submitCount; i++) {
+         for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
+            VK_FROM_HANDLE(hk_cmd_buffer, cmd,
+                           pSubmits[i].pCommandBufferInfos[j].commandBuffer);
+            if (list_is_empty(&cmd->control_streams))
+               continue;
+            needs_queue = true;
+            if (rq_capable)
+               render_rq |= hk_cmd_buffer_needs_render_rq(cmd);
+         }
+      }
+      if (needs_queue) {
+         VkResult result = hk_queue_admit(queue, render_rq);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+   }
+
+   return vk_common_QueueSubmit2(_queue, submitCount, pSubmits, fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
+                   const VkBindSparseInfo *pBindInfo, VkFence fence)
+{
+   VK_FROM_HANDLE(vk_queue, vk_queue, _queue);
+   struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
+   struct hk_device *dev = hk_queue_device(queue);
+
+   if (hk_queue_admits_at_entry(dev)) {
+      if (vk_device_is_lost(&dev->vk))
+         return VK_ERROR_DEVICE_LOST;
+
+      /* Sparse image changes may require a GPU maintenance command. Reserve
+       * its queue before any bind or semaphore operation in this API call.
+       */
+      for (uint32_t i = 0; i < bindInfoCount; i++) {
+         if (pBindInfo[i].imageOpaqueBindCount || pBindInfo[i].imageBindCount) {
+            VkResult result = hk_queue_admit(queue, 0);
+            if (result != VK_SUCCESS)
+               return result;
+            break;
+         }
+      }
+   }
+
+   return vk_common_QueueBindSparse(_queue, bindInfoCount, pBindInfo, fence);
+}
+
+/* A submission a sibling kernel queue may run (hk_queue::sib): its streams
+ * dispatch at least sib.min_threads threads each (or only internal work), it
+ * depends on no earlier submission (every stream's prior is zero or names a
+ * command of this submission, see resolve_one) and holds only plain compute
+ * streams, without query access, timestamps, scratch or ray queries.
+ * Anything that needs the primary kernel queue's own state stays there. */
+static bool
+hk_sibling_eligible(struct hk_device *dev, const struct hk_queue *queue,
+                    const struct vk_queue_submit *submit,
+                    const uint64_t base[HK_SYNC_NUM_SQ], unsigned command_count,
+                    bool kernel_cumulative)
+{
+   if (submit->buffer_bind_count || submit->image_bind_count ||
+       submit->image_opaque_bind_count ||
+       command_count > max_commands_per_submit(dev) ||
+       (submit->signal_count && !kernel_cumulative) ||
+       (dev->dev.debug & (AGX_DBG_SYNC | AGX_DBG_TRACE)))
+      return false;
+
+   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
+      struct hk_cmd_buffer *cmdbuf =
+         (struct hk_cmd_buffer *)submit->command_buffers[i];
+
+      list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         /* Overlapping kicks of a few threads costs more in ordering than it
+          * gains (a 32-thread dispatch stream at depth 4 ran 13% slower). */
+         if (cs->sib_threads && !cs->sib_indirect &&
+             cs->sib_threads < queue->sib.min_threads)
+            return false;
+         if (cs->type != HK_CS_CDM || cs->query_access ||
+             cs->timestamp.start.handle || cs->timestamp.end.handle ||
+             cs->scratch.cs.main || cs->scratch.cs.preamble ||
+             cs->gen1_native_rq)
+            return false;
+
+         /* A zero barrier names every command of earlier ioctls. */
+         for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+            if ((cs->sync.prior[sq] && cs->sync.prior[sq] <= base[sq]) ||
+                cs->sync.barrier[sq] == 0)
+               return false;
+         }
+      }
+   }
+
+   return true;
+}
+
+/* Whether a sibling kernel queue may take the next eligible submission: at
+ * least sib.min_in_flight earlier submissions of this queue are still in
+ * flight (submitted_point is the queue timeline's last point before this
+ * submission). Two kicks run at once on sibling queues, so each takes about
+ * twice as long; with only one other submission in flight both then finish
+ * together and the GPU idles for the whole completion-to-resubmit round trip
+ * (a depth-2 compute stream ran 19% slower with siblings on the M4 Pro).
+ * With work queued behind them, the overlap fills the launch and drain gaps
+ * between kicks instead. */
+static bool
+hk_sibling_deep(struct hk_device *dev, struct hk_queue *queue,
+                uint64_t submitted_point)
+{
+   uint64_t done = 0;
+
+   if (!queue->sib.min_in_flight)
+      return true;
+   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1))
+      return false;
+   return submitted_point >= done + queue->sib.min_in_flight;
+}
+
+/* A stream's prior in the ordinals of the kernel queue it is sent to: a
+ * command of this submission keeps its offset from the submission's first
+ * ordinal; an earlier submission's command becomes every earlier command of
+ * that kernel queue, and the submission also waits for the siblings' work
+ * (*earlier). */
+static inline uint64_t
+hk_sibling_prior(uint64_t prior, uint64_t base, uint64_t kq_base, bool *earlier)
+{
+   if (prior == 0)
+      return 0;
+   if (prior > base)
+      return kq_base + (prior - base);
+   *earlier = true;
+   return kq_base;
 }
 
 static VkResult
@@ -1183,9 +1599,16 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       return queue_submit_empty(dev, queue, submit);
    }
 
-   VkResult queue_result = hk_queue_ensure_drm(dev, queue);
+   bool replaced;
+   VkResult queue_result = hk_queue_ensure_drm(
+      dev, queue, hk_submit_needs_render_rq(submit), &replaced);
    if (queue_result != VK_SUCCESS)
       return queue_result;
+
+   /* The new kernel queue starts after all work of the one it replaces. */
+   const uint64_t replaced_point = queue->drm.timeline_value;
+   if (replaced)
+      hk_queue_restart_sync(queue);
 
    const uint64_t prior_base[HK_SYNC_NUM_SQ] = {
       queue->sync.submitted[HK_SYNC_VDM], queue->sync.submitted[HK_SYNC_CDM],
@@ -1220,8 +1643,16 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    queue->drm.timeline_value += point_count;
    unsigned wait_count = 0;
    struct drm_asahi_sync *syncs =
-      alloca((submit->wait_count + kernel_signal_count + 1) *
+      alloca((submit->wait_count + kernel_signal_count + 3) *
              sizeof(struct drm_asahi_sync));
+
+   if (replaced) {
+      syncs[wait_count++] = (struct drm_asahi_sync){
+         .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
+         .handle = queue->drm.syncobj,
+         .timeline_value = replaced_point,
+      };
+   }
 
    for (unsigned i = 0; i < submit->wait_count; ++i) {
       /* The kernel rejects the submission if we try to wait on the same
@@ -1322,6 +1753,19 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
 
    if (flush_sstt) {
       assert(queue->g17p_sstt_flush_bo);
+      if (agx_chip_g17_m5(dev->dev.chip) &&
+          (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) {
+         /* This stream flushes metadata without dispatching a shader. Declare
+          * its empty resource list, as for other flush-only M5 streams.
+          */
+         const struct drm_asahi_cmd_header resources = {
+            .cmd_type = DRM_ASAHI_SET_COMPUTE_RESOURCES,
+            .size = 0,
+            .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
+            .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
+         };
+         util_dynarray_append(&payload, resources);
+      }
       struct drm_asahi_cmd_header header = agx_cmd_header(true, 0, 0);
       const struct drm_asahi_cmd_compute_with_prior cmd = {
          .legacy = {
@@ -1357,7 +1801,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
     * A kernel advertising per-command waits needs no such execution edge.
     * A serialized queue without exact priors replaces every field below
     * (hk_drm_serialize_prefix), and keeps no ordinals, so it skips this. */
-   const bool resolve = !queue->sync.serialize || queue->sync.exact_prior;
+   const bool resolve = !queue->sync.serialize || queue->sync.exact_prior ||
+                        queue->sync.stage_overlap;
    if (resolve && !hk_sync_resolve_submit(queue,
                           (struct hk_cmd_buffer *const *)submit->command_buffers,
                           submit->command_buffer_count, flush_sstt,
@@ -1369,6 +1814,38 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       if (unlikely(anatomy))
          hk_frame_anatomy_end_submit(anatomy, dev, queue, VK_ERROR_DEVICE_LOST);
       return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
+   }
+
+   /* Sibling kernel queues (hk_queue::sib): an eligible submission takes the
+    * next kernel queue in turn. Once a sibling has run work, the primary's
+    * ordinals differ from sync.submitted: priors are then rewritten for the
+    * kernel queue they go to (hk_sibling_prior), and a submission that
+    * depends on an earlier one also waits for the latest sibling point. */
+   unsigned sib_target = 0;
+   const bool sib_remap = queue->sib.count > 1 && queue->sib.used;
+   bool sib_earlier = false;
+   if (queue->sib.count > 1 && !replaced && !flush_sstt && !unlikely(anatomy) &&
+       hk_sibling_eligible(dev, queue, submit, prior_base, command_count,
+                           kernel_cumulative) &&
+       hk_sibling_deep(dev, queue, first_chunk_point - 1)) {
+      sib_target = queue->sib.next;
+      queue->sib.next = (queue->sib.next + 1) % queue->sib.count;
+      if (sib_target && queue->sib.id[sib_target] == UINT32_MAX) {
+         queue->sib.id[sib_target] = agx_create_command_queue(
+            &dev->dev, (enum drm_asahi_priority)(queue->drm.virt_ring_idx - 1));
+         if (queue->sib.id[sib_target] == UINT32_MAX) {
+            /* Out of kernel queues: keep the ones already created. */
+            queue->sib.count = sib_target;
+            queue->sib.next = 0;
+            sib_target = 0;
+         }
+      }
+   }
+   const bool sib_rewrite = sib_remap || sib_target != 0;
+   uint64_t kq_base[HK_SYNC_NUM_SQ] = {prior_base[0], prior_base[1]};
+   if (sib_rewrite) {
+      kq_base[HK_SYNC_VDM] = queue->sib.submitted[sib_target][HK_SYNC_VDM];
+      kq_base[HK_SYNC_CDM] = queue->sib.submitted[sib_target][HK_SYNC_CDM];
    }
 
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
@@ -1393,6 +1870,15 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
          uint64_t command_prior[HK_SYNC_NUM_SQ] = {
             cs->sync.prior[HK_SYNC_VDM], cs->sync.prior[HK_SYNC_CDM],
          };
+         if (sib_rewrite) {
+            for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+               command_prior[sq] = hk_sibling_prior(
+                  command_prior[sq], prior_base[sq], kq_base[sq], &sib_earlier);
+               /* A zero barrier names this kernel queue's earlier ioctls. */
+               if (cs->sync.barrier[sq] == 0)
+                  sib_earlier = true;
+            }
+         }
          /* The same recording can occur twice in a merged submit (for
           * example synchronization2.basic.event.none_set_reset). Assign
           * classic prefixes here, per emitted occurrence. Storing them in
@@ -1475,25 +1961,33 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                cmd.intersection_first=1;cmd.intersection_count=112;
                cmd.intersection_default_program=UINT64_C(0x10010020000);
                cmd.intersection_default_control=UINT64_C(0x16000000000);
-            } else if (cs->m5_native_rq) {
-               header.size = sizeof(cmd);
-               cmd.scs_layout = dev->m5_rq_instances
-                  ? ((debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_PROBE", false) || debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_API", false))
-                     ? UINT64_C(0x01140000600100e8) /* 276-entry IFT50 tail */
-                     : UINT64_C(0x00480000600100e8))
-                  : UINT64_C(0x0028000060000070);
-               cmd.cdm_auxiliary_allocation = 14;
-               cmd.intersection_pool = dev->m5_rq_ift->va->addr;
-               cmd.intersection_pool_bytes = 0x8000;
-               cmd.intersection_first = 1;
-               cmd.intersection_count = 112;
-               cmd.intersection_default_program = dev->m5_rq_default_program;
-               cmd.intersection_default_control = dev->m5_rq_default_control;
             }
             if (queue->sync.exact_prior) {
                header.size = sizeof(cmd);
                cmd.prior_vdm = command_prior[HK_SYNC_VDM];
                cmd.prior_cdm = command_prior[HK_SYNC_CDM];
+            }
+            if (dev->dev.chip == AGX_CHIP_G18G) {
+               /* G18 kernels consume the versioned resource suffix on
+                * every compute command (agx_batch.c's extended payload).
+                * The G18 kernel never advertises
+                * DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS, so
+                * queue->sync.exact_prior is always false here and the
+                * legacy (non-prior) command carries everything the G18
+                * UAPI accepts (w7Q PR-10 finding 4). */
+               struct drm_asahi_cmd_compute_g18 g18 = {
+                  .base.legacy = cmd.legacy,
+                  .resources = cs->g18_compute_resources,
+               };
+               g18.base.legacy.flags |= DRM_ASAHI_COMPUTE_G18_RESOURCES;
+               g18.resources.version = 1;
+               struct drm_asahi_cmd_header g18_header = header;
+               g18_header.size = sizeof(g18);
+               util_dynarray_append(&payload, g18_header);
+               util_dynarray_append_array(&payload, uint8_t, &g18,
+                                          sizeof(g18));
+               nr_cdm++;
+               continue;
             }
             util_dynarray_append(&payload, header);
             util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
@@ -1550,13 +2044,47 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             struct drm_asahi_cmd_render_with_prior cmd = {0};
             asahi_fill_vdm_command(dev, cs, &cmd.legacy);
 
+            /* M5: the vertex half's own render and compute prefixes, when
+             * they are narrower than the whole render's, so its tiling can
+             * overlap the fragment work of the renders only its fragment
+             * half depends on. Supersedes the single-subqueue forms below. */
+            const bool stage_prefixes =
+               agx_chip_g17_m5(dev->dev.chip) && !queue->sync.serialize &&
+               queue->sync.exact_prior &&
+               (dev->dev.params.features &
+                DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES) &&
+               cs->sync.ta_split;
+            if (stage_prefixes)
+               cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
+
+            /* G17P: a render whose vertex half depends on less compute work
+             * than its fragment half (image-only producers ordered by image
+             * barriers, fragment-only destinations) goes as a staged render:
+             * the kernel orders its tiling kick after the narrower prefixes
+             * alone, so its vertex work overlaps compute work that only its
+             * fragment half waits for. Every other render keeps the forms
+             * below, which the kernel can publish directly. */
+            const bool g17p_staged =
+               dev->dev.chip == AGX_CHIP_G17P && !queue->sync.serialize &&
+               queue->sync.exact_prior &&
+               (dev->dev.params.features &
+                DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2) &&
+               cs->sync.ta_split &&
+               (cs->sync.barrier_ta[HK_SYNC_CDM] !=
+                   cs->sync.barrier[HK_SYNC_CDM] ||
+                cs->sync.prior_ta[HK_SYNC_CDM] != cs->sync.prior[HK_SYNC_CDM]);
+            if (g17p_staged) {
+               cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
+               perf_debug_dev(&dev->dev, "G17P staged render");
+            }
+
             /* The render's vertex half depends on no earlier render while its
              * fragment half does (hk_sync: every render dependency targets
              * fragment or attachment work alone): let the kernel order only
              * the fragment half after them, so this render's vertex work can
              * overlap their fragment work. Compute dependencies keep ordering
              * the vertex half either way. */
-            if (!queue->sync.serialize &&
+            if (!stage_prefixes && !g17p_staged && !queue->sync.serialize &&
                 (dev->dev.params.features &
                  DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
                 cs->sync.ta_split &&
@@ -1566,6 +2094,43 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                  cs->sync.prior[HK_SYNC_VDM] != 0))
                cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
 
+            /* Serialized queue (G13/G14): the header keeps both engines'
+             * whole prefixes, but when the recorded dependencies show that
+             * the vertex half reads nothing an earlier render produced, the
+             * kernel may order only the fragment half after the render
+             * prefix. The fragment queue keeps pass order and each
+             * fragment half still waits for its own vertex half. */
+            if (queue->sync.stage_overlap &&
+                (cs->sync.ta_split
+                    ? cs->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+                         cs->sync.prior_ta[HK_SYNC_VDM] == 0
+                    : cs->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+                         cs->sync.prior[HK_SYNC_VDM] == 0))
+               cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+
+            /* G17P: a vertex half that still names earlier renders can use
+             * the fragment-only barriers too when the order of tiling kicks
+             * already covers what it names. A staged render takes neither
+             * the flag nor part in ta_cover: its tiling waits only for its
+             * narrower tiling prefix. */
+            if (dev->dev.chip == AGX_CHIP_G17P && !g17p_staged &&
+                !queue->sync.serialize && queue->sync.exact_prior &&
+                (dev->dev.params.features &
+                 DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)) {
+               const uint64_t base = prior_base[HK_SYNC_VDM];
+               const uint64_t whole = hk_drm_render_prefix(
+                  base, cs->sync.barrier[HK_SYNC_VDM],
+                  cs->sync.prior[HK_SYNC_VDM]);
+               const uint64_t vertex = hk_drm_render_prefix(
+                  base, cs->sync.barrier_ta[HK_SYNC_VDM],
+                  cs->sync.prior_ta[HK_SYNC_VDM]);
+               if (hk_drm_g17p_tiling_ordered(
+                      base, nr_vdm, whole, vertex,
+                      cmd.legacy.flags & DRM_ASAHI_RENDER_FRAGMENT_BARRIERS,
+                      &queue->sync.ta_cover))
+                  cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+            }
+
             /* Likewise for compute: when the vertex half depends on less
              * compute work than the fragment half (image-only producers
              * ordered by image barriers, fragment-only destinations), the
@@ -1573,6 +2138,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             STATIC_ASSERT(sizeof(struct drm_asahi_cmd_render_with_stage_prior) ==
                           sizeof(struct drm_asahi_cmd_render_with_prior) + 16);
             const bool stage_cdm =
+               !stage_prefixes &&
                agx_chip_g17_m5(dev->dev.chip) && queue->sync.exact_prior &&
                (dev->dev.params.features &
                 DRM_ASAHI_FEATURE_COMPUTE_STAGE_BARRIERS) &&
@@ -1586,31 +2152,48 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                hk_frame_anatomy_render(anatomy, dev, cs, &cmd.legacy, i,
                                        nr_vdm + nr_cdm, payload.size);
             header.size = hk_drm_render_command_size(
-               agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip),
+               agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
+                  dev->dev.chip == AGX_CHIP_G18G,
                queue->sync.exact_prior);
             if (queue->sync.exact_prior) {
                cmd.prior_vdm = command_prior[HK_SYNC_VDM];
                cmd.prior_cdm = command_prior[HK_SYNC_CDM];
             }
-            if (!agx_chip_g17_m5(dev->dev.chip) &&
+            STATIC_ASSERT(sizeof(struct drm_asahi_cmd_render_with_ray_query) == 448);
+            STATIC_ASSERT(sizeof(struct drm_asahi_cmd_render_staged) == 480);
+            if (g17p_staged) {
+               struct drm_asahi_cmd_render_staged staged = {
+                  .render = {.legacy = cmd},
+                  .stage_prefixes = {
+                     .ta_cdm_barrier = cs->sync.barrier_ta[HK_SYNC_CDM],
+                     .ta_prior_cdm = cs->sync.prior_ta[HK_SYNC_CDM],
+                     .ta_vdm_barrier = cs->sync.barrier_ta[HK_SYNC_VDM],
+                     .ta_prior_vdm = cs->sync.prior_ta[HK_SYNC_VDM],
+                  },
+               };
+               hk_gen1_render_ray_query_stages(dev, cs, staged.render.ray_query);
+               header.size = sizeof(staged);
+               util_dynarray_append(&payload, header);
+               util_dynarray_append_array(&payload, uint8_t, &staged, header.size);
+            } else if (!agx_chip_g17_m5(dev->dev.chip) &&
                 (cs->gen1_native_fragment_rq || cs->gen1_native_vertex_rq)) {
                struct drm_asahi_cmd_render_with_ray_query extended = {.legacy = cmd};
-               for (unsigned stage = 0; stage < 2; ++stage) {
-                  if (!(stage ? cs->gen1_native_fragment_rq
-                              : cs->gen1_native_vertex_rq))
-                     continue;
-                  struct drm_asahi_render_ray_query_stage *rt = &extended.ray_query[stage];
-                  rt->scs_layout = hk_gen1_ray_query_scs_layout(dev);
-                  rt->intersection_pool = dev->gen1_rq_ift->va->addr;
-                  rt->intersection_pool_bytes = 0x4000;
-                  rt->intersection_first = 1;
-                  rt->intersection_count = 112;
-                  rt->intersection_default = UINT64_C(0x10010020000);
-                  rt->intersection_default_control = UINT64_C(0x16000000000);
-               }
+               hk_gen1_render_ray_query_stages(dev, cs, extended.ray_query);
                header.size = sizeof(extended);
                util_dynarray_append(&payload, header);
                util_dynarray_append_array(&payload, uint8_t, &extended, header.size);
+            } else if (stage_prefixes) {
+               const struct drm_asahi_cmd_render_with_stage_prefixes staged = {
+                  .legacy = cmd,
+                  .ta_cdm_barrier = cs->sync.barrier_ta[HK_SYNC_CDM],
+                  .ta_prior_cdm = cs->sync.prior_ta[HK_SYNC_CDM],
+                  .ta_vdm_barrier = cs->sync.barrier_ta[HK_SYNC_VDM],
+                  .ta_prior_vdm = cs->sync.prior_ta[HK_SYNC_VDM],
+               };
+               header.size = sizeof(staged);
+               util_dynarray_append(&payload, header);
+               util_dynarray_append_array(&payload, uint8_t, &staged,
+                                          header.size);
             } else if (stage_cdm) {
                const struct drm_asahi_cmd_render_with_stage_prior staged = {
                   .legacy = cmd,
@@ -1637,9 +2220,23 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       agxdecode_next_frame();
    }
 
+   /* Work that depends on an earlier submission also waits for the
+    * siblings' (only a primary submission can). A replaced kernel queue's
+    * first submission already waits for every earlier point. */
+   if (sib_remap && sib_earlier && !replaced) {
+      assert(sib_target == 0);
+      memmove(&syncs[wait_count + 1], &syncs[wait_count],
+              (kernel_signal_count + 1) * sizeof(*syncs));
+      syncs[wait_count++] = (struct drm_asahi_sync){
+         .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
+         .handle = queue->drm.syncobj,
+         .timeline_value = queue->sib.last_point,
+      };
+   }
+
    struct drm_asahi_submit submit_ioctl = {
       .flags = 0,
-      .queue_id = queue->drm.id,
+      .queue_id = sib_target ? queue->sib.id[sib_target] : queue->drm.id,
       .in_sync_count = wait_count,
       .out_sync_count = kernel_signal_count + 1,
       .cmdbuf_size = payload.size,
@@ -1651,16 +2248,37 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    if (unlikely(anatomy))
       hk_frame_anatomy_prepare(anatomy, dev, payload.data, payload.size);
 
+   struct hk_cmd_pending *pending = NULL;
+   if (agx_chip_g17_m5(dev->dev.chip) && !dev->dev.is_virtio) {
+      unsigned chunks = 1 + (command_count - 1) / max_commands_per_submit(dev);
+      VkResult pin_result = hk_cmd_pending_begin(dev, submit, chunks, &pending);
+      if (pin_result != VK_SUCCESS) {
+         util_dynarray_fini(&payload);
+         /* Sync ordinals were already resolved above; this is not retryable
+          * without rolling them back. No GPU submission has happened. */
+         return vk_device_set_lost(&dev->vk, "Command-memory pin allocation failed");
+      }
+   }
    VkResult result;
    if (command_count <= max_commands_per_submit(dev)) {
       if (unlikely(anatomy))
          hk_frame_anatomy_note_barriers(anatomy, payload.data, 0, payload.size);
       result =
-         queue_submit_single(dev, &submit_ioctl, queue->drm.virt_ring_idx);
+         queue_submit_single(dev, &submit_ioctl, queue->drm.virt_ring_idx, pending);
    } else {
       result = queue_submit_looped(dev, queue, &submit_ioctl, command_count,
-                                   queue->drm.virt_ring_idx, prior_base,
-                                   chunk_timelines, first_chunk_point, anatomy);
+                                   queue->drm.virt_ring_idx, kq_base,
+                                   chunk_timelines, first_chunk_point, anatomy,
+                                   pending);
+   }
+   hk_cmd_pending_end(dev, pending, queue, result);
+   if (queue->sib.count > 1 && result == VK_SUCCESS) {
+      queue->sib.submitted[sib_target][HK_SYNC_VDM] += nr_vdm;
+      queue->sib.submitted[sib_target][HK_SYNC_CDM] += nr_cdm;
+      if (sib_target) {
+         queue->sib.used = true;
+         queue->sib.last_point = queue->drm.timeline_value;
+      }
    }
    if (cumulative_signals && !kernel_cumulative) {
       /* The kernel can publish an error fence even when submission fails.
@@ -1679,18 +2297,42 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    return result;
 }
 
+static bool
+hk_submit_has_compute(const struct vk_queue_submit *submit)
+{
+   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
+      struct hk_cmd_buffer *cmdbuf =
+         (struct hk_cmd_buffer *)submit->command_buffers[i];
+
+      list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         if (cs->type == HK_CS_CDM)
+            return true;
+      }
+   }
+
+   return false;
+}
+
 static VkResult
 hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
    struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
    struct hk_device *dev = hk_queue_device(queue);
 
-   if (vk_queue_is_lost(&queue->vk))
+   if (vk_device_is_lost_no_report(&dev->vk))
       return VK_ERROR_DEVICE_LOST;
+
+   /* Look at the command buffers before they are submitted: once the work is
+    * with the kernel it can complete, and the application may then free or
+    * reset them while this callback is still running on a submit thread. */
+   const bool has_compute =
+      queue->kick.watched && hk_submit_has_compute(submit);
 
    VkResult result = queue_submit(dev, queue, submit);
    if (result != VK_SUCCESS)
       result = vk_queue_set_lost(&queue->vk, "Submit failed");
+   else if (has_compute)
+      hk_compute_kick_note(dev, queue);
 
    if (dev->dev.debug & AGX_DBG_SYNC) {
       /* Wait for completion */
@@ -1708,6 +2350,42 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    }
 
    return result;
+}
+
+void
+hk_device_quiesce_lost_submissions(struct hk_device *dev)
+{
+   if (!agx_chip_g17_m5(dev->dev.chip) ||
+       !vk_device_is_lost_no_report(&dev->vk))
+      return;
+
+   /* GPU storage remains pinned separately. This protects host object data
+    * and sync implementations referenced by deferred/threaded submissions.
+    */
+   vk_foreach_queue(queue, &dev->vk)
+      vk_queue_wait_lost_submissions(queue);
+}
+
+/* A pending host submission also retains raw semaphore/fence sync pointers.
+ * Join or cancel that host work before freeing the sync implementation. */
+VKAPI_ATTR void VKAPI_CALL
+hk_DestroySemaphore(VkDevice _device, VkSemaphore semaphore,
+                    const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(hk_device, dev, _device);
+   if (semaphore != VK_NULL_HANDLE)
+      hk_device_quiesce_lost_submissions(dev);
+   vk_common_DestroySemaphore(_device, semaphore, pAllocator);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_DestroyFence(VkDevice _device, VkFence fence,
+                const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(hk_device, dev, _device);
+   if (fence != VK_NULL_HANDLE)
+      hk_device_quiesce_lost_submissions(dev);
+   vk_common_DestroyFence(_device, fence, pAllocator);
 }
 
 static enum drm_asahi_priority
@@ -1731,9 +2409,36 @@ translate_priority(VkQueueGlobalPriorityKHR prio)
    }
 }
 
-VkResult
-hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
-              uint32_t index_in_family)
+void
+hk_queue_share(struct hk_device *dev, struct hk_queue *queue)
+{
+   /* Keep independent Vulkan submit workers while bounding scarce kernel
+    * contexts per device. Queue families differ in exposed capabilities, but
+    * each kernel queue supports both engines. Priority and creation flags
+    * must match; the common runtime serializes callbacks on the backing queue.
+    */
+   if (!agx_chip_g17_m5(dev->dev.chip))
+      return;
+
+   vk_foreach_queue(iter, &dev->vk) {
+      if (iter == &queue->vk)
+         break;
+      if (vk_queue_is_emulated(iter))
+         continue;
+      struct hk_queue *real = container_of(iter, struct hk_queue, vk);
+      if (real->drm.virt_ring_idx != queue->drm.virt_ring_idx ||
+          real->vk.flags != queue->vk.flags)
+         continue;
+      queue->vk.driver_submit = NULL;
+      vk_queue_set_emulated(&queue->vk, iter);
+      break;
+   }
+}
+
+static VkResult
+hk_queue_create(struct hk_device *dev,
+                const VkDeviceQueueCreateInfo *pCreateInfo,
+                uint32_t index_in_family, bool kick, struct hk_queue **out)
 {
    struct hk_physical_device *pdev = hk_device_physical(dev);
    VkResult result;
@@ -1744,6 +2449,8 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
                                       8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!queue)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   list_inithead(&queue->cmd_pending);
 
    const VkDeviceQueueGlobalPriorityCreateInfoKHR *priority_info =
       vk_find_struct_const(pCreateInfo->pNext,
@@ -1759,6 +2466,11 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
     * qualification.
     */
    enum drm_asahi_priority drm_priority = translate_priority(priority);
+   if (drm_priority == DRM_ASAHI_PRIORITY_REALTIME) {
+      vk_free(&dev->vk.alloc, queue);
+      return VK_ERROR_NOT_PERMITTED_EXT;
+   }
+
    if (agx_chip_g17_m5(dev->dev.chip)) {
       if (!priority_info &&
           pCreateInfo->pQueuePriorities[index_in_family] < 0.5f)
@@ -1774,6 +2486,12 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
       return result;
    }
 
+   /* The kicker owns a kick queue: keep it out of the walks of the
+    * application's queues (vkDeviceWaitIdle, lost-device quiescing, queue
+    * sharing). Only the kicker thread submits to it. */
+   if (kick)
+      list_delinit(&queue->vk.link);
+
    queue->vk.driver_submit = hk_queue_submit;
    queue->sync.precise_tile_evictions = agx_is_m4_pro(&dev->dev);
    queue->sync.direct_single_footprints = agx_is_m4_pro(&dev->dev);
@@ -1785,11 +2503,33 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
     * ordinals carry no information there. They only make the kernel resolve
     * a historical dependency per engine for every command, which costs
     * single-submission latency on G13 and G14. Keep upstream's payload. */
+   queue->sync.stage_overlap =
+      queue->sync.serialize &&
+      (dev->dev.params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+      debug_get_bool_option("HK_G13_STAGE_OVERLAP", true);
    queue->sync.exact_prior =
       !queue->sync.serialize &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;
 
    queue->drm.id = UINT32_MAX;
+   for (unsigned i = 0; i < HK_QUEUE_SIBLINGS_MAX; ++i)
+      queue->sib.id[i] = UINT32_MAX;
+   queue->sib.count = 1;
+   if (dev->dev.chip == AGX_CHIP_G17P && !dev->dev.is_virtio &&
+       queue->sync.exact_prior &&
+       (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) &&
+       (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)) {
+      /* The M4 Pro runs two compute kicks of one context at once. */
+      queue->sib.count = CLAMP(
+         debug_get_num_option("ASAHI_G17P_SIBLING_QUEUES",
+                              agx_is_m4_pro(&dev->dev) ? 3 : 1),
+         1, HK_QUEUE_SIBLINGS_MAX);
+      queue->sib.min_in_flight =
+         debug_get_num_option("ASAHI_G17P_SIBLING_MIN_IN_FLIGHT", 2);
+      queue->sib.min_threads =
+         debug_get_num_option("ASAHI_G17P_SIBLING_MIN_THREADS", 65536);
+   }
+   queue->drm.render_rq = 0;
    queue->drm.virt_ring_idx = drm_priority + 1;
 
    if (drmSyncobjCreate(dev->dev.fd, 0, &queue->drm.syncobj)) {
@@ -1818,7 +2558,7 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
 
    if ((dev->dev.chip == AGX_CHIP_G17P ||
         agx_chip_g17_m5(dev->dev.chip)) &&
-       dev->vk.enabled_features.sparseBinding) {
+       dev->vk.enabled_features.sparseBinding && !kick) {
       queue->g17p_sstt_flush_bo =
          agx_bo_create(&dev->dev, AIL_PAGESIZE, 0, 0, "SSTT flush stream");
       if (!queue->g17p_sstt_flush_bo) {
@@ -1837,16 +2577,79 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
       }
    }
 
+   /* A kick queue needs a kernel queue of its own. */
+   if (!kick)
+      hk_queue_share(dev, queue);
+
+   /* Permission for an elevated class must be checked during device
+    * creation, while the application can still fall back to MEDIUM. Delaying
+    * it until submission would consume payloads or turn refusal into device
+    * loss. Ordinary queues remain lazy to avoid reserving unused contexts.
+    */
+   if (!vk_queue_is_emulated(&queue->vk) && !kick &&
+       drm_priority == DRM_ASAHI_PRIORITY_HIGH) {
+      /* Without the render ray-query reservation; a render that needs it
+       * replaces this kernel queue at submission. */
+      bool replaced;
+      result = hk_queue_ensure_drm(dev, queue, 0, &replaced);
+      if (result != VK_SUCCESS) {
+         hk_queue_finish(dev, queue);
+         return result;
+      }
+   }
+
+   if (out)
+      *out = queue;
    return VK_SUCCESS;
+}
+
+VkResult
+hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
+              uint32_t index_in_family)
+{
+   return hk_queue_create(dev, pCreateInfo, index_in_family, false, NULL);
+}
+
+/* A queue of the given priority class that the application cannot get:
+ * its index is past any family's queue count, it is not in the device's
+ * queue list, and it shares no kernel queue with the application's queues.
+ * Its kernel queue is created at its first submission, like theirs. The
+ * caller finishes it with hk_queue_finish. */
+VkResult
+hk_queue_init_kick(struct hk_device *dev, enum drm_asahi_priority priority,
+                   struct hk_queue **out)
+{
+   const VkDeviceQueueGlobalPriorityCreateInfoKHR priority_info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR,
+      .globalPriority = priority == DRM_ASAHI_PRIORITY_LOW
+                           ? VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR
+                        : priority == DRM_ASAHI_PRIORITY_HIGH
+                           ? VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR
+                           : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR,
+   };
+   const uint32_t index = UINT32_MAX - 1;
+   const VkDeviceQueueCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .pNext = &priority_info,
+      .queueFamilyIndex = 0,
+      .queueCount = index + 1,
+   };
+   return hk_queue_create(dev, &info, index, true, out);
 }
 
 void
 hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
 {
+   /* Stop/join the submit worker before releasing anything it can use. */
+   vk_queue_finish(&queue->vk);
+   hk_cmd_pending_finish_queue(dev, queue);
    drmSyncobjDestroy(dev->dev.fd, queue->drm.syncobj);
    if (queue->drm.id != UINT32_MAX)
       agx_destroy_command_queue(&dev->dev, queue->drm.id);
+   for (unsigned i = 1; i < HK_QUEUE_SIBLINGS_MAX; ++i) {
+      if (queue->sib.id[i] != UINT32_MAX)
+         agx_destroy_command_queue(&dev->dev, queue->sib.id[i]);
+   }
    agx_bo_unreference(&dev->dev, queue->g17p_sstt_flush_bo);
-   vk_queue_finish(&queue->vk);
    vk_free(&dev->vk.alloc, queue);
 }

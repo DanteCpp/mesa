@@ -113,6 +113,7 @@ static const struct debug_named_value agx_debug_options[] = {
    {"1queue",    AGX_DBG_1QUEUE,   "Force usage of a single queue for multiple contexts"},
    {"nosoft",    AGX_DBG_NOSOFT,   "Disable soft fault optimizations"},
    {"nomerge",   AGX_DBG_NOMERGE,  "Disable control stream merging"},
+   {"faulttrace",AGX_DBG_FAULTTRACE,"Retain G18 failure diagnostics"},
    {"asynctrace",AGX_DBG_ASYNCTRACE,"Trace command streams without waiting"},
    {"bodumpverbose", AGX_DBG_BODUMPVERBOSE,   "Include extra info with dumps"},
    DEBUG_NAMED_VALUE_END
@@ -124,7 +125,8 @@ agx_bo_free(struct agx_device *dev, struct agx_bo *bo)
 {
    const uint64_t handle = bo->handle;
 
-   if (bo->_map)
+   /* The application owns the mapping of a host-pointer BO. */
+   if (bo->_map && !(bo->flags & AGX_BO_HOST_PTR))
       dev->ops.bo_munmap(dev, bo);
 
    if (bo->g17p_vdm_alias) {
@@ -195,6 +197,17 @@ agx_drm_vm_status(struct agx_device *dev, int32_t *error)
 
    *error = status.error;
    return true;
+}
+
+/* True once the kernel has failed this VM (a GPU recovery blamed our work).
+ * Every later bind and submission on it is refused.
+ */
+bool
+agx_device_vm_failed(struct agx_device *dev)
+{
+   int32_t error = 0;
+
+   return agx_drm_vm_status(dev, &error) && error != 0;
 }
 
 static int
@@ -432,11 +445,144 @@ agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
 
    ret = agx_bo_bind(dev, bo, bo->va->addr, bo->size, 0, bind);
    if (ret) {
+      int32_t vm_error = 0;
+
+      /* Once a GPU recovery has failed this VM, every bind is refused and
+       * every later submission fails, which the context already reports as
+       * a reset. Keep the BO, mapped for the CPU but unbound, so drivers
+       * that do not check every allocation keep running until the
+       * application notices the reset and recreates its context (Zen died
+       * in agx_batch_init's encoder allocation). Nothing that references it
+       * can execute on this VM.
+       */
+      if (agx_drm_vm_status(dev, &vm_error) && vm_error != 0)
+         return bo;
+
       agx_bo_free(dev, bo);
       return NULL;
    }
 
    return bo;
+}
+
+static int
+agx_drm_bo_userptr(struct agx_device *dev, void *ptr, size_t size,
+                   bool read_only, uint32_t *handle)
+{
+   struct drm_asahi_gem_userptr args = {
+      .userptr = (uintptr_t)ptr,
+      .size = size,
+      .flags = DRM_ASAHI_GEM_VM_PRIVATE |
+               (read_only ? DRM_ASAHI_GEM_USERPTR_READ_ONLY : 0),
+      .vm_id = dev->vm_id,
+   };
+
+   if (drmIoctl(dev->fd, DRM_IOCTL_ASAHI_GEM_USERPTR, &args))
+      return -errno;
+
+   *handle = args.handle;
+   return 0;
+}
+
+/*
+ * A BO over `size` bytes of application memory at `ptr`, both multiples of
+ * the page size, without a copy. The kernel pins the pages for the BO's life,
+ * for writing: the GPU may write the memory wherever the API lets it. NULL,
+ * with errno set, when the kernel refuses the range (EFAULT for memory the
+ * application cannot write, a read-only mapping of a file, say).
+ *
+ * With AGX_HOST_PTR_ANY, memory the kernel can only pin for reading is taken
+ * too: the BO, flagged AGX_BO_READONLY, is bound read-only for the GPU. A
+ * GPU write to it is not performed: it is discarded where the kernel has
+ * soft faults, and faults the job otherwise. AGX_HOST_PTR_READ_ONLY takes
+ * only such memory and refuses memory the kernel can pin for writing
+ * (EACCES), so the GPU writes no memory imported this way.
+ */
+struct agx_bo *
+agx_bo_import_host_ptr(struct agx_device *dev, void *ptr, size_t size,
+                       enum agx_host_ptr_access access)
+{
+   if (!agx_has_userptr(dev)) {
+      errno = EOPNOTSUPP;
+      return NULL;
+   }
+
+   enum agx_bo_flags flags = AGX_BO_HOST_PTR | AGX_BO_NO_CACHE;
+   uint32_t handle = 0;
+   int ret = agx_drm_bo_userptr(dev, ptr, size, false, &handle);
+   if (ret == 0 && access == AGX_HOST_PTR_READ_ONLY) {
+      agx_drm_bo_close(dev, handle);
+      errno = EACCES;
+      return NULL;
+   }
+   if (ret == -EFAULT && access != AGX_HOST_PTR_WRITABLE) {
+      ret = agx_drm_bo_userptr(dev, ptr, size, true, &handle);
+      flags |= AGX_BO_READONLY;
+   }
+   if (ret) {
+      errno = -ret;
+      return NULL;
+   }
+
+   simple_mtx_lock(&dev->bo_map_lock);
+   struct agx_bo *bo = agx_lookup_bo(dev, handle);
+   agx_include_bo_handle(dev, handle);
+   simple_mtx_unlock(&dev->bo_map_lock);
+
+   /* Fresh handle */
+   assert(!memcmp(bo, &((struct agx_bo){}), sizeof(*bo)));
+
+   bo->dev = dev;
+   bo->size = size;
+   bo->align = AIL_PAGESIZE;
+   bo->flags = flags;
+   bo->handle = bo->uapi_handle = handle;
+   bo->prime_fd = -1;
+   bo->label = "Host memory";
+   bo->_map = ptr;
+   bo->_map_size = size;
+   p_atomic_set(&bo->refcnt, 1);
+
+   if (dev->debug & (AGX_DBG_TRACE | AGX_DBG_ASYNCTRACE))
+      agxdecode_track_alloc(dev->agxdecode, bo);
+
+   bo->va = agx_va_alloc(dev, size, bo->align, 0, 0);
+   if (!bo->va) {
+      agx_bo_free(dev, bo);
+      errno = ENOMEM;
+      return NULL;
+   }
+
+   uint32_t bind = DRM_ASAHI_BIND_READ;
+   if (!(flags & AGX_BO_READONLY))
+      bind |= DRM_ASAHI_BIND_WRITE;
+
+   if (agx_bo_bind(dev, bo, bo->va->addr, bo->size, 0, bind)) {
+      int err = errno;
+      agx_bo_free(dev, bo);
+      errno = err;
+      return NULL;
+   }
+
+   return bo;
+}
+
+/* Asks the kernel to release a BO's memory after that of the VM's other
+ * BOs when it reclaims the VM's idle memory, or withdraws the request. A
+ * hint: see struct drm_asahi_gem_residency. */
+int
+agx_bo_set_resident(struct agx_device *dev, struct agx_bo *bo, bool keep)
+{
+   if (!agx_has_residency_control(dev))
+      return -EOPNOTSUPP;
+
+   struct drm_asahi_gem_residency args = {
+      .handle = bo->uapi_handle,
+      .flags = keep ? DRM_ASAHI_GEM_RESIDENCY_KEEP : 0,
+   };
+
+   return drmIoctl(dev->fd, DRM_IOCTL_ASAHI_GEM_RESIDENCY, &args) ? -errno
+                                                                   : 0;
 }
 
 static void
@@ -569,7 +715,7 @@ agx_bo_import(struct agx_device *dev, int fd)
    assert(bo->dev != NULL && "post-condition");
 
    if (dev->debug &
-       (AGX_DBG_TRACE | AGX_DBG_ASYNCTRACE)) {
+       (AGX_DBG_TRACE | AGX_DBG_FAULTTRACE | AGX_DBG_ASYNCTRACE)) {
       agx_bo_map(bo);
       agxdecode_track_alloc(dev->agxdecode, bo);
    }
@@ -859,10 +1005,15 @@ agx_open_device(void *memctx, struct agx_device *dev)
          goto fail;
       }
 
-      if (!strcmp(version->name, "asahi")) {
+      if (agx_is_native_drm_driver(version->name)) {
          dev->is_virtio = false;
-         dev->render_rsrc_spec_hi = version->version_major > 0 ||
-                                   version->version_minor >= 2;
+         /* The 0.2 rule describes the "asahi" numbering only. The "aurora"
+          * kernel versions its UAPI separately and gates the high dwords on
+          * DRM_ASAHI_RENDER_RSRC_SPEC_HI per runtime.
+          */
+         dev->render_rsrc_spec_hi =
+            !strcmp(version->name, AGX_DRM_DRIVER_NAME_LEGACY) &&
+            (version->version_major > 0 || version->version_minor >= 2);
          dev->ops = agx_device_drm_ops;
       } else if (!strcmp(version->name, "virtio_gpu")) {
          dev->is_virtio = true;
@@ -898,6 +1049,14 @@ agx_open_device(void *memctx, struct agx_device *dev)
       goto fail;
    }
 
+   if (agx_params_fixup_upstream_uapi(&dev->params) &&
+       (dev->debug & AGX_DBG_PERF))
+      fprintf(stderr,
+              "AGX: kernel publishes the upstream UAPI parameters; features "
+              "masked to %#llx, USC %u, HAL %u\n",
+              (unsigned long long)dev->params.features,
+              dev->params.usc_generation, dev->params.gpu_hal_generation);
+
    dev->chip = agx_chip_from_params(&dev->params);
 
    /*
@@ -906,12 +1065,15 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * is implemented; otherwise a newly-recognised chip can silently reach an
     * encoder from the wrong generation.
     */
-   const bool m5_bringup =
-      debug_get_bool_option("ASAHI_M5_BRINGUP", false) &&
-      agx_params_m5_bringup_supported(&dev->params);
-   if (m5_bringup)
-      fprintf(stderr, "Experimental M5 HAL300 integration enabled; general rendering is unqualified\n");
-   if (!agx_params_driver_supported(&dev->params) && !m5_bringup) {
+   const bool m5 = agx_params_m5_supported(&dev->params);
+   /* M6: the G18G records are the M5 ones (agx_chip_hal300_records) and its
+    * code is G17G-family (agx3c) code re-encoded as agx3d
+    * (agx_gather_device_key). */
+   const bool g18g_bringup =
+      agx_params_g18g_bringup_supported(&dev->params);
+   if (g18g_bringup)
+      fprintf(stderr, "Experimental M6 G18G integration enabled (M5 paths, agx3d code); rendering is unqualified\n");
+   if (!agx_params_driver_supported(&dev->params) && !m5 && !g18g_bringup) {
       if (dev->chip == AGX_CHIP_UNKNOWN) {
          fprintf(stderr,
                  "Unsupported Apple GPU architecture G%u (variant 0x%x, %u "
@@ -955,6 +1117,16 @@ agx_open_device(void *memctx, struct agx_device *dev)
       goto fail;
    }
 
+   if (dev->chip == AGX_CHIP_G15G &&
+       !agx_params_native_kernel_abi_supported(&dev->params)) {
+      fprintf(stderr,
+              "Incompatible native AGX3 kernel contract (features %#llx); "
+              "use the kernel matched to this Mesa build; see its "
+              "compatibility documentation\n",
+              (unsigned long long)dev->params.features);
+      goto fail;
+   }
+
    /* The M4 Pro runs as G17P too; it takes the M-series name below. */
    const char *product = dev->params.chip_id == 0x8140
                             ? agx_chip_exact_product_name(dev->chip)
@@ -974,6 +1146,10 @@ agx_open_device(void *memctx, struct agx_device *dev)
          break;
       case 'C':
          variant = " Max";
+         break;
+      case 'X':
+         if (dev->params.chip_id == 0x6041)
+            variant = " Max";
          break;
       case 'D':
          variant = " Ultra";
@@ -1056,7 +1232,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * a practical limit. */
    if (agx_chip_native_agx3(dev->chip))
       dev->shader_base = AGX_G17P_USC_WINDOW_BASE;
-   else if (agx_chip_g17_m5(dev->chip))
+   else if (agx_chip_g17_m5(dev->chip) || dev->chip == AGX_CHIP_G18G)
       dev->shader_base = AGX_M5_SHADER_BASE;
 
    if (dev->shader_base < reservation) {
@@ -1067,6 +1243,9 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
 
    uint64_t shader_size = 0x100000000ull;
+   /* T8122: only the lower half of the 2^40 window is free. */
+   if (dev->chip == AGX_CHIP_G15G)
+      shader_size = AGX_T8122_RUNTIME_WINDOW_HIGH - dev->shader_base;
 
    /*
     * Where the user heap goes relative to the USC window.
@@ -1092,7 +1271,8 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * directly representable, with no per-run alias option.
     */
    const bool heap_below_usc = agx_chip_native_agx3(dev->chip) ||
-                               agx_chip_g17_m5(dev->chip);
+                               agx_chip_g17_m5(dev->chip) ||
+                               dev->chip == AGX_CHIP_G18G;
 
    /*
     * Start the low heap as high as it can go rather than at the reservation.
@@ -1146,7 +1326,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
    /* G17P is bounded by the narrower of the compact VDM aperture and the
     * absolute USC texture/sampler table pointer, both of which sit below the
     * USC window. Other chips retain the kernel-reported user limit. */
-   if (agx_chip_g17_m5(dev->chip)) {
+   if (agx_chip_g17_m5(dev->chip) || dev->chip == AGX_CHIP_G18G) {
       struct agx_m5_va_layout layout;
       if (!agx_m5_va_layout(dev->params.vm_start, dev->params.vm_end,
                             dev->params.vm_kernel_min_size, dev->shader_base,
@@ -1158,9 +1338,11 @@ agx_open_device(void *memctx, struct agx_device *dev)
       vm_create.kernel_end = layout.driver_end;
       user_start = layout.data_start;
    }
-   const uint64_t user_limit = agx_chip_g17_m5(dev->chip)
-      ? AGX_M5_DATA_END
-      : heap_below_usc ? AGX_G17P_USER_LIMIT : vm_create.kernel_start;
+   const uint64_t user_limit =
+      agx_chip_g17_m5(dev->chip) || dev->chip == AGX_CHIP_G18G
+         ? AGX_M5_DATA_END
+         : agx_va_user_limit(dev->chip, heap_below_usc,
+                             vm_create.kernel_start);
    uint64_t user_size = user_limit - user_start;
 
    int ret = dev->ops.simple_ioctl(dev, DRM_IOCTL_ASAHI_VM_CREATE, &vm_create);
@@ -1248,6 +1430,16 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
    if (agx_chip_native_agx3(dev->chip))
       initialized |= AGX_INIT_ALIAS_HEAP;
+   /* The compact alias heap starts inside the T8122 runtime USC base; keep
+    * out of it (the rest of that range is already outside the heap). */
+   if (dev->chip == AGX_CHIP_G15G &&
+       !util_vma_heap_alloc_addr(&dev->g17p_vdm_alias_heap,
+                                 AGX_G17P_VDM_ALIAS_BASE,
+                                 AGX_G17P_VDM_ALIAS_RESERVED_START -
+                                    AGX_G17P_VDM_ALIAS_BASE)) {
+      fprintf(stderr, "Failed to reserve the T8122 runtime USC base\n");
+      goto fail;
+   }
 
    if (!agx_va_reserve_runtime_graph_hole(
           dev->chip, &dev->main_heap, user_start, user_size,
@@ -1258,9 +1450,11 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
 
    /* Keep captured addresses unavailable to ordinary allocations between
-    * capture and replay. Reserve after all fixed firmware/alias holes, and
-    * for native AGX3 and M5 using the common allocator; other winsyses own their VA. */
-   if (agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip)) {
+    * capture and replay, on every chip that uses the common allocator: on
+    * G13/G14 too, a captured address freed by the application is otherwise
+    * handed to the next ordinary allocation, and replaying it fails.
+    * Reserve after all fixed firmware/alias holes; virtio owns its VA. */
+   if (!dev->is_virtio) {
       dev->replay_heap_initialized = agx_capture_replay_heap_init(
          &dev->main_heap, &dev->replay_heap, user_size);
       if (!dev->replay_heap_initialized) {
@@ -1281,6 +1475,13 @@ agx_open_device(void *memctx, struct agx_device *dev)
          dev->libagx_programs = libagx_g13g;
    } else if (dev->chip == AGX_CHIP_G17P) {
       dev->libagx_programs = libagx_g17p;
+   } else if (dev->chip == AGX_CHIP_G18G) {
+      /* Compiled as G17G and re-encoded as agx3d (asahi_clc), launched
+       * through the M5 compute profile (agx_launch_precomp). */
+      dev->libagx_programs = libagx_g18g;
+   } else if (dev->chip == AGX_CHIP_G15G) {
+      /* Its own build: G15G needs the scheduling stalls G15S does not. */
+      dev->libagx_programs = libagx_g15g;
    } else if (dev->chip == AGX_CHIP_G15S || dev->chip == AGX_CHIP_G15C) {
       /* G15C executes the same AGX3B encoding as G15S with no extra
        * scheduling rules, so it runs the G15S build of the programs. */
@@ -1322,6 +1523,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
       /* The contents of the scratch page are undefined, but making them nonzero
        * helps fuzz for bugs where we incorrectly read from the write section.
+       * Unbound sparse pages map hk's own zeroed fill page instead.
        */
       void *map = agx_bo_map(dev->scratch_bo);
       if (!map)
@@ -1360,7 +1562,8 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
 
    const bool dynamic_printf = agx_chip_native_agx3(dev->chip) ||
-                               agx_chip_g17_m5(dev->chip);
+                               agx_chip_g17_m5(dev->chip) ||
+                               dev->chip == AGX_CHIP_G18G;
    struct agx_bo *bo =
       dynamic_printf
          ? agx_bo_create(dev, LIBAGX_PRINTF_BUFFER_SIZE, 0, AGX_BO_WRITEBACK,
@@ -1396,7 +1599,8 @@ agx_open_device(void *memctx, struct agx_device *dev)
    initialized |= AGX_INIT_PRINTF;
 
    /* Map the stage helper tables at the USC execution-window base. */
-   if (agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip)) {
+   if (agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
+       dev->chip == AGX_CHIP_G18G) {
       const size_t usc_base_size = AIL_PAGESIZE;
 
       simple_mtx_lock(&dev->vma_lock);
@@ -1424,13 +1628,19 @@ agx_open_device(void *memctx, struct agx_device *dev)
          goto fail;
       }
 
-      if (agx_chip_g17_m5(dev->chip)) {
+      if (dev->chip == AGX_CHIP_G18G) {
+         memset(map, 0, usc_base_size);
+         if (!agx3_build_g18g_container_lead(map, usc_base_size))
+            goto fail;
+      } else if (agx_chip_g17_m5(dev->chip)) {
          memset(map, 0, usc_base_size);
          if (!agx3_build_m5_container_lead(map, usc_base_size,
                                           dev->params.num_clusters_total))
             goto fail;
       } else {
-         agx3_build_usc_base_page(map, usc_base_size, dev->chip, dev->params.num_cores_per_cluster);
+         agx3_build_usc_base_page(map, usc_base_size, dev->chip,
+                                  dev->params.num_cores_per_cluster,
+                                  dev->params.num_clusters_total);
       }
       agx_bo_assert_range(usc_base, 0, usc_base_size);
 
@@ -1474,6 +1684,27 @@ agx_close_device(struct agx_device *dev)
    dev->fd = -1;
 }
 
+bool
+agx_probe_high_priority(struct agx_device *dev)
+{
+   /* Bypass the debug shared-queue cache: it could be MEDIUM and cannot be
+    * destroyed through agx_destroy_command_queue in 1queue mode.
+    */
+   struct drm_asahi_queue_create create = {
+      .vm_id = dev->vm_id,
+      .priority = DRM_ASAHI_PRIORITY_HIGH,
+      .usc_exec_base = dev->shader_base,
+   };
+   unsigned request = DRM_IOCTL_ASAHI_QUEUE_CREATE;
+   request = _IOC(_IOC_DIR(request), _IOC_TYPE(request), _IOC_NR(request),
+                  offsetof(struct drm_asahi_queue_create, render_scs_layout));
+   if (dev->ops.simple_ioctl(dev, request, &create))
+      return false;
+
+   struct drm_asahi_queue_destroy destroy = {.queue_id = create.queue_id};
+   return dev->ops.simple_ioctl(dev, DRM_IOCTL_ASAHI_QUEUE_DESTROY, &destroy) == 0;
+}
+
 uint32_t
 agx_create_command_queue(struct agx_device *dev,
                          enum drm_asahi_priority priority)
@@ -1505,17 +1736,24 @@ agx_create_command_queue_with_render_scs(struct agx_device *dev,
       }
    }
 
+   const bool timeout = dev->compute_timeout_ms &&
+                        (dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT);
    struct drm_asahi_queue_create queue_create = {
       .vm_id = dev->vm_id,
       .priority = priority,
       .usc_exec_base = dev->shader_base,
       .render_scs_layout = {layouts[0], layouts[1]},
+      .compute_timeout_ms = timeout ? dev->compute_timeout_ms : 0,
    };
 
+   /* Older kernels take the struct only up to the fields they know. */
    unsigned request = DRM_IOCTL_ASAHI_QUEUE_CREATE;
-   if (!layouts[0] && !layouts[1])
-      request = _IOC(_IOC_DIR(request), _IOC_TYPE(request), _IOC_NR(request),
-                     offsetof(struct drm_asahi_queue_create, render_scs_layout));
+   unsigned size = sizeof(queue_create);
+   if (!timeout)
+      size = offsetof(struct drm_asahi_queue_create, compute_timeout_ms);
+   if (!timeout && !layouts[0] && !layouts[1])
+      size = offsetof(struct drm_asahi_queue_create, render_scs_layout);
+   request = _IOC(_IOC_DIR(request), _IOC_TYPE(request), _IOC_NR(request), size);
    int ret = dev->ops.simple_ioctl(dev, request, &queue_create);
    if (ret) {
       int saved_errno = errno;
@@ -1527,6 +1765,7 @@ agx_create_command_queue_with_render_scs(struct agx_device *dev,
 
    if (dev->debug & AGX_DBG_1QUEUE) {
       dev->queue_id = queue_create.queue_id;
+      dev->queue_priority = priority;
       dev->queue_layouts[0] = layouts[0];
       dev->queue_layouts[1] = layouts[1];
       simple_mtx_unlock(&dev->vma_lock);
@@ -1726,10 +1965,16 @@ agx_gather_device_key(struct agx_device *dev)
                     dev->params.num_clusters_total > 1) ||
                    dev->params.num_dies > 1;
 
+   /* G18G compiles as G17G and re-encodes as agx3d; see emit_agx3d. */
+   const bool g18g = dev->chip == AGX_CHIP_G18G;
+   const enum agx_chip chip = g18g ? AGX_CHIP_G17G : dev->chip;
+
    return (struct agx_device_key){
-      .chip = dev->chip,
-      .encoding = agx_chip_isa_encoding(dev->chip),
+      .chip = chip,
+      .encoding = agx_chip_isa_encoding(chip),
       .needs_g13x_coherency = u_tristate_make(g13x_coh),
       .soft_fault = agx_has_soft_fault(dev),
+      .emit_agx3d = g18g,
+      .shader_quad_control = dev->chip == AGX_CHIP_G17P,
    };
 }

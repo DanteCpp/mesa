@@ -5,16 +5,20 @@
 
 /* CPU control of the production RT creation entry point.  Translation and
  * megakernel construction are real; only GPU shader compilation/upload is
- * replaced.  These checks do not execute shaders or establish conformance.
+ * replaced (with a serializable stand-in, so pipeline cache entries can be
+ * written and read back).  These checks do not execute shaders or establish
+ * conformance.
  */
 #include "spirv/spirv.h"
 #include "asahi/compiler/agx3_compute_program.h"
+#include "util/blob.h"
 #include "util/set.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_physical_device.h"
 #include "hk_ray_tracing_pipeline.h"
 #include "hk_shader.h"
+#include "hk_rt_recursion_spv.h"
 #include "nir.h"
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
@@ -22,6 +26,7 @@
 #include "vk_nir.h"
 #include "vk_pipeline_cache.h"
 #include "vk_pipeline_layout.h"
+#include "vk_shader.h"
 #include "vk_shader_module.h"
 
 #include <stdio.h>
@@ -38,6 +43,7 @@
 #define EARLY VK_PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT
 
 static unsigned translations, backends, shader_destroys, live_nir;
+static unsigned last_instrs, last_calls, last_max_block;
 static nir_shader *tracked_nir[64];
 static VkResult backend_result = VK_SUCCESS;
 static unsigned fail_translation;
@@ -98,6 +104,33 @@ __wrap_ralloc_free(void *ptr)
    __real_ralloc_free(ptr);
 }
 
+static unsigned restored;
+
+static bool
+fake_serialize(struct vk_device *device, const struct vk_shader *shader,
+               struct blob *blob)
+{
+   blob_write_uint32(blob, 0x5348524b);
+   return !blob->out_of_memory;
+}
+static const struct vk_shader_ops fake_shader_ops = {.serialize = fake_serialize};
+
+static VkResult
+fake_deserialize(struct vk_device *device, struct blob_reader *blob,
+                 uint32_t version, const VkAllocationCallbacks *alloc,
+                 struct vk_shader **out)
+{
+   CHECK(blob_read_uint32(blob) == 0x5348524b);
+   restored++;
+   struct hk_api_shader *shader = calloc(1, sizeof(*shader));
+   CHECK(shader);
+   shader->vk.ops = &fake_shader_ops;
+   *out = &shader->vk;
+   return VK_SUCCESS;
+}
+static const struct vk_device_shader_ops fake_device_ops = {
+   .deserialize = fake_deserialize};
+
 VkResult
 __wrap_hk_compile_shader(struct hk_device *dev,
                          struct vk_shader_compile_info *info,
@@ -115,11 +148,25 @@ __wrap_hk_compile_shader(struct hk_device *dev,
                          struct hk_api_shader **out)
 {
    backends++;
+   /* What the last megakernel holds: every call must be inlined. */
+   last_instrs = last_calls = last_max_block = 0;
+   nir_foreach_function_impl(impl, info->nir) {
+      nir_foreach_block(block, impl) {
+         unsigned n = 0;
+         nir_foreach_instr(instr, block) {
+            n++;
+            last_calls += instr->type == nir_instr_type_call;
+         }
+         last_instrs += n;
+         last_max_block = MAX2(last_max_block, n);
+      }
+   }
    ralloc_free(info->nir);
    if (backend_result != VK_SUCCESS)
       return backend_result;
    *out = calloc(1, sizeof(**out));
    CHECK(*out);
+   (*out)->vk.ops = &fake_shader_ops;
    return VK_SUCCESS;
 }
 
@@ -273,6 +320,31 @@ check_refusal(VkPipelineCache cache, VkRayTracingPipelineCreateInfoKHR ci)
    CHECK(pipeline_allocs - a == pipeline_frees - f);
 }
 
+/* A pipeline cache entry satisfies VK_PIPELINE_COMPILE_REQUIRED: no stage
+ * translation, no backend compile. */
+static void
+check_hit(VkPipelineCache cache, VkRayTracingPipelineCreateInfoKHR ci)
+{
+   VkPipeline p;
+   unsigned t = translations, b = backends;
+   unsigned a = pipeline_allocs, f = pipeline_frees, refs = layout->ref_cnt;
+   VkResult result = create(cache, &ci, &p);
+   if (result != VK_SUCCESS || translations != t || backends != b)
+      fprintf(stderr, "cache oracle: result=%d, translations=%u, backends=%u\n",
+              result, translations - t, backends - b);
+   CHECK(result == VK_SUCCESS && p != VK_NULL_HANDLE);
+   CHECK(translations == t && backends == b);
+   destroy(p);
+   CHECK(layout->ref_cnt == refs);
+   CHECK(pipeline_allocs - a == pipeline_frees - f);
+}
+
+static struct hk_ray_tracing_pipeline *
+rt(VkPipeline p)
+{
+   return hk_ray_tracing_pipeline_from_handle(p);
+}
+
 int
 main(void)
 {
@@ -302,6 +374,7 @@ main(void)
    pdev.vk.properties.subgroupSize = 32;
    pdev.vk.properties.minSubgroupSize = 32;
    pdev.vk.properties.maxSubgroupSize = 32;
+   dev.vk.shader_ops = &fake_device_ops;
    device = hk_device_to_handle(&dev);
    layout = vk_pipeline_layout_zalloc(
       &dev.vk, sizeof(*layout),
@@ -356,31 +429,98 @@ main(void)
    };
    VkPipeline p;
    for (unsigned c = 0; c < ARRAY_SIZE(caches); c++) {
+      /* caches[0] is VK_NULL_HANDLE, and this device has no internal cache. */
+      const bool cached = c != 0;
       for (unsigned inline_code = 0; inline_code < 2; inline_code++) {
          stage.module = inline_code ? VK_NULL_HANDLE : module;
          stage.pNext = inline_code ? &module_info : NULL;
-         check_refusal(caches[c], info(FAIL));
+         /* Inline code hashes like its module: the second pass is warm. */
+         const bool warm = cached && inline_code;
+         if (warm)
+            check_hit(caches[c], info(FAIL));
+         else
+            check_refusal(caches[c], info(FAIL));
          check_refusal(caches[c], info(FAIL | LIB));
          VkRayTracingPipelineCreateInfoKHR ci = info(0);
-         unsigned t = translations, b = backends;
+         unsigned t = translations, b = backends, r = restored;
          CHECK(create(caches[c], &ci, &p) == VK_SUCCESS);
-         CHECK(translations == t + 1 && backends == b + 1);
+         CHECK(translations == t + !warm && backends == b + !warm);
+         CHECK(restored == r + warm);
          destroy(p);
          CHECK(live_nir == 0);
-         /* Warming a cache through this API cannot create an RT cache hit. */
-         check_refusal(caches[c], info(FAIL));
+         /* Warming a pipeline cache creates an RT cache hit. */
          VkPipelineCreateFlags2CreateInfoKHR flags2 = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
             .flags = FAIL,
          };
-         ci.pNext = &flags2;
-         check_refusal(caches[c], ci);
+         if (cached) {
+            check_hit(caches[c], info(FAIL));
+            ci.pNext = &flags2;
+            check_hit(caches[c], ci);
+         } else {
+            check_refusal(caches[c], info(FAIL));
+            ci.pNext = &flags2;
+            check_refusal(caches[c], ci);
+         }
       }
       stage.module = VK_NULL_HANDLE;
       stage.pNext = &identifier;
       check_refusal(caches[c], info(FAIL));
       check_refusal(caches[c], info(FAIL | LIB));
+      if (cached) {
+         /* The module's identifier names the cached stage. */
+         VkShaderModuleIdentifierEXT id = {
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_IDENTIFIER_EXT};
+         vk_common_GetShaderModuleIdentifierEXT(device, module, &id);
+         VkPipelineShaderStageModuleIdentifierCreateInfoEXT module_id = {
+            .sType =
+               VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT,
+            .identifierSize = id.identifierSize,
+            .pIdentifier = id.identifier,
+         };
+         stage.pNext = &module_id;
+         check_hit(caches[c], info(FAIL));
+         /* Anything else that changes the code misses. */
+         stage.module = module;
+         stage.pNext = NULL;
+         const VkSpecializationMapEntry entry = {.size = sizeof(uint32_t)};
+         const uint32_t value = 1;
+         const VkSpecializationInfo spec = {.mapEntryCount = 1,
+                                            .pMapEntries = &entry,
+                                            .dataSize = sizeof(value),
+                                            .pData = &value};
+         stage.pSpecializationInfo = &spec;
+         check_refusal(caches[c], info(FAIL));
+         stage.pSpecializationInfo = NULL;
+         VkRayTracingPipelineCreateInfoKHR deeper = info(FAIL);
+         deeper.maxPipelineRayRecursionDepth = 2;
+         check_refusal(caches[c], deeper);
+         const VkRayTracingShaderGroupCreateInfoKHR other_group = {
+            .sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,
+            .type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR,
+            .generalShader = 0,
+            .closestHitShader = VK_SHADER_UNUSED_KHR,
+            .anyHitShader = VK_SHADER_UNUSED_KHR,
+            .intersectionShader = VK_SHADER_UNUSED_KHR,
+         };
+         const VkRayTracingShaderGroupCreateInfoKHR two_groups[] = {group,
+                                                                    other_group};
+         VkRayTracingPipelineCreateInfoKHR wider = info(FAIL);
+         wider.groupCount = 2;
+         wider.pGroups = two_groups;
+         check_refusal(caches[c], wider);
+         VkPipelineCreateFlags2CreateInfoKHR capture = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR,
+            .flags = FAIL |
+                     VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR,
+         };
+         VkRayTracingPipelineCreateInfoKHR ir = info(0);
+         ir.pNext = &capture;
+         check_refusal(caches[c], ir);
+      }
    }
+   puts("PASS: warm caches hit by module, inline code and module identifier; "
+        "changed code misses");
    /* The nonempty-ID cases without FAIL here are defensive function controls,
     * not valid application calls.  A module or inline code takes precedence
     * over an identifier in the translator.  A zero
@@ -470,7 +610,8 @@ main(void)
       };
       VkPipeline pipelines[3] = {(VkPipeline)1, (VkPipeline)1, (VkPipeline)1};
       t = translations;
-      CHECK(hk_CreateRayTracingPipelinesKHR(device, VK_NULL_HANDLE, caches[2],
+      /* No cache, so the FAIL entry cannot hit. */
+      CHECK(hk_CreateRayTracingPipelinesKHR(device, VK_NULL_HANDLE, caches[0],
                                             3, batch, &alloc, pipelines) ==
             VK_PIPELINE_COMPILE_REQUIRED);
       CHECK(pipelines[0] != VK_NULL_HANDLE && pipelines[1] == VK_NULL_HANDLE);
@@ -514,6 +655,57 @@ main(void)
    CHECK(create(VK_NULL_HANDLE, &ci, &p) == VK_ERROR_FEATURE_NOT_PRESENT);
    CHECK(p == VK_NULL_HANDLE);
    puts("PASS: stage-only libraries, link-time groups, legacy-client depth 10/31 and overflow");
+
+   /* A library loaded from a cache takes the handles of the latest identical
+    * library on this device. An executable linking libraries hits only while
+    * their handles are the ones compiled into the entry. */
+   {
+      /* `library` above is still alive with its stage NIR. */
+      const unsigned live0 = live_nir;
+      struct vk_pipeline_cache *lc = vk_pipeline_cache_create(
+         &dev.vk,
+         &(struct vk_pipeline_cache_create_info){.force_enable = true,
+                                                 .skip_disk_cache = true},
+         NULL);
+      CHECK(lc);
+      VkPipelineCache lch = vk_pipeline_cache_to_handle(lc);
+      VkPipeline l1, l2, l3;
+      ci = info(LIB);
+      CHECK(create(lch, &ci, &l1) == VK_SUCCESS);
+      ci = info(FAIL | LIB);
+      t = translations;
+      CHECK(create(lch, &ci, &l2) == VK_SUCCESS && translations == t);
+      CHECK(rt(l2)->groups[0].handle.index == rt(l1)->groups[0].handle.index);
+      VkPipelineLibraryCreateInfoKHR link = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+         .libraryCount = 1,
+         .pLibraries = &l1,
+      };
+      ci = info(0);
+      ci.stageCount = ci.groupCount = 0;
+      ci.pLibraryInfo = &link;
+      b = backends;
+      CHECK(create(lch, &ci, &p) == VK_SUCCESS && backends == b + 1);
+      CHECK(rt(p)->groups[0].handle.index == rt(l1)->groups[0].handle.index);
+      destroy(p);
+      link.pLibraries = &l2;
+      ci.flags = FAIL;
+      check_hit(lch, ci);
+      ci = info(LIB);
+      CHECK(create(VK_NULL_HANDLE, &ci, &l3) == VK_SUCCESS);
+      CHECK(rt(l3)->groups[0].handle.index != rt(l1)->groups[0].handle.index);
+      link.pLibraries = &l3;
+      ci = info(FAIL);
+      ci.stageCount = ci.groupCount = 0;
+      ci.pLibraryInfo = &link;
+      check_refusal(lch, ci);
+      destroy(l1);
+      destroy(l2);
+      destroy(l3);
+      vk_pipeline_cache_destroy(lc, NULL);
+      CHECK(live_nir == live0);
+   }
+   puts("PASS: cached library handles and executable keys over linked handles");
    /* M1-M3 retain the legacy limit even for the same library request. */
    dev.dev.chip = AGX_CHIP_G13G;
    ci = info(LIB);
@@ -553,10 +745,140 @@ main(void)
    CHECK(!agx3_g17p_compute_program_generate(AGX_CHIP_G17P, &desc, &program));
    puts("PASS: G17P callable-size spill frames and encoding bounds");
 
+   /* Continuation mode: raygen, closest-hit and miss trace from every level,
+    * with an any-hit and a recursive callable. Above depth 3 every stage and
+    * the traversal appear once, so the code size does not grow with the
+    * depth, and the stack grows by one closest-hit/miss frame and record per
+    * level. */
+   {
+      static const struct {
+         const uint32_t *code;
+         size_t size;
+         VkShaderStageFlagBits stage;
+      } spv[] = {
+         {hk_rt_recursion_rgen_spv, sizeof(hk_rt_recursion_rgen_spv),
+          VK_SHADER_STAGE_RAYGEN_BIT_KHR},
+         {hk_rt_recursion_chit_spv, sizeof(hk_rt_recursion_chit_spv),
+          VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
+         {hk_rt_recursion_miss_spv, sizeof(hk_rt_recursion_miss_spv),
+          VK_SHADER_STAGE_MISS_BIT_KHR},
+         {hk_rt_recursion_ahit_spv, sizeof(hk_rt_recursion_ahit_spv),
+          VK_SHADER_STAGE_ANY_HIT_BIT_KHR},
+         {hk_rt_recursion_call_spv, sizeof(hk_rt_recursion_call_spv),
+          VK_SHADER_STAGE_CALLABLE_BIT_KHR},
+      };
+      VkShaderModule mods[ARRAY_SIZE(spv)];
+      VkPipelineShaderStageCreateInfo stages[ARRAY_SIZE(spv)];
+      for (unsigned i = 0; i < ARRAY_SIZE(spv); ++i) {
+         VkShaderModuleCreateInfo mi = {
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = spv[i].size,
+            .pCode = spv[i].code,
+         };
+         CHECK(vk_common_CreateShaderModule(device, &mi, NULL, &mods[i]) ==
+               VK_SUCCESS);
+         stages[i] = (VkPipelineShaderStageCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = spv[i].stage,
+            .module = mods[i],
+            .pName = "main",
+         };
+      }
+      VkRayTracingShaderGroupCreateInfoKHR groups[] = {group, group, group, group};
+      groups[1].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+      groups[1].generalShader = VK_SHADER_UNUSED_KHR;
+      groups[1].closestHitShader = 1;
+      groups[1].anyHitShader = 3;
+      groups[2].generalShader = 2;
+      groups[3].generalShader = 4;
+
+      const uint32_t depths[] = {3, 4, 8, 31};
+      uint32_t stack[ARRAY_SIZE(depths)], instrs[ARRAY_SIZE(depths)], cm = 0;
+      for (unsigned d = 0; d < ARRAY_SIZE(depths); ++d) {
+         ci = info(0);
+         ci.stageCount = ARRAY_SIZE(stages);
+         ci.pStages = stages;
+         ci.groupCount = ARRAY_SIZE(groups);
+         ci.pGroups = groups;
+         ci.maxPipelineRayRecursionDepth = depths[d];
+         b = backends;
+         CHECK(create(VK_NULL_HANDLE, &ci, &p) == VK_SUCCESS);
+         CHECK(backends == b + 1 && last_calls == 0);
+         struct hk_ray_tracing_pipeline *rp =
+            hk_ray_tracing_pipeline_from_handle(p);
+         stack[d] = rp->stack_size;
+         instrs[d] = last_instrs;
+         if (depths[d] > HK_RT_INLINE_MAX_RAY_RECURSION_DEPTH) {
+            CHECK(rp->stack_sizes.closest_hit >= HK_RAY_HIT_ATTRIBS_SIZE);
+            cm = ((MAX2(rp->stack_sizes.closest_hit, rp->stack_sizes.miss) +
+                   15) & ~15u) + HK_RT_RETURN_RECORD_SIZE;
+         }
+         fprintf(stderr, "continuation test: depth %u: %u instructions, "
+                 "stack %u bytes\n", depths[d], last_instrs, stack[d]);
+         destroy(p);
+      }
+      CHECK(stack[3] - stack[2] == 23 * cm && stack[2] - stack[1] == 4 * cm);
+      /* Group handles and the stack limit are constants that differ between
+       * the pipelines, so folding may differ by a few instructions; a copy
+       * per depth level would be orders of magnitude more. */
+#define NEAR(a, b) ((a) <= (b) + (b) / 50 && (b) <= (a) + (a) / 50)
+      CHECK(NEAR(instrs[1], instrs[2]) && NEAR(instrs[1], instrs[3]));
+#undef NEAR
+
+      /* Many callable groups: continuations find a group's entry and a part
+       * by balanced search, so no block grows with the number of groups. */
+      unsigned max_block[2];
+      const unsigned callables[2] = {8, 48};
+      for (unsigned k = 0; k < 2; ++k) {
+         const unsigned n = 3 + callables[k];
+         VkPipelineShaderStageCreateInfo many[3 + 48];
+         VkRayTracingShaderGroupCreateInfoKHR many_groups[3 + 48];
+         for (unsigned i = 0; i < n; ++i) {
+            /* raygen, closest-hit, miss, then the callables */
+            many[i] = stages[i < 3 ? i : 4];
+            many_groups[i] = i < 3 ? groups[i] : groups[3];
+            if (i >= 3)
+               many_groups[i].generalShader = i;
+         }
+         many_groups[1].anyHitShader = VK_SHADER_UNUSED_KHR;
+         ci = info(0);
+         ci.stageCount = n;
+         ci.pStages = many;
+         ci.groupCount = n;
+         ci.pGroups = many_groups;
+         ci.maxPipelineRayRecursionDepth = 4;
+         CHECK(create(VK_NULL_HANDLE, &ci, &p) == VK_SUCCESS && last_calls == 0);
+         max_block[k] = last_max_block;
+         fprintf(stderr, "continuation test: %u callable groups: largest block "
+                 "%u instructions\n", callables[k], max_block[k]);
+         destroy(p);
+      }
+      CHECK(max_block[1] <= max_block[0] + 16);
+
+      struct hk_rt_stack_sizes sizes = {
+         .raygen = 40, .closest_hit = 72, .miss = 20, .any_hit = 32,
+         .intersection = 48, .callable = 100,
+      };
+      uint32_t leaf;
+      CHECK(hk_rt_continuation_stack_size(&sizes, 5, false, 0, &leaf) ==
+            32 + (48 + 32) + 5 * (80 + 32) + 112 && leaf == 112);
+      CHECK(hk_rt_continuation_stack_size(&sizes, 5, true, 0, &leaf) ==
+            32 + (48 + 32) + 5 * (80 + 32) + 31 * (112 + 32) + 112);
+      CHECK(hk_rt_continuation_stack_size(&sizes, 5, false, 72, &leaf) ==
+            32 + (48 + 32) + 5 * (80 + 32) + 160 && leaf == 80 + 80);
+      for (unsigned i = 0; i < ARRAY_SIZE(mods); ++i)
+         vk_common_DestroyShaderModule(device, mods[i], NULL);
+      puts("PASS: continuation mode above depth 3: no calls, code size "
+           "independent of depth, linear stack");
+   }
+
    destroy(library);
    CHECK(live_nir == 0 && pipeline_allocs == pipeline_frees);
    CHECK(layout->ref_cnt == 1);
-   CHECK(shader_destroys == backends - 1); /* injected backend failure */
+   /* Every compiled or restored shader is destroyed, less the injected
+    * backend failure. */
+   CHECK(shader_destroys == backends - 1 + restored);
+   hk_rt_device_finish(&dev);
    vk_pipeline_layout_unref(&dev.vk, layout);
    vk_common_DestroyShaderModule(device, module, NULL);
    vk_pipeline_cache_destroy(empty, NULL);

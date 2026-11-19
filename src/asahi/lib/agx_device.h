@@ -6,6 +6,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <string.h>
 #ifdef HAVE_LIBDRM
 #include <xf86drm.h>
 #endif
@@ -35,6 +36,20 @@ struct vdrm_device;
 struct asahi_ccmd_submit_res;
 #endif
 
+/* DRM name of the native kernel driver. Kernels before the Aurora rename
+ * report "asahi", so both are accepted and Mesa and the kernel can update in
+ * either order.
+ */
+#define AGX_DRM_DRIVER_NAME        "aurora"
+#define AGX_DRM_DRIVER_NAME_LEGACY "asahi"
+
+static inline bool
+agx_is_native_drm_driver(const char *name)
+{
+   return name && (!strcmp(name, AGX_DRM_DRIVER_NAME) ||
+                   !strcmp(name, AGX_DRM_DRIVER_NAME_LEGACY));
+}
+
 enum agx_dbg {
    AGX_DBG_TRACE = BITFIELD_BIT(0),
    AGX_DBG_BODUMP = BITFIELD_BIT(1),
@@ -61,6 +76,7 @@ enum agx_dbg {
    AGX_DBG_NOMERGE = BITFIELD_BIT(22),
    /* Track BOs without serializing submissions, then decode only a failed
     * submit while its command stream and referenced allocations are live. */
+   AGX_DBG_FAULTTRACE = BITFIELD_BIT(23),
    /* Decode every command stream at submit time without waiting for the GPU. */
    AGX_DBG_ASYNCTRACE = BITFIELD_BIT(24),
 };
@@ -176,8 +192,13 @@ struct agx_device {
 
    /* Global queue handle */
    uint32_t queue_id;
+   /* Watchdog allowance of the compute commands of the queues this device
+    * creates, in ms; 0 keeps the kernel's default. Sent only to a kernel with
+    * DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT. */
+   uint32_t compute_timeout_ms;
    /* AGX_DBG_1QUEUE: render SCS layouts the shared queue was created with. */
    uint64_t queue_layouts[2];
+   enum drm_asahi_priority queue_priority;
 
    /* VMA heaps */
    simple_mtx_t vma_lock;
@@ -302,7 +323,7 @@ agx_bo_sync_for_device(struct agx_bo *bo, size_t offset, size_t size)
  * for sparse_ro_offset.
  */
 static inline bool
-agx_addr_is_ro(struct agx_device *dev, uint64_t addr)
+agx_addr_is_ro(const struct agx_device *dev, uint64_t addr)
 {
    return (addr & dev->sparse_ro_offset);
 }
@@ -327,7 +348,7 @@ agx_fill_bind_flags(const struct agx_device *dev)
 }
 
 static inline uint64_t
-agx_rw_addr_to_ro(struct agx_device *dev, uint64_t addr)
+agx_rw_addr_to_ro(const struct agx_device *dev, uint64_t addr)
 {
    assert(!agx_addr_is_ro(dev, addr));
    return addr + dev->sparse_ro_offset;
@@ -359,6 +380,10 @@ agx_bo_map_size(const struct agx_bo *bo)
 static inline void *
 agx_bo_map_placed(struct agx_bo *bo, void *fixed_addr, size_t length)
 {
+   /* Application memory is mapped where the application put it. */
+   if (bo->flags & AGX_BO_HOST_PTR)
+      return fixed_addr && fixed_addr != bo->_map ? NULL : bo->_map;
+
    /* The BO cache deliberately preserves CPU mappings.  A Vulkan allocation
     * may therefore inherit a mapping from an earlier allocation even though
     * the new VkDeviceMemory object has never been mapped.  A placed map must
@@ -397,7 +422,7 @@ static inline void *
 agx_bo_map_owned(struct agx_bo *bo, void *fixed_addr, size_t length,
                  size_t *size)
 {
-   if (!bo->dev->ops.bo_mmap_independent)
+   if (!bo->dev->ops.bo_mmap_independent || (bo->flags & AGX_BO_HOST_PTR))
       return NULL;
 
    struct agx_bo copy = *bo;
@@ -417,8 +442,24 @@ agx_bo_unmap_owned(struct agx_bo *bo, void *map, size_t size)
    bo->dev->ops.bo_munmap(bo->dev, &copy);
 }
 
+/* The kernel can create BOs over application memory (GEM_USERPTR). */
 static inline bool
-agx_has_soft_fault(struct agx_device *dev)
+agx_has_userptr(const struct agx_device *dev)
+{
+   return !dev->is_virtio &&
+          (dev->params.features & DRM_ASAHI_FEATURE_USERPTR);
+}
+
+/* The kernel can keep a BO resident under memory pressure (GEM_RESIDENCY). */
+static inline bool
+agx_has_residency_control(const struct agx_device *dev)
+{
+   return !dev->is_virtio &&
+          (dev->params.features & DRM_ASAHI_FEATURE_GEM_RESIDENCY);
+}
+
+static inline bool
+agx_has_soft_fault(const struct agx_device *dev)
 {
    return (dev->params.features & DRM_ASAHI_FEATURE_SOFT_FAULTS) &&
           !(dev->debug & AGX_DBG_NOSOFT);
@@ -494,6 +535,8 @@ uint32_t agx_create_command_queue(struct agx_device *dev,
 uint32_t agx_create_command_queue_with_render_scs(struct agx_device *dev,
    enum drm_asahi_priority priority, const uint64_t layouts[2]);
 int agx_destroy_command_queue(struct agx_device *dev, uint32_t queue_id);
+bool agx_probe_high_priority(struct agx_device *dev);
+bool agx_device_vm_failed(struct agx_device *dev);
 
 int agx_import_sync_file(struct agx_device *dev, struct agx_bo *bo, int fd);
 int agx_export_sync_file(struct agx_device *dev, struct agx_bo *bo);
@@ -522,6 +565,15 @@ agx_native_graphics(const struct agx_device *dev)
    return agx_chip_native_agx3(dev->chip);
 }
 
+/* This interface carries native sampler state in GPU records, not in the
+ * firmware command's optional sampler-heap fields. */
+static inline bool
+agx_stream_sampler_state(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G15G &&
+          dev->params.gpu_hal_generation == DRM_ASAHI_GPU_HAL_200;
+}
+
 /* T6040 uses the G17P architecture profile, while capability rollout may
  * still be product-specific. Device admission has already checked USC/HAL. */
 static inline bool
@@ -529,6 +581,15 @@ agx_is_m4_pro(const struct agx_device *dev)
 {
    return dev->chip == AGX_CHIP_G17P && dev->params.chip_id == 0x6040 &&
           dev->params.gpu_generation == 16 && dev->params.gpu_variant == 'S';
+}
+
+/* Product capability rollout must not follow the shared G17P architecture
+ * profile: T6040 also uses that profile. Device admission checked USC/HAL. */
+static inline bool
+agx_is_a18_pro(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G17P && dev->params.chip_id == 0x8140 &&
+          dev->params.gpu_generation == 17 && dev->params.gpu_variant == 'P';
 }
 
 struct agx_va *agx_va_alloc(struct agx_device *dev, uint64_t size_B,
@@ -548,16 +609,36 @@ agx_cmd_header(bool compute, uint16_t barrier_vdm, uint16_t barrier_cdm)
    };
 }
 
+/*
+ * Whether the kernel sizes each render's firmware pools from the programs the
+ * render runs. The M5 Pro and M5 Max (G17S, G17C) run on the G17 kernel
+ * runtime, which reports this contract as DRM_ASAHI_FEATURE_RENDER_RESOURCES:
+ * every render must follow a DRM_ASAHI_SET_RENDER_RESOURCES(_V2) list in its
+ * submission (SUBMIT fails with EINVAL otherwise), and compute commands take
+ * a DRM_ASAHI_SET_COMPUTE_RESOURCES list when the kernel reports
+ * DRM_ASAHI_FEATURE_COMPUTE_RESOURCES. The M5 (G17G) takes the same lists
+ * where it runs on the G17 runtime (integration/aurora); the M5 runtime of
+ * older kernels reports neither.
+ */
+static inline bool
+agx_m5_render_resources(const struct agx_device *dev)
+{
+   return agx_chip_g17_m5(dev->chip) &&
+          (dev->params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES);
+}
+
 /* Size of the render command passed to the kernel. drm_asahi_cmd_render grew
  * the high words of the background/EOT resource specifiers for the native
  * AGX3 path, whose USC window sits at 2^40, and kernels that predate them
- * reject the longer packet with EINVAL. Every other chip keeps the original
- * layout, as Honeykrisp does in hk_drm_render_command_size().
+ * reject the longer packet with EINVAL. The G17 runtime's M5 command set
+ * reads them too (the M5 colour background's specifier is
+ * 0xffff800000000040). Every other chip keeps the original layout, as
+ * Honeykrisp does in hk_drm_render_command_size().
  */
 static inline uint16_t
 agx_render_command_size(const struct agx_device *dev)
 {
-   return agx_chip_native_agx3(dev->chip)
+   return agx_chip_native_agx3(dev->chip) || agx_m5_render_resources(dev)
              ? sizeof(struct drm_asahi_cmd_render)
              : offsetof(struct drm_asahi_cmd_render, bg_eot_rsrc_spec_hi);
 }

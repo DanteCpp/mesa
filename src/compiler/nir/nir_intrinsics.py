@@ -483,6 +483,11 @@ intrinsic("deref_buffer_array_length", src_comp=[-1], dest_comp=1,
 intrinsic("deref_buffer_address", src_comp=[-1], dest_comp=0,
           indices=[ACCESS], flags=[CAN_ELIMINATE, CAN_REORDER])
 
+# Gets the 32-bit byte offset of a buffer deref in its binding, as its
+# address holds it (zero in address formats that hold no such offset)
+intrinsic("deref_buffer_offset", src_comp=[-1], dest_comp=1,
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
 # Gets the length of an unsized array
 intrinsic("deref_implicit_array_length", src_comp=[-1], dest_comp=1,
           flags=[CAN_ELIMINATE, CAN_REORDER])
@@ -2542,6 +2547,13 @@ intrinsic("load_image_descriptor_word_agx", [1], 1, [],
           flags=[CAN_ELIMINATE, CAN_REORDER],
           bit_sizes=[32])
 
+# Byte size of a texel in the actual bound Gallium image view (source 0 is
+# the API image index). Lowered from validated software layout metadata,
+# before native descriptor lowering; it is not a hardware descriptor field.
+intrinsic("load_image_block_size_agx", [1], 1, [],
+          flags=[CAN_ELIMINATE, CAN_REORDER],
+          bit_sizes=[32])
+
 # Load descriptor set address
 intrinsic("load_descriptor_set_agx", [], 1, [DESC_SET],
           flags=[CAN_ELIMINATE, CAN_REORDER],
@@ -3433,6 +3445,11 @@ load("global_predicated_agx", [1, 1, 1],
 # a contiguous vec2-u32 descriptor; FLAGS selects the witnessed primitive leaf.
 intrinsic("allocate_mesh_uvb_agx", [1, 1])
 intrinsic("store_mesh_uvb_agx", [2], indices=[FLAGS])
+# G17P exporter phase boundary. BASE is enum agx_mesh_export_fence: complete
+# the index phase, or the preceding 32-vertex batch. Kept outside the export
+# predicates, including zero/partial counts. Not an API memory barrier or a
+# descriptor-lifetime annotation; no payload or SSA lifetime is introduced.
+intrinsic("fence_mesh_uvb_agx", indices=[BASE])
 # Object invocation0/1/2 publishes one child-grid dimension through UVSW.
 intrinsic("store_object_childcount_agx", [1])
 

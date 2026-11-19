@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_device.h"
+#include "hk_buffer_view.h"
 #include "hk_frame_anatomy.h"
 
 #include "hk_acceleration_structure.h"
@@ -16,10 +17,12 @@
 #include "agx_scratch.h"
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
+#include "hk_compute_kick.h"
 #include "hk_descriptor_table.h"
 #include "hk_entrypoints.h"
 #include "hk_instance.h"
 #include "hk_native_sampler.h"
+#include "hk_ray_tracing_pipeline.h"
 #include "hk_physical_device.h"
 #include "hk_shader.h"
 
@@ -55,8 +58,10 @@ hk_g17p_prewarm_poly_kernels(struct hk_device *dev)
 {
 #define PREWARM(program, args)                                                \
    do {                                                                        \
-      if (!hk_g17p_compute_program_cache_prewarm(                              \
-             dev, program, sizeof(struct args)))                               \
+      if (agx_chip_g17_m5(dev->dev.chip)                                       \
+             ? !agx_get_precompiled(&dev->bg_eot, program)                     \
+             : !hk_g17p_compute_program_cache_prewarm(                         \
+                  dev, program, sizeof(struct args)))                          \
          return false;                                                         \
    } while (0)
 
@@ -73,6 +78,11 @@ hk_g17p_prewarm_poly_kernels(struct hk_device *dev)
    PREWARM(LIBAGX_TESS_QUAD_1, libagx_tess_quad_args);
 
 #undef PREWARM
+
+   /* M5 resets the geometry heap with an immediate-write kernel. */
+   if (agx_chip_g17_m5(dev->dev.chip) &&
+       !agx_get_precompiled(&dev->bg_eot, LIBAGX_WRITE_U32S))
+      return false;
 
    return true;
 }
@@ -143,7 +153,8 @@ hk_upload_rodata(struct hk_device *dev)
       memcpy(map + offs + i * sampler_size, &txf, sampler_size);
    offs += sampler_count * sampler_size;
 
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
+   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
+       dev->dev.chip == AGX_CHIP_G18G) {
       const uint64_t pointers[2] = {
          dev->sampled_images.base_va,
          dev->samplers.table.bo->va->addr,
@@ -263,15 +274,17 @@ hk_init_sampler_heap(struct hk_device *dev, struct hk_sampler_heap *h)
    VkResult result =
       hk_descriptor_table_init(dev, &h->table, sampler_size, 1024,
                                agx_native_graphics(&dev->dev) ? 4096
-                               : agx_chip_g17_m5(dev->dev.chip) ? 2048
-                                                                : 1024);
+                               : (agx_chip_g17_m5(dev->dev.chip) ||
+                                  dev->dev.chip == AGX_CHIP_G18G) ? 2048
+                                                                  : 1024);
 
    if (result != VK_SUCCESS) {
       ralloc_free(h->ht);
       return result;
    }
 
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
+   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
+       dev->dev.chip == AGX_CHIP_G18G) {
       /* Native indexed read() and sample() share the sampler table prefix.
        * Reserve texel-fetch sampler zero once, so mixed shaders need no
        * per-fetch pointer switch or descriptor copy. Preserve at least the
@@ -306,7 +319,7 @@ hk_destroy_sampler_heap(struct hk_device *dev, struct hk_sampler_heap *h)
 static VkResult
 hk_sampler_heap_add_locked(struct hk_device *dev, struct hk_sampler_heap *h,
                            const struct hk_native_sampler_descriptor *desc,
-                           struct hk_rc_sampler **out)
+                           bool capture, struct hk_rc_sampler **out)
 {
    /* Only the first eight bytes carry recovered sampler state.  The sparse
     * tail is required to be zero, so the packed word is a complete dedup key;
@@ -329,6 +342,7 @@ hk_sampler_heap_add_locked(struct hk_device *dev, struct hk_sampler_heap *h,
 
       assert((*out)->refcount != 0);
       (*out)->refcount++;
+      (*out)->replay |= capture;
 
       return VK_SUCCESS;
    }
@@ -339,7 +353,10 @@ hk_sampler_heap_add_locked(struct hk_device *dev, struct hk_sampler_heap *h,
 
    uint32_t index;
    VkResult result =
-      hk_descriptor_table_add(dev, &h->table, desc, h->table.desc_size, &index);
+      capture ? hk_descriptor_table_add_replay(dev, &h->table, desc,
+                                               h->table.desc_size, &index)
+              : hk_descriptor_table_add(dev, &h->table, desc,
+                                        h->table.desc_size, &index);
    if (result != VK_SUCCESS) {
       ralloc_free(rc);
       return result;
@@ -349,6 +366,7 @@ hk_sampler_heap_add_locked(struct hk_device *dev, struct hk_sampler_heap *h,
       .key = key,
       .refcount = 1,
       .index = index,
+      .replay = capture,
    };
 
    _mesa_hash_table_insert(h->ht, &rc->key, rc);
@@ -365,10 +383,72 @@ hk_sampler_heap_add(struct hk_device *dev,
    struct hk_sampler_heap *h = &dev->samplers;
 
    simple_mtx_lock(&h->lock);
-   VkResult result = hk_sampler_heap_add_locked(dev, h, desc, out);
+   VkResult result = hk_sampler_heap_add_locked(dev, h, desc, false, out);
    simple_mtx_unlock(&h->lock);
 
    return result;
+}
+
+/* For a sampler created to be captured (VK_EXT_descriptor_buffer). */
+VkResult
+hk_sampler_heap_add_capture(struct hk_device *dev,
+                            const struct hk_native_sampler_descriptor *desc,
+                            struct hk_rc_sampler **out)
+{
+   struct hk_sampler_heap *h = &dev->samplers;
+
+   simple_mtx_lock(&h->lock);
+   VkResult result = hk_sampler_heap_add_locked(dev, h, desc, true, out);
+   simple_mtx_unlock(&h->lock);
+
+   return result;
+}
+
+/* VK_EXT_descriptor_buffer replay: the hardware sampler must sit at the heap
+ * index the captured descriptors name. Share an identical sampler only when it
+ * is already there; otherwise take that index, failing if it is in use. A
+ * sampler whose key already lives elsewhere stays out of the dedup table. */
+VkResult
+hk_sampler_heap_add_at(struct hk_device *dev,
+                       const struct hk_native_sampler_descriptor *desc,
+                       uint32_t index, struct hk_rc_sampler **out)
+{
+   struct hk_sampler_heap *h = &dev->samplers;
+   struct agx_sampler_packed key;
+   memcpy(&key, desc, sizeof(key));
+
+   simple_mtx_lock(&h->lock);
+   struct hash_entry *ent = _mesa_hash_table_search(h->ht, &key);
+   if (ent != NULL && ((struct hk_rc_sampler *)ent->data)->index == index) {
+      *out = ent->data;
+      (*out)->refcount++;
+      (*out)->replay = true;
+      simple_mtx_unlock(&h->lock);
+      return VK_SUCCESS;
+   }
+
+   struct hk_rc_sampler *rc = ralloc(h->ht, struct hk_rc_sampler);
+   VkResult result = rc ? hk_descriptor_table_add_at(dev, &h->table, desc,
+                                                     h->table.desc_size, index)
+                        : VK_ERROR_OUT_OF_HOST_MEMORY;
+   if (result != VK_SUCCESS) {
+      ralloc_free(rc);
+      simple_mtx_unlock(&h->lock);
+      return result;
+   }
+
+   *rc = (struct hk_rc_sampler){
+      .key = key,
+      .refcount = 1,
+      .index = index,
+      .replay = true,
+   };
+   if (ent == NULL)
+      _mesa_hash_table_insert(h->ht, &rc->key, rc);
+   *out = rc;
+
+   simple_mtx_unlock(&h->lock);
+   return VK_SUCCESS;
 }
 
 static void
@@ -379,8 +459,14 @@ hk_sampler_heap_remove_locked(struct hk_device *dev, struct hk_sampler_heap *h,
    rc->refcount--;
 
    if (rc->refcount == 0) {
-      hk_descriptor_table_remove(dev, &h->table, rc->index);
-      _mesa_hash_table_remove_key(h->ht, &rc->key);
+      if (rc->replay)
+         hk_descriptor_table_remove_replay(dev, &h->table, rc->index);
+      else
+         hk_descriptor_table_remove(dev, &h->table, rc->index);
+      /* A replayed sampler may share its key with the dedup entry. */
+      struct hash_entry *ent = _mesa_hash_table_search(h->ht, &rc->key);
+      if (ent != NULL && ent->data == rc)
+         _mesa_hash_table_remove(h->ht, ent);
       ralloc_free(rc);
    }
 }
@@ -796,6 +882,53 @@ hk_device_init_diag(const void *pdev, const void *dev, const char *stage,
    errno = saved_errno;
 }
 
+/* Whether memory can be mapped at a second GPU virtual address at any time
+ * in the life of `dev`, from what it enabled (hk_cdm_alias_scope()):
+ *
+ * - sparse buffers and images, and capture/replay buffers, have an address
+ *   of their own, and the memory bound to them keeps its own as well;
+ * - an fd import of memory from elsewhere gets an address of its own, and
+ *   another import may map the same pages (two dma-bufs over one memfd, or
+ *   a dma-buf and a host import of its pages);
+ * - a host import gets an address of its own, and the same pages may be
+ *   imported again. With hk_host_memory_import_read_only every host import
+ *   is read-only for the GPU, so the GPU writes no imported page and a read
+ *   through the import cannot miss a write through another address.
+ *
+ * Nothing else maps memory the GPU writes at two addresses: the read-only
+ * shadow of every allocation is read only through sparse and capture/replay
+ * buffers, and the driver's other second mappings (descriptor tables,
+ * acceleration structure tables, shader code) hold memory written by the
+ * CPU alone. The structures of these features may only be used when they
+ * are enabled, so a device that enabled none of them never has such memory.
+ */
+static bool
+hk_device_may_alias_memory(const struct hk_device *dev,
+                           const struct hk_instance *instance)
+{
+   const struct vk_features *f = &dev->vk.enabled_features;
+   const struct vk_device_extension_table *ext = &dev->vk.enabled_extensions;
+
+   if (f->sparseBinding || f->sparseResidencyBuffer ||
+       f->sparseResidencyImage2D || f->sparseResidencyImage3D ||
+       f->sparseResidency2Samples || f->sparseResidency4Samples ||
+       f->sparseResidency8Samples || f->sparseResidency16Samples ||
+       f->sparseResidencyAliased)
+      return true;
+
+   if (f->bufferDeviceAddressCaptureReplay ||
+       f->bufferDeviceAddressCaptureReplayEXT ||
+       f->descriptorBufferCaptureReplay ||
+       f->accelerationStructureCaptureReplay)
+      return true;
+
+   if (ext->KHR_external_memory_fd || ext->EXT_external_memory_dma_buf)
+      return true;
+
+   return ext->EXT_external_memory_host &&
+          !instance->drirc.misc.host_memory_import_read_only;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_CreateDevice(VkPhysicalDevice physicalDevice,
                 const VkDeviceCreateInfo *pCreateInfo,
@@ -857,6 +990,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    dev->vk.shader_ops = &hk_device_shader_ops;
    dev->vk.command_dispatch_table = &dev->cmd_dispatch;
+   dev->may_alias_memory = hk_device_may_alias_memory(dev, instance);
 
    drmDevicePtr drm_device = NULL;
    int ret = drmGetDeviceFromDevId(pdev->render_dev, 0, &drm_device);
@@ -877,8 +1011,13 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    }
 
    dev->perftest = debug_get_flags_option("HK_PERFTEST", hk_perf_options, 0);
+   dev->dev.compute_timeout_ms = instance->drirc.misc.compute_timeout_ms;
 
-   if (instance->drirc.misc.disable_border_emulation) {
+   /* Native graphics compiles the emulation in only once a custom border
+    * sampler exists, and most samples then pay one branch, so D3D content keeps
+    * its correct borders there. */
+   if (instance->drirc.misc.disable_border_emulation &&
+       !agx_native_graphics(&pdev->dev)) {
       dev->perftest |= HK_PERF_NOBORDER;
    }
 
@@ -919,7 +1058,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
              dev->dev.user_timestamp_to_ns.den &&
           "user timestamps are in ns");
 
-   if (agx_chip_g17_m5(dev->dev.chip) &&
+   if ((agx_chip_g17_m5(dev->dev.chip) ||
+        hk_sparse_texel_residency_from_map(&dev->dev)) &&
        dev->vk.enabled_features.sparseResidencyBuffer) {
       const uint64_t pages = dev->dev.main_heap_size / AIL_PAGESIZE;
       const uint64_t bytes = align64(16 + DIV_ROUND_UP(pages, 8), AIL_PAGESIZE);
@@ -938,11 +1078,29 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       }
    }
 
+   /* Capture-replay buffers reserve their VA and bind the fill page until
+    * memory is bound, like sparse buffers, so they need it too. */
+   if (dev->vk.enabled_features.sparseBinding ||
+       dev->vk.enabled_features.bufferDeviceAddressCaptureReplay) {
+      dev->sparse_fill = agx_bo_create(&dev->dev, AIL_PAGESIZE, 0, 0,
+                                       "Sparse fill page");
+      if (!dev->sparse_fill || !agx_bo_map(dev->sparse_fill)) {
+         result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         HK_INIT_FAIL(fail_dev, "sparse-fill", 0);
+      }
+      memset(agx_bo_map(dev->sparse_fill), 0, AIL_PAGESIZE);
+      if (agx_bo_sync_for_device(dev->sparse_fill, 0, AIL_PAGESIZE)) {
+         result = vk_error(dev, VK_ERROR_DEVICE_LOST);
+         HK_INIT_FAIL(fail_dev, "sparse-fill-sync", 0);
+      }
+   }
+
    result = hk_init_sampler_heap(dev, &dev->samplers);
    if (result != VK_SUCCESS)
       HK_INIT_FAIL(fail_dev, "sampler-heap", 0);
 
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
+   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
+       dev->dev.chip == AGX_CHIP_G18G) {
       /* Capacity stays HK_MAX_DESCRIPTORS, but memory is added a chunk at a
        * time as image and buffer views are created. */
       result = hk_descriptor_table_init(dev, &dev->sampled_images, 32,
@@ -960,6 +1118,14 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       if (result != VK_SUCCESS)
          HK_INIT_FAIL(fail_sampled_images, "null-texture-descriptor", 0);
       assert(null_index == 0);
+
+      /* Reserved right after the null texture, so their indices are the
+       * same on every device with the same features. */
+      if (dev->vk.enabled_features.descriptorBuffer) {
+         result = hk_texel_windows_init(dev);
+         if (result != VK_SUCCESS)
+            HK_INIT_FAIL(fail_sampled_images, "texel-buffer-windows", 0);
+      }
    }
 
    result = hk_descriptor_table_init(
@@ -980,11 +1146,11 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    }
    hk_g17p_bg_eot_dev_cache_init(dev);
 
-   /* Geometry and tessellation are advertised core functionality on G17P.
-    * Upload their immutable internal kernels with the device instead of
+   /* Geometry and tessellation are advertised core functionality on G17P and
+    * M5. Upload their immutable internal kernels with the device instead of
     * making the first vkCmdDraw that needs each kernel serialize on the
     * cache lock and allocate its executable image. */
-   if (agx_native_graphics(&dev->dev) &&
+   if ((agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
        !hk_g17p_prewarm_poly_kernels(dev)) {
       result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
       HK_INIT_FAIL(fail_bg_eot, "poly-prewarm", 0);
@@ -1045,8 +1211,15 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    *pDevice = hk_device_to_handle(dev);
 
+   simple_mtx_init(&dev->cmd_pending_lock, mtx_plain);
+   list_inithead(&dev->cmd_pending_queues);
+   list_inithead(&dev->cmd_pending_failed);
+   dev->cmd_pending_ready = true;
    simple_mtx_init(&dev->vdm.lock, mtx_plain);
-   list_inithead(&dev->vdm.slabs);
+   for (unsigned class = 0; class < HK_CMD_SLAB_COUNT; ++class) {
+      list_inithead(&dev->vdm.slabs[class]);
+      list_inithead(&dev->vdm.full[class]);
+   }
    simple_mtx_init(&dev->scratch.lock, mtx_plain);
    simple_mtx_init(&dev->shader_binary_cache.lock, mtx_plain);
    agx_scratch_init(&dev->dev, &dev->scratch.vs);
@@ -1059,6 +1232,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    /* Opt-in profiler; never fails device creation. */
    hk_frame_anatomy_init(dev);
+   hk_compute_kick_init(dev, instance->drirc.misc.compute_kick_ms);
 
    if (init_diag)
       hk_device_init_diag(pdev, dev, "success", VK_SUCCESS, 0);
@@ -1073,7 +1247,11 @@ fail_accel_struct:
 fail_mem_cache:
    vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
 fail_queues:
-   vk_foreach_queue_safe(iter, &dev->vk) {
+   /* Aliases were created after their backing queues. Finish
+    * them first so a submit worker cannot refer to a freed backing queue. */
+   while (!list_is_empty(&dev->vk.queues)) {
+      struct vk_queue *iter =
+         list_last_entry(&dev->vk.queues, struct vk_queue, link);
       struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
       hk_queue_finish(dev, queue);
    }
@@ -1092,13 +1270,16 @@ fail_rodata:
 fail_queries:
    hk_descriptor_table_finish(dev, &dev->occlusion_queries);
 fail_sampled_images:
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip))
+   hk_texel_windows_finish(dev);
+   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
+       dev->dev.chip == AGX_CHIP_G18G)
       hk_descriptor_table_finish(dev, &dev->sampled_images);
 fail_samplers:
    hk_destroy_sampler_heap(dev, &dev->samplers);
 fail_dev:
    hk_finish_vm_status_mirror(dev);
    agx_bo_unreference(&dev->dev, dev->physical_sparse_map);
+   agx_bo_unreference(&dev->dev, dev->sparse_fill);
    agx_bo_unreference(&dev->dev, dev->code_heap.chunk);
    agx_close_device(&dev->dev);
    /* agx_close_device owns the DRM fd after agx_open_device succeeds. */
@@ -1121,6 +1302,9 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (!dev)
       return;
 
+   /* Its thread and kicks use the queues and the device's kernels. */
+   hk_compute_kick_stop(dev);
+
    util_dynarray_fini(&dev->external_bos.counts);
    util_dynarray_fini(&dev->external_bos.list);
    u_rwlock_destroy(&dev->external_bos.lock);
@@ -1131,6 +1315,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    hk_shader_binary_cache_finish(dev);
    hk_g17p_compute_program_cache_finish(dev);
    hk_device_finish_accel_struct_state(dev);
+   hk_rt_device_finish(dev);
    hk_destroy_internal_shaders(dev, &dev->kernels, false);
    hk_destroy_internal_shaders(dev, &dev->prolog_epilog, true);
 
@@ -1139,13 +1324,24 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    /* Retire pending profiler records while the queue syncobjs exist. */
    hk_frame_anatomy_finish(dev);
 
-   vk_foreach_queue_safe(iter, &dev->vk) {
+   /* Aliases were created after their backing queues. Finish
+    * them first so a submit worker cannot refer to a freed backing queue. */
+   while (!list_is_empty(&dev->vk.queues)) {
+      struct vk_queue *iter =
+         list_last_entry(&dev->vk.queues, struct vk_queue, link);
       struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
       hk_queue_finish(dev, queue);
    }
 
+   /* No submit thread is left to call into the kicker. */
+   hk_compute_kick_finish(dev);
+
    vk_device_finish(&dev->vk);
 
+   /* All submit workers/queues are gone. No command bytes can be handed to
+    * a new recording during teardown. Kernel job pins retain failed work. */
+   hk_cmd_pending_finish(dev);
+   simple_mtx_destroy(&dev->cmd_pending_lock);
    hk_device_finish_vdm_slabs(dev);
    simple_mtx_destroy(&dev->vdm.lock);
 
@@ -1173,7 +1369,9 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    }
 
    hk_destroy_sampler_heap(dev, &dev->samplers);
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip))
+   hk_texel_windows_finish(dev);
+   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
+       dev->dev.chip == AGX_CHIP_G18G)
       hk_descriptor_table_finish(dev, &dev->sampled_images);
    hk_descriptor_table_finish(dev, &dev->occlusion_queries);
    agx_bo_unreference(&dev->dev, dev->rodata.heap_bo);
@@ -1184,6 +1382,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    agx_bg_eot_cleanup(&dev->bg_eot);
    hk_finish_vm_status_mirror(dev);
    agx_bo_unreference(&dev->dev, dev->physical_sparse_map);
+   agx_bo_unreference(&dev->dev, dev->sparse_fill);
    agx_bo_unreference(&dev->dev, dev->code_heap.chunk);
    simple_mtx_destroy(&dev->code_heap.lock);
    agx_close_device(&dev->dev);

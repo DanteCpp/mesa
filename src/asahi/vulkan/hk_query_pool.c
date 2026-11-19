@@ -286,7 +286,13 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
 
-   if (agx_native_graphics(&dev->dev)) {
+   /* A deferred stream (hk_query_oq.c) is judged at the end of the command
+    * buffer, when it is no longer current: a post-graphics dispatch would
+    * open a new stream after every later command, a query copy or reset
+    * included. Write into the stream itself, as native AGX3 does. */
+   const bool pin = agx_native_graphics(&dev->dev) ||
+                    (cs != cmd->current_cs.post_gfx && cs != cmd->current_cs.cs);
+   if (pin) {
       /* End-of-stream writes belong to this exact post-graphics stream.
        * Pin it while the common native helper obtains its CDM stream; it
        * must not move availability ahead of the VDM producer. */
@@ -391,6 +397,16 @@ hk_cmd_end_query_stamped(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    util_dynarray_append(&cs->oq_stamps, stamp);
 }
 
+/* Mark the stream that received a query copy or reset: only such a stream
+ * reads or writes query values the kernel may still be publishing for earlier
+ * commands (DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS). */
+static void
+hk_note_query_access(struct hk_cmd_buffer *cmd)
+{
+   if (cmd->current_cs.cs)
+      cmd->current_cs.cs->query_access = true;
+}
+
 static void
 emit_zero_queries_g17p(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
                        uint32_t first_index, uint32_t num_queries,
@@ -409,6 +425,7 @@ emit_zero_queries_g17p(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    if (pool->vk.query_type != VK_QUERY_TYPE_TIMESTAMP &&
        pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION &&
        pool->vk.query_type != VK_QUERY_TYPE_PIPELINE_STATISTICS &&
+       pool->vk.query_type != VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT &&
        pool->vk.query_type != VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT &&
        pool->vk.query_type != VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT &&
        !hk_is_acceleration_structure_query(pool->vk.query_type)) {
@@ -453,6 +470,7 @@ emit_zero_queries_g17p(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    libagx_reset_query_struct(cmd, agx_1d(num_queries),
                              set_available ? AGX_BARRIER_ALL : AGX_BARRIER_NONE,
                              info);
+   hk_note_query_access(cmd);
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
 
@@ -513,6 +531,7 @@ emit_zero_queries(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    };
 
    libagx_reset_query_struct(cmd, agx_1d(num_queries), AGX_BARRIER_ALL, info);
+   hk_note_query_access(cmd);
 }
 
 static void
@@ -570,11 +589,11 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    if (!pool)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   /* Native AGX3 occlusion availability lives in 64-bit slots of a bound
-    * timestamp buffer (hk_cmd_end_query_stamped()), on chips whose kernel
-    * writes them at render retirement (hk_oq_render_stamps_supported()). */
-   const bool stamped = occlusion && agx_native_graphics(&dev->dev) &&
-                        hk_oq_render_stamps_supported(dev->dev.chip);
+   /* Occlusion availability lives in 64-bit slots of a bound timestamp
+    * buffer (hk_cmd_end_query_stamped()) on chips whose kernel writes them at
+    * render retirement (hk_oq_render_stamps_supported(): G17P and M5). */
+   const bool stamped =
+      occlusion && hk_oq_render_stamps_supported(dev->dev.chip);
    pool->avail_shift = stamped ? 1 : 0;
 
    /* We place the availability first and then data. Pipeline-statistics pools
@@ -641,6 +660,8 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
          }
 
          assert(pool->handle && "handles are nonzero");
+         hk_frame_anatomy_bind_pool(dev, pool->handle, agx_bo_map(pool->bo),
+                                    pool->bo->size);
       }
 
       /* Without a binding, every query end keeps the queued store. */
@@ -696,8 +717,10 @@ hk_DestroyQueryPool(VkDevice device, VkQueryPool queryPool,
          hk_descriptor_table_remove(dev, &dev->occlusion_queries, oq_index[i]);
    }
 
-   if (pool->handle)
+   if (pool->handle) {
+      hk_frame_anatomy_unbind_pool(dev, pool->handle);
       dev->dev.ops.bo_unbind_object(&dev->dev, pool->handle);
+   }
 
    agx_bo_unreference(&dev->dev, pool->bo);
    vk_free2(&dev->vk.alloc, pAllocator, pool->oq_submit);
@@ -1348,6 +1371,7 @@ hk_cmd_copy_query_pool_results(struct hk_cmd_buffer *cmd,
       hk_cdm_cache_flush(dev, cs);
       libagx_copy_query_g17p_struct(cmd, agx_1d(queryCount), AGX_BARRIER_NONE,
                                    info);
+      hk_note_query_access(cmd);
       if (vk_command_buffer_has_error(&cmd->vk))
          return;
 
@@ -1371,9 +1395,11 @@ hk_cmd_copy_query_pool_results(struct hk_cmd_buffer *cmd,
       .dst_stride = stride,
       .reports_per_query = hk_reports_per_query(pool),
       .flags = flags,
+      .availability_shift = pool->avail_shift,
    };
 
    libagx_copy_query_struct(cmd, agx_1d(queryCount), AGX_BARRIER_ALL, info);
+   hk_note_query_access(cmd);
 }
 
 VKAPI_ATTR void VKAPI_CALL

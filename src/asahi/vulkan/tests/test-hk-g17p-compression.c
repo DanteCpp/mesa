@@ -223,9 +223,11 @@ check_minecraft(void)
    CHECK(ELIGIBLE(color));
    CHECK(ELIGIBLE(atlas));
    CHECK(ELIGIBLE(depth));
-   /* Small blit-generated RGBA8/BGRA8 UNORM mip chains the application
-    * never renders to stay on the raw compute path; from
-    * HK_G17P_MIP_PBE_MIN_TEXELS texels, and everything else, compresses. */
+   /* Small colour images the application never renders to stay plain:
+    * each upload into a compressed image is a render pass, and a small
+    * blit-generated RGBA8/BGRA8 UNORM mip chain stays on the raw compute
+    * path. From HK_G17P_MIP_PBE_MIN_TEXELS texels, and attachments at any
+    * size, compress. */
    const VkImageUsageFlags texture_usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
       VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
    const VkFormat compute_blit[] = {VK_FORMAT_R8G8B8A8_UNORM,
@@ -234,7 +236,9 @@ check_minecraft(void)
       VkImageCreateInfo t = image(compute_blit[f], 256, 256, 9, texture_usage);
       CHECK(!ELIGIBLE(t));
       t.mipLevels = 1;
-      CHECK(ELIGIBLE(t));
+      CHECK(!ELIGIBLE(t));
+      VkImageCreateInfo single = image(compute_blit[f], 512, 256, 1, texture_usage);
+      CHECK(ELIGIBLE(single));
       t.mipLevels = 9;
       t.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
       CHECK(ELIGIBLE(t));
@@ -247,11 +251,25 @@ check_minecraft(void)
       big = image(compute_blit[f], 4096, 4096, 13, texture_usage);
       CHECK(ELIGIBLE(big));
    }
+
+   /* The same holds for every compressed colour format and mip count: a
+    * small glyph-cache style R8 texture taking tile uploads stays plain
+    * unless it is also rendered to. */
+   VkImageCreateInfo r8 = image(VK_FORMAT_R8_UNORM, 130, 130, 1, texture_usage);
+   CHECK(!ELIGIBLE(r8));
+   r8.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   CHECK(ELIGIBLE(r8));
+   r8 = image(VK_FORMAT_R8_UNORM, 512, 512, 1, texture_usage);
+   CHECK(ELIGIBLE(r8));
    VkImageCreateInfo srgb = image(VK_FORMAT_R8G8B8A8_SRGB, 256, 256, 9,
                                   texture_usage);
+   CHECK(!ELIGIBLE(srgb));
+   srgb.extent.width = 512;
    CHECK(ELIGIBLE(srgb));
    VkImageCreateInfo half = image(VK_FORMAT_R16G16B16A16_SFLOAT, 256, 256, 9,
                                   texture_usage);
+   CHECK(!ELIGIBLE(half));
+   half.extent.width = 512;
    CHECK(ELIGIBLE(half));
 
    /* The swapchain is external/WSI memory and stays plain. */
@@ -383,7 +401,7 @@ check_shared(void)
       CHECK(hk_g17p_shared_compression_eligible((enum agx_chip)chip, 0,
                                                 &base) ==
             (chip == AGX_CHIP_G17P || chip == AGX_CHIP_G17G ||
-             chip == AGX_CHIP_G17S));
+             chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C));
    CHECK(!hk_g17p_shared_compression_eligible(AGX_CHIP_G17P, 1, &base));
    CHECK(!hk_g17p_shared_compression_eligible(AGX_CHIP_G17P, 0, NULL));
 
@@ -565,8 +583,12 @@ check_m5_color(void)
    VkImageCreateInfo c = i;
    c.arrayLayers = 2;
    CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   /* A transfer destination is made renderable like an attachment; an
+    * image that is neither is not compressed. */
    c = i;
    c.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.usage &= ~VK_IMAGE_USAGE_TRANSFER_DST_BIT;
    CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
    c = i;
    c.format = VK_FORMAT_R32G32B32A32_SFLOAT;

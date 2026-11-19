@@ -177,7 +177,7 @@ agx_instr_accepts_uniform(enum agx_isa_encoding encoding, enum agx_opcode op,
 
       /* Apple's G17P loop
        * test compares a GPR with an aligned 32-bit uniform in one icmp
-       * (fs-apple.bin +0xbc 0a832307060007020000: f18 = u6, f24 = 3), so
+       * (the uniform's half index in f18, operand class f24 = 3), so
        * keep the uniform as the second operand instead of copying it into
        * a GPR on every iteration. */
       return (encoding == AGX_ISA_ENCODING_AGX3B ||
@@ -420,7 +420,12 @@ agx3_fold_m5_constant_lods(agx_context *ctx)
 static void
 agx3_lower_m5_live_scalar_lods(agx_context *ctx)
 {
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C)
+   /* G18G samples through j873's G17G-family sampler
+    * (agx3_emit_texture_sample_g17g), which takes a per-lane level or bias
+    * only as the 16-bit scalar itself, not as a packed word.
+    */
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       agx_is_g18g(&ctx->key->dev))
       return;
 
    bool needed = false;
@@ -796,14 +801,16 @@ agx_lower_uniform_sources(agx_context *ctx)
          I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
          agx3_tex_uniform_pair_unwitnessed(ctx, I, I->src[3], I->src[4]);
 
-      /* M5 fragment SMP reads both its texture and its sampler handle from
-       * aligned 64-bit uniforms (f97/f103=3 and f126/f132=3) when Metal
-       * passes them through an argument buffer; the native
-       * G17G compiler compiles texture2d::sample, level and bias that way.
+      /* M5 fragment and compute SMP read both the texture and the sampler
+       * handle from aligned 64-bit uniforms (f97/f103=3 and f126/f132=3)
+       * when Metal passes them through an argument buffer; the native
+       * G17G compiler compiles texture2d::sample, level and bias that way,
+       * and so samples in compute kernels.
        * Only that pair is witnessed: keep both or copy both. */
       bool m5_tex_uniform_pair =
          ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-         ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble &&
+         (ctx->stage == MESA_SHADER_FRAGMENT ||
+          ctx->stage == MESA_SHADER_COMPUTE) && !ctx->is_preamble &&
          I->op == AGX_OPCODE_TEXTURE_SAMPLE && I->nr_srcs >= 5;
       for (unsigned j = 3; m5_tex_uniform_pair && j < 5; ++j) {
          const agx_index x = I->src[j];
@@ -874,7 +881,7 @@ agx_lower_uniform_sources(agx_context *ctx)
             I->op == AGX_OPCODE_BREAK_IF_ICMP;
          /* An aligned 32-bit
           * uniform against an 8-bit immediate is one native icmp (Apple's
-          * G17P loop guard, fs-apple.bin +0x0c: u6 == 0). Keep the uniform
+          * G17P loop guard, e.g. u6 == 0). Keep the uniform
           * in place instead of copying it into a GPR first; the packer
           * emits agx3_cf_icmp_uniform_imm() for either operand order. */
          const bool uniform_imm_compare =
@@ -974,11 +981,18 @@ agx_lower_uniform_sources(agx_context *ctx)
             (I->src[s].size == AGX_SIZE_16 || !(I->src[s].value & 1)) &&
             !(I->src[0].type == AGX_INDEX_IMMEDIATE &&
               I->src[1].type == AGX_INDEX_IMMEDIATE);
+         /* G18G: export coalescing can introduce copies during register
+          * allocation. Materialize half uniforms while virtual registers are
+          * available, rather than asking the late parallel-copy pass to
+          * encode an unwitnessed uniform-to-half move. */
+         const bool copy_g18g_half_export =
+            agx_is_g18g(&ctx->key->dev) && I->op == AGX_OPCODE_EXPORT &&
+            I->src[s].size == AGX_SIZE_16;
          if (I->src[s].type == AGX_INDEX_UNIFORM && !select_uniform_flag &&
              !select_uniform_comparand && !select_uniform_alternative &&
              (s == first_uniform ||
               copy_minmax || copy_float_uniforms || copy_float_modifier ||
-              copy_compare_uniform || copy_tex ||
+              copy_compare_uniform || copy_tex || copy_g18g_half_export ||
               !(native_integer || native_m5_float || uniform_imm_compare ||
                 (s < 3 && keep_m5_float_uniform[s]) ||
                 (s < 4 && keep_isel_uniform[s]) ||
@@ -999,7 +1013,8 @@ agx_lower_uniform_sources(agx_context *ctx)
             }
             if (reused)
                continue;
-            if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+            if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+                 agx_is_g18g(&ctx->key->dev)) &&
                 idx.size == AGX_SIZE_16) {
                /* Native uniform copies fetch an aligned word. Extract the
                 * requested half through an SSA split, so RA can coalesce

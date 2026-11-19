@@ -19,6 +19,7 @@ extern "C" {
 #include "compiler/nir/nir_builder.h"
 #include "agx_nir_m5_mesh.h"
 #include "agx3_mesh_core.h"
+#include "agx_mesh_abi.h"
 #include <gtest/gtest.h>
 #include <vector>
 #include <csignal>
@@ -1197,6 +1198,64 @@ TEST(NativeForms, ImageStoreUsesDataTypeAcrossChipsAndFormats)
    EXPECT_NE(reference[0], reference[1]);
 }
 
+/* A G17P state-0 storage image that the shader also reads names its
+ * texture/PBE descriptor pair through state 0 (hk's read/write ABI): record 0
+ * is the texture, which read as a PBE describes a far larger surface, so the
+ * store must take record 1. A write-only image's state 0 is the PBE itself and
+ * keeps record 0. Only the immediate descriptor index may differ. */
+TEST(NativeForms, G17PState0PairedStoreTakesTheSecondRecord)
+{
+   agx3_encoded_end end;
+   ASSERT_TRUE(agx3_pack_end(AGX_ISA_ENCODING_AGX3B, &end));
+
+   std::vector<uint8_t> store[2];
+   for (bool pair : {false, true}) {
+      SCOPED_TRACE(pair ? "read/write pair" : "write-only");
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "state-0 store record");
+      nir_def *input = agx_test_load_preamble(&b, 4, 32, 4);
+      nir_intrinsic_instr *intr = nir_image_store(
+         &b, nir_imm_intN_t(&b, 0, 16), nir_imm_ivec4(&b, 0, 0, 0, 0),
+         nir_imm_intN_t(&b, 0, 16), input, nir_imm_intN_t(&b, 0, 16));
+      nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_2D);
+      nir_intrinsic_set_format(intr, PIPE_FORMAT_R32_UINT);
+      nir_intrinsic_set_src_type(intr, nir_type_uint32);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.reserved_preamble = 16;
+      key.g17p_storage_image_pair = pair;
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      const uint8_t *code = static_cast<const uint8_t *>(part.binary);
+      const unsigned size = part.info.binary_size;
+      ASSERT_GE(size, AGX3_IMAGE_WRITE_LENGTH + end.length);
+      const uint8_t *write = code + size - end.length - AGX3_IMAGE_WRITE_LENGTH;
+      store[pair].assign(write, write + AGX3_IMAGE_WRITE_LENGTH);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* The encoder's own difference between records 0 and 1 at one base. */
+   agx3_image_write_desc d = {};
+   d.image_kind = AGX3_TEX_OPERAND_IMMEDIATE;
+   d.dim = AGX3_IMAGE_WRITE_2D;
+   uint8_t record[2][AGX3_IMAGE_WRITE_LENGTH], length[2];
+   for (unsigned i = 0; i < 2; ++i) {
+      d.image_value = i;
+      ASSERT_TRUE(agx3_tex_encode_image_write_2d(AGX_ISA_ENCODING_AGX3B, &d, 0,
+                                                 1, record[i], &length[i]));
+   }
+   ASSERT_EQ(length[0], AGX3_IMAGE_WRITE_LENGTH);
+   for (unsigned i = 0; i < AGX3_IMAGE_WRITE_LENGTH; ++i) {
+      SCOPED_TRACE(i);
+      EXPECT_EQ(store[0][i] ^ store[1][i], record[0][i] ^ record[1][i]);
+   }
+   EXPECT_NE(store[0], store[1]);
+}
+
 TEST(NativeForms, VertexImageLoadRegisterLod)
 {
    nir_builder b = nir_builder_init_simple_shader(
@@ -2215,9 +2274,60 @@ TEST(NativeForms, CubeArrayShadowZeroLodUsesNativeDescriptors)
          nir_def_init(&tex->instr, &tex->def, 1, 32);
          nir_builder_instr_insert(&b, &tex->instr);
          nir_store_ssbo(&b, &tex->def, nir_imm_int(&b, 0), nir_imm_int(&b, 0));
-         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader), lod == 0.0f);
+         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader, true), lod == 0.0f);
          ralloc_free(b.shader);
       }
+   }
+}
+
+/* A constant descriptor may be read ahead of its sample. A dynamic index is
+ * only known to be in range where the sample runs, and there are no soft
+ * faults: speculating `if (i >= 0) sample(tex[i])` would read element -1. */
+TEST(NativeForms, HeapIndexReadsSpeculateOnlyForConstantDescriptors)
+{
+   for (bool dynamic : {false, true}) {
+      SCOPED_TRACE(dynamic);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "heap index access");
+      nir_def *texture = nir_bindless_image_agx(
+         &b, dynamic ? nir_load_local_invocation_index(&b) : nir_imm_int(&b, 0));
+      nir_def *sampler = nir_bindless_sampler_agx(
+         &b, nir_imm_int(&b, 32), nir_imm_intN_t(&b, 5, 16));
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader, 5);
+      tex->op = nir_texop_txl;
+      tex->sampler_dim = GLSL_SAMPLER_DIM_CUBE;
+      tex->is_array = true;
+      tex->is_shadow = true;
+      tex->is_new_style_shadow = true;
+      tex->coord_components = 4;
+      tex->dest_type = nir_type_float32;
+      tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_backend1,
+                                      nir_imm_vec4(&b, 1, 0, 0, 0));
+      tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_comparator,
+                                      nir_imm_float(&b, 0.5));
+      tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_float(&b, 0));
+      tex->src[3] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, texture);
+      tex->src[4] = nir_tex_src_for_ssa(nir_tex_src_sampler_handle, sampler);
+      nir_def_init(&tex->instr, &tex->def, 1, 32);
+      nir_builder_instr_insert(&b, &tex->instr);
+      nir_store_ssbo(&b, &tex->def, nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+      ASSERT_TRUE(agx_nir_lower_g17p_indexed_samplers(b.shader, true));
+
+      unsigned reads = 0;
+      nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic ||
+                nir_instr_as_intrinsic(instr)->intrinsic !=
+                   nir_intrinsic_load_global_constant)
+               continue;
+            reads++;
+            EXPECT_EQ(nir_intrinsic_access(nir_instr_as_intrinsic(instr)) &
+                         ACCESS_CAN_SPECULATE,
+                      dynamic ? 0u : (unsigned)ACCESS_CAN_SPECULATE);
+         }
+      }
+      EXPECT_EQ(reads, 1u);
+      ralloc_free(b.shader);
    }
 }
 
@@ -4349,6 +4459,122 @@ TEST(NativeForms, M5TaskGridFitsFullThreadgroupMemory)
    }
 }
 
+/* The constant byte offset past the payload address of a lowered payload
+ * access, or UINT64_MAX if the address is not payload address + constant. */
+static uint64_t
+m5_payload_access_offset(nir_def *addr)
+{
+   nir_scalar a = nir_scalar_resolved(addr, 0);
+   if (!nir_scalar_is_alu(a) || nir_scalar_alu_op(a) != nir_op_iadd)
+      return UINT64_MAX;
+   for (unsigned k = 0; k < 2; ++k) {
+      nir_scalar c = nir_scalar_chase_alu_src(a, k);
+      if (nir_scalar_is_const(c))
+         return nir_scalar_as_uint(c);
+   }
+   return UINT64_MAX;
+}
+
+/* Without the grid record (a mesh that never reads gl_NumWorkGroups) the
+ * task stores no child grid at the payload address and both stages address
+ * the payload from +0; with it, the grid takes +0 and the payload starts at
+ * +16. A payload word at byte 1020 is the last of a full 1 KiB payload. */
+TEST(NativeForms, M5TaskPayloadAtZeroWithoutGridRecord)
+{
+   for (bool grid_record : {false, true}) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_TASK,
+         &agx_nir_options, "task payload layout");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.task_payload_size = 1024;
+      nir_store_task_payload(&b, nir_imm_int(&b, 7), nir_imm_int(&b, 1020),
+                             .align_mul = 4);
+      nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 256, 1, 1));
+      ASSERT_TRUE(agx_nir_lower_m5_task(b.shader, 16384, grid_record));
+      nir_validate_shader(b.shader, "task payload layout");
+      NIR_PASS(_, b.shader, nir_opt_constant_folding);
+      unsigned grid_stores = 0, payload_stores = 0;
+      uint64_t payload_offset = UINT64_MAX;
+      nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(in, block) {
+            if (in->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+            EXPECT_NE(i->intrinsic, nir_intrinsic_store_task_payload);
+            if (i->intrinsic != nir_intrinsic_store_global)
+               continue;
+            if (i->src[0].ssa->num_components == 3) {
+               grid_stores++;
+            } else {
+               payload_stores++;
+               payload_offset = m5_payload_access_offset(i->src[1].ssa);
+            }
+         }
+      }
+      EXPECT_EQ(grid_stores, grid_record ? 1u : 0u);
+      EXPECT_EQ(payload_stores, 1u);
+      EXPECT_EQ(payload_offset, grid_record ? 1036u : 1020u);
+      ralloc_free(b.shader);
+   }
+
+   /* The mesh side of the same two layouts. */
+   for (unsigned base : {0u, 16u}) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_MESH,
+         &agx_nir_options, "mesh payload layout");
+      b.shader->info.task_payload_size = 1024;
+      nir_def *value = nir_load_task_payload(&b, 1, 32, nir_imm_int(&b, 1020),
+                                             .align_mul = 4);
+      nir_store_global(&b, value, nir_imm_int64(&b, 0x2000000),
+                       .write_mask = 1, .align_mul = 4);
+      ASSERT_TRUE(agx_nir_lower_m5_task_payload(b.shader, 16384, base));
+      nir_validate_shader(b.shader, "mesh payload layout");
+      NIR_PASS(_, b.shader, nir_opt_constant_folding);
+      uint64_t load_offset = UINT64_MAX;
+      nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(in, block) {
+            if (in->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+            EXPECT_NE(i->intrinsic, nir_intrinsic_load_task_payload);
+            if (i->intrinsic == nir_intrinsic_load_global)
+               load_offset = m5_payload_access_offset(i->src[0].ssa);
+         }
+      }
+      EXPECT_EQ(load_offset, 1020u + base);
+      ralloc_free(b.shader);
+   }
+}
+
+/* A payload-free task on a kernel that backs the payload keeps the
+ * rendezvous form without the grid record: only a kernel without payload
+ * storage takes the direct form. */
+TEST(NativeForms, M5PayloadFreeTaskWithoutGridRecordKeepsRendezvous)
+{
+   for (unsigned max_payload_B : {0u, 16384u}) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_TASK,
+         &agx_nir_options, "payload-free task");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 2, 1, 1));
+      ASSERT_TRUE(agx_nir_lower_m5_task(b.shader, max_payload_B, false));
+      nir_validate_shader(b.shader, "payload-free task");
+      bool exit_barrier = false, global_stores = false;
+      nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(in, block) {
+            if (in->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+            exit_barrier |=
+               i->intrinsic == nir_intrinsic_object_payload_exit_barrier_agx;
+            global_stores |= i->intrinsic == nir_intrinsic_store_global;
+         }
+      }
+      EXPECT_EQ(exit_barrier, max_payload_B != 0);
+      EXPECT_FALSE(global_stores);
+      ralloc_free(b.shader);
+   }
+}
+
 TEST(NativeForms, M5MeshUserSharedBarrierCompile)
 {
    for (unsigned shared : {0u,4u,64u,128u}) {
@@ -4492,14 +4718,13 @@ TEST(NativeForms, M5MeshPrimitiveDeclarationsRespectWrittenMask)
             .src_type = nir_type_float32,
             .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
       }
-      EXPECT_EQ(agx_nir_lower_m5_mesh_triangle_probe(b.shader), !written);
-      if (written) {
-         EXPECT_EQ(b.shader->info.shared_size, 0u);
-         EXPECT_EQ(b.shader->info.workgroup_size[0], 1u);
-      } else {
-         EXPECT_EQ(b.shader->info.shared_size, 4928u);
-         nir_validate_shader(b.shader, "mesh unused primitive declaration");
-      }
+      /* A written per-primitive word would need 768 private vertices; the
+       * provoking vertex carries it instead (mesh_layout_provoking): 784
+       * index and count bytes, 8 planes of 256 slots, then the slot map. */
+      ASSERT_TRUE(agx_nir_lower_m5_mesh_triangle_probe(b.shader));
+      EXPECT_EQ(b.shader->info.shared_size, written ? 10048u : 4928u);
+      EXPECT_EQ(b.shader->info.mesh.max_vertices_out, 256u);
+      nir_validate_shader(b.shader, "mesh primitive declaration");
       ralloc_free(b.shader);
    }
 }
@@ -4787,6 +5012,144 @@ TEST(NativeForms, M5MeshClipDistancesPublishVaryingAndClippingPlanes)
       ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
          << agx_last_compile_refusal();
       free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(NativeForms, Gen1MeshClipCullPointSizeFollowHardwareUVSOrder)
+{
+   /* Two clip and one cull distance plus gl_CullPrimitiveEXT. User words
+    * (the CLIP_DIST slot) come first, then point size, then the clip group,
+    * as agx_nir_lower_uvs lays out the hardware vertex. */
+   for (mesa_prim prim : {MESA_PRIM_TRIANGLES, MESA_PRIM_POINTS}) {
+      const unsigned corners = prim == MESA_PRIM_POINTS ? 1 : 3;
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_MESH, &agx_nir_options, "gen1 mesh clip/cull");
+      b.shader->info.io_lowered = true;
+      b.shader->info.workgroup_size[0] = 3;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.mesh.max_vertices_out = 3;
+      b.shader->info.mesh.max_primitives_out = 1;
+      b.shader->info.mesh.primitive_type = prim;
+      b.shader->info.clip_distance_array_size = 2;
+      b.shader->info.cull_distance_array_size = 1;
+      b.shader->info.outputs_written = VARYING_BIT_POS | VARYING_BIT_CLIP_DIST0 |
+         VARYING_BIT_PRIMITIVE_INDICES | VARYING_BIT_CULL_PRIMITIVE;
+      b.shader->info.per_primitive_outputs =
+         VARYING_BIT_PRIMITIVE_INDICES | VARYING_BIT_CULL_PRIMITIVE;
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 3),
+                                       nir_imm_int(&b, 1), nir_imm_int(&b, 0));
+      nir_store_per_vertex_output(&b, nir_imm_vec4(&b, 0, 0, 0, 1),
+         nir_imm_int(&b, 0), nir_imm_int(&b, 0), .write_mask = 15,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_vertex_output(&b, nir_imm_vec3(&b, 1, 1, -1),
+         nir_imm_int(&b, 0), nir_imm_int(&b, 0), .write_mask = 7,
+         .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_CLIP_DIST0, .num_slots = 1});
+      nir_store_per_primitive_output(&b, nir_imm_ivec3(&b, 0, 1, 2),
+         nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+         .write_mask = BITFIELD_MASK(corners), .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+      nir_store_per_primitive_output(&b, nir_imm_true(&b), nir_imm_int(&b, 0),
+         nir_imm_int(&b, 0), .write_mask = 1, .src_type = nir_type_bool1,
+         .io_semantics = {.location = VARYING_SLOT_CULL_PRIMITIVE,
+                          .num_slots = 1});
+      struct agx_m5_mesh_varyings v;
+      ASSERT_TRUE(agx_gen1_mesh_gather_varyings(b.shader, &v));
+      const unsigned psiz = prim == MESA_PRIM_POINTS;
+      EXPECT_TRUE(v.cull_primitive);
+      EXPECT_EQ(v.components[VARYING_SLOT_CLIP_DIST0], 3u);
+      EXPECT_EQ(v.first[VARYING_SLOT_CLIP_DIST0], 4u);
+      EXPECT_EQ(v.components[VARYING_SLOT_PSIZ], psiz);
+      if (psiz) {
+         EXPECT_EQ(v.first[VARYING_SLOT_PSIZ], 7u);
+      }
+      EXPECT_EQ(v.clip_first, 7u + psiz);
+      EXPECT_EQ(v.clip_count, 2u);
+      EXPECT_EQ(v.size, 9u + psiz);
+      ASSERT_TRUE(agx_nir_lower_gen1_mesh(b.shader, &v));
+      EXPECT_EQ(b.shader->info.cull_distance_array_size, 0u);
+      nir_validate_shader(b.shader, "gen1 mesh clip/cull");
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(NativeForms, Gen1MeshLayerExportsFromThreadgroupMemory)
+{
+   /* A per-primitive layer (hk's multiview lowering writes one) reaches the
+    * exported layer/viewport vertex word from threadgroup memory: the export
+    * must not read it back from the primitive's record in device memory. The
+    * record keeps its copy for a fragment shader reading gl_Layer.
+    *
+    * near: the shader's own threadgroup memory leaves room for the export
+    * arena (1,920 + 1,792 bytes from 28,992) but not for the 128 bytes of
+    * layer words; it still compiles, keeps the arena, and reads the record. */
+   for (unsigned variant = 0; variant < 3; ++variant) {
+      const bool cull = variant == 1, near = variant == 2;
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_MESH, &agx_nir_options, "gen1 mesh layer");
+      b.shader->info.io_lowered = true;
+      b.shader->info.workgroup_size[0] = 40;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.mesh.max_vertices_out = 64;
+      b.shader->info.mesh.max_primitives_out = 32;
+      b.shader->info.mesh.primitive_type = MESA_PRIM_LINES;
+      b.shader->info.shared_size = near ? 28992 : 0;
+      b.shader->info.outputs_written = VARYING_BIT_POS | VARYING_BIT_LAYER |
+         VARYING_BIT_PRIMITIVE_INDICES | (cull ? VARYING_BIT_CULL_PRIMITIVE : 0);
+      b.shader->info.per_primitive_outputs = VARYING_BIT_LAYER |
+         VARYING_BIT_PRIMITIVE_INDICES | (cull ? VARYING_BIT_CULL_PRIMITIVE : 0);
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 64),
+                                       nir_imm_int(&b, 32), nir_imm_int(&b, 0));
+      nir_store_per_vertex_output(&b, nir_imm_vec4(&b, 0, 0, 0, 1), lane,
+         nir_imm_int(&b, 0), .write_mask = 15, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      nir_store_per_primitive_output(&b, nir_imm_ivec2(&b, 0, 1), lane,
+         nir_imm_int(&b, 0), .write_mask = 3, .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES,
+                          .num_slots = 1});
+      if (cull) {
+         nir_store_per_primitive_output(&b, nir_imm_false(&b), lane,
+            nir_imm_int(&b, 0), .write_mask = 1, .src_type = nir_type_bool1,
+            .io_semantics = {.location = VARYING_SLOT_CULL_PRIMITIVE,
+                             .num_slots = 1});
+      }
+      nir_store_per_primitive_output(&b, nir_imm_int(&b, 1), lane,
+         nir_imm_int(&b, 0), .write_mask = 1, .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_LAYER, .num_slots = 1});
+      struct agx_m5_mesh_varyings v;
+      ASSERT_TRUE(agx_gen1_mesh_gather_varyings(b.shader, &v));
+      EXPECT_TRUE(v.lv);
+      EXPECT_EQ(v.primitive_stride_B, 4u);
+      const unsigned shared_before = b.shader->info.shared_size;
+      ASSERT_TRUE(agx_nir_lower_gen1_mesh(b.shader, &v));
+      nir_validate_shader(b.shader, "gen1 mesh layer");
+      unsigned global_loads = 0, global_stores = 0;
+      nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+         nir_foreach_instr(in, block) {
+            if (in->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+            global_loads += i->intrinsic == nir_intrinsic_load_global;
+            global_stores += i->intrinsic == nir_intrinsic_store_global;
+         }
+      }
+      /* Culling still moves the records themselves (one load per record
+       * word); near the limit the export reads the layer from the record;
+       * nothing else reads device memory. */
+      EXPECT_EQ(global_loads, (cull || near) ? 1u : 0u);
+      EXPECT_GE(global_stores, 1u);
+      EXPECT_LE(b.shader->info.shared_size, 32768u);
+      if (near) {
+         /* The export arena is kept: 2 private vertices per line. */
+         EXPECT_EQ(b.shader->info.mesh.max_vertices_out, 64u);
+         EXPECT_EQ(b.shader->info.shared_size, 28992u + 1920u + 1792u);
+      } else {
+         EXPECT_GE(b.shader->info.shared_size, shared_before + 4u * 32u);
+      }
       ralloc_free(b.shader);
    }
 }
@@ -5260,14 +5623,22 @@ TEST(NativeForms, M5QuadHelpersKeepFragmentEntryUnmarked)
 }
 
 
-TEST(NativeForms, M5MultisampleTileDataRemainsLiveUntilLastStore)
+/* A G17P eMRT epilog shares one high-register payload across samples too
+ * (vulkan-msaa-mrt rgba16f,r32f 2 4 load). */
+TEST(NativeForms, MultisampleTileDataRemainsLiveUntilLastStore)
 {
+   for (bool g17p : {false, true})
    for (unsigned targets : {1u, 4u}) {
       SCOPED_TRACE(targets);
+      SCOPED_TRACE(g17p);
+      const enum agx_isa_encoding enc =
+         g17p ? AGX_ISA_ENCODING_AGX3B : AGX_ISA_ENCODING_AGX3C;
+      const unsigned data_reg = g17p ? 24 : 0;
       void *mem = ralloc_context(NULL);
       agx_shader_key key = {};
-      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
-      key.dev.chip = AGX_CHIP_G17S;
+      key.dev.encoding = enc;
+      key.dev.chip = g17p ? AGX_CHIP_G17P : AGX_CHIP_G17S;
+      key.g17p_emrt = g17p;
       key.secondary = true;
       key.no_preamble = true;
       key.fs.nr_samples = 4;
@@ -5282,14 +5653,14 @@ TEST(NativeForms, M5MultisampleTileDataRemainsLiveUntilLastStore)
       for (unsigned sample = 0; sample < 4; ++sample) {
          for (unsigned target = targets; target-- > 0;) {
             const bool last = sample == 3 && target == 0;
-            agx_index data = agx_register(0, AGX_SIZE_16);
+            agx_index data = agx_register(data_reg, AGX_SIZE_16);
             data.channels_m1 = 1;
             data.discard = last;
             const agx_index coverage = agx_register(16 + sample, AGX_SIZE_16);
             agx_st_tile(b, data, coverage, agx_null(), AGX_FORMAT_U8NORM,
                         15, target * 4, false, target);
             uint8_t bytes[AGX3_TILE_MAX_LENGTH], length;
-            ASSERT_TRUE(agx3_tile_store_f13(AGX_ISA_ENCODING_AGX3C, 0,
+            ASSERT_TRUE(agx3_tile_store_f13(enc, data_reg,
                AGX3_TILE_W8, 15, target * 4,
                agx3_tile_sample_reg(16 + sample, false), 0, last,
                bytes, &length));
@@ -5755,6 +6126,388 @@ TEST(NativeForms, M5MeshPerPrimitiveRefusalsLeaveShaderUntouched)
    nir_validate_shader(s,"mesh 85 primitives");ralloc_free(s);
 }
 
+/* A mesh of `locations` per-primitive uvec4 words whose private vertices
+ * do not fit: the shapes of mesh_shader.ext.smoke.*_lib (256 triangles),
+ * misc.max_lines (255 lines) and properties.max_mesh_output_size_*_per_primitive
+ * (96 points, 19 locations). */
+static nir_shader *
+m5_mesh_provoking_shader(mesa_prim primitive, unsigned vertices,
+                         unsigned primitives, unsigned locations, bool cull)
+{
+   const unsigned corners =
+      primitive == MESA_PRIM_POINTS ? 1 : primitive == MESA_PRIM_LINES ? 2 : 3;
+   const bool points = primitive == MESA_PRIM_POINTS;
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_MESH, &agx_nir_options, "mesh provoking words");
+   b.shader->info.io_lowered = true;
+   b.shader->info.workgroup_size[0] = 1;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.mesh.max_vertices_out = vertices;
+   b.shader->info.mesh.max_primitives_out = primitives;
+   b.shader->info.mesh.primitive_type = primitive;
+   const uint64_t words = BITFIELD64_RANGE(VARYING_SLOT_VAR0, locations);
+   b.shader->info.outputs_written = VARYING_BIT_POS |
+      VARYING_BIT_PRIMITIVE_INDICES | words | (points ? VARYING_BIT_PSIZ : 0) |
+      (cull ? VARYING_BIT_CULL_PRIMITIVE : 0);
+   b.shader->info.per_primitive_outputs = VARYING_BIT_PRIMITIVE_INDICES | words |
+      (cull ? VARYING_BIT_CULL_PRIMITIVE : 0);
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, vertices),
+                                      nir_imm_int(&b, primitives), nir_imm_int(&b, 0));
+   nir_store_per_vertex_output(&b, nir_imm_vec4(&b, 0, 0, 0, 1), lane,
+      nir_imm_int(&b, 0), .write_mask = 15, .src_type = nir_type_float32,
+      .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+   if (points)
+      nir_store_per_vertex_output(&b, nir_imm_float(&b, 1), lane,
+         nir_imm_int(&b, 0), .write_mask = 1, .src_type = nir_type_float32,
+         .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
+   nir_def *index[3] = {lane, nir_iadd_imm(&b, lane, 1), nir_iadd_imm(&b, lane, 2)};
+   nir_store_per_primitive_output(&b, nir_vec(&b, index, corners), lane,
+      nir_imm_int(&b, 0), .write_mask = BITFIELD_MASK(corners),
+      .src_type = nir_type_uint32,
+      .io_semantics = {.location = VARYING_SLOT_PRIMITIVE_INDICES, .num_slots = 1});
+   for (unsigned l = 0; l < locations; ++l) {
+      nir_store_per_primitive_output(&b, nir_imm_ivec4(&b, l, 1, 2, 3), lane,
+         nir_imm_int(&b, 0), .write_mask = 15, .src_type = nir_type_uint32,
+         .io_semantics = {.location = VARYING_SLOT_VAR0 + l, .num_slots = 1});
+   }
+   if (cull)
+      nir_store_per_primitive_output(&b, nir_imm_false(&b), lane,
+         nir_imm_int(&b, 0), .write_mask = 1, .src_type = nir_type_bool1,
+         .io_semantics = {.location = VARYING_SLOT_CULL_PRIMITIVE, .num_slots = 1});
+   return b.shader;
+}
+
+TEST(NativeForms, Gen1MeshExportFencesCoverGenericShapesAndPartialCounts)
+{
+   const struct {
+      mesa_prim topology;
+      unsigned x, y, z, vertices, primitives;
+   } rows[] = {
+      {MESA_PRIM_TRIANGLES, 3,1,1,3,1},
+      {MESA_PRIM_LINES, 16,1,1,32,16},
+      {MESA_PRIM_LINES, 32,1,1,64,32},
+      {MESA_PRIM_LINES, 10,4,1,256,256},
+      {MESA_PRIM_POINTS, 1,1,128,128,128},
+      {MESA_PRIM_LINES, 128,1,1,256,128},
+      {MESA_PRIM_POINTS, 32,1,1,33,1},
+   };
+   for (const auto &r : rows) {
+      for (unsigned count : {0u, 1u, r.vertices}) {
+         nir_shader *s = m5_mesh_provoking_shader(r.topology, r.vertices,
+                                                  r.primitives, 0, false);
+         s->info.workgroup_size[0]=r.x; s->info.workgroup_size[1]=r.y;
+         s->info.workgroup_size[2]=r.z;
+         nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+            nir_foreach_instr(in, block) {
+               if (in->type != nir_instr_type_intrinsic ||
+                   nir_instr_as_intrinsic(in)->intrinsic !=
+                      nir_intrinsic_set_vertex_and_primitive_count)
+                  continue;
+               nir_builder b = nir_builder_at(nir_before_instr(in));
+               nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+               nir_src_rewrite(&i->src[0], nir_imm_int(&b, count));
+               nir_src_rewrite(&i->src[1], nir_imm_int(&b, MIN2(count, r.primitives)));
+            }
+         }
+         struct agx_m5_mesh_varyings v;
+         ASSERT_TRUE(agx_gen1_mesh_gather_varyings(s, &v));
+         ASSERT_TRUE(agx_nir_lower_gen1_mesh(s, &v));
+         nir_validate_shader(s, "gen1 mesh export phase scopes");
+         unsigned phase=0, index_sites=0, vertex_sites=0;
+         nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+            nir_foreach_instr(in, block) {
+               if (in->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+               if (i->intrinsic == nir_intrinsic_fence_mesh_uvb_agx) {
+                  EXPECT_EQ(nir_intrinsic_base(i), phase ?
+                     AGX_MESH_EXPORT_FENCE_VERTEX_BATCH : AGX_MESH_EXPORT_FENCE_INDICES);
+                  /* Each fence is in SIMD0's then-list, after the prior
+                   * index/batch IF and before the NEXT vertex IF. This
+                   * remains true at count0, count1 and the full limit. */
+                  ASSERT_NE(block->cf_node.parent, nullptr);
+                  EXPECT_EQ(block->cf_node.parent->type, nir_cf_node_if);
+                  EXPECT_EQ(nir_cf_node_prev(&block->cf_node)->type, nir_cf_node_if);
+                  EXPECT_EQ(nir_cf_node_next(&block->cf_node)->type, nir_cf_node_if);
+                  ++phase;
+               } else if (i->intrinsic == nir_intrinsic_store_mesh_uvb_agx) {
+                  if (nir_intrinsic_flags(i)) {
+                     EXPECT_EQ(phase, 0u); ++index_sites;
+                  } else {
+                     ASSERT_GT(phase, 0u); ++vertex_sites;
+                     ASSERT_TRUE(nir_src_is_const(i->src[0]));
+                     EXPECT_EQ(nir_src_comp_as_uint(i->src[0],0) >> 16,
+                               32 * (phase - 1));
+                  }
+               }
+            }
+         }
+         EXPECT_EQ(phase, DIV_ROUND_UP(r.vertices,32));
+         const unsigned corners = r.topology == MESA_PRIM_POINTS ? 1 :
+                                  r.topology == MESA_PRIM_LINES ? 2 : 3;
+         EXPECT_EQ(index_sites, DIV_ROUND_UP(DIV_ROUND_UP(corners*r.primitives,4),32));
+         EXPECT_GT(vertex_sites, 0u);
+         ralloc_free(s);
+      }
+   }
+   /* The separate G17S exporter has no new fence or changed protocol. */
+   nir_shader *s = m5_mesh_provoking_shader(MESA_PRIM_POINTS,128,128,0,false);
+   ASSERT_TRUE(agx_nir_lower_m5_mesh_triangle_probe(s));
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(in, block) {
+         if (in->type == nir_instr_type_intrinsic)
+            EXPECT_NE(nir_instr_as_intrinsic(in)->intrinsic, nir_intrinsic_fence_mesh_uvb_agx);
+      }
+   }
+   ralloc_free(s);
+}
+
+static bool
+m5_test_provoking_last(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   if (i->intrinsic != nir_intrinsic_load_provoking_last)
+      return false;
+   b->cursor = nir_before_instr(&i->instr);
+   nir_def_replace(&i->def, nir_imm_int(b, *(const bool *)data ? -1 : 0));
+   return true;
+}
+
+/* Per-primitive words on the provoking vertex: the export slots are the API
+ * vertices plus private provoking copies, the threadgroup memory holds each
+ * per-primitive word once, and a line or triangle mesh reads the provoking
+ * selector from the draw (load_provoking_last). */
+TEST(NativeForms, M5MeshProvokingVertexCarriesPrimitiveWords)
+{
+   const struct {
+      mesa_prim primitive;
+      unsigned vertices, primitives, locations;
+      bool cull;
+      unsigned slots, shared;
+   } rows[] = {
+      /* 784 index/count bytes, 8 planes x 256 slots, 1 KiB slot map. */
+      {MESA_PRIM_TRIANGLES, 256, 256, 1, false, 256, 10048},
+      /* The same, then 256 cull bytes. */
+      {MESA_PRIM_TRIANGLES, 256, 256, 1, true, 256, 10304},
+      /* 528 index/count bytes, 8 planes x 256 slots, slot map. */
+      {MESA_PRIM_LINES, 256, 255, 1, false, 256, 9792},
+      /* 112 index/count bytes, 81 planes x 96 slots, slot map; private
+       * vertices would need 62336 bytes. No room for private copies. */
+      {MESA_PRIM_POINTS, 96, 96, 19, false, 96, 31616},
+   };
+   for (const auto &r : rows) {
+      for (bool last : {false, true}) {
+         nir_shader *s = m5_mesh_provoking_shader(r.primitive, r.vertices,
+            r.primitives, r.locations, r.cull);
+         struct agx_m5_mesh_varyings v;
+         ASSERT_TRUE(agx_m5_mesh_gather_varyings(s, &v));
+         EXPECT_FALSE(v.lv);
+         EXPECT_EQ(v.cull_primitive, r.cull);
+         v.dynamic = false;
+         ASSERT_TRUE(agx_nir_lower_m5_mesh(s, &v)) << r.primitive;
+         EXPECT_EQ(s->info.mesh.max_vertices_out, r.slots);
+         EXPECT_EQ(s->info.shared_size, r.shared);
+         EXPECT_EQ(s->info.workgroup_size[0], 32u);
+         nir_validate_shader(s, "mesh provoking words");
+         unsigned provoking = 0, uvst = 0, uvb = 0;
+         nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+            nir_foreach_instr(in, block) {
+               if (in->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+               EXPECT_NE(i->intrinsic, nir_intrinsic_store_per_primitive_output);
+               EXPECT_NE(i->intrinsic, nir_intrinsic_store_per_vertex_output);
+               EXPECT_NE(i->intrinsic, nir_intrinsic_load_mesh_primitive_storage_agx);
+               provoking += i->intrinsic == nir_intrinsic_load_provoking_last;
+               uvb += i->intrinsic == nir_intrinsic_allocate_mesh_uvb_agx;
+               uvst += i->intrinsic == nir_intrinsic_store_mesh_uvb_agx &&
+                       !nir_intrinsic_flags(i);
+            }
+         }
+         /* A point is its own provoking vertex. */
+         EXPECT_EQ(provoking, r.primitive == MESA_PRIM_POINTS ? 0u : 1u);
+         EXPECT_EQ(uvb, 1u);
+         EXPECT_EQ(uvst, DIV_ROUND_UP(r.slots, 32) * v.size);
+         NIR_PASS(_, s, nir_shader_intrinsics_pass, m5_test_provoking_last,
+                  nir_metadata_control_flow, &last);
+         agx_preprocess_nir_m5(s);
+         agx_shader_key key = {};
+         key.dev.chip = AGX_CHIP_G17S;
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.no_preamble = true;
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(s, &key, &part))
+            << agx_last_compile_refusal();
+         free(part.binary);
+         ralloc_free(s);
+      }
+   }
+}
+
+/* Shapes whose private vertices fit keep them, with no provoking selector:
+ * 85 triangles (255 private vertices) of per-primitive words. */
+TEST(NativeForms, M5MeshFittingPrimitiveWordsKeepPrivateVertices)
+{
+   nir_shader *s = m5_mesh_provoking_shader(MESA_PRIM_TRIANGLES, 256, 85, 1, false);
+   struct agx_m5_mesh_varyings v;
+   ASSERT_TRUE(agx_m5_mesh_gather_varyings(s, &v));
+   ASSERT_TRUE(agx_nir_lower_m5_mesh(s, &v));
+   EXPECT_EQ(s->info.mesh.max_vertices_out, 255u);
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(in, block) {
+         if (in->type == nir_instr_type_intrinsic) {
+            EXPECT_NE(nir_instr_as_intrinsic(in)->intrinsic,
+                      nir_intrinsic_load_provoking_last);
+         }
+      }
+   }
+   nir_validate_shader(s, "mesh fitting primitive words");
+   ralloc_free(s);
+}
+
+static bool
+m5_test_root_address(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   (void)data;
+   if (i->intrinsic != nir_intrinsic_load_root_agx)
+      return false;
+   b->cursor = nir_before_instr(&i->instr);
+   nir_def_replace(&i->def, nir_imm_int64(b, 0x100000));
+   return true;
+}
+
+struct m5_line_bias_counts {
+   unsigned roots, root_B, fdiv, ffma, rendezvous;
+};
+
+static m5_line_bias_counts
+m5_test_line_bias_counts(nir_shader *s)
+{
+   m5_line_bias_counts n = {};
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(in, block) {
+         if (in->type == nir_instr_type_alu) {
+            n.fdiv += nir_instr_as_alu(in)->op == nir_op_fdiv;
+            n.ffma += nir_instr_as_alu(in)->op == nir_op_ffma;
+            continue;
+         }
+         if (in->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+         n.rendezvous += i->intrinsic == nir_intrinsic_barrier &&
+                         nir_intrinsic_execution_scope(i) == SCOPE_WORKGROUP;
+         if (i->intrinsic != nir_intrinsic_load_root_agx)
+            continue;
+         n.roots++;
+         nir_foreach_use(use, &i->def) {
+            nir_alu_instr *add = nir_instr_as_alu(nir_src_use_instr(use));
+            EXPECT_EQ(add->op, nir_op_iadd);
+            for (unsigned k = 0; k < 2; ++k) {
+               if (nir_src_is_const(add->src[k].src))
+                  n.root_B = nir_src_as_uint(add->src[k].src);
+            }
+         }
+      }
+   }
+   return n;
+}
+
+/* Lines drawn toward +y move by the root's row step (m5_mesh_line_bias) in
+ * every output form, which stays as it is: the same slot count, and the
+ * same threadgroup memory but for the mark bytes. The welded and
+ * private-vertex forms append one mark byte per API vertex; the
+ * provoking-vertex form of misc.max_lines (255 lines of a per-primitive
+ * colour) keeps them in its slot map. */
+TEST(NativeForms, M5MeshLineRowBias)
+{
+   const unsigned root_B = 0x2f4;
+   const struct {
+      unsigned vertices, primitives, locations;
+      bool cull;
+      unsigned slots, marks, shared;
+   } rows[] = {
+      /* Welded: no per-primitive words. */
+      {256, 255, 0, false, 256, 256, 0},
+      /* 64 private vertices, cull bytes, then the marks. */
+      {64, 32, 1, true, 64, 64, 0},
+      /* misc.max_lines: 9792 bytes with or without the bias. */
+      {256, 255, 1, false, 256, 0, 9792},
+   };
+   for (const auto &r : rows) {
+      for (bool last : {false, true}) {
+         nir_shader *plain = m5_mesh_provoking_shader(MESA_PRIM_LINES,
+            r.vertices, r.primitives, r.locations, r.cull);
+         nir_shader *s = m5_mesh_provoking_shader(MESA_PRIM_LINES,
+            r.vertices, r.primitives, r.locations, r.cull);
+         struct agx_m5_mesh_varyings v;
+         ASSERT_TRUE(agx_m5_mesh_gather_varyings(plain, &v));
+         v.dynamic = false;
+         ASSERT_TRUE(agx_nir_lower_m5_mesh(plain, &v));
+         ASSERT_TRUE(agx_m5_mesh_gather_varyings(s, &v));
+         v.dynamic = false;
+         v.line_bias_root_B = root_B;
+         ASSERT_TRUE(agx_nir_lower_m5_mesh(s, &v)) << r.locations;
+         nir_validate_shader(s, "mesh line row bias");
+         EXPECT_EQ(s->info.mesh.max_vertices_out, r.slots);
+         EXPECT_EQ(plain->info.mesh.max_vertices_out, r.slots);
+         EXPECT_EQ(s->info.shared_size, plain->info.shared_size + r.marks);
+         if (r.shared) {
+            EXPECT_EQ(s->info.shared_size, r.shared);
+         }
+         EXPECT_EQ(s->info.workgroup_size[0], plain->info.workgroup_size[0]);
+         /* One root load at the given offset and two more rendezvous. The
+          * passes are unrolled per workgroup-sized chunk, as gen1's are per
+          * 32 lanes: two NDC divisions per chunk of primitives and one move
+          * per chunk of vertices. */
+         const unsigned lanes = s->info.workgroup_size[0] *
+                                s->info.workgroup_size[1] *
+                                s->info.workgroup_size[2];
+         ASSERT_GT(lanes, 0u);
+         const m5_line_bias_counts a = m5_test_line_bias_counts(plain);
+         const m5_line_bias_counts n = m5_test_line_bias_counts(s);
+         EXPECT_EQ(a.roots, 0u);
+         EXPECT_EQ(n.roots, 1u);
+         EXPECT_EQ(n.root_B, root_B);
+         EXPECT_EQ(n.fdiv, a.fdiv + 2 * DIV_ROUND_UP(r.primitives, lanes));
+         EXPECT_EQ(n.ffma, a.ffma + DIV_ROUND_UP(r.vertices, lanes));
+         EXPECT_EQ(n.rendezvous, a.rendezvous + 2);
+         ralloc_free(plain);
+         NIR_PASS(_, s, nir_shader_intrinsics_pass, m5_test_root_address,
+                  nir_metadata_control_flow, NULL);
+         NIR_PASS(_, s, nir_shader_intrinsics_pass, m5_test_provoking_last,
+                  nir_metadata_control_flow, &last);
+         agx_preprocess_nir_m5(s);
+         agx_shader_key key = {};
+         key.dev.chip = AGX_CHIP_G17S;
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.no_preamble = true;
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(s, &key, &part))
+            << agx_last_compile_refusal();
+         free(part.binary);
+         ralloc_free(s);
+      }
+   }
+   /* Triangles and points take no row bias: they lower as without it. */
+   for (auto primitive : {MESA_PRIM_TRIANGLES, MESA_PRIM_POINTS}) {
+      nir_shader *plain = m5_mesh_provoking_shader(primitive, 96, 32, 1, false);
+      nir_shader *s = m5_mesh_provoking_shader(primitive, 96, 32, 1, false);
+      struct agx_m5_mesh_varyings v;
+      ASSERT_TRUE(agx_m5_mesh_gather_varyings(plain, &v));
+      ASSERT_TRUE(agx_nir_lower_m5_mesh(plain, &v));
+      ASSERT_TRUE(agx_m5_mesh_gather_varyings(s, &v));
+      v.line_bias_root_B = root_B;
+      ASSERT_TRUE(agx_nir_lower_m5_mesh(s, &v)) << primitive;
+      EXPECT_EQ(s->info.shared_size, plain->info.shared_size);
+      EXPECT_EQ(s->info.mesh.max_vertices_out, plain->info.mesh.max_vertices_out);
+      EXPECT_EQ(m5_test_line_bias_counts(s).roots, 0u);
+      EXPECT_EQ(m5_test_line_bias_counts(s).rendezvous,
+                m5_test_line_bias_counts(plain).rendezvous);
+      ralloc_free(plain);
+      ralloc_free(s);
+   }
+}
+
 TEST(NativeForms, M5MeshPrimitiveIdIsAPrimitiveWord)
 {
    /* A mesh-written gl_PrimitiveID is a flat user word of the primitive's
@@ -5897,5 +6650,497 @@ TEST(NativeForms, M5OrSelectTracksVectorConversionComponent)
             }
          }
       }
+   }
+}
+
+TEST(NativeForms, G17PHalfImmediateMultiplyReachesPacker)
+{
+   for (unsigned multiplier : {6u, 7u, 9u, 11u, 17u, 255u}) {
+      for (bool constant_first : {false, true}) {
+         SCOPED_TRACE(multiplier);
+         SCOPED_TRACE(constant_first);
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = AGX_CHIP_G17P;
+         b->shader->key = &key;
+         b->shader->stage = MESA_SHADER_COMPUTE;
+         b->shader->max_reg = 15;
+         agx_index input = agx_register(2, AGX_SIZE_16);
+         agx_index imm = agx_immediate(multiplier);
+         agx_instr *mul = agx_imad_to(
+            b, agx_register(4, AGX_SIZE_16), constant_first ? imm : input,
+            constant_first ? input : imm, agx_zero(), 0);
+         agx_materialize_agx3_alu_constants(b->shader);
+         ASSERT_TRUE(agx_is_equiv(mul->src[0], input));
+         ASSERT_EQ(mul->src[1].type, AGX_INDEX_NORMAL);
+         agx_instr *constant = NULL;
+         agx_foreach_instr_global(b->shader, I) {
+            if (I->nr_dests && agx_is_equiv(I->dest[0], mul->src[1]))
+               constant = I;
+         }
+         ASSERT_NE(constant, nullptr);
+         ASSERT_EQ(constant->op, AGX_OPCODE_MOV_IMM);
+         EXPECT_EQ(constant->imm, multiplier);
+         EXPECT_EQ(constant->dest[0].size, AGX_SIZE_16);
+         /* Stand in for allocation, then check the real register-multiply
+          * encoding rather than accepting only a change in the IR. */
+         constant->dest[0] = agx_register(6, AGX_SIZE_16);
+         mul->src[1] = constant->dest[0];
+         agx_stop(b);
+         util_dynarray binary;
+         util_dynarray_init(&binary, mem);
+         EXPECT_TRUE(agx3_pack_binary(b->shader, &binary));
+         util_dynarray_fini(&binary);
+         ralloc_free(mem);
+      }
+   }
+}
+
+TEST(NativeForms, HalfMultiplyMaterializationPreservesOtherDomains)
+{
+   for (unsigned control = 0; control < 3; ++control) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = control == 0 ? AGX_ISA_ENCODING_AGX2 : AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = control == 0 ? AGX_CHIP_G13G : AGX_CHIP_G17P;
+      b->shader->key = &key;
+      agx_size size = control == 1 ? AGX_SIZE_32 : AGX_SIZE_16;
+      agx_instr *mul = agx_imad_to(b, agx_register(4, size),
+         agx_register(2, size), agx_immediate(7),
+         control == 2 ? agx_immediate(1) : agx_zero(), 0);
+      agx_materialize_agx3_alu_constants(b->shader);
+      EXPECT_EQ(mul->src[1].type, AGX_INDEX_IMMEDIATE);
+      EXPECT_EQ(mul->src[1].value, 7u);
+      ralloc_free(mem);
+   }
+}
+
+TEST(NativeForms, G17PSignExtendRetainsZeroExtendedWord)
+{
+   for (bool multiply : {false, true}) {
+      for (bool negate : {false, true}) {
+         for (agx_size size : {AGX_SIZE_32, AGX_SIZE_64}) {
+            SCOPED_TRACE(multiply);
+            SCOPED_TRACE(negate);
+            SCOPED_TRACE(size);
+            void *mem = ralloc_context(NULL);
+            agx_builder *b = agx_test_builder(mem);
+            agx_shader_key key = {};
+            key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+            key.dev.chip = AGX_CHIP_G17P;
+            b->shader->key = &key;
+            agx_index word = agx_temp(b->shader, AGX_SIZE_32);
+            agx_signext_to(b, word, agx_register(0, AGX_SIZE_16));
+            agx_index source = agx_abs(word);
+            source.neg = negate;
+            agx_index out = agx_temp(b->shader, size);
+            agx_instr *use = multiply
+               ? agx_imad_to(b, out, source, agx_register(2, AGX_SIZE_32),
+                             agx_zero(), 0)
+               : agx_iadd_to(b, out, source, agx_register(2, size), 0);
+            agx_unit_test(b, out);
+            agx_optimizer_forward(b->shader);
+            EXPECT_TRUE(agx_is_equiv(use->src[0], word));
+            EXPECT_EQ(use->src[0].size, AGX_SIZE_32);
+            EXPECT_TRUE(use->src[0].abs);
+            EXPECT_EQ(use->src[0].neg, negate);
+            ralloc_free(mem);
+         }
+      }
+   }
+}
+
+/* The class-12 wait that begin_invocation_interlock emits orders the critical
+ * section, so it survives in a fragment shader with no tile access. */
+TEST(NativeForms, InterlockWaitSurvivesUnreadPixelWaitMerge)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->any_interlock = true;
+   agx_instr *wait = agx_wait_pix(b, 0xc);
+   agx_stop(b);
+   EXPECT_FALSE(agx3_merge_unread_pixel_waits(b->shader));
+   unsigned waits = 0;
+   agx_foreach_instr_global(b->shader, I)
+      waits += I == wait && I->writeout == 0xc;
+   EXPECT_EQ(waits, 1u);
+   ralloc_free(mem);
+}
+
+/* G13 and G14 hit the same fold: before #232 an abs (zero-extend) source on a
+ * SIGNEXT def was narrowed to the half, an assert in debug builds and a wrong
+ * value for negative halves in release builds. */
+TEST(NativeForms, AGX2SignExtendRetainsZeroExtendedWord)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G14G}) {
+      for (bool multiply : {false, true}) {
+         SCOPED_TRACE(chip);
+         SCOPED_TRACE(multiply);
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX2;
+         key.dev.chip = chip;
+         b->shader->key = &key;
+         agx_index word = agx_temp(b->shader, AGX_SIZE_32);
+         agx_signext_to(b, word, agx_register(0, AGX_SIZE_16));
+         agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+         agx_instr *use =
+            multiply ? agx_imad_to(b, out, agx_abs(word),
+                                   agx_register(2, AGX_SIZE_32), agx_zero(), 0)
+                     : agx_iadd_to(b, out, agx_abs(word),
+                                   agx_register(2, AGX_SIZE_32), 0);
+         agx_unit_test(b, out);
+         agx_optimizer_forward(b->shader);
+         EXPECT_TRUE(agx_is_equiv(use->src[0], word));
+         EXPECT_EQ(use->src[0].size, AGX_SIZE_32);
+         EXPECT_TRUE(use->src[0].abs);
+         ralloc_free(mem);
+      }
+   }
+}
+
+TEST(NativeForms, SignExtendSignedConsumersStillFold)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G17P}) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = chip == AGX_CHIP_G13G ? AGX_ISA_ENCODING_AGX2 : AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = chip;
+      b->shader->key = &key;
+      agx_index input = agx_register(0, AGX_SIZE_16);
+      agx_index word = agx_temp(b->shader, AGX_SIZE_32);
+      agx_signext_to(b, word, input);
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *use = agx_iadd_to(b, out, word, agx_register(2, AGX_SIZE_32), 0);
+      agx_unit_test(b, out);
+      agx_optimizer_forward(b->shader);
+      EXPECT_TRUE(agx_is_equiv(use->src[0], input));
+      EXPECT_FALSE(use->src[0].abs);
+      ralloc_free(mem);
+   }
+}
+
+/* The VDM-launched G17P mesh program reads textures with the indexed forms of
+ * the other pre-raster stages (mesh_shader.ext.synchronization.*_to_mesh):
+ * an explicit-level sample packs as in a vertex program, and an image read
+ * stages its coordinates as in a kernel. */
+static std::vector<uint8_t>
+g17p_pack_texture_read(mesa_shader_stage stage, bool sample,
+                       bool register_lod = false)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = stage;
+   agx_index coords = agx_register(12, AGX_SIZE_32);
+   coords.channels_m1 = 1;
+   agx_index result = agx_register(24, AGX_SIZE_32);
+   result.channels_m1 = 3;
+   if (sample) {
+      agx_index lod = register_lod ? agx_register(14, AGX_SIZE_16)
+                                   : agx_immediate(0);
+      agx_texture_sample_to(b, result, coords, lod, agx_zero(),
+                            agx_register(16, AGX_SIZE_64),
+                            agx_register(20, AGX_SIZE_64), agx_null(),
+                            AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 1, false,
+                            false, false, AGX_GATHER_NONE, false);
+   } else {
+      agx_instr *read = agx_alloc_instr(b, AGX_OPCODE_IMAGE_LOAD, 1, 6);
+      read->dest[0] = result;
+      read->src[0] = coords;
+      read->src[1] = agx_immediate(0);
+      read->src[2] = agx_immediate(0);
+      read->src[3] = agx_register(18, AGX_SIZE_64);
+      read->src[4] = agx_immediate(0);
+      read->src[5] = agx_null();
+      read->dim = AGX_DIM_2D;
+      read->lod_mode = AGX_LOD_MODE_AUTO_LOD;
+      read->mask = 1;
+      agx_builder_insert(&b->cursor, read);
+   }
+   agx_stop(b);
+   util_dynarray bytes;
+   util_dynarray_init(&bytes, mem);
+   std::vector<uint8_t> out;
+   if (agx3_pack_binary(b->shader, &bytes)) {
+      const uint8_t *data = static_cast<const uint8_t *>(bytes.data);
+      out.assign(data, data + bytes.size);
+   }
+   ralloc_free(mem);
+   return out;
+}
+
+TEST(NativeForms, G17PMeshTextureReadsUsePreRasterForms)
+{
+   for (bool sample : {false, true}) {
+      SCOPED_TRACE(sample);
+      const std::vector<uint8_t> mesh =
+         g17p_pack_texture_read(MESA_SHADER_MESH, sample);
+      ASSERT_FALSE(mesh.empty()) << agx_last_compile_refusal();
+      EXPECT_EQ(mesh, g17p_pack_texture_read(
+         sample ? MESA_SHADER_VERTEX : MESA_SHADER_COMPUTE, sample));
+   }
+}
+
+/* A per-lane explicit level in a register (Astro Bot's mesh shaders) packs
+ * in a mesh program as in a vertex program. */
+TEST(NativeForms, G17PMeshRegisterLodSampleUsesVertexForm)
+{
+   const std::vector<uint8_t> mesh =
+      g17p_pack_texture_read(MESA_SHADER_MESH, true, true);
+   ASSERT_FALSE(mesh.empty()) << agx_last_compile_refusal();
+   EXPECT_EQ(mesh, g17p_pack_texture_read(MESA_SHADER_VERTEX, true, true));
+}
+
+/* G17P has no task stage, so a mesh payload read is never executed
+ * (mesh_shader.ext.misc.payload_not_accessed) and needs no payload memory. */
+TEST(NativeForms, G17PMeshPayloadReadIsUndefined)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_MESH,
+      &agx_nir_options, "gen1 mesh payload read");
+   b.shader->info.task_payload_size = 16;
+   nir_def *value = nir_load_task_payload(&b, 1, 32, nir_imm_int(&b, 12));
+   nir_store_global(&b, value, nir_imm_int64(&b, 0x2000000),
+                    .write_mask = 1, .align_mul = 4);
+   ASSERT_TRUE(agx_nir_lower_gen1_task_payload_probe(b.shader));
+   nir_foreach_block(block, b.impl) nir_foreach_instr(in, block) {
+      if (in->type != nir_instr_type_intrinsic)
+         continue;
+      const nir_intrinsic_op op = nir_instr_as_intrinsic(in)->intrinsic;
+      EXPECT_NE(op, nir_intrinsic_load_task_payload);
+      EXPECT_NE(op, nir_intrinsic_load_mesh_payload_address_agx);
+   }
+   nir_validate_shader(b.shader, "gen1 mesh payload read");
+   ralloc_free(b.shader);
+}
+
+/*
+ * The 8x8 cooperative-matrix multiply-add exists on the AGX3B ISA (G15/G16 and
+ * G17P) as well as on M5's AGX3C. These four f32matmad8x8 witnesses are real
+ * Apple G16G captures carried verbatim in the AGX3B half of the compose corpus
+ * (agx3_compose_corpus_vectors.c entries by74/by95/by96/by98), spanning the
+ * c-is-zero and c-present forms with both the destination cache hint and the
+ * operand discard hints. agx3_matrix_encode_mma8() must reproduce each one
+ * byte-for-byte when asked for the AGX3B encoding.
+ *
+ * by74 and by95 carry a nonzero scoreboard wait: their field 74 (wait slot 5)
+ * is set, i.e. wait_mask 0x20. Field 74 is the sixth wait bit, not a c-is-zero
+ * marker, so the descriptor must request that wait explicitly; by96/by98 have
+ * field 74 clear (wait_mask 0).
+ */
+TEST(NativeForms, Agx3bMatmad8x8MatchesAppleG16G)
+{
+   const struct {
+      const char *tag;
+      struct agx3_matrix_mma8_desc desc;
+      std::vector<uint8_t> bytes; /* real Apple G16G capture */
+   } cases[] = {
+      {"by74 c_zero dest4 wait_sb5",
+       {.dest = 4, .a = 4, .b = 8, .c_zero = true,
+        .discard = {true, true, false}, .wait_mask = 0x20,
+        .input_type = AGX3_MATRIX_INPUT_F32},
+       {207, 2, 86, 2, 0, 4, 8, 0, 212, 65, 36, 0}},
+      {"by95 c_zero dest12 cache wait_sb5",
+       {.dest = 12, .a = 4, .b = 8, .c_zero = true, .dest_cache = true,
+        .cache = {true, true, false}, .wait_mask = 0x20,
+        .input_type = AGX3_MATRIX_INPUT_F32},
+       {207, 2, 86, 6, 1, 132, 9, 0, 84, 64, 36, 0}},
+      {"by96 c_present dest12 cache+discardC",
+       {.dest = 12, .a = 4, .b = 8, .c = 12, .dest_cache = true,
+        .cache = {true, true, false}, .discard = {false, false, true},
+        .input_type = AGX3_MATRIX_INPUT_F32},
+       {207, 2, 84, 6, 1, 132, 9, 9, 84, 66, 36, 1}},
+      {"by98 c_present dest4 discardAll",
+       {.dest = 4, .a = 4, .b = 8, .c = 12, .discard = {true, true, true},
+        .input_type = AGX3_MATRIX_INPUT_F32},
+       {207, 2, 84, 2, 0, 4, 8, 9, 212, 67, 36, 1}},
+   };
+   for (const auto &c : cases) {
+      uint8_t out[14], length = 0;
+      ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &c.desc, out,
+                                          &length)) << c.tag;
+      EXPECT_EQ(length, c.bytes.size()) << c.tag;
+      EXPECT_EQ(std::vector<uint8_t>(out, out + length), c.bytes) << c.tag;
+   }
+}
+
+/*
+ * Adding the AGX3B path must not perturb the M5 (AGX3C) encoding. The AGX3C
+ * form is 14 bytes (its two extra selector fields f67/f68 and the wider
+ * scoreboard-wait range are absent on the 12-byte AGX3B form), and its output
+ * for the same descriptors is exactly what the hardware-qualified M5 encoder
+ * emitted before this change. The two encodings therefore never collide.
+ */
+TEST(NativeForms, Agx3cMatmad8x8IsUnchangedByAgx3b)
+{
+   const struct agx3_matrix_mma8_desc c_present = {
+      .dest = 12, .a = 4, .b = 8, .c = 12, .dest_cache = true,
+      .cache = {true, true, false}, .discard = {false, false, true},
+      .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   const struct agx3_matrix_mma8_desc c_zero = {
+      .dest = 4, .a = 4, .b = 8, .c_zero = true,
+      .discard = {true, true, false}, .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   const std::vector<uint8_t> gold_present =
+      {0x27, 0x80, 0x05, 0x9a, 0x28, 0x20, 0xaf, 0x1a,
+       0x10, 0x08, 0x10, 0x00, 0x90, 0x18};
+   const std::vector<uint8_t> gold_zero =
+      {0x27, 0x00, 0x05, 0x9a, 0x20, 0x20, 0xaf, 0x0a,
+       0x30, 0x06, 0x40, 0x00, 0x10, 0x01};
+   uint8_t out[14], length = 0;
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &c_present, out,
+                                       &length));
+   EXPECT_EQ(std::vector<uint8_t>(out, out + length), gold_present);
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &c_zero, out,
+                                       &length));
+   EXPECT_EQ(std::vector<uint8_t>(out, out + length), gold_zero);
+}
+
+/*
+ * The AGX3B form carries six scoreboard-wait bits (slots 0..5, fields 69..74);
+ * a full 0x3f mask still encodes, while bit 6 (slot 6) has no witness field, so
+ * the encoder refuses rather than emit an unverified encoding.
+ */
+TEST(NativeForms, Agx3bMatmad8x8RefusesUnwitnessedWait)
+{
+   struct agx3_matrix_mma8_desc desc = {
+      .dest = 4, .a = 4, .b = 8, .c = 12, .discard = {true, true, true},
+      .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   uint8_t out[14], length = 0;
+   desc.wait_mask = 0x3f;
+   EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &desc, out,
+                                       &length));
+   desc.wait_mask = 0x40;
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &desc, out,
+                                        &length));
+}
+
+/*
+ * Field 74 (packed bit 17, the second-least bit of byte 2) is AGX3B wait slot
+ * 5, not a c-is-zero marker: it must track wait_mask bit 5 regardless of the
+ * accumulate/c-is-zero choice (which lives in field 59). A c-is-zero op with no
+ * wait leaves field 74 clear; an accumulating op that waits slot 5 sets it.
+ * This guards against the field reverting to a c_zero marker.
+ */
+TEST(NativeForms, Agx3bMatmad8x8Field74IsWaitSlot5NotCZero)
+{
+   uint8_t out[14], length = 0;
+   /* c-is-zero, no wait: field 74 must be 0 (c_zero alone must not set it). */
+   struct agx3_matrix_mma8_desc c_zero_nowait = {
+      .dest = 4, .a = 4, .b = 8, .c_zero = true,
+      .discard = {true, true, false}, .wait_mask = 0,
+      .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &c_zero_nowait,
+                                       out, &length));
+   EXPECT_EQ((out[2] >> 1) & 1, 0);
+   /* accumulate (c present), wait slot 5: field 74 must be 1. */
+   struct agx3_matrix_mma8_desc accum_wait5 = {
+      .dest = 12, .a = 4, .b = 8, .c = 12, .dest_cache = true,
+      .cache = {true, true, false}, .discard = {false, false, true},
+      .wait_mask = 0x20, .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &accum_wait5,
+                                       out, &length));
+   EXPECT_EQ((out[2] >> 1) & 1, 1);
+}
+
+/* The implemented cooperative-matrix path is enabled for every AGX3B
+ * encoding and for M5. Earlier AGX2 devices do not gain the extension. */
+TEST(NativeForms, CooperativeMatrixDefaultsFollowTheImplementedEncoding)
+{
+   /* G16S and the other AGX3B parts use the same 8x8 path. */
+   EXPECT_TRUE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G16S));
+   EXPECT_EQ(agx_chip_isa_encoding(AGX_CHIP_G16S), AGX_ISA_ENCODING_AGX3B);
+
+   /* All AGX3B parts advertise the implemented path by default. */
+   for (enum agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G17A, AGX_CHIP_G16P,
+                              AGX_CHIP_G16G, AGX_CHIP_G16C, AGX_CHIP_G15G,
+                              AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D}) {
+      EXPECT_EQ(agx_chip_isa_encoding(chip), AGX_ISA_ENCODING_AGX3B);
+      EXPECT_TRUE(agx_chip_cooperative_matrix_supported(chip));
+   }
+
+   /* M5 has the AGX3C path; AGX2 has neither implementation. */
+   EXPECT_TRUE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G17G));
+   EXPECT_FALSE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G13G));
+}
+
+/* A G17P 2D-array comparison keeps a nonzero constant level or bias in a
+ * register, since agx3_emit_texture_sample() refuses that immediate. Every
+ * form the packer already encoded keeps its immediate, so no shader that
+ * compiled before compiles differently. */
+TEST(NativeForms, G17PArrayShadowConstantLodKeepsEncodableImmediates)
+{
+   struct {
+      mesa_shader_stage stage;
+      enum agx_lod_mode lod_mode;
+      uint16_t value; /* fp16 */
+      bool offset;
+      enum agx_chip chip;
+      bool immediate;
+   } cases[] = {
+      /* The refused forms. */
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000 /* 2.0 */, false,
+       AGX_CHIP_G17P, false},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_AUTO_LOD_BIAS, 0x3800 /* 0.5 */,
+       false, AGX_CHIP_G17P, false},
+      {MESA_SHADER_COMPUTE, AGX_LOD_MODE_LOD_MIN, 0x4000, false, AGX_CHIP_G17P,
+       false},
+      /* Forms the packer encodes as immediates. */
+      {MESA_SHADER_VERTEX, AGX_LOD_MODE_LOD_MIN, 0x4000, false, AGX_CHIP_G17P,
+       true},
+      {MESA_SHADER_MESH, AGX_LOD_MODE_LOD_MIN, 0x4000, false, AGX_CHIP_G17P,
+       true},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x0000 /* 0.0 */, false,
+       AGX_CHIP_G17P, true},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x8000 /* -0.0 */, false,
+       AGX_CHIP_G17P, true},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_AUTO_LOD_BIAS, 0x8000, false,
+       AGX_CHIP_G17P, true},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000, true,
+       AGX_CHIP_G17P, true},
+      /* Other chips are unchanged. */
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000, false,
+       AGX_CHIP_G16G, true},
+   };
+   for (const auto &c : cases) {
+      SCOPED_TRACE(::testing::Message()
+                   << "stage=" << c.stage << " lod_mode=" << c.lod_mode
+                   << " value=" << c.value << " offset=" << c.offset
+                   << " chip=" << c.chip);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.chip = c.chip;
+      key.dev.encoding = agx_chip_isa_encoding(c.chip);
+      b->shader->key = &key;
+      b->shader->stage = c.stage;
+      agx_index coords = agx_register(8, AGX_SIZE_32);
+      coords.channels_m1 = 2;
+      agx_index lod = agx_mov_imm(b, 16, c.value);
+      agx_instr *I = agx_texture_sample_to(
+         b, agx_temp(b->shader, AGX_SIZE_16), coords, lod, agx_immediate(0),
+         agx_immediate(0), agx_immediate(0), agx_register(16, AGX_SIZE_32),
+         AGX_DIM_2D_ARRAY, c.lod_mode, 1, c.offset, true, false,
+         AGX_GATHER_NONE, false);
+      agx_optimizer_forward(b->shader);
+      EXPECT_EQ(I->src[1].type == AGX_INDEX_IMMEDIATE, c.immediate);
+      ralloc_free(mem);
    }
 }

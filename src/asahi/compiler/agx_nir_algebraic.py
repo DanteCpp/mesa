@@ -58,9 +58,18 @@ for s in [8, 16, 32, 64]:
          ("ubitfield_extract", 'value', ('iand', 'offset', s - 1), 'bits'))
     ]
 
+# Based on the VIR lowering: step back one ulp when RTNE rounded away from zero.
+def f2f16_rtz(x):
+    return ('bcsel', ('flt', ('fabs', x), ('fabs', ('f2f32', ('f2f16_rtne', x)))),
+            ('isub', ('f2f16_rtne', x), 1), ('f2f16_rtne', x))
+
 lower_pack = [
+    # The hardware converts with RTNE; D3D's f32tof16 (and AMD's packHalf)
+    # truncate, and GLSL leaves the rounding to the implementation.
     (('pack_half_2x16_split', a, b),
-     ('pack_32_2x16_split', ('f2f16', a), ('f2f16', b))),
+     ('pack_32_2x16_split', f2f16_rtz(a), f2f16_rtz(b))),
+    (('pack_half_2x16_rtz_split', a, b),
+     ('pack_32_2x16_split', f2f16_rtz(a), f2f16_rtz(b))),
 
     # We don't have 8-bit ALU, so we need to lower this. But if we lower it like
     # this, we can at least coalesce the pack_32_2x16_split and only pay the
@@ -68,6 +77,14 @@ lower_pack = [
     (('pack_32_4x8_split', a, b, c, d),
      ('pack_32_2x16_split', ('ior', ('u2u16', a), ('ishl', ('u2u16', b), 8)),
                             ('ior', ('u2u16', c), ('ishl', ('u2u16', d), 8)))),
+
+    # A half taken from a word and narrowed again (u2u16(extract_u16(x, 1)),
+    # as the cooperative matrix lowering builds an operand from a 32-bit
+    # load) is the half itself. Without this the u2u32 of the rewrite below
+    # stays: a 16-to-32-bit move and a split per half, which register
+    # allocation turned into two moves per operand half.
+    (('u2u16', ('u2u32', 'a@16')), a),
+    (('u2u16', ('i2i32', 'a@16')), a),
 
     (('extract_u16', 'a@32', 0), ('u2u32', ('unpack_32_2x16_split_x', a))),
     (('extract_u16', 'a@32', 1), ('u2u32', ('unpack_32_2x16_split_y', a))),
@@ -87,14 +104,27 @@ lower_pack = [
     (('unpack_64_2x32_split_x', ('pack_64_2x32_split', a, b)), a),
     (('unpack_64_2x32_split_y', ('pack_64_2x32_split', a, b)), b),
 
-    # Based on the VIR lowering
-    (('f2f16_rtz', 'a@32'),
-     ('bcsel', ('flt', ('fabs', a), ('fabs', ('f2f32', ('f2f16_rtne', a)))),
-      ('isub', ('f2f16_rtne', a), 1), ('f2f16_rtne', a))),
+    (('f2f16_rtz', 'a@32'), f2f16_rtz(a)),
 
     # Codegen depends on this trivial case being optimized out.
     (('ubitfield_extract', 'value', 'offset', 0), 0),
     (('ibitfield_extract', 'value', 'offset', 0), 0),
+]
+
+# Vulkan leaves the rounding of a float to bfloat16 conversion to the
+# implementation unless it has an FPRoundingMode decoration (spirv_to_nir
+# builds those from integer operations, so f2bf is never decorated), and the
+# shared lower_bfloat16_conversions rule truncates. Round to nearest even
+# instead, as constant folding of f2bf does (_mesa_float_to_bfloat16_bits_rte):
+# add 0x7fff plus the lowest kept bit and keep the high half. A NaN would carry
+# into the exponent or the sign, so it keeps its sign and top payload bits and
+# becomes quiet. Only bf2f is left to the shared rule, which is exact.
+lower_f2bf_rtne = [
+    (('f2bf', 'a@32'),
+     ('bcsel', ('fneu(preserve_nan_inf)', a, a),
+               ('ior', ('unpack_32_2x16_split_y', a), 0x40),
+               ('unpack_32_2x16_split_y',
+                ('iadd', ('iadd', a, 0x7fff), ('iand', ('ushr', a, 16), 1))))),
 ]
 
 lower_selects = []
@@ -301,6 +331,7 @@ for s_ in range(1, 5):
 
     v = 1 << s
     is_mult = f'(is_unsigned_multiple_of_{v})'
+    is_mult_below_2g = f'(is_unsigned_multiple_of_{v}_below_2g)'
 
     fuse_lea += [
         # A + b * s = A + B * s with relaxed multiply
@@ -311,32 +342,27 @@ for s_ in range(1, 5):
         (('iadd', 'a@64', ('u2u64', ('amul', 'b@32', f'#c{is_mult}'))),
          ('ulea_agx', a, ('imul', b, ('ushr', c, s)), s)),
 
-        # A + (b 2^s + c d 2^s) = A + (b + cd) 2^s with relaxation.
+        # A + (b + c d) = A + ((b + c d) / 2^s) 2^s with relaxation, for b and
+        # d multiples of 2^s.
         #
-        # amul is bounded by the buffer size by definition, and both the GL & VK
-        # limit UBOs and SSBOs to INT32_MAX bytes. Therefore, amul has no signed
-        # wrap.
+        # The offset is the 32-bit sum X = (b + c d) mod 2^32, zero-extended;
+        # amul does not wrap. With unsigned shifts,
         #
-        # Further, because we are zero-extending the 32-bit result, the 32-bit
-        # sum must be nonnegative -- if it were negative, it would represent an
-        # offset above INT32_MAX which would be invalid given the amul and
-        # max buffer size. Thus with signed math
+        #   X / 2^s = ((b >> s) + c (d >> s)) mod 2^(32 - s)
         #
-        #   0 <= b 2^s + cd 2^s < INT32_MAX
-        #
-        # ..and hence
-        #
-        #   0 <= b + cd < INT32_MAX
-        #
-        # Those bounds together with distributivity mean that
-        #
-        #   (b 2^s + cd 2^s) mod 2^32 = 2^s ((b + cd) mod 2^32)
-        #
-        # ...which is exactly what we need to factor out the shift.
+        # because 2^s ((b >> s) + c (d >> s)) = b + c d exactly. When b is below
+        # 2^31 the sum wraps only for an offset past 4 GiB, outside every buffer,
+        # so the mod is free. A larger b is either an offset past 2 GiB or a
+        # negative one, b - 2^32 (buf[i - 1]); there the sum wraps, so mask it.
+        (('iadd', 'a@64', ('u2u64', ('iadd', f'#b{is_mult_below_2g}',
+                                     ('amul', 'c@32', f'#d{is_mult}')))),
+         ('ulea_agx', a, ('iadd', ('ushr', b, s),
+                                  ('amul', 'c@32', ('ushr', d, s))), s)),
         (('iadd', 'a@64', ('u2u64', ('iadd', f'#b{is_mult}',
                                      ('amul', 'c@32', f'#d{is_mult}')))),
-         ('ulea_agx', a, ('iadd', ('ishr', b, s),
-                                  ('amul', 'c@32', ('ishr', d, s))), s)),
+         ('ulea_agx', a, ('iand', ('iadd', ('ushr', b, s),
+                                           ('amul', 'c@32', ('ushr', d, s))),
+                                  (1 << (32 - s)) - 1), s)),
     ]
 
 # 8-bit rules are lowest precedence since we really like to fuse shifts
@@ -383,6 +409,17 @@ for bits in range(1, 16):
          ('ubitfield_extract', a, 16, bits)),
     ])
 
+# Computing (2*b)*b first can overflow even when a - 2*a*b*b is finite.
+# Multiplying a first bounds the intermediates when the final result is finite;
+# keeping the factor of two in the final FMA also avoids overflow before the
+# subtraction. Only reassociate non-precise FP32 operations with no shared
+# intermediate. Run after the generic algebraic passes to preserve this order.
+avoid_square_overflow = [
+    (('~ffma@32', ('fneg', a),
+      ('~fmul(is_used_once)', ('~fmul(is_used_once)', 2.0, b), b), a),
+     ('ffma', -2.0, ('fmul', ('fmul', a, b), b), a)),
+]
+
 fold_aligned_bounds = []
 for shift in (1, 2):
     size = 1 << shift
@@ -395,10 +432,69 @@ for shift in (1, 2):
                               delta + size - 1), 'b@32'),
              ('ult', ('ushr', folded_offset, shift), ('ushr', b, shift))))
 
+# D3D float-to-integer conversions saturate and map NaN to 0. DXVK spells them
+# out as a conversion plus clamping selects; the M5 hardware conversion already
+# does exactly this (verified for both signs of NaN, infinities and every
+# boundary), so fold the selects into the bare conversion.
+fold_d3d_float_to_int = [
+    (('bcsel', ('fneu', 'a@32', a), 0,
+      ('bcsel', ('flt', a, -2147483648.0), -0x80000000,
+       ('bcsel', ('flt', 2147483520.0, a), 0x7fffffff, ('f2i32', a)))),
+     ('f2i32', a)),
+    (('bcsel', ('flt', 4294967040.0, 'a@32'), 0xffffffff,
+      ('f2u32', ('bcsel', ('fneu', a, a), 0.0, ('fmax', a, 0.0)))),
+     ('f2u32', a)),
+    (('bcsel', ('flt', 4294967040.0, 'a@32'), 0xffffffff,
+      ('f2u32', ('fmax', a, 0.0))),
+     ('f2u32', a)),
+]
+
 fold_selected_f2i32 = [
     (('bcsel@32(agx_selected_f2i32_controls_match)', 'a@1',
       ('f2i32(is_used_once)', 'b@32'), ('f2i32(is_used_once)', 'c@32')),
      ('f2i32', ('bcsel', a, b, c))),
+]
+
+# A sign-extended byte converted to float: (x << (24 - 8k)) >> 24 is three
+# instructions on M5 (insert, arithmetic shift, word conversion). int2flt has a
+# signed-byte form that reads the low eight bits of a half register, so convert
+# the byte from the half that holds it: free for bytes 0 and 2 of a word, one
+# 16-bit shift for bytes 1 and 3 of a word. The emitter feeds the conversion
+# the u2u8's source directly (agx_emit_alu, i2f of an 8-bit value).
+fold_byte_to_float = []
+for conv in ['i2f32', 'i2f16']:
+    fold_byte_to_float.extend([
+        ((conv, ('ishr', ('ishl', ('u2u32', 'a@16'), 24), 24)),
+         (conv, ('u2u8', a))),
+        ((conv, ('ishr', ('ishl', ('u2u32', 'a@16'), 16), 24)),
+         (conv, ('u2u8', ('ushr', a, 8)))),
+        ((conv, ('ishr', ('ishl', 'a@32', 24), 24)),
+         (conv, ('u2u8', ('unpack_32_2x16_split_x', a)))),
+        ((conv, ('ishr', ('ishl', 'a@32', 16), 24)),
+         (conv, ('u2u8', ('ushr', ('unpack_32_2x16_split_x', a), 8)))),
+        ((conv, ('ishr', ('ishl', 'a@32', 8), 24)),
+         (conv, ('u2u8', ('unpack_32_2x16_split_y', a)))),
+        ((conv, ('ibitfield_extract', 'a@32', 0, 8)),
+         (conv, ('u2u8', ('unpack_32_2x16_split_x', a)))),
+        ((conv, ('ibitfield_extract', 'a@32', 8, 8)),
+         (conv, ('u2u8', ('ushr', ('unpack_32_2x16_split_x', a), 8)))),
+        ((conv, ('ibitfield_extract', 'a@32', 16, 8)),
+         (conv, ('u2u8', ('unpack_32_2x16_split_y', a)))),
+    ])
+
+# The same for unsigned bytes 0 and 2 of a word ((x >> 8k) & 0xff: an AND or
+# a bitfield extract, then a word conversion), into the unsigned-byte form of
+# int2flt (float32 results only). Bytes 1 and 3 cost two either way.
+fold_ubyte_to_float = [
+    (('u2f32', ('iand', ('u2u32', 'a@16'), 0xff)), ('u2f32', ('u2u8', a))),
+    (('u2f32', ('iand', 'a@32', 0xff)),
+     ('u2f32', ('u2u8', ('unpack_32_2x16_split_x', a)))),
+    (('u2f32', ('iand', ('ushr', 'a@32', 16), 0xff)),
+     ('u2f32', ('u2u8', ('unpack_32_2x16_split_y', a)))),
+    (('u2f32', ('ubitfield_extract', 'a@32', 0, 8)),
+     ('u2f32', ('u2u8', ('unpack_32_2x16_split_x', a)))),
+    (('u2f32', ('ubitfield_extract', 'a@32', 16, 8)),
+     ('u2f32', ('u2u8', ('unpack_32_2x16_split_y', a)))),
 ]
 
 def main():
@@ -441,6 +537,10 @@ agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
     print(nir_algebraic.AlgebraicPass("agx_nir_lower_algebraic_late",
                                       lower_sm5_shift + lower_pack +
                                       lower_selects).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_lower_f2bf_rtne",
+                                      lower_f2bf_rtne).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_avoid_square_overflow",
+                                      avoid_square_overflow).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_selects",
                                       opt_selects).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fold_pixel_coord",
@@ -449,6 +549,12 @@ agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
                                       fold_extract16_bfe).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_doubled_add",
                                       fuse_doubled_add).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_fold_byte_to_float",
+                                      fold_byte_to_float).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_fold_ubyte_to_float",
+                                      fold_ubyte_to_float).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_fold_d3d_float_to_int",
+                                      fold_d3d_float_to_int).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_algebraic_late",
                                       fuse_extr + fuse_ubfe +
                                       fuse_imad + ixor_bcsel +

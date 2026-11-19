@@ -12,6 +12,7 @@
 #include "agx_bo.h"
 #include "agx_device.h"
 #include "hk_device.h"
+#include "hk_queue.h"
 #include "hk_device_memory.h"
 #include "hk_entrypoints.h"
 #include "hk_physical_device.h"
@@ -76,9 +77,20 @@ hk_get_buffer_alignment(const struct hk_physical_device *pdev,
                       VK_BUFFER_USAGE_2_STORAGE_TEXEL_BUFFER_BIT_KHR))
       alignment = MAX2(alignment, HK_MIN_TEXEL_BUFFER_ALIGNMENT);
 
+   /* Descriptor buffer addresses must meet descriptorBufferOffsetAlignment */
+   if (usage_flags & (VK_BUFFER_USAGE_2_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
+                      VK_BUFFER_USAGE_2_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+                      VK_BUFFER_USAGE_2_PUSH_DESCRIPTORS_DESCRIPTOR_BUFFER_BIT_EXT))
+      alignment = MAX2(alignment, HK_MIN_UBO_ALIGNMENT);
+
    if (create_flags & (VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
                        VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT))
       alignment = MAX2(alignment, 16384);
+
+   /* D3D12 heaps and tiles sit on 64 KiB boundaries, and vkd3d-proton backs
+    * its heaps with sparse-capable buffers. */
+   if (create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)
+      alignment = MAX2(alignment, 64 * 1024);
 
    return alignment;
 }
@@ -115,6 +127,22 @@ hk_get_bda_replay_addr(const VkBufferCreateInfo *pCreateInfo)
          break;
       }
 
+      case VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT: {
+         /* VK_EXT_descriptor_buffer replay: hk_GetBufferOpaqueCapture-
+          * DescriptorDataEXT() recorded the buffer's own VA. */
+         if (!(pCreateInfo->flags &
+               VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT))
+            break;
+         const VkOpaqueCaptureDescriptorDataCreateInfoEXT *info = ext;
+         struct hk_buffer_capture capture;
+         memcpy(&capture, info->opaqueCaptureDescriptorData, sizeof(capture));
+         if (capture.va != 0) {
+            assert(addr == 0 || capture.va == addr);
+            addr = capture.va;
+         }
+         break;
+      }
+
       default:
          break;
       }
@@ -133,7 +161,7 @@ hk_bind_scratch(struct hk_device *dev, struct agx_va *va, unsigned offset_B,
    /* The kernel refuses a fill it cannot back (ENOMEM; on M5 also its
     * hypervisor page-table budget): that is device memory exhaustion. */
    /* Map read-write scratch to the primary (bottom half) VA range */
-   int ret = agx_bo_bind(&dev->dev, dev->dev.scratch_bo, addr, size_B, 0,
+   int ret = agx_bo_bind(&dev->dev, dev->sparse_fill, addr, size_B, 0,
                          flags | DRM_ASAHI_BIND_WRITE);
    if (ret)
       return errno == ENOMEM ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_UNKNOWN;
@@ -141,6 +169,22 @@ hk_bind_scratch(struct hk_device *dev, struct agx_va *va, unsigned offset_B,
    /* Map read-only scratch to the secondary (top half) VA range */
    ret = agx_bo_bind(&dev->dev, dev->dev.zero_bo,
                      addr + dev->dev.sparse_ro_offset, size_B, 0, flags);
+   if (ret)
+      return errno == ENOMEM ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_UNKNOWN;
+
+   return VK_SUCCESS;
+}
+
+VkResult
+hk_bind_unbound_sparse_buffer(struct hk_device *dev, struct agx_va *va,
+                              size_t size_B)
+{
+   if (!hk_sparse_buffer_unmapped(&dev->dev))
+      return hk_bind_scratch(dev, va, 0, size_B);
+
+   int ret = agx_bo_bind(&dev->dev, dev->dev.zero_bo,
+                         va->addr + dev->dev.sparse_ro_offset, size_B, 0,
+                         DRM_ASAHI_BIND_READ | agx_fill_bind_flags(&dev->dev));
    if (ret)
       return errno == ENOMEM ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_UNKNOWN;
 
@@ -199,9 +243,11 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       assert(alignment >= 16384);
       uint64_t vma_size_B = align64(buffer->vk.size, alignment);
 
+      /* A buffer with its own VA replays it for descriptor buffers too. */
       const bool bda_capture_replay =
          buffer->vk.create_flags &
-         VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+         (VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT |
+          VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT);
 
       enum agx_va_flags flags = 0;
       uint64_t bda_fixed_addr = 0;
@@ -218,6 +264,12 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
 
       if (!buffer->va) {
          vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+         /* A replay address that is already taken is the application's
+          * error to handle, not an out-of-memory condition. */
+         if (bda_fixed_addr != 0)
+            return vk_errorf(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+                             "Capture/replay address %#llx is in use",
+                             (unsigned long long)bda_fixed_addr);
          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Sparse VMA allocation failed");
       }
@@ -242,7 +294,7 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
          }
          buffer->sparse_scratch_B =
             agx_chip_g17_m5(dev->dev.chip) ? vma_size_B : 0;
-         result = hk_bind_scratch(dev, buffer->va, 0, vma_size_B);
+         result = hk_bind_unbound_sparse_buffer(dev, buffer->va, vma_size_B);
          if (result != VK_SUCCESS) {
             hk_release_sparse_scratch(dev, buffer->sparse_scratch_B);
             agx_va_free(&dev->dev, buffer->va, true);
@@ -301,7 +353,7 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       }
    }
 
-   if (buffer->sparse_map) {
+   if (hk_buffer_in_physical_sparse_map(dev, buffer)) {
       VkResult result = hk_update_physical_sparse_map(
          dev, buffer->va->addr, align64(buffer->vk.size, AIL_PAGESIZE), true);
       if (result != VK_SUCCESS) {
@@ -335,7 +387,9 @@ hk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
    if (!buffer)
       return;
 
-   if (buffer->sparse_map)
+   hk_device_quiesce_lost_submissions(dev);
+
+   if (hk_buffer_in_physical_sparse_map(dev, buffer))
       hk_update_physical_sparse_map(dev, buffer->va->addr,
          align64(buffer->vk.size, AIL_PAGESIZE), false);
 
@@ -418,6 +472,14 @@ hk_GetPhysicalDeviceExternalBufferProperties(
       pExternalBufferProperties->externalMemoryProperties =
          hk_dma_buf_mem_props;
       return;
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT: {
+      VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
+      if (!pdev->vk.supported_extensions.EXT_external_memory_host)
+         goto unsupported;
+      pExternalBufferProperties->externalMemoryProperties =
+         hk_host_ptr_mem_props;
+      return;
+   }
    default:
       goto unsupported;
    }
@@ -465,7 +527,7 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
       } else {
          assert(buffer->vk.device_address == 0);
          buffer->vk.device_address =
-            mem->bo->va->addr + pBindInfos[i].memoryOffset;
+            hk_device_memory_addr(mem) + pBindInfos[i].memoryOffset;
       }
 
       VK_FROM_HANDLE(hk_device, dev, device);
@@ -480,6 +542,22 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
       if (status != NULL && status->pResult != NULL)
          *status->pResult = VK_SUCCESS;
    }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetBufferOpaqueCaptureDescriptorDataEXT(
+   VkDevice device, const VkBufferCaptureDescriptorDataInfoEXT *pInfo,
+   void *pData)
+{
+   VK_FROM_HANDLE(hk_buffer, buffer, pInfo->buffer);
+
+   /* A buffer bound to memory takes the memory's (replayed) address; only a
+    * VA of its own needs replaying. */
+   const struct hk_buffer_capture capture = {
+      .va = buffer->va ? buffer->va->addr : 0,
+   };
+   memcpy(pData, &capture, sizeof(capture));
    return VK_SUCCESS;
 }
 

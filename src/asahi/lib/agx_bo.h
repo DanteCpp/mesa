@@ -46,6 +46,10 @@ enum agx_bo_flags {
     * including objects which fail before their first successful export. */
    AGX_BO_NO_CACHE = 1 << 7,
 
+   /* BO over memory the application owns (DRM_IOCTL_ASAHI_GEM_USERPTR): _map
+    * is the application's pointer, which is never unmapped or moved, and the
+    * BO is never cached. Implies AGX_BO_NO_CACHE. */
+   AGX_BO_HOST_PTR = 1 << 8,
 };
 
 enum agx_va_flags {
@@ -164,6 +168,20 @@ void agx_bo_reference(struct agx_bo *bo);
 void agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo);
 
 struct agx_bo *agx_bo_import(struct agx_device *dev, int fd);
+/* Which application memory agx_bo_import_host_ptr() takes. */
+enum agx_host_ptr_access {
+   /* Memory the kernel can pin for writing, bound read-write. */
+   AGX_HOST_PTR_WRITABLE,
+   /* That, or else memory it can pin for reading, bound read-only. */
+   AGX_HOST_PTR_ANY,
+   /* Only memory the kernel cannot pin for writing, bound read-only. */
+   AGX_HOST_PTR_READ_ONLY,
+};
+
+struct agx_bo *agx_bo_import_host_ptr(struct agx_device *dev, void *ptr,
+                                      size_t size,
+                                      enum agx_host_ptr_access access);
+int agx_bo_set_resident(struct agx_device *dev, struct agx_bo *bo, bool keep);
 int agx_bo_export(struct agx_device *dev, struct agx_bo *bo);
 bool agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo);
 
@@ -172,6 +190,8 @@ uint64_t agx_bo_get_g17p_vdm_alias(struct agx_device *dev, struct agx_bo *bo);
 struct agx_bo *agx_bo_cache_fetch(struct agx_device *dev, size_t size,
                                   size_t align, uint32_t flags,
                                   const bool dontwait);
+bool agx_bo_cache_has(struct agx_device *dev, size_t size, size_t align,
+                      uint32_t flags);
 void agx_bo_cache_evict_all(struct agx_device *dev);
 void agx_bo_cache_start_idle_trim(struct agx_device *dev);
 void agx_bo_cache_stop_idle_trim(struct agx_device *dev);

@@ -377,12 +377,11 @@ agx_ioto_state_pack_spectpr(enum agx_chip chip,
       AGX_IOTO_SPECTPR_SIZE, agx_ioto_state_encode_spectpr);
 }
 
-/* The two-bit sample selector inside the SPECLM word. Apple's
- * SpecLM::encodeImageBlockData (AGXMetalG17P, 0x216af6848) returns
- * log2(samples) beside the eight-byte stride, and the SPECLM instruction
- * encoder (0x216af6a3c) deposits that code in word 1 bits 7..8 through the
- * table {0 -> 2, 1 -> 0, 2 -> 1}. The one-sample value 2 matches every
- * captured one-sample record.
+/* The two-bit sample selector inside the SPECLM word. On G17P the imageblock
+ * description carries log2(samples) beside the eight-byte stride, and the
+ * SPECLM instruction holds that code in word 1 bits 7..8 through the table
+ * {0 -> 2, 1 -> 0, 2 -> 1}. The one-sample value 2 matches every captured
+ * one-sample record.
  */
 static unsigned
 agx_ioto_g17p_speclm_sample_bits(unsigned samples)
@@ -411,10 +410,9 @@ agx_ioto_g17p_fragment_speclm_build(
          sample_size_B * samples * imageblock->tile_size_px > 32768u)))
       return false;
 
-   /* SpecLM::encodeImageBlockData deposits the stride, in eight-byte units,
-    * as a five-bit field (bfi #35, #5 at 0x216af6a30), so a sample may hold
-    * up to 248 bytes; Apple's own fragments store eight RGBA32Float targets,
-    * 128 bytes a sample.
+   /* The SPECLM word holds the stride, in eight-byte units, as a five-bit
+    * field at bit 35, so a sample may hold up to 248 bytes; Apple's own
+    * fragments store eight RGBA32Float targets, 128 bytes a sample.
     *
     * The imageblock bound here is structural -- a tile larger than 32 KiB has
     * nowhere to live. Which tile a given format and sample count actually gets
@@ -427,7 +425,7 @@ agx_ioto_g17p_fragment_speclm_build(
     * distinguish the native 32x32, 32x16 and 16x16 layouts but remain opaque
     * to the anonymous semantic map, so keep the exact records as seeds.
     *
-    * SpecLM::encodeImageBlockData then places the byte stride in f22 (eight
+    * The SPECLM word then carries the byte stride in f22 (eight
     * byte granularity) and log2(samples) in f21.  Patch only those named bit
     * slices, retaining every opaque geometry and fragment-profile bit.
     */
@@ -668,6 +666,24 @@ agx_ioto_g17p_compiler_spectpr_values(uint32_t spill_bytes,
    *spill_quads = (uint16_t)((spill_bytes + 3) >> 2);
    *d_rounded =
       (uint16_t)(((((uint64_t)d_value + 3) >> 2) + 1) & UINT64_C(0xffe));
+   return true;
+}
+
+bool
+agx_ioto_g17p_compiler_spectpr_build(
+   uint32_t spill_bytes, uint32_t d_value, struct agx_ioto_state *state)
+{
+   uint16_t spill_quads, d_rounded;
+   if (!state || !agx_ioto_g17p_compiler_spectpr_values(
+                    spill_bytes, d_value, &spill_quads, &d_rounded))
+      return false;
+
+   struct agx_ioto_state staged = {0};
+   staged.f[20] = spill_quads;
+   staged.f[21] = spill_quads;
+   staged.f[22] = d_rounded;
+
+   *state = staged;
    return true;
 }
 

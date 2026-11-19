@@ -203,7 +203,11 @@ agx_write_registers(const agx_context *ctx, const agx_instr *I, unsigned d)
    case AGX_OPCODE_LOCAL_LOAD:
    case AGX_OPCODE_STACK_LOAD:
    case AGX_OPCODE_LD_TILE:
-      if (I->op == AGX_OPCODE_LOCAL_LOAD && I->memory_is_packed) {
+      /* Packed bytes: two 8-bit channels per 16-bit register. M5 (AGX3C)
+       * scratch uses the packed form for 8-bit vectors as well
+       * (agx_emit_load_scratch, subgroups.ballot_broadcast.*.i8vec3). */
+      if ((I->op == AGX_OPCODE_LOCAL_LOAD ||
+           I->op == AGX_OPCODE_STACK_LOAD) && I->memory_is_packed) {
          assert(agx_isa_is_agx3(ctx->key->dev.encoding));
          assert(I->format == AGX_FORMAT_I8 && I->dest[d].size == AGX_SIZE_16);
          return DIV_ROUND_UP(util_bitcount(I->mask), 2);
@@ -383,7 +387,8 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
       /* See agx_write_registers */
       if (s == 0) {
          if ((I->op == AGX_OPCODE_DEVICE_STORE ||
-              I->op == AGX_OPCODE_LOCAL_STORE) && I->memory_is_packed) {
+              I->op == AGX_OPCODE_LOCAL_STORE ||
+              I->op == AGX_OPCODE_STACK_STORE) && I->memory_is_packed) {
             assert(agx_isa_is_agx3(ctx->key->dev.encoding));
             assert(I->format == AGX_FORMAT_I8);
             return DIV_ROUND_UP(util_bitcount(I->mask), 2);
@@ -446,12 +451,16 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
                    agx_channels(I->src[s]) == 1);
             return 2;
          }
+         /* AGX3's integer-level PACK_SMPIR reads a 32-bit GPR on both
+          * encodings: generation 9 and 10 texture lowering restore txf's
+          * level to 32 bits (agx_nir_lower_texture.c), as does
+          * agx_emit_image_load() for a register image level. */
          if ((I->op == AGX_OPCODE_TEXTURE_LOAD ||
               I->op == AGX_OPCODE_IMAGE_LOAD) &&
-             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+             agx_isa_is_agx3(ctx->key->dev.encoding) &&
              I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
              I->src[s].type != AGX_INDEX_IMMEDIATE)
-             return 2;
+            return 2;
 
          if (I->lod_mode == AGX_LOD_MODE_LOD_GRAD ||
              I->lod_mode == AGX_LOD_MODE_LOD_GRAD_MIN) {

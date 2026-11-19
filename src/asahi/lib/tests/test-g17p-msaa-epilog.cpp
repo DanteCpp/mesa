@@ -6,6 +6,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "agx_tilebuffer.h"
 #include "agx_linker.h"
+#include "util/u_debug.h"
 extern "C" {
 #include "asahi/compiler/agx_nir.h"
 #include "asahi/compiler/agx_debug.h"
@@ -63,6 +64,50 @@ TEST_F(G17PMSAAEpilog, M5SampleAlphaCoveragePrecedesAllColourStores)
       }
       EXPECT_EQ(updates, 1u);
       EXPECT_EQ(stores, samples);
+      ralloc_free(b.shader);
+   }
+}
+
+/* Two testing updates lose depth samples and can hang G17P, so an epilog must
+ * not update coverage again after a main part that applied alpha-to-coverage. */
+TEST_F(G17PMSAAEpilog, AlphaCoverageInMainLeavesNoUpdateInTheEpilog)
+{
+   for (bool a2c_in_main : {false, true}) {
+      SCOPED_TRACE(a2c_in_main);
+      agx_fs_epilog_key fs = {};
+      fs.nr_samples = 2;
+      fs.max_sample_size_B = 248;
+      fs.max_bytes_per_tile = 65536;
+      fs.max_samples_per_tile = 2048;
+      fs.link.loc_written = 1;
+      fs.link.size_32 = 1;
+      fs.link.colour_comps = 15;
+      fs.rt_formats[0] = PIPE_FORMAT_R8G8B8A8_UNORM;
+      fs.remap[0] = 0;
+      fs.blend.rt[0].colormask = 15;
+      fs.blend.rt[0].mode = agx_pack_blend_standard(
+         PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO,
+         PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO);
+      fs.blend.alpha_to_coverage = true;
+      fs.a2c_in_main = a2c_in_main;
+      agx_fs_epilog_apply_device_policy(AGX_CHIP_G17P, &fs);
+
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "G17P alpha coverage");
+      agx_nir_fs_epilog_g17p(&b, &fs);
+      nir_validate_shader(b.shader, "G17P alpha coverage epilog");
+
+      unsigned updates = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            updates += instr->type == nir_instr_type_intrinsic &&
+                       (nir_instr_as_intrinsic(instr)->intrinsic ==
+                           nir_intrinsic_sample_mask_agx ||
+                        nir_instr_as_intrinsic(instr)->intrinsic ==
+                           nir_intrinsic_demote_samples);
+         }
+      }
+      EXPECT_EQ(updates != 0, !a2c_in_main);
       ralloc_free(b.shader);
    }
 }
@@ -238,13 +283,213 @@ TEST_F(G17PMSAAEpilog, PerSampleMainExportsCompile)
    }
 }
 
+/* A sample-shaded main that kills coverage is unrolled per sample, then tests
+ * its coverage once: every copy's kill goes into that one update. Kill-only
+ * updates of part of a multisampled pixel lose the killed samples' previous
+ * contents, and a testing update per copy can stall the GPU beside another
+ * context's fragment work. */
+TEST_F(G17PMSAAEpilog, PerSampleKillsUseOneCoverageUpdate)
+{
+   for (unsigned samples : {2u, 4u}) {
+      SCOPED_TRACE(samples);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "G17P per-sample kill");
+      b.shader->info.fs.uses_sample_shading = true;
+      b.shader->info.fs.uses_discard = true;
+
+      /* Odd samples are discarded. */
+      nir_def *id = nir_load_sample_id(&b);
+      nir_demote_if(&b, nir_ine_imm(&b, nir_iand_imm(&b, id, 1), 0));
+
+      nir_def *value = nir_u2f32(&b, id);
+      nir_intrinsic_instr *store =
+         nir_intrinsic_instr_create(b.shader, nir_intrinsic_store_output);
+      store->num_components = 4;
+      store->src[0] = nir_src_for_ssa(nir_vec4(&b, value, value, value, value));
+      store->src[1] = nir_src_for_ssa(nir_imm_int(&b, 0));
+      nir_intrinsic_set_base(store, 0);
+      nir_intrinsic_set_write_mask(store, 15);
+      nir_intrinsic_set_src_type(store, nir_type_float32);
+      nir_io_semantics sem = {};
+      sem.location = FRAG_RESULT_DATA0;
+      sem.num_slots = 1;
+      nir_intrinsic_set_io_semantics(store, sem);
+      nir_builder_instr_insert(&b, &store->instr);
+      b.shader->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
+
+      /* As both drivers order it: discards to demotes, the unroll, then the
+       * coverage lowering. */
+      agx_nir_lower_discard_zs_emit(b.shader);
+      agx_fs_epilog_link_info link = {};
+      agx_nir_lower_fs_output_to_epilog_for_device(b.shader, AGX_CHIP_G17P, &link);
+      ASSERT_TRUE(agx_nir_lower_g17p_sample_shading(b.shader, &link, samples));
+      nir_opt_constant_folding(b.shader);
+      /* Negative control: AGX_G17P_SAMPLE_KILL_ONE_UPDATE=0 selects the
+       * lowering with a kill-only update per copy, as it does in the
+       * drivers; the expectations below must then fail. */
+      if (debug_get_bool_option("AGX_G17P_SAMPLE_KILL_ONE_UPDATE", true))
+         ASSERT_TRUE(agx_nir_lower_sample_mask_one_update(b.shader));
+      else
+         ASSERT_TRUE(agx_nir_lower_sample_mask_deferred(b.shader));
+      nir_validate_shader(b.shader, "G17P per-sample kill coverage");
+
+      unsigned updates = 0, kill_only = 0, demotes = 0;
+      nir_foreach_function_impl(impl, b.shader) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+               if (in->intrinsic == nir_intrinsic_demote_samples)
+                  demotes++;
+               if (in->intrinsic != nir_intrinsic_sample_mask_agx)
+                  continue;
+               updates++;
+               if (nir_src_is_const(in->src[1]) && nir_src_as_uint(in->src[1]) == 0)
+                  kill_only++;
+            }
+         }
+      }
+      EXPECT_EQ(demotes, 0u);
+      EXPECT_EQ(updates, 1u);
+      EXPECT_EQ(kill_only, 0u);
+
+      /* The drivers bind or fold the update's test selector; here the
+       * fragment always tests. */
+      nir_shader_intrinsics_pass(
+         b.shader,
+         [](nir_builder *nb, nir_intrinsic_instr *in, void *) -> bool {
+            if (in->intrinsic != nir_intrinsic_load_shader_part_tests_zs_agx)
+               return false;
+            nb->cursor = nir_before_instr(&in->instr);
+            nir_def_replace(&in->def,
+                            nir_imm_intN_t(nb, UINT16_MAX, in->def.bit_size));
+            return true;
+         },
+         nir_metadata_control_flow, NULL);
+
+      agx_preprocess_nir(b.shader);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.no_stop = true;
+      key.fs.nr_samples = samples;
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part)) << agx_last_compile_refusal();
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+/* M5 unrolls sample-shaded mains like G17P (in its larger register file) and
+ * collects the copies' kills into one testing update too, in M5's uniformly
+ * selected form: one testing update, a kill-only update at most on the branch
+ * where the draw does not test, no demote left, and the result compiles for
+ * G17S at 2x and 4x. */
+TEST_F(G17PMSAAEpilog, M5PerSampleKillsUseOneTestingUpdate)
+{
+   /* hk_native_fs_registers() on M5: the whole register file (AGX_NUM_REGS). */
+   const unsigned m5_registers = 256;
+   for (unsigned samples : {2u, 4u}) {
+      SCOPED_TRACE(samples);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "M5 per-sample kill");
+      b.shader->info.fs.uses_sample_shading = true;
+      b.shader->info.fs.uses_discard = true;
+
+      /* Odd samples are discarded. */
+      nir_def *id = nir_load_sample_id(&b);
+      nir_demote_if(&b, nir_ine_imm(&b, nir_iand_imm(&b, id, 1), 0));
+
+      nir_def *value = nir_u2f32(&b, id);
+      nir_intrinsic_instr *store =
+         nir_intrinsic_instr_create(b.shader, nir_intrinsic_store_output);
+      store->num_components = 4;
+      store->src[0] = nir_src_for_ssa(nir_vec4(&b, value, value, value, value));
+      store->src[1] = nir_src_for_ssa(nir_imm_int(&b, 0));
+      nir_intrinsic_set_base(store, 0);
+      nir_intrinsic_set_write_mask(store, 15);
+      nir_intrinsic_set_src_type(store, nir_type_float32);
+      nir_io_semantics sem = {};
+      sem.location = FRAG_RESULT_DATA0;
+      sem.num_slots = 1;
+      nir_intrinsic_set_io_semantics(store, sem);
+      nir_builder_instr_insert(&b, &store->instr);
+      b.shader->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
+
+      /* As Honeykrisp orders it on M5: discards to demotes, the unroll, then
+       * the coverage lowering. */
+      agx_nir_lower_discard_zs_emit(b.shader);
+      agx_fs_epilog_link_info link = {};
+      agx_nir_lower_fs_output_to_epilog_for_device(b.shader, AGX_CHIP_G17S, &link);
+      ASSERT_TRUE(agx_nir_lower_g17p_sample_shading_file(b.shader, &link, samples,
+                                                         m5_registers, true));
+      nir_opt_constant_folding(b.shader);
+      ASSERT_TRUE(agx_nir_lower_sample_mask_one_update_m5(b.shader));
+      nir_validate_shader(b.shader, "M5 per-sample kill coverage");
+
+      unsigned testing = 0, kill_only = 0, demotes = 0;
+      nir_foreach_function_impl(impl, b.shader) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+               if (in->intrinsic == nir_intrinsic_demote_samples)
+                  demotes++;
+               if (in->intrinsic != nir_intrinsic_sample_mask_agx)
+                  continue;
+               if (nir_src_is_const(in->src[1]) && nir_src_as_uint(in->src[1]) == 0)
+                  kill_only++;
+               else
+                  testing++;
+            }
+         }
+      }
+      EXPECT_EQ(demotes, 0u);
+      EXPECT_EQ(testing, 1u);
+      EXPECT_LE(kill_only, 1u);
+
+      /* The drivers bind or fold the update's test selector; here the
+       * fragment always tests. */
+      nir_shader_intrinsics_pass(
+         b.shader,
+         [](nir_builder *nb, nir_intrinsic_instr *in, void *) -> bool {
+            if (in->intrinsic != nir_intrinsic_load_shader_part_tests_zs_agx)
+               return false;
+            nb->cursor = nir_before_instr(&in->instr);
+            nir_def_replace(&in->def,
+                            nir_imm_intN_t(nb, UINT16_MAX, in->def.bit_size));
+            return true;
+         },
+         nir_metadata_control_flow, NULL);
+
+      agx_preprocess_nir(b.shader);
+      agx_nir_lower_g17p_tile_samples(b.shader, samples);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = AGX_CHIP_G17S;
+      key.no_preamble = true;
+      key.secondary = true;
+      key.fs.nr_samples = samples;
+      BITSET_SET(key.g17p_tile_partitions, 0);
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part)) << agx_last_compile_refusal();
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
 TEST_F(G17PMSAAEpilog, NativeSpillEpilogsCompile)
 {
    for (unsigned samples : {2u, 4u}) {
       for (unsigned targets : {4u, 8u}) {
-         for (bool blend : {false, true}) {
+         for (unsigned variant = 0; variant < 3; ++variant) {
+            const bool blend = variant == 1, a2c = variant == 2;
             agx_fs_epilog_key fs = {};
             fs.nr_samples = samples;
+            fs.blend.alpha_to_coverage = a2c;
             fs.max_sample_size_B = AGX_G17P_MAX_BYTES_PER_SAMPLE;
             fs.max_bytes_per_tile = 32768;
             fs.max_samples_per_tile = 2048;
@@ -274,7 +519,8 @@ TEST_F(G17PMSAAEpilog, NativeSpillEpilogsCompile)
             if (!agx_tilebuffer_spills(&tib))
                continue;
             SCOPED_TRACE(::testing::Message() << samples << " samples, "
-                         << targets << " targets, blend=" << blend);
+                         << targets << " targets, blend=" << blend
+                         << ", alpha-to-coverage=" << a2c);
             nir_builder b = nir_builder_init_simple_shader(
                MESA_SHADER_FRAGMENT, &agx_nir_options, "G17P spilled MRT epilog");
             agx_nir_fs_epilog_g17p(&b, &fs);

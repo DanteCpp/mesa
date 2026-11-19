@@ -40,11 +40,11 @@ enum ail_tiling {
    /**
     * G17P Interchange (descriptor Layout 3): 16x16-element macroblocks in
     * row-major order, row pitch ceil(width / 16) * 256 * blocksize; inside a
-    * macroblock, 8x4 blocks in row-major order, each x-first Morton
-    * (AGXMetalG17P InterchangeTiledMemory).  This is the layout the display
-    * coprocessor scans out as an address-format-5 surface.  Always lossless
-    * compressed (8 bytes of metadata per macroblock, as for GPU tiling).
-    * Single level, single layer, single sample, 32-bit formats only.
+    * macroblock, 8x4 blocks in row-major order, each x-first Morton. This is
+    * the layout the display coprocessor scans out as an address-format-5
+    * surface.  Always lossless compressed (8 bytes of metadata per macroblock,
+    * as for GPU tiling). Single level, single layer, single sample, 32-bit
+    * formats only.
     */
    AIL_TILING_INTERCHANGE,
 };
@@ -176,6 +176,13 @@ struct ail_layout {
     * for rendering, either PBE or ZLS.
     */
    bool renderable;
+
+   /** G18G (M6) image under AIL_LAYOUT_POLICY_M5: compression metadata tiles
+    * that depend on the sample count, and compact depth/stencil array layers,
+    * whose stride the G18G ZLS encodes in cachelines below a page. Set by the
+    * drivers on G18G only; zero keeps the G17G-family rules. Last, so that
+    * no other field moves. */
+   bool g18g;
 };
 
 /* Bytes per row of 16x16 macroblocks of an interchange layout. */
@@ -347,9 +354,12 @@ ail_get_tiled_element_B(const struct ail_layout *layout, unsigned level,
 static inline struct ail_tile
 ail_metadata_tile(const struct ail_layout *layout)
 {
+   /* G18G sizes 16 B/px tiles by the sample count (HAL300/HAL400
+    * getMacroBlockDimensions); the G17G-family rule is the single-sample one. */
    return layout->policy == AIL_LAYOUT_POLICY_M5 && !layout->mipmapped_z
              ? ail_m5_compression_tile_size(
-                  util_format_get_blocksize(layout->format))
+                  util_format_get_blocksize(layout->format),
+                  layout->g18g ? layout->sample_count_sa : 1)
              : (struct ail_tile){16, 16};
 }
 

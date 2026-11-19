@@ -8,9 +8,9 @@
 #include "util/format/u_format.h"
 #include "hk_frame_anatomy.h"
 #include "hk_ppp_state.h"
+#include "hk_sampler_index.h"
 #include "asahi/compiler/agx3_graphics_program.h"
 #include "hk_g17p_patch.h"
-#include "asahi/lib/agx_scs_layout.h"
 
 #include "agx_abi.h"
 #include "agx_bo.h"
@@ -21,6 +21,9 @@
 #include "decode.h"
 #include "hk_agx3_ioto_program_core.h"
 #include "asahi/compiler/agx3_compute_program.h"
+#include "asahi/compiler/agx3_transcode.h"
+#include "asahi/lib/agx3_compute_program_core.h"
+#include "asahi/lib/agx3_cdm_direct_launch_semantic_core.h"
 #include "asahi/compiler/agx_debug.h"
 #include "hk_agx3_vdm_decode.h"
 #include "asahi/lib/agx_ioto_load_core.h"
@@ -36,6 +39,7 @@
 #include "hk_image_view.h"
 #include "hk_physical_device.h"
 #include "hk_shader.h"
+#include "hk_queue.h"
 #include "libagx_shaders.h"
 
 #include "util/cache_ops.h"
@@ -45,6 +49,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include "util/log.h"
+#include "util/u_debug.h"
 #include "util/hash_table.h"
 #include "util/set.h"
 #include "util/u_debug.h"
@@ -123,8 +128,8 @@ hk_g17p_vdm_lookup(struct hk_cmd_buffer *cmd, uint64_t primary, bool bind)
 
    {
       list_for_each_entry(struct hk_cmd_bo, bo, &cmd->uploader.main.bos, link) {
-         const uint64_t start = bo->bo->va->addr;
-         if (primary < start || primary - start >= bo->bo->size)
+         const uint64_t start = bo->addr;
+         if (bo->span || primary < start || primary - start >= bo->size)
             continue;
 
          if (bind) {
@@ -176,94 +181,12 @@ hk_descriptor_state_fini(struct hk_cmd_buffer *cmd,
    }
 }
 
-struct hk_m5_rt_state_diag_entry {
-   uint8_t *cpu;
-   uint64_t gpu, size;
-   uint8_t *initial;
-};
-
-/* Opt-in diagnostic (ASAHI_M5_RT_STATE_DIAG=<dir>): remember the initial
- * contents of each SCS state block this recording allocates, so the bytes the
- * GPU changed can be reported once the application has finished with the
- * command buffer. No effect on the recorded commands. */
-void
-hk_m5_rt_state_diag_record(struct hk_cmd_buffer *cmd, struct agx_ptr state,
-                           uint64_t size)
-{
-   struct hk_m5_rt_state_diag_entry e = {
-      .cpu = state.cpu, .gpu = state.gpu, .size = size, .initial = malloc(size),
-   };
-   if (!e.initial)
-      return;
-   memcpy(e.initial, state.cpu, size);
-   util_dynarray_append(&cmd->m5_rt_state.diag, e);
-}
-
-static void
-hk_m5_rt_state_diag_flush(struct hk_cmd_buffer *cmd)
-{
-   const char *dir = os_get_option("ASAHI_M5_RT_STATE_DIAG");
-   static unsigned seq;
-   util_dynarray_foreach(&cmd->m5_rt_state.diag,
-                         struct hk_m5_rt_state_diag_entry, e) {
-      const unsigned n = p_atomic_inc_return(&seq);
-      char path[512];
-      snprintf(path, sizeof(path), "%s/state-%d-%u.txt", dir ? dir : "/tmp",
-               (int)getpid(), n);
-      FILE *f = fopen(path, "w");
-      if (f) {
-         uint64_t changed = 0, ranges = 0, start = UINT64_MAX, last = 0;
-         fprintf(f, "gpu 0x%" PRIx64 " size 0x%" PRIx64 "\n", e->gpu, e->size);
-         for (uint64_t o = 0; o < e->size; o += 16) {
-            if (!memcmp(e->cpu + o, e->initial + o, 16))
-               continue;
-            changed += 16;
-            if (start != UINT64_MAX && o > last + 256) {
-               fprintf(f, "range 0x%" PRIx64 " 0x%" PRIx64 "\n", start, last + 16);
-               ranges++;
-               start = UINT64_MAX;
-            }
-            if (start == UINT64_MAX)
-               start = o;
-            last = o;
-         }
-         if (start != UINT64_MAX) {
-            fprintf(f, "range 0x%" PRIx64 " 0x%" PRIx64 "\n", start, last + 16);
-            ranges++;
-         }
-         fprintf(f, "changed16 %" PRIu64 " ranges %" PRIu64 "\n", changed, ranges);
-         fclose(f);
-      }
-      if (n <= 4) {
-         snprintf(path, sizeof(path), "%s/state-%d-%u.final.bin", dir ? dir : "/tmp",
-                  (int)getpid(), n);
-         f = fopen(path, "wb");
-         if (f) {
-            fwrite(e->cpu, 1, e->size, f);
-            fclose(f);
-         }
-         snprintf(path, sizeof(path), "%s/state-%d-%u.initial.bin", dir ? dir : "/tmp",
-                  (int)getpid(), n);
-         f = fopen(path, "wb");
-         if (f) {
-            fwrite(e->initial, 1, e->size, f);
-            fclose(f);
-         }
-      }
-      free(e->initial);
-   }
-   util_dynarray_fini(&cmd->m5_rt_state.diag);
-   memset(&cmd->m5_rt_state.diag, 0, sizeof(cmd->m5_rt_state.diag));
-}
-
 static void
 hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
 {
-   if (cmd->m5_rt_state.diag.size)
-      hk_m5_rt_state_diag_flush(cmd);
-
    struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
    struct hk_device *dev = hk_cmd_pool_device(pool);
+   hk_cmd_pending_reap(dev);
 
    /* The cached span is only valid while this recording owns its leases. */
    cmd->g17p_vdm_last_allocation = NULL;
@@ -293,13 +216,14 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    list_for_each_entry_safe(struct hk_vdm_allocation, allocation,
                             &cmd->vdm_allocations, link) {
       list_del(&allocation->link);
-      hk_cmd_pool_free_vdm(pool, allocation);
+      hk_device_free_span(dev, allocation);
    }
 
    list_for_each_entry_safe(struct hk_cs, it, &cmd->control_streams, node) {
       list_del(&it->node);
       hk_cs_destroy(it);
    }
+   hk_tess_batch_reset(cmd);
 
    hk_ioto_arena_finish(cmd);
    hk_cmd_buffer_release_bos(cmd, &dev->dev);
@@ -312,6 +236,7 @@ hk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
       container_of(vk_cmd_buffer, struct hk_cmd_buffer, vk);
    struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
 
+   hk_device_quiesce_lost_submissions(hk_cmd_pool_device(pool));
    hk_free_resettable_cmd_buffer(cmd);
    util_dynarray_fini(&cmd->large_bos);
    free(cmd->retained_set);
@@ -376,15 +301,18 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    struct hk_cmd_buffer *cmd =
       container_of(vk_cmd_buffer, struct hk_cmd_buffer, vk);
 
+   hk_device_quiesce_lost_submissions(hk_cmd_pool_device(hk_cmd_buffer_pool(cmd)));
    vk_command_buffer_reset(&cmd->vk);
    hk_free_resettable_cmd_buffer(cmd);
 
    cmd->uploader.main.map = NULL;
    cmd->uploader.main.base = 0;
    cmd->uploader.main.offset = 0;
+   cmd->uploader.main.capacity = 0;
    cmd->uploader.usc.map = NULL;
    cmd->uploader.usc.base = 0;
    cmd->uploader.usc.offset = 0;
+   cmd->uploader.usc.capacity = 0;
    cmd->uploader.root.map = NULL;
    cmd->uploader.root.base = 0;
    cmd->uploader.root.offset = 0;
@@ -397,6 +325,7 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    cmd->uploader.streams.map = NULL;
    cmd->uploader.streams.base = 0;
    cmd->uploader.streams.offset = 0;
+   cmd->uploader.streams.capacity = 0;
 
    cmd->current_cs.gfx = NULL;
    cmd->current_cs.cs = NULL;
@@ -485,11 +414,19 @@ hk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
 }
 
 static VkResult
-hk_cmd_buffer_alloc_bo(struct hk_cmd_buffer *cmd, enum hk_cmd_bo_type type,
-                       struct hk_cmd_bo **bo_out)
+hk_cmd_buffer_alloc_bo(struct hk_cmd_buffer *cmd,
+                       const struct hk_uploader *uploader, uint32_t size,
+                       enum hk_cmd_bo_type type, struct hk_cmd_bo **bo_out)
 {
    struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
-   VkResult result = hk_cmd_pool_alloc_bo(pool, type, bo_out);
+   const uint32_t span = uploader == &cmd->uploader.streams
+                            ? HK_CMD_STREAM_SPAN_SIZE
+                            : HK_CMD_SPAN_SIZE;
+   VkResult result =
+      !uploader->map && size <= span && list_is_empty(&pool->free_bos[type]) &&
+            hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev)
+         ? hk_cmd_pool_alloc_bo_span(pool, type, span, bo_out)
+         : hk_cmd_pool_alloc_bo(pool, type, bo_out);
    if (result != VK_SUCCESS)
       return result;
 
@@ -538,8 +475,8 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
 
    uint32_t offset = align(uploader->offset, alignment);
 
-   assert(offset <= HK_CMD_BO_SIZE);
-   if (uploader->map != NULL && size <= HK_CMD_BO_SIZE - offset) {
+   if (uploader->map != NULL && offset <= uploader->capacity &&
+       size <= uploader->capacity - offset) {
       uploader->offset = offset + size;
 
       return (struct agx_ptr){
@@ -549,7 +486,7 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
    }
 
    struct hk_cmd_bo *bo;
-   VkResult result = hk_cmd_buffer_alloc_bo(cmd, type, &bo);
+   VkResult result = hk_cmd_buffer_alloc_bo(cmd, uploader, size, type, &bo);
    if (unlikely(result != VK_SUCCESS)) {
       vk_command_buffer_set_error(&cmd->vk, result);
       return (struct agx_ptr){0};
@@ -563,14 +500,16 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
     * upload BO on this one allocation and continuing on the current upload
     * BO.
     */
-   if (uploader->map == NULL || size < uploader->offset) {
-      uploader->map = agx_bo_map(bo->bo);
-      uploader->base = bo->bo->va->addr;
+   if (uploader->map == NULL ||
+       bo->size - size > uploader->capacity - uploader->offset) {
+      uploader->map = bo->map;
+      uploader->base = bo->addr;
       uploader->offset = size;
+      uploader->capacity = bo->size;
    }
 
    return (struct agx_ptr){
-      .gpu = bo->bo->va->addr,
+      .gpu = bo->addr,
       .cpu = bo->map,
    };
 }
@@ -627,9 +566,9 @@ hk_pool_vdm_primary_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
       MAX2(alignment, HK_G17P_VDM_UPLOAD_CHUNK_SIZE);
    struct agx_ptr chunk = {0};
    struct hk_vdm_allocation *allocation = NULL;
-   const VkResult result = hk_cmd_pool_alloc_vdm(
-      hk_cmd_buffer_pool(cmd), chunk_size, chunk_alignment, &chunk,
-      &allocation);
+   const VkResult result = hk_cmd_pool_alloc_span(
+      hk_cmd_buffer_pool(cmd), HK_CMD_SLAB_VDM, chunk_size, chunk_alignment,
+      &chunk, &allocation);
    if (unlikely(result != VK_SUCCESS)) {
       vk_command_buffer_set_error(&cmd->vk, result);
       return (struct agx_ptr){0};
@@ -738,7 +677,79 @@ hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
    return current;
 }
 
-static void *
+int hk_g17p_launch_trace_state = -1;
+
+int
+hk_g17p_launch_trace_init(void)
+{
+   const int enabled = debug_get_bool_option("HK_G17P_LAUNCH_TRACE", false) ? 1 : 0;
+   hk_g17p_launch_trace_state = enabled;
+   return enabled;
+}
+
+/* Single line, distinct tag. The multi-line dump below has twice been reported
+ * as "only the header printed", so anything that must not be lost in a log
+ * filter goes through this instead. */
+void
+hk_g17p_trace_line(const char *label, uint64_t base, const void *data,
+                   size_t len)
+{
+   const uint8_t *bytes = data;
+   fprintf(stderr, "G17P %s: base=%" PRIx64 " len=%zu bytes=", label, base,
+           len);
+   for (size_t i = 0; i < len; ++i)
+      fprintf(stderr, "%02x", bytes[i]);
+   fprintf(stderr, "\n");
+   fflush(stderr);
+}
+
+void
+hk_g17p_trace_hexdump(const char *label, uint64_t base, const void *data,
+                      size_t len)
+{
+   const uint8_t *bytes = data;
+   fprintf(stderr, "G17P dump: %s base=%" PRIx64 " len=%zu\n", label, base,
+           len);
+   for (size_t off = 0; off < len; off += 16) {
+      fprintf(stderr, "G17P dump:   +%04zx ", off);
+      for (size_t i = 0; i < 16 && off + i < len; ++i)
+         fprintf(stderr, "%02x ", bytes[off + i]);
+      fprintf(stderr, "\n");
+   }
+   fflush(stderr);
+}
+
+/* w74: HK_G17P_LAUNCH_TRACE=1 dump of one graphics stage's uniform ranges, one
+ * line per range. A draw's texture/descriptor/root bindings reach the shader
+ * only through these ranges, so this is what to compare with the shader's
+ * load_preamble/device_load bases in the AGX3 dump. */
+static void
+hk_g17p_trace_gfx_ranges(const struct hk_shader *s,
+                         const struct agx3_ioto_uniform_range *ranges,
+                         size_t count, const uint8_t *sources)
+{
+   fprintf(stderr,
+           "G17P gfx-ranges: stage=%d count=%zu root_uniform=%u set_count=%u "
+           "uses_root=%d combined_sampler=%d indexed_sampler=%d "
+           "rodata16=%u uniform_dma=%u push_count=%u\n",
+           (int)s->info.stage, count, s->info.agx3_root_uniform,
+           (unsigned)s->info.set_count, (int)s->info.agx3_uses_root,
+           (int)s->info.agx3_combined_sampler_valid,
+           (int)s->info.agx3_indexed_sampler_valid,
+           (unsigned)s->b.info.rodata.size_16,
+           (unsigned)s->b.info.agx3_uniform_dma_count,
+           (unsigned)s->b.info.push_count);
+   for (size_t i = 0; i < count; ++i)
+      fprintf(stderr,
+              "G17P gfx-range: stage=%d i=%zu start_halfs=%u size_halfs=%u "
+              "address=%" PRIx64 " source=%u\n",
+              (int)s->info.stage, i, (unsigned)ranges[i].start_halfs,
+              (unsigned)ranges[i].size_halfs, (uint64_t)ranges[i].address,
+              (unsigned)sources[i]);
+   fflush(stderr);
+}
+
+void *
 hk_cmd_buffer_emit_cdm_terminate(struct hk_cmd_buffer *cmd, void *current)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -850,10 +861,17 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 static void
 merge_control_streams(struct hk_cmd_buffer *cmd)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const bool g18 = dev->dev.chip == AGX_CHIP_G18G;
    struct hk_cs *last = NULL;
 
    list_for_each_entry_safe(struct hk_cs, cs, &cmd->control_streams, node) {
-      if (cs->type == HK_CS_CDM && last && last->type == HK_CS_CDM &&
+      /* G18G CDM streams never merge: launches would add past the
+       * HK_G18_BATCH cap and hk_cs_merge_cdm does not combine
+       * g18_compute_resources, so the merged command would keep only the
+       * first stream's registers, staging and local size. */
+      if (cs->type == HK_CS_CDM && last && last->type == HK_CS_CDM && !g18 &&
+          !last->g18_dispatch_sealed && !cs->g18_dispatch_sealed &&
           !last->timestamp.end.handle &&
           !(last->timestamp.start.handle && cs->g17p_timestamp_query) &&
           !(last->timestamp.start.handle && cs->timestamp.start.handle) &&
@@ -898,9 +916,9 @@ hk_cmd_bo_clean_unlinked_streams(struct hk_cmd_buffer *cmd,
                                  const struct hk_cmd_bo *bo)
 {
    const uintptr_t base = (uintptr_t)bo->map;
-   if (bo->bo->size > UINTPTR_MAX - base)
+   if (bo->size > UINTPTR_MAX - base)
       return false;
-   const uintptr_t limit = base + bo->bo->size;
+   const uintptr_t limit = base + bo->size;
 
    list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
       const uintptr_t start = (uintptr_t)cs->start;
@@ -945,7 +963,7 @@ hk_cmd_buffer_publish_cached_uploads(struct hk_cmd_buffer *cmd)
          if (bo->stream_only && !linked_stream &&
              hk_cmd_bo_clean_unlinked_streams(cmd, bo))
             continue;
-         size_t size = bo->bo->size;
+         size_t size = bo->size;
          for (unsigned u = 0; u < ARRAY_SIZE(current); ++u) {
             if (current[u]->map == bo->map)
                size = MIN2(size, current[u]->offset);
@@ -986,7 +1004,27 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
     * missing stream terminates.
     */
    list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
-      if (cs->type == HK_CS_CDM) {
+      /* A G18G native dispatch stream is sealed: the launch is followed by its
+       * barrier and its own stream terminate (hk_cmd_dispatch.c, hk_cmd_buffer.c
+       * helper path).  Appending a second terminate makes the stream 52 bytes;
+       * the G18 kernel admits at most 48 (one dispatch) and refuses the submit
+       * with ENOTSUPP ("G18 compute admission rejected ... stream_bytes=52").
+       */
+      if (cs->type == HK_CS_CDM && !cs->g18_dispatch_sealed) {
+         /* Where the kernel lets another queue's kick wait for this stream's
+          * completion in firmware, which a weak tail reports before the
+          * stream's writes are visible, end the stream with the strong
+          * memory-scoped flush, upgrading the weak record in place, and say
+          * so in the command (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
+          */
+         if (agx_chip_g17_m5(dev->dev.chip) &&
+             (dev->dev.params.features &
+              DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION)) {
+            if (cs->current == cs->weak_barrier_end)
+               hk_cdm_visibility_flush(dev, cs, true);
+            cs->visible_completion = cs->current == cs->strong_flush_end &&
+                                     cs->current == cs->memory_flush_end;
+         }
          cs->current = hk_cmd_buffer_emit_cdm_terminate(cmd, cs->current);
       }
    }
@@ -1001,23 +1039,42 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    return vk_command_buffer_end(&cmd->vk);
 }
 
+/* Whether one barrier of a dependency reaches the host: it names a host
+ * access, or MEMORY_READ or MEMORY_WRITE with the host stage in its
+ * destination scope. Those stand for every read or write valid in the scope,
+ * the host's too. ALL_COMMANDS does not include the host stage. A host write
+ * needs the earlier device writes written back first as much as a host read
+ * does: a line written back after it would overwrite it. */
 static bool
-hk_dependency_has_host_read(const VkDependencyInfo *info)
+hk_barrier_has_host_access(VkPipelineStageFlags2 dst_stages,
+                           VkAccessFlags2 dst_access)
+{
+   if (dst_access & (VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_HOST_WRITE_BIT))
+      return true;
+
+   return (dst_stages & VK_PIPELINE_STAGE_2_HOST_BIT) &&
+          (dst_access &
+           (VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT));
+}
+
+static bool
+hk_dependency_has_host_access(const VkDependencyInfo *info)
 {
    for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
-      if (info->pMemoryBarriers[i].dstAccessMask & VK_ACCESS_2_HOST_READ_BIT)
+      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+      if (hk_barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
          return true;
    }
 
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
-      if (info->pBufferMemoryBarriers[i].dstAccessMask &
-          VK_ACCESS_2_HOST_READ_BIT)
+      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
+      if (hk_barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
          return true;
    }
 
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
-      if (info->pImageMemoryBarriers[i].dstAccessMask &
-          VK_ACCESS_2_HOST_READ_BIT)
+      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+      if (hk_barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
          return true;
    }
 
@@ -1128,7 +1185,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    /* Host availability is recorded against the work already recorded. */
    if (cmd->state.deferred_clear_count &&
-       hk_dependency_has_host_read(pDependencyInfo))
+       hk_dependency_has_host_access(pDependencyInfo))
       hk_flush_deferred_clears(cmd);
 
    /* In-pass dependencies stay scoped to the API pass, even when its
@@ -1180,13 +1237,13 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    /* A barrier-only command buffer otherwise records no GPU work, so it
     * cannot make a preceding fragment store visible to the host. Emit the
     * native strong CDM cache-maintenance record only when the API requests
-    * host-read availability, in a stream ordered after the source scope.
-    * The host reads memory, so on G17P the record has memory scope: a strong
-    * flush alone leaves the data in the GPU caches, and the end of the
-    * command does not reliably write it back before completion is reported
-    * when render work shares the queue. */
+    * host availability, in a stream ordered after the source scope. The
+    * host accesses memory, so the record has memory scope: a strong flush
+    * alone leaves the data in the GPU caches, and the end of the command
+    * does not reliably write it back before completion is reported when
+    * render work shares the queue. */
    if ((dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
-       hk_dependency_has_host_read(pDependencyInfo)) {
+       hk_dependency_has_host_access(pDependencyInfo)) {
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
       hk_sync_src_dep(cmd, src_kinds, cmd->current_cs.cs, dep);
 
@@ -1243,7 +1300,8 @@ hk_g17p_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
       return false;
 
    struct hk_api_shader *vs = gfx->shaders[MESA_SHADER_VERTEX];
-   struct hk_api_shader *fs = gfx->shaders[MESA_SHADER_FRAGMENT];
+   struct hk_api_shader *fs =
+      gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
    if (!vs || !fs || fs->g17p_sample_variants)
       return false;
 
@@ -1285,7 +1343,7 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
       VK_FROM_HANDLE(hk_descriptor_set, set, info->pDescriptorSets[i]);
 
       if (desc->sets[s] != set ||
-          (desc->push_active & BITFIELD_BIT(s))) {
+          ((desc->push_active | desc->buffer_active) & BITFIELD_BIT(s))) {
          binding_changed = true;
          if (set != NULL) {
             root_changed |= desc->root.sets[s] != hk_descriptor_set_addr(set);
@@ -1303,6 +1361,7 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
       }
       desc->push_active &= ~BITFIELD_BIT(s);
       desc->push_dirty &= ~BITFIELD_BIT(s);
+      desc->buffer_active &= ~BITFIELD_BIT(s);
 
       root_changed |=
          desc->root.set_dynamic_buffer_start[s] != dyn_buffer_start;
@@ -1410,6 +1469,130 @@ hk_CmdPushConstants2KHR(VkCommandBuffer commandBuffer,
       hk_push_constants(cmd, &cmd->state.rt.descriptors, pPushConstantsInfo);
 }
 
+/* VK_EXT_descriptor_buffer */
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdBindDescriptorBuffersEXT(
+   VkCommandBuffer commandBuffer, uint32_t bufferCount,
+   const VkDescriptorBufferBindingInfoEXT *pBindingInfos)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   /* The push descriptor buffer (bufferlessPushDescriptors is false) is never
+    * read: push descriptors keep their own command-buffer storage. */
+   assert(bufferCount <= HK_MAX_DESCRIPTOR_BUFFERS);
+   for (uint32_t i = 0; i < bufferCount; i++)
+      cmd->state.descriptor_buffers[i] = pBindingInfos[i].address;
+}
+
+/* Bind set s to `size` bytes of descriptors at `addr`. */
+static void
+hk_bind_buffer_set(struct hk_descriptor_state *desc,
+                   const struct vk_pipeline_layout *pipeline_layout,
+                   uint32_t s, uint64_t addr, uint32_t size)
+{
+   desc->root.sets[s] = addr;
+   desc->set_sizes[s] = size;
+   desc->sets[s] = NULL;
+   desc->sets_dirty |= BITFIELD_BIT(s);
+   desc->push_active &= ~BITFIELD_BIT(s);
+   desc->push_dirty &= ~BITFIELD_BIT(s);
+   desc->buffer_active |= BITFIELD_BIT(s);
+
+   /* Descriptor-buffer layouts have no dynamic buffers. */
+   desc->root.set_dynamic_buffer_start[s] =
+      pipeline_layout->dynamic_descriptor_offset[s];
+}
+
+static void
+hk_set_descriptor_buffer_offsets(struct hk_cmd_buffer *cmd,
+                                 struct hk_descriptor_state *desc,
+                                 const VkSetDescriptorBufferOffsetsInfoEXT *info)
+{
+   VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, info->layout);
+
+   for (uint32_t i = 0; i < info->setCount; ++i) {
+      const uint32_t s = info->firstSet + i;
+      const struct hk_descriptor_set_layout *set_layout =
+         pipeline_layout->set_layouts[s]
+            ? vk_to_hk_descriptor_set_layout(pipeline_layout->set_layouts[s])
+            : NULL;
+      assert(info->pBufferIndices[i] < HK_MAX_DESCRIPTOR_BUFFERS);
+      const uint64_t addr =
+         cmd->state.descriptor_buffers[info->pBufferIndices[i]] +
+         info->pOffsets[i];
+
+      hk_bind_buffer_set(desc, pipeline_layout, s, addr,
+                         set_layout ? set_layout->max_buffer_size : 0);
+   }
+
+   desc->root_dirty = true;
+   desc->generation++;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdSetDescriptorBufferOffsets2EXT(
+   VkCommandBuffer commandBuffer,
+   const VkSetDescriptorBufferOffsetsInfoEXT *pInfo)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   if (pInfo->stageFlags & (VK_SHADER_STAGE_ALL_GRAPHICS |
+                            VK_SHADER_STAGE_TASK_BIT_EXT |
+                            VK_SHADER_STAGE_MESH_BIT_EXT)) {
+      hk_m5_pass_merge_note_set_bind(cmd);
+      hk_set_descriptor_buffer_offsets(cmd, &cmd->state.gfx.descriptors, pInfo);
+   }
+
+   if (pInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+      hk_set_descriptor_buffer_offsets(cmd, &cmd->state.cs.descriptors, pInfo);
+
+   if (pInfo->stageFlags & HK_RT_SHADER_STAGES)
+      hk_set_descriptor_buffer_offsets(cmd, &cmd->state.rt.descriptors, pInfo);
+}
+
+static void
+hk_bind_embedded_samplers(struct hk_cmd_buffer *cmd,
+                          struct hk_descriptor_state *desc,
+                          const VkBindDescriptorBufferEmbeddedSamplersInfoEXT *info)
+{
+   VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, info->layout);
+   const struct hk_descriptor_set_layout *set_layout =
+      vk_to_hk_descriptor_set_layout(pipeline_layout->set_layouts[info->set]);
+   assert(set_layout->embedded_samplers != NULL);
+
+   /* Uploaded per bind, so the descriptors outlive the layout for as long as
+    * the command buffer needs them. */
+   const uint32_t size = MAX2(set_layout->non_variable_descriptor_buffer_size,
+                              HK_MIN_UBO_ALIGNMENT);
+   const uint64_t addr = hk_pool_upload(cmd, set_layout->embedded_samplers,
+                                        size, HK_MIN_UBO_ALIGNMENT);
+
+   hk_bind_buffer_set(desc, pipeline_layout, info->set, addr, size);
+   desc->root_dirty = true;
+   desc->generation++;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdBindDescriptorBufferEmbeddedSamplers2EXT(
+   VkCommandBuffer commandBuffer,
+   const VkBindDescriptorBufferEmbeddedSamplersInfoEXT *pInfo)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   if (pInfo->stageFlags & (VK_SHADER_STAGE_ALL_GRAPHICS |
+                            VK_SHADER_STAGE_TASK_BIT_EXT |
+                            VK_SHADER_STAGE_MESH_BIT_EXT)) {
+      hk_m5_pass_merge_note_set_bind(cmd);
+      hk_bind_embedded_samplers(cmd, &cmd->state.gfx.descriptors, pInfo);
+   }
+
+   if (pInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+      hk_bind_embedded_samplers(cmd, &cmd->state.cs.descriptors, pInfo);
+
+   if (pInfo->stageFlags & HK_RT_SHADER_STAGES)
+      hk_bind_embedded_samplers(cmd, &cmd->state.rt.descriptors, pInfo);
+}
+
 static struct hk_push_descriptor_set *
 hk_cmd_push_descriptors(struct hk_cmd_buffer *cmd,
                         struct hk_descriptor_state *desc, uint32_t set)
@@ -1427,6 +1610,7 @@ hk_cmd_push_descriptors(struct hk_cmd_buffer *cmd,
 
    /* Pushing descriptors replaces whatever sets are bound */
    desc->sets[set] = NULL;
+   desc->buffer_active &= ~BITFIELD_BIT(set);
    desc->push_dirty |= BITFIELD_BIT(set);
    desc->push_active |= BITFIELD_BIT(set);
    desc->generation++;
@@ -1743,7 +1927,7 @@ hk_g17p_basic_fragment_layout(struct hk_cmd_buffer *cmd)
 
 /* Keep native interpolation bounded to the f32 UVS layout already supported
  * by hk_agx3_g17p_vertex_program_info: position plus up to 64 user words.
- * HAL200 updateVaryingTable (0x3efa58) uses the same CF entry encoding for
+ * The HAL200 varying table uses the same CF entry encoding for
  * smooth, linear and flat inputs, including their mixture in one shader.
  * Flat inputs select C. Native G17P Point and Triangle pipelines have identical
  * complete fragment text for flat vec2/vec3/vec4 inputs. The provoking selector
@@ -1899,7 +2083,10 @@ hk_g17p_smooth_varyings_supported_uncached(struct hk_cmd_buffer *cmd,
              b->offset + b->count > vs->info.uvs.components[b->slot])
             return false;
          ++user_bindings;
-         const unsigned slot = gfx->linked_varyings.slots[b->slot];
+         unsigned slot = gfx->linked_varyings.slots[b->slot];
+         /* A canonical layout's flat inputs read the flat copy. */
+         if (slot && !b->smooth)
+            slot += gfx->linked_varyings.flat_copy;
          if (slot < 4 || slot + b->offset + b->count > vs->info.uvs.size)
             return false;
       }
@@ -2046,7 +2233,13 @@ hk_g17p_basic_graphics_program_supported(struct hk_cmd_buffer *cmd,
 
    {
       const bool smooth = hk_g17p_smooth_varyings_supported(cmd, linked);
-      const bool layout = hk_g17p_basic_fragment_layout(cmd);
+      /* The narrow RT0 colour-link layout is a G17G witness-profile guard.
+       * The G18G general path binds any tile layout through the general
+       * graphics core and the separately validated EEOT, so it is not a
+       * composer constraint there. */
+      const bool layout =
+         hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G18G ||
+         hk_g17p_basic_fragment_layout(cmd);
 
       if (!smooth || !layout) {
          mesa_loge_once("G17P graphics program refused: stage=fs "
@@ -2165,6 +2358,9 @@ hk_g17p_dma_buffer_in(const struct hk_descriptor_state *desc, int set,
          return false;
       table = &desc->root;
       table_B = sizeof(desc->root);
+   } else if (desc->buffer_active & BITFIELD_BIT(set)) {
+      /* Descriptor buffers are never static (hk_static_set_mask()). */
+      return false;
    } else if (desc->push_active & BITFIELD_BIT(set)) {
       table = desc->push[set]->data;
       table_B = sizeof(desc->push[set]->data);
@@ -2261,71 +2457,6 @@ hk_m5_compute_uniform_dma_ranges(
          return false;
       }
    }
-   return true;
-}
-
-static bool
-hk_m5_graphics_query_uniforms(struct hk_cmd_buffer *cmd, bool vertex,
-                             struct agx3_ioto_uniform_range *range)
-{
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   const uint64_t packed = UINT64_C(0x01140000600100e8);
-   struct agx_scs_layout_gen2 scs;
-   if (!dev->m5_native_rq || !dev->m5_rq_instances ||
-       !agx_scs_layout_gen2_init(packed, &scs) || !cmd->current_cs.gfx)
-      return false;
-   const uint64_t size = MAX2(UINT64_C(0x800000),
-      ALIGN_POT((uint64_t)scs.end[12], 0x4000));
-   struct agx_ptr state = hk_pool_alloc(cmd, size, 0x4000);
-   struct agx_ptr uniforms = hk_pool_alloc(cmd, 512, 16);
-   uint64_t table = hk_m5_upload_as_table(cmd);
-   if (!state.cpu || !uniforms.cpu || !table)
-      return false;
-   memcpy(state.cpu, dev->m5_rq_user_image, 0x800000);
-   if (size > 0x800000)
-      memset((uint8_t *)state.cpu + 0x800000, 0, size - 0x800000);
-   agx_scs_layout_gen2_parameters(&scs, (uint8_t *)state.cpu + 0x80020);
-   memset(uniforms.cpu, 0, 512);
-   memcpy(uniforms.cpu, dev->m5_rq_uniforms, sizeof(dev->m5_rq_uniforms));
-   uint64_t sizes = (uint64_t)scs.end[6] | ((uint64_t)scs.end[11] << 32);
-   uint64_t driver = scs.end[5];
-   memcpy((uint8_t *)uniforms.cpu + 48*2, &sizes, 8);
-   memcpy((uint8_t *)uniforms.cpu + 52*2, &packed, 8);
-   memcpy((uint8_t *)uniforms.cpu + 56*2, &driver, 8);
-   uint64_t query_payload = UINT64_C(0x3fffffff00008000);
-   memcpy((uint8_t *)uniforms.cpu + 152*2, &query_payload, 8);
-   for (unsigned i = 0; i < 80; i += 2) {
-      uint64_t pointer;
-      memcpy(&pointer, (uint8_t *)uniforms.cpu + i*4, 8);
-      if (pointer >= UINT64_C(0x10000000000) && pointer < UINT64_C(0x10000800000)) {
-         pointer += state.gpu - UINT64_C(0x10000000000);
-         memcpy((uint8_t *)uniforms.cpu + i*4, &pointer, 8);
-      }
-   }
-   memcpy((uint8_t *)uniforms.cpu + 32*2, &table, 8);
-   uint32_t context[32] = {0, 0, (uint32_t)packed, (uint32_t)(packed >> 32)};
-   const uint32_t offsets[] = {0x18000,0x18200,0x18400,0x18500,0x18700,0x19b00};
-   for (unsigned i = 0; i < 6; ++i) {
-      uint64_t pointer = i == 4 ? table : state.gpu + offsets[i];
-      memcpy(context + 4 + 2*i, &pointer, 8);
-   }
-   context[20] = scs.end[5];
-   context[22] = scs.end[10] - scs.end[5];
-   const unsigned levels = (packed >> 16) & 0xff;
-   context[23] = (levels + (levels > 1)) * 8;
-   uint64_t extra = state.gpu + 0x80050;
-   memcpy(context + 26, &extra, 8);
-   extra = state.gpu + 0x18900;
-   memcpy(context + 30, &extra, 8);
-   uint64_t ctx = uniforms.gpu + 352;
-   memcpy((uint8_t *)uniforms.cpu + 352, context, sizeof(context));
-   memcpy((uint8_t *)uniforms.cpu + 320, &ctx, 8);
-   memcpy((uint8_t *)uniforms.cpu + 328, &table, 8);
-   *range = (struct agx3_ioto_uniform_range){0, 168, uniforms.gpu};
-   hk_cmd_buffer_retain_bo(cmd, dev->m5_rq_code);
-   hk_cmd_buffer_retain_bo(cmd, dev->m5_rq_ift);
-   if (vertex) cmd->current_cs.gfx->gen1_native_vertex_rq = true;
-   else cmd->current_cs.gfx->gen1_native_fragment_rq = true;
    return true;
 }
 
@@ -2462,9 +2593,8 @@ hk_g17p_graphics_uniform_ranges(
       if (linked->g17p_prolog_uses_root ||
           agx_tilebuffer_spills(&cmd->state.gfx.render.tilebuffer) ||
           hk_cmd_uses_blend_constant(cmd) ||
-          !(agx_chip_g17_m5(dev->dev.chip)
-             ? hk_m5_graphics_query_uniforms(cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count])
-             : hk_gen1_upload_fragment_query_state(cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count])))
+          agx_chip_g17_m5(dev->dev.chip) ||
+          !hk_gen1_upload_fragment_query_state(cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count]))
          return hk_g17p_graphics_ranges_refused(range_count,count);
       count++;
    }
@@ -2585,7 +2715,8 @@ hk_g17p_graphics_uniform_ranges(
       const void *set_map = set ? set->mapped_ptr : NULL;
       uint32_t set_size = set ? set->size : 0;
       uint64_t set_addr = set ? hk_descriptor_set_addr(set) : 0;
-      if (!set && descriptors->push[0] && descriptors->root.sets[0]) {
+      if (!set && descriptors->push[0] && descriptors->root.sets[0] &&
+          !(descriptors->buffer_active & BITFIELD_BIT(0))) {
          set_map = descriptors->push[0]->data;
          set_size = sizeof(descriptors->push[0]->data);
          set_addr = descriptors->root.sets[0];
@@ -2604,6 +2735,11 @@ hk_g17p_graphics_uniform_ranges(
              (const uint8_t *)set_map +
                 binding->sampler_index_offset_B,
              sizeof(sampler_index));
+      /* G18G publishes AGX2-biased sampler indices (native_sampler_indices
+       * in hk_descriptor_set_layout.c); the combined-sampler pointer path
+       * needs the heap index. */
+      if (dev->dev.chip == AGX_CHIP_G18G)
+         sampler_index = hk_sampler_heap_index(false, sampler_index);
 
       const unsigned sampler_element_size =
          agx_chip_sampler_heap_element_size(dev->dev.chip);
@@ -2624,12 +2760,12 @@ hk_g17p_graphics_uniform_ranges(
       if (!hk_agx3_g17p_combined_sampler_pointers(&heap, pointers))
          return hk_g17p_graphics_ranges_refused(range_count, count);
 
-      /* HAL200 FragmentProgramVariant::finalize (374968..3749c0) maps
-       * compiler bindpoints 0x31/0x35 to driver qwords +0xc0/+0xe0.
-       * encodeAndEmitRenderState writes the raw texture/sampler table VAs
-       * there (4c5580/4c5598); ESL copies them to uniform dwords 0..3.
-       * Keep this upload immutable for the command-buffer lifetime, just
-       * like the per-draw graphics state. Both shader indices are zero.
+      /* On HAL200 compiler bindpoints 0x31/0x35 are the texture and sampler
+       * table addresses, at driver qwords +0xc0/+0xe0. Render state carries
+       * the raw texture/sampler table VAs there; ESL copies them to uniform
+       * dwords 0..3. Keep this upload immutable for the command-buffer
+       * lifetime, just like the per-draw graphics state. Both shader indices
+       * are zero.
        */
       const unsigned cache_index =
          ((pointers[0] >> 4) ^ (pointers[0] >> 32) ^
@@ -2664,6 +2800,42 @@ hk_g17p_graphics_uniform_ranges(
       if (!pointers_va)
          return hk_g17p_graphics_ranges_refused(range_count, count);
 
+      if (hk_g17p_launch_trace_enabled()) {
+         /* Descriptor bytes as the set holds them, the texture state the
+          * hardware will actually read (the 32-byte aligned copy), and the
+          * sampler heap element the shader's sampler index selects. */
+         const uint8_t *tex_src =
+            (const uint8_t *)set_map + binding->texture_offset_B;
+         hk_g17p_trace_line("gfx-combined-set-texture", set_addr +
+                               binding->texture_offset_B, tex_src,
+                            MIN2(set_size - binding->texture_offset_B,
+                                 (uint32_t)sizeof(struct hk_sampled_image_descriptor)));
+         fprintf(stderr,
+                 "G17P gfx-combined: set_addr=%" PRIx64 " set_size=%u "
+                 "texture_offset_B=%u sampler_index_offset_B=%u "
+                 "sampler_index=%u sampler_count=%u sampler_elem_B=%u "
+                 "tex_ptr_in=%" PRIx64 " tex_ptr_published=%" PRIx64
+                 " sampler_heap_va=%" PRIx64 " pointers_va=%" PRIx64 "\n",
+                 set_addr, set_size, binding->texture_offset_B,
+                 binding->sampler_index_offset_B, (unsigned)sampler_index,
+                 (unsigned)dev->samplers.table.alloc, sampler_element_size,
+                 pointers[0], cached->valid ? cached->published[0] : 0,
+                 pointers[1], pointers_va);
+         if (sampler_index < dev->samplers.table.alloc)
+            hk_g17p_trace_line(
+               "gfx-combined-sampler-element",
+               dev->samplers.table.bo->va->addr +
+                  (uint64_t)sampler_index * sampler_element_size,
+               hk_descriptor_table_entry(&dev->samplers.table, sampler_index),
+               sampler_element_size);
+         if (cached->valid && cached->published[0])
+            fprintf(stderr, "G17P gfx-combined: texture state %s 32-byte "
+                            "aligned\n",
+                    (cached->published[0] & (HK_G17P_TEXTURE_STATE_ALIGN - 1))
+                       ? "NOT" : "is");
+         fflush(stderr);
+      }
+
       sources[count] = HK_G17P_RANGE_SOURCE_UPLOADED;
       ranges[count++] = (struct agx3_ioto_uniform_range){
          .start_halfs = texture_uniform_base,
@@ -2678,13 +2850,24 @@ hk_g17p_graphics_uniform_ranges(
    if (s->info.agx3_indexed_sampler_valid || native_spills) {
       if ((s->b.info.stage != MESA_SHADER_FRAGMENT &&
            s->b.info.stage != MESA_SHADER_VERTEX &&
+           s->b.info.stage != MESA_SHADER_MESH &&
            !(agx_chip_g17_m5(dev->dev.chip) &&
-             (s->b.info.stage == MESA_SHADER_MESH ||
-              s->b.info.stage == MESA_SHADER_TASK))) ||
+             s->b.info.stage == MESA_SHADER_TASK)) ||
           !dev->sampled_images.base_va || !dev->samplers.table.bo ||
           !dev->rodata.indexed_heap_pointers)
          return hk_g17p_graphics_ranges_refused(range_count, count);
       const uint64_t pointers_va = dev->rodata.indexed_heap_pointers;
+      if (hk_g17p_launch_trace_enabled())
+         fprintf(stderr,
+                 "G17P gfx-indexed: sampled_images_base_va=%" PRIx64
+                 " sampled_image_desc_size=%u sampled_images_alloc=%u "
+                 "sampler_heap_va=%" PRIx64 " sampler_alloc=%u "
+                 "heap_pointers_va=%" PRIx64 "\n",
+                 dev->sampled_images.base_va,
+                 (unsigned)dev->sampled_images.desc_size,
+                 (unsigned)dev->sampled_images.alloc,
+                 dev->samplers.table.bo->va->addr,
+                 (unsigned)dev->samplers.table.alloc, pointers_va);
       sources[count] = HK_G17P_RANGE_SOURCE_CONSTANT;
       ranges[count++] = (struct agx3_ioto_uniform_range){
          .start_halfs = texture_uniform_base, .size_halfs = 8, .address = pointers_va,
@@ -2740,6 +2923,8 @@ hk_g17p_graphics_uniform_ranges(
                            HK_AGX3_G17P_GRAPHICS_MAX_RANGES, &count, sources))
       return hk_g17p_graphics_ranges_refused(range_count, count);
 
+   if (hk_g17p_launch_trace_enabled())
+      hk_g17p_trace_gfx_ranges(s, ranges, count, sources);
    *range_count = count;
    return count <= HK_AGX3_G17P_GRAPHICS_MAX_RANGES;
 }
@@ -3264,7 +3449,7 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (!linked ||
        (dev->dev.chip == AGX_CHIP_G17P
-          ? (!linked->b.g17p_compiler_d_valid || hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE)
+          ? !linked->b.g17p_compiler_d_valid
           : (dev->dev.chip != AGX_CHIP_G17S ||
              !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2))))
       goto refused;
@@ -3287,6 +3472,15 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
          .start_halfs = 0, .size_halfs = 4,
          .address = hk_pool_upload(cmd, &grid, sizeof(grid), 8),
       };
+      /* Promoted constants, as for the other graphics programs
+       * (hk_g17p_graphics_uniform_ranges()). */
+      const struct agx_rodata *rodata = &s->b.info.rodata;
+      if (dev->dev.chip == AGX_CHIP_G17P && rodata->size_16 != 0 &&
+          (!s->bo || !s->bo->va ||
+           !hk_agx3_g17p_rodata_range(rodata->base_uniform, rodata->size_16,
+                                      hk_shader_code_va(s), rodata->offset,
+                                      s->b.info.binary_size, &ranges[count++])))
+         goto refused;
    } else if (!hk_g17p_graphics_uniform_ranges(cmd, s, linked,
                                                cmd->state.gfx.root, ranges,
                                                &count, NULL)) {
@@ -3296,9 +3490,13 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       .shader_va = linked->b.bo->va->addr + linked->b.entry_offset,
       .uniform_ranges = ranges, .uniform_range_count = count,
       .shader_binary_size = linked->b.size,
-      .scratch_size = MAX2(linked->b.scratch_size,
-                           dev->dev.chip == AGX_CHIP_G17P
-                              ? s->b.info.scratch_size : linked->b.agx3_spectpr_scratch_size),
+      /* The thread-private frame also holds returned atomic words
+       * (agx3_spectpr_scratch_size), as for the vertex and fragment programs. */
+      .scratch_size = dev->dev.chip == AGX_CHIP_G17P
+                         ? MAX3(linked->b.scratch_size, s->b.info.scratch_size,
+                                linked->b.agx3_spectpr_scratch_size)
+                         : MAX2(linked->b.scratch_size,
+                                linked->b.agx3_spectpr_scratch_size),
       .nr_gprs = linked->b.nr_gprs,
       .compiler_d_valid = linked->b.g17p_compiler_d_valid,
       .compiler_d = linked->b.g17p_compiler_d,
@@ -3376,6 +3574,7 @@ static uint64_t
 hk_m5_upload_graphics_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                               struct hk_linked_shader *linked)
 {
+   s = hk_linked_shader_source(s, linked);
    const unsigned stage = s->info.stage == MESA_SHADER_FRAGMENT ? 1 : 0;
    struct hk_g17p_graphics_ioto_cache_entry *cached =
       &cmd->state.gfx.g17p_ioto[stage];
@@ -3476,6 +3675,90 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (dev->dev.chip == AGX_CHIP_G18G) {
+      struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+      uint8_t sources[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+      size_t range_count = 0;
+      struct hk_agx3_g17p_graphics_program_desc desc;
+      size_t capacity;
+
+      /* G17G retains its native uncached composer. G17P's new loader and
+       * replay records describe a different instruction encoding. */
+      if (!hk_g17p_basic_graphics_program_supported(cmd, s, linked) ||
+          !hk_g17p_graphics_uniform_ranges(cmd, s, linked, cmd->state.gfx.root,
+                                           ranges, &range_count, sources) ||
+          !hk_g17p_graphics_program_desc_init(cmd, s, linked, ranges,
+                                              range_count, &desc) ||
+          !hk_agx3_g17g_graphics_program_bound(
+             dev->dev.chip == AGX_CHIP_G18G ? AGX_CHIP_G17G : dev->dev.chip,
+             ranges, range_count, &capacity)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return 0;
+      }
+
+      /* Room for the agx3d re-encoding: twice the G17G bound covers every
+       * witness (agx_ioto_capacity). Callers refuse a longer program. */
+      const size_t reserve_capacity =
+         dev->dev.chip == AGX_CHIP_G18G ? 2 * capacity : capacity;
+      hk_cmd_buffer_retain_bo(cmd, linked->b.bo);
+      if (s->b.info.rodata.size_16 != 0 || s->b.info.has_preamble)
+         hk_cmd_buffer_retain_bo(cmd, s->bo);
+
+      struct hk_ioto_reservation reservation;
+      if (!hk_cmd_reserve_ioto_program(cmd, reserve_capacity,
+                                        "G17G Ioto program", &reservation))
+         return 0;
+      desc.program_va = reservation.va;
+      if (!agx_va_in_usc_window(&dev->dev, desc.program_va) ||
+          !agx_va_in_usc_window(&dev->dev, desc.shader_va)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_UNKNOWN);
+         return 0;
+      }
+
+      struct hk_agx3_g17p_graphics_program program;
+      if (!hk_agx3_g17g_basic_graphics_program_generate(dev->dev.chip, &desc,
+                                                        &program)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return 0;
+      }
+      if (program.length > capacity) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return 0;
+      }
+      if (dev->dev.chip == AGX_CHIP_G18G) {
+         /* G18G consumes the canonical GPU1 record re-encoded as agx3d. The
+          * G17G program embeds no address of its own, so the longer text
+          * stays position-independent (agx_ioto_capacity). */
+         struct util_dynarray code;
+         util_dynarray_init(&code, NULL);
+         memcpy(util_dynarray_grow_bytes(&code, 1, program.length),
+                program.bytes, program.length);
+         const struct agx3_transcode_ioto ioto = {
+            .api_program = true,
+            .shader_gprs = s->b.info.nr_gprs,
+         };
+         const char *why = NULL;
+         unsigned at = 0;
+         const bool ok =
+            agx3_transcode_agx3d_ioto(&code, 0, &ioto, &why, &at) &&
+            code.size <= reserve_capacity;
+         if (!ok) {
+            mesa_loge("hk: G18G Ioto program not re-encoded: %s at +0x%x",
+                      why ? why : "longer than the reservation", at);
+            util_dynarray_fini(&code);
+            vk_command_buffer_set_error(&cmd->vk,
+                                        VK_ERROR_FEATURE_NOT_PRESENT);
+            return 0;
+         }
+         const size_t published_size = code.size;
+         memcpy(reservation.map, code.data, code.size);
+         util_dynarray_fini(&code);
+         return hk_cmd_publish_ioto_program(cmd, &reservation,
+                                            published_size);
+      }
+      memcpy(reservation.map, program.bytes, program.length);
+      return hk_cmd_publish_ioto_program(cmd, &reservation, program.length);
+   }
 
    if (agx_chip_g17_m5(dev->dev.chip))
       return hk_m5_upload_graphics_program(cmd, s, linked);
@@ -3690,7 +3973,239 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
 
    struct agx_precompiled_shader *prog = agx_get_precompiled(&dev->bg_eot, idx);
    if (!prog) {
+      if (dev->dev.chip == AGX_CHIP_G18G)
+         mesa_loge("missing precompiled helper %u on %s (barrier=%u)",
+                   idx, agx_chip_name(dev->dev.chip), barrier);
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+
+   if (dev->dev.chip == AGX_CHIP_G18G) {
+      /* M5 compute launch (the grounded Gallium agx_launch_precomp_m5
+       * shape): a per-dispatch Ioto program re-encoded as agx3d, the
+       * native direct CDM record, and one terminated dispatch per
+       * command stream. Scratch and threadgroup-memory kernels need the
+       * G18 scratch admission this kernel build does not enable. */
+      struct hk_cs **target =
+         (barrier & AGX_POSTGFX)  ? &cmd->current_cs.post_gfx
+         : (barrier & AGX_PREGFX) ? &cmd->current_cs.pre_gfx
+                                  : &cmd->current_cs.cs;
+      struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
+      if (!cs)
+         return;
+
+      const uint32_t scratch_bytes =
+         MAX3(prog->info.scratch_size, prog->info.agx3_spectpr_scratch_size,
+              prog->info.agx3_tps_size);
+      if (!prog->bo || !prog->info.main_size || !prog->info.nr_gprs ||
+          prog->info.nr_preamble_gprs || scratch_bytes ||
+          prog->info.local_size ||
+          (prog->info.rodata.size_16 && !prog->rodata_offset) ||
+          (prog->info.printf_uniform &&
+           prog->info.printf_uniform < AGX_ABI_AGX3_PRECOMP_ARG_HALFS) ||
+          !prog->info.agx3_staging_known || !data || !data_size ||
+          data_size > UINT16_MAX * 2u ||
+          prog->entry_offset > UINT64_MAX - prog->ptr ||
+          !prog->b.workgroup.x || !prog->b.workgroup.y ||
+          !prog->b.workgroup.z ||
+          agx_is_indirect(grid) || !grid.count[0] || !grid.count[1] ||
+          !grid.count[2]) {
+         mesa_loge("hk: refusing precompiled G18G program %u shape "
+                   "(preamble_gprs=%u scratch=%u tps=%u local=%u "
+                   "staging_known=%u indirect=%u)",
+                   idx, prog->info.nr_preamble_gprs, scratch_bytes,
+                   prog->info.agx3_tps_size, prog->info.local_size,
+                   prog->info.agx3_staging_known,
+                   agx_is_indirect(grid));
+         vk_command_buffer_set_error(&cmd->vk,
+                                     VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+
+      /* Uniform ranges: rebased arguments above the hardware ABI halves,
+       * then promoted constants (agx_precomp_agx3_uniform_ranges). */
+      const size_t printf_offset =
+         prog->info.printf_uniform
+            ? (size_t)(prog->info.printf_uniform -
+                       AGX_ABI_AGX3_PRECOMP_ARG_HALFS) * 2
+            : 0;
+      const size_t upload_size =
+         ALIGN_POT(prog->info.printf_uniform
+                      ? MAX2(data_size, printf_offset + 8)
+                      : data_size, 4);
+      struct agx_ptr uploaded = hk_pool_alloc(cmd, upload_size, 4);
+      if (!uploaded.cpu || upload_size / 2 > UINT16_MAX) {
+         vk_command_buffer_set_error(&cmd->vk,
+                                     VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
+      memcpy(uploaded.cpu, data, data_size);
+      memset((uint8_t *)uploaded.cpu + data_size, 0,
+             upload_size - data_size);
+      if (prog->info.printf_uniform)
+         memcpy((uint8_t *)uploaded.cpu + printf_offset,
+                &dev->dev.printf_buffer_address, sizeof(uint64_t));
+      struct agx3_ioto_uniform_range ranges[2] = {0};
+      unsigned range_count = 0;
+      ranges[range_count++] = (struct agx3_ioto_uniform_range){
+         .start_halfs = AGX_ABI_AGX3_PRECOMP_ARG_HALFS,
+         .size_halfs = upload_size / 2,
+         .address = uploaded.gpu,
+      };
+      if (prog->info.rodata.size_16) {
+         ranges[range_count++] = (struct agx3_ioto_uniform_range){
+            .start_halfs = prog->info.rodata.base_uniform,
+            .size_halfs = prog->info.rodata.size_16,
+            .address = prog->ptr + prog->rodata_offset,
+         };
+      }
+
+      /* The Ioto program must lie in the USC window (checked below).  The main
+       * command pool is not allocated LOW_VA, so its addresses never are:
+       * every G18G precompiled-helper dispatch used to fail here with
+       * VK_ERROR_UNKNOWN at vkEndCommandBuffer.  Use the USC pool. */
+      struct agx_ptr program_t = hk_pool_usc_alloc(
+         cmd, AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE,
+         AGX_IOTO_PROGRAM_ALIGNMENT);
+      if (!program_t.cpu) {
+         vk_command_buffer_set_error(&cmd->vk,
+                                     VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
+      if (!agx_va_in_usc_window(&dev->dev, program_t.gpu) ||
+          !agx_va_in_usc_window(&dev->dev,
+                                prog->ptr + prog->entry_offset)) {
+         mesa_loge("hk: G18G helper %u: program %" PRIx64 " or entry %" PRIx64
+                   " outside the USC window (base %" PRIx64 ")",
+                   idx, (uint64_t)program_t.gpu,
+                   (uint64_t)(prog->ptr + prog->entry_offset),
+                   (uint64_t)dev->dev.shader_base);
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_UNKNOWN);
+         return;
+      }
+      const struct agx3_g17p_graphics_program_desc desc = {
+         .program_va = program_t.gpu,
+         .shader_va = prog->ptr + prog->entry_offset,
+         .uniform_ranges = ranges,
+         .uniform_range_count = range_count,
+         .shader_binary_size = prog->info.main_size,
+         .scratch_size = 0,
+         .nr_gprs = prog->info.nr_gprs,
+         .compiler_d_valid = prog->info.agx3_staging_known,
+         .compiler_d = (uint32_t)prog->info.agx3_staging_halfs * 2,
+         .threadgroup_memory_size_B = 0,
+      };
+      struct agx3_g17p_graphics_program generated;
+      if (!agx3_g18g_compute_program_generate(&desc, &generated) ||
+          generated.length > AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE) {
+         mesa_loge("hk: G18G compute program %u generation failed", idx);
+         vk_command_buffer_set_error(&cmd->vk,
+                                     VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      struct util_dynarray code;
+      util_dynarray_init(&code, NULL);
+      memcpy(util_dynarray_grow_bytes(&code, 1, generated.length),
+             generated.bytes, generated.length);
+      const struct agx3_transcode_ioto ioto = {
+         .api_program = true,
+         .shader_gprs = prog->info.nr_gprs,
+      };
+      const char *why = NULL;
+      unsigned at = 0;
+      const bool ok =
+         agx3_transcode_agx3d_ioto(&code, 0, &ioto, &why, &at) &&
+         code.size <= AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE;
+      if (!ok) {
+         mesa_loge("hk: G18G compute program %u not re-encoded: %s at "
+                   "+0x%x", idx, why ? why : "too long", at);
+         util_dynarray_fini(&code);
+         vk_command_buffer_set_error(&cmd->vk,
+                                     VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      memcpy(program_t.cpu, code.data, code.size);
+      util_dynarray_fini(&code);
+
+      struct agx3_g17p_native_compute_program_desc bind_desc = {
+         .chip = AGX_CHIP_G17G,
+         .program_va = program_t.gpu,
+         .shader_va = prog->ptr + prog->entry_offset,
+      };
+      struct agx3_compute_program launch;
+      if (!agx3_cdm_direct_template_sources_compute(false, false, false,
+                                                    &bind_desc.launch_sources) ||
+          !agx3_g17g_native_compute_program_bind(&bind_desc, &launch)) {
+         mesa_loge("hk: G18G compute program %u bind failed", idx);
+         vk_command_buffer_set_error(&cmd->vk,
+                                     VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      /* w7C/w7P: the helper's identity and size, for the stream decodes. */
+      mesa_logi("hk: G18G precomp helper %u dispatch: main_size=%u "
+                "generated=%u grid=%ux%ux%u wg=%ux%ux%u",
+                idx, prog->info.main_size, (unsigned)generated.length,
+                grid.count[0], grid.count[1], grid.count[2],
+                prog->b.workgroup.x, prog->b.workgroup.y,
+                prog->b.workgroup.z);
+      hk_ensure_cs_has_space(cmd, cs, 0x200);
+      struct agx3_compute_dispatch_sink sink = {
+         .data = cs->current,
+         .capacity = (size_t)((uint8_t *)cs->end - (uint8_t *)cs->current),
+      };
+      /* G18G's only grounded post-dispatch barrier word is the flag-free
+       * form the dispatcher embeds. */
+      const struct agx3_compute_direct_grid direct = {
+         .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
+         .size = {grid.count[0], grid.count[1], grid.count[2]},
+         .local_size = {prog->b.workgroup.x, prog->b.workgroup.y,
+                        prog->b.workgroup.z},
+         .dimensions = grid.count[2] != 1 || prog->b.workgroup.z != 1
+                          ? 3
+                          : (grid.count[1] != 1 || prog->b.workgroup.y != 1
+                                ? 2
+                                : 1),
+      };
+      /* rel29: the helper joins an open batch with the SAME strong (flags=5)
+       * barrier the user launches use — the stall signature had the helper's
+       * weak 0x60000160 as the Nth (>=10th) launch's tail word, and user
+       * batches of 16 pass when the helper is sealed away (rel28b), so the
+       * weak barrier mid-batch at position >=10 is the suspect, not the
+       * launch count. */
+      const bool launched = agx3_g17g_native_compute_dispatch_append(
+         &launch, &direct, 5, &sink);
+      uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
+      if (!launched ||
+          !agx3_cdm_stream_terminate_pack(dev->dev.chip, terminate) ||
+          sink.capacity - sink.length < sizeof(terminate)) {
+         mesa_loge("hk: G18G compute program %u dispatch append failed",
+                   idx);
+         vk_command_buffer_set_error(&cmd->vk,
+                                     VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      memcpy(sink.data + sink.length, terminate, sizeof(terminate));
+      sink.length += sizeof(terminate);
+      cs->current = sink.data + sink.length;
+      cs->stats.cmds++;
+      cs->g18_dispatch_sealed = true;
+      /* Overwrite (last-wins) as in the admitted shape: this branch seals
+       * the stream, so it ends a batch rather than joining one; the
+       * validator-safe cross-launch merge is the rel28 work (per-bit flag
+       * OR, largest-product local dims). */
+      cs->g18_compute_resources = (struct drm_asahi_g18_compute_resources){
+         .version = 1,
+         .flags = 1,
+         .registers_16 = prog->info.nr_gprs,
+         .scratch_bytes = prog->info.scratch_size,
+         .spectpr_scratch_bytes = prog->info.agx3_spectpr_scratch_size,
+         .staging_16 = prog->info.agx3_staging_halfs,
+         .local_bytes = prog->info.local_size,
+         .imageblock_stride = prog->info.imageblock_stride,
+         .local_size = {prog->b.workgroup.x, prog->b.workgroup.y,
+                        prog->b.workgroup.z},
+      };
+      hk_cmd_buffer_retain_bo(cmd, prog->bo);
       return;
    }
 
@@ -3838,12 +4353,15 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
    hk_drm_attachment_set_init(&cs->fragment_attachments);
 
-   /* Only the native AGX3 path submits the spans (hk_queue.c). */
-   if (agx_native_graphics(&dev->dev))
+   /* Only the native AGX3 path submits the spans (hk_queue.c). G18G
+    * submits them too, as it did before the paths were split. */
+   const bool g18g = dev->dev.chip == AGX_CHIP_G18G;
+   if (agx_native_graphics(&dev->dev) || g18g)
       hk_cs_capture_fragment_attachments(dev, render, cs);
 
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
-      /* The kext preserves a zero final VDM word when this selector is the
+   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
+       g18g) {
+      /* The final VDM word stays zero when this selector is the
        * UINT32_MAX sentinel.  This reproduces m1n1's direct-triangle prefix. */
       cs->agx3_active_context_selector_valid = true;
       cs->agx3_raw_active_context_selector = UINT32_MAX;
@@ -4110,6 +4628,11 @@ hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs->end = cs->current + size;
    cs->chunk = T;
    cs->stream_linked |= linked;
+   /* Conservative: G17P and the M5 re-emit their restart state after a
+    * link. */
+   if (vdm && (hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P ||
+               agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)))
+      cs->restart_index_set = false;
 }
 
 static void
@@ -4128,8 +4651,8 @@ clear_attachment_as_image(struct hk_cmd_buffer *cmd,
     * aspect, so take the format from the image. Colour keeps the view format,
     * in which the clear value is expressed.
     */
-   const bool zs = aspect & (VK_IMAGE_ASPECT_DEPTH_BIT |
-                             VK_IMAGE_ASPECT_STENCIL_BIT);
+   const bool zs = view->vk.image->aspects & (VK_IMAGE_ASPECT_DEPTH_BIT |
+                                              VK_IMAGE_ASPECT_STENCIL_BIT);
    const VkImageAspectFlags aspects = zs ? view->vk.image->aspects
                                          : view->vk.aspects;
    if (!(aspects & aspect))

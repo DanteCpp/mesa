@@ -8,10 +8,13 @@
 #include <errno.h>
 #include <stdio.h>
 #include <xf86drm.h>
+#include <linux/dma-buf.h>
 #include "asahi/compiler/agx_compile.h"
+#include "asahi/compiler/agx_debug.h"
 #include "asahi/layout/layout.h"
 #include "asahi/genxml/agx3_cmdstream.h"
 #include "asahi/lib/agx_g17p_compression.h"
+#include "asahi/lib/agx_zls_pixels.h"
 #include "asahi/lib/decode.h"
 #include "drm-uapi/asahi_drm.h"
 #include "drm-uapi/drm_fourcc.h"
@@ -57,6 +60,29 @@
 #include "agx_state.h"
 #include "agx_tilebuffer.h"
 #include "shader_enums.h"
+
+int agx_env_flags[AGX_ENV_FLAG_COUNT] = {
+   [0 ... AGX_ENV_FLAG_COUNT - 1] = -1,
+};
+
+static const char *const agx_env_flag_names[AGX_ENV_FLAG_COUNT] = {
+   [AGX_ENV_NEO_DRAW_DIAGNOSTICS] = "NEO_AGX_DRAW_DIAGNOSTICS",
+   [AGX_ENV_NEO_UNIFORM_DIAGNOSTICS] = "NEO_AGX_UNIFORM_DIAGNOSTICS",
+   [AGX_ENV_NEO_BINARY_DIAGNOSTICS] = "NEO_AGX_BINARY_DIAGNOSTICS",
+   [AGX_ENV_G18_RESOURCE_TRACE] = "ASAHI_G18_RESOURCE_TRACE",
+   [AGX_ENV_NO_STAGED_BUFFER_WRITES] = "ASAHI_NO_STAGED_BUFFER_WRITES",
+   [AGX_ENV_NO_M5_PROGRAM_CACHE] = "ASAHI_NO_M5_PROGRAM_CACHE",
+   [AGX_ENV_M5_VERIFY_PROGRAM_CACHE] = "ASAHI_M5_VERIFY_PROGRAM_CACHE",
+};
+
+bool
+agx_env_flag_init(enum agx_env_flag flag)
+{
+   int v = getenv(agx_env_flag_names[flag]) != NULL;
+
+   p_atomic_set(&agx_env_flags[flag], v);
+   return v;
+}
 
 uint64_t agx_best_modifiers[] = {
    DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
@@ -153,6 +179,8 @@ agx_resource_setup(struct agx_device *dev, struct agx_resource *nresource)
       .sample_count_sa = MAX2(templ->nr_samples, 1),
       .levels = templ->last_level + 1,
       .writeable_image = templ->bind & PIPE_BIND_SHADER_IMAGE,
+      /* G18G keeps sample-dependent metadata tiles and compact Z/S layers. */
+      .g18g = dev->chip == AGX_CHIP_G18G,
 
       /* Ostensibly this should be based on the bind, but Gallium bind flags are
        * notoriously unreliable. The only cost of setting this excessively is a
@@ -446,6 +474,28 @@ agx_twiddled_allowed(const struct agx_resource *pres)
  * neither shared nor scanned out, so a feedback loop or a shader-image
  * binding reallocates it uncompressed (agx_decompress()), as on AGX2.
  */
+/* G17P depth: a private, single-level, single-layer, single-sample Z32F
+ * depth buffer, as Honeykrisp compresses (hk_g17p_compression_depth_format()).
+ * ZLS writes it compressed through the metadata agx_batch already passes, and
+ * the compressed Gen9 2D texture packet reads it. On the M4 Max this is
+ * byte-identical to plain depth through depth testing across passes,
+ * readback, sampling, shadow comparison, blits and scissored clears, and a
+ * Sodium-style terrain frame took 6-8 % less time. ASAHI_G17P_GL_DEPTH_COMPRESS=0
+ * turns it off. */
+static bool
+agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
+                                           const struct pipe_resource *templ)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("ASAHI_G17P_GL_DEPTH_COMPRESS", true);
+   return enabled && dev->chip == AGX_CHIP_G17P &&
+          templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
+          templ->array_size <= 1 && templ->last_level == 0 &&
+          templ->nr_samples <= 1 && templ->format == PIPE_FORMAT_Z32_FLOAT &&
+          !(templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DEPTH_STENCIL));
+}
+
 static bool
 agx_g17p_private_compression_allowed(const struct agx_device *dev,
                                      const struct pipe_resource *templ)
@@ -478,7 +528,8 @@ agx_compression_allowed(const struct agx_resource *pres)
     * that never need it.
     */
    if (agx_gallium_descriptor_generation_is_agx3(generation)) {
-      if (!agx_g17p_private_compression_allowed(dev, &pres->base)) {
+      if (!agx_g17p_private_compression_allowed(dev, &pres->base) &&
+          !agx_g17p_private_depth_compression_allowed(dev, &pres->base)) {
          rsrc_debug(pres, "No compression: outside the G17P policy\n");
          return false;
       }
@@ -791,6 +842,52 @@ agx_shadow(struct agx_context *ctx, struct agx_resource *rsrc, bool needs_copy)
  * Perform the required synchronization before a transfer_map operation can
  * complete. This may require syncing batches.
  */
+/*
+ * A writer on another context is not in this context's writer table. That is
+ * the window-system case: the EGL context renders a GBM surface buffer and
+ * flushes it at eglSwapBuffers, and gbm_bo_map() maps it through the GBM
+ * device's own context, which then read the buffer before the GPU had
+ * written it (gbm-scanout-test read black on the M5 Pro unless the client
+ * called glFinish first). Wait for the syncobj the writing submission left
+ * on the BO (agx_batch_submit records it for every BO a batch writes), and
+ * for the implicit fences of an exported BO, which also cover writers in
+ * other processes.
+ */
+static void
+agx_sync_foreign_writer(struct agx_context *ctx, struct agx_resource *rsrc)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   struct agx_bo *bos[2] = {rsrc->bo,
+                            rsrc->separate_stencil ? rsrc->separate_stencil->bo
+                                                   : NULL};
+
+   for (unsigned i = 0; i < ARRAY_SIZE(bos); ++i) {
+      struct agx_bo *bo = bos[i];
+      if (!bo)
+         continue;
+
+      const uint64_t writer = p_atomic_read(&bo->writer);
+      if (writer && agx_bo_writer_queue(writer) != ctx->queue_id) {
+         uint32_t syncobj = agx_bo_writer_syncobj(writer);
+         int ret;
+         do {
+            ret = drmSyncobjWait(dev->fd, &syncobj, 1, INT64_MAX,
+                                 DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+         } while (ret == -EINTR);
+      }
+
+      if ((bo->flags & AGX_BO_SHARED) && bo->prime_fd >= 0) {
+         struct dma_buf_sync sync = {
+            .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
+         };
+         if (!drmIoctl(bo->prime_fd, DMA_BUF_IOCTL_SYNC, &sync)) {
+            sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+            drmIoctl(bo->prime_fd, DMA_BUF_IOCTL_SYNC, &sync);
+         }
+      }
+   }
+}
+
 static void
 agx_prepare_for_map(struct agx_context *ctx, struct agx_resource *rsrc,
                     unsigned level,
@@ -802,6 +899,11 @@ agx_prepare_for_map(struct agx_context *ctx, struct agx_resource *rsrc,
     */
    if (staging_blit)
       return;
+
+   /* Before the validity test: a write on another context need not have
+    * marked the level valid here. */
+   if (!(usage & PIPE_MAP_UNSYNCHRONIZED))
+      agx_sync_foreign_writer(ctx, rsrc);
 
    /* If the level has not been written, we may freely do CPU access (writes),
     * even if other levels are being written by the GPU. This lets us write some
@@ -989,6 +1091,62 @@ agx_blit_to_staging(struct pipe_context *pctx, struct agx_transfer *trans)
    agx_blit(pctx, &blit);
 }
 
+/*
+ * glBufferSubData and glMapBufferRange(GL_MAP_INVALIDATE_RANGE_BIT) into a
+ * buffer that unfinished batches use. Writing it on the CPU means waiting for
+ * those batches, and buffers too large to shadow (a game's 128 MiB vertex
+ * heap) have no other way out, so every such upload drained the GPU. Instead,
+ * write a staging copy and copy it into place on the GPU at unmap, after the
+ * batches already recorded and before any later one.
+ */
+static bool
+agx_stage_buffer_write(struct agx_context *ctx, struct agx_resource *rsrc,
+                       unsigned usage, const struct pipe_box *box)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+
+   if (rsrc->base.target != PIPE_BUFFER ||
+       (usage & (PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE)) !=
+          (PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE) ||
+       (usage & (PIPE_MAP_READ | PIPE_MAP_UNSYNCHRONIZED | PIPE_MAP_PERSISTENT |
+                 PIPE_MAP_COHERENT | PIPE_MAP_DIRECTLY |
+                 PIPE_MAP_DISCARD_WHOLE_RESOURCE)))
+      return false;
+
+   /* G17G copies buffers on the CPU (no precompiled kernels) */
+   if (agx_chip_g17_m5(dev->chip) || (dev->debug & AGX_DBG_NOSHADOW) ||
+       agx_env_flag(AGX_ENV_NO_STAGED_BUFFER_WRITES))
+      return false;
+
+   if (rsrc->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE))
+      return false;
+
+   /* A range nothing wrote yet can be written directly */
+   if (!util_ranges_intersect(&rsrc->valid_buffer_range, box->x,
+                              box->x + box->width))
+      return false;
+
+   /* A whole-buffer write can rename the storage instead */
+   if (box->x == 0 && box->width == rsrc->base.width0 &&
+       !(rsrc->base.flags & PIPE_RESOURCE_FLAG_MAP_PERSISTENT))
+      return false;
+
+   /* Where agx_prepare_for_map can shadow, keep doing so: a CPU copy of a
+    * small buffer adds no GPU work, while a copy between two frames' passes
+    * would stop them overlapping. Stage only what would otherwise wait.
+    */
+   if (rsrc->layout.size_B <= MAX_SHADOW_BYTES &&
+       rsrc->shadowed_bytes < MAX_TOTAL_SHADOW_BYTES &&
+       !(rsrc->base.flags & PIPE_RESOURCE_FLAG_MAP_PERSISTENT))
+      return false;
+
+   /* Batches stay listed until a later sync retires them, so this can be
+    * stale. That costs a copy, while asking the kernel would cost a call on
+    * every upload.
+    */
+   return agx_any_batch_uses_resource(ctx, rsrc);
+}
+
 static void *
 agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
                  unsigned level,
@@ -998,6 +1156,34 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
 {
    struct agx_context *ctx = agx_context(pctx);
    struct agx_resource *rsrc = agx_resource(resource);
+
+   if (agx_stage_buffer_write(ctx, rsrc, usage, box)) {
+      /* Match the destination's alignment within 16 bytes so the copy can
+       * be vectorized.
+       */
+      unsigned misalign = box->x & 0xf;
+      struct pipe_resource *staging = NULL;
+      unsigned offset = 0;
+      void *map = NULL;
+
+      u_upload_alloc_ref(pctx->stream_uploader, 0, box->width + misalign, 16,
+                         &offset, &staging, &map);
+      if (staging) {
+         util_range_add(resource, &rsrc->valid_buffer_range, box->x,
+                        box->x + box->width);
+
+         struct agx_transfer *transfer = CALLOC_STRUCT(agx_transfer);
+         transfer->base.level = level;
+         transfer->base.usage = usage;
+         transfer->base.box = *box;
+         pipe_resource_reference(&transfer->base.resource, resource);
+         u_box_1d(offset + misalign, box->width, &transfer->staging.box);
+         transfer->staging.rsrc = staging;
+         *out_transfer = &transfer->base;
+
+         return (uint8_t *)map + misalign;
+      }
+   }
 
    /* Can't map tiled/compressed directly */
    if ((usage & PIPE_MAP_DIRECTLY) && rsrc->modifier != DRM_FORMAT_MOD_LINEAR)
@@ -1014,6 +1200,31 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
    bool staging_blit = ail_is_level_logically_compressed(&rsrc->layout, level);
 
    agx_prepare_for_map(ctx, rsrc, level, usage, box, staging_blit);
+
+   struct agx_device *dev = agx_device(pctx->screen);
+   const bool trace_read = (dev->chip == AGX_CHIP_G18G || agx_chip_g17_m5(dev->chip)) &&
+                          (dev->debug & AGX_DBG_FAULTTRACE) &&
+                          (usage & PIPE_MAP_READ);
+   if (trace_read) {
+      fprintf(stderr, "M5_READBACK va=%#llx size=%llu format=%s modifier=%#llx valid=%u staging=%u box=%d,%d,%d,%d stride=%u\n",
+              (unsigned long long)rsrc->bo->va->addr,
+              (unsigned long long)rsrc->bo->size,
+              util_format_name(rsrc->layout.format),
+              (unsigned long long)rsrc->modifier,
+              agx_resource_valid(rsrc, level), staging_blit,
+              box->x, box->y, box->width, box->height,
+              util_format_get_stride(rsrc->layout.format, box->width));
+      const uint8_t *raw = agx_bo_map(rsrc->bo);
+      if (raw) {
+         size_t nonzero = 0;
+         for (size_t i = 0; i < rsrc->bo->size; ++i)
+            nonzero += raw[i] != 0;
+         fprintf(stderr, "M5_READBACK_RAW nonzero=%zu head=", nonzero);
+         for (unsigned i = 0; i < MIN2(rsrc->bo->size, 32); ++i)
+            fprintf(stderr, "%02x", raw[i]);
+         fputc('\n', stderr);
+      }
+   }
 
    /* Track the written buffer range */
    if (resource->target == PIPE_BUFFER) {
@@ -1084,6 +1295,16 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
 
             ail_detile(map, dst, &rsrc->layout, level, transfer->base.stride,
                        box->x, box->y, box->width, box->height);
+            if (trace_read) {
+               size_t nonzero = 0;
+               for (size_t i = 0; i < transfer->base.layer_stride; ++i)
+                  nonzero += dst[i] != 0;
+               fprintf(stderr, "M5_READBACK_DETILED layer=%u nonzero=%zu head=",
+                       z, nonzero);
+               for (unsigned i = 0; i < MIN2(transfer->base.layer_stride, 32); ++i)
+                  fprintf(stderr, "%02x", dst[i]);
+               fputc('\n', stderr);
+            }
          }
       }
 
@@ -1108,6 +1329,40 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
    }
 }
 
+/* texture_subdata into a twiddled level: tile straight from the caller's
+ * data. The generic path maps through a calloc'd copy of the box, fills it
+ * and tiles that on unmap -- for a compositor uploading a 4K SHM frame per
+ * commit, the extra 33 MB copy and its page faults cost as much as the
+ * tiling. Depth/stencil and MSAA keep the transfer helper's handling. */
+static void
+agx_texture_subdata(struct pipe_context *pctx, struct pipe_resource *prsrc,
+                    unsigned level, unsigned usage, const struct pipe_box *box,
+                    const void *data, unsigned stride, uintptr_t layer_stride)
+{
+   struct agx_resource *rsrc = agx_resource(prsrc);
+
+   if (prsrc->target == PIPE_BUFFER || level >= rsrc->layout.levels ||
+       prsrc->nr_samples > 1 ||
+       util_format_is_depth_or_stencil(prsrc->format) ||
+       !ail_is_level_twiddled_uncompressed(&rsrc->layout, level)) {
+      u_default_texture_subdata(pctx, prsrc, level, usage, box, data, stride,
+                                layer_stride);
+      return;
+   }
+
+   usage |= PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE;
+   agx_prepare_for_map(agx_context(pctx), rsrc, level, usage, box, false);
+
+   for (unsigned z = 0; z < box->depth; ++z) {
+      uint8_t *map = agx_map_texture_cpu(rsrc, level, box->z + z);
+
+      ail_tile(map, (uint8_t *)data + layer_stride * z, &rsrc->layout, level,
+               stride, box->x, box->y, box->width, box->height);
+   }
+
+   BITSET_SET(rsrc->data_valid, level);
+}
+
 static void
 agx_transfer_unmap(struct pipe_context *pctx, struct pipe_transfer *transfer)
 {
@@ -1117,7 +1372,11 @@ agx_transfer_unmap(struct pipe_context *pctx, struct pipe_transfer *transfer)
    struct pipe_resource *prsrc = transfer->resource;
    struct agx_resource *rsrc = (struct agx_resource *)prsrc;
 
-   if (trans->staging.rsrc && (transfer->usage & PIPE_MAP_WRITE)) {
+   if (trans->staging.rsrc && prsrc->target == PIPE_BUFFER) {
+      /* A staged buffer write, see agx_stage_buffer_write */
+      agx_copy_buffer_range(pctx, prsrc, transfer->box.x, trans->staging.rsrc,
+                            trans->staging.box.x, transfer->box.width);
+   } else if (trans->staging.rsrc && (transfer->usage & PIPE_MAP_WRITE)) {
       assert(prsrc->target != PIPE_BUFFER);
       agx_blit_from_staging(pctx, trans);
       agx_flush_readers(agx_context(pctx), agx_resource(trans->staging.rsrc),
@@ -1160,6 +1419,26 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
           const union pipe_color_union *color, double depth, unsigned stencil)
 {
    struct agx_context *ctx = agx_context(pctx);
+
+   /* G17G clears a layer at a time, as it draws (agx_g17g_bind_layer). */
+   if (agx_chip_g17_m5(agx_device(pctx->screen)->chip) &&
+       !ctx->g17g_layer_split &&
+       util_framebuffer_get_num_layers(&ctx->framebuffer) > 1) {
+      if (agx_render_condition_check(ctx))
+         agx_g17g_layered_clear(ctx, buffers, color_clear_mask,
+                                stencil_clear_mask, color, depth, stencil);
+      return;
+   }
+
+   /* G17G clears a colour attachment at a time, as it draws. */
+   if (agx_chip_g17_m5(agx_device(pctx->screen)->chip) &&
+       ctx->framebuffer.nr_cbufs > 1) {
+      if (agx_render_condition_check(ctx))
+         agx_g17g_split_mrt_clear(ctx, buffers, color_clear_mask,
+                                  stencil_clear_mask, color, depth, stencil);
+      return;
+   }
+
    struct agx_batch *batch = agx_get_batch(ctx);
 
    if (unlikely(!agx_render_condition_check(ctx)))
@@ -1327,6 +1606,33 @@ build_timestamp_offset(struct agx_batch *batch, unsigned offset)
 #define timestamp_offset(batch, offs)                                          \
    build_timestamp_offset(batch, offsetof(struct agx_timestamps, offs))
 
+/* Native G18 ZLS arrays use either 16-KiB pages (bit 0) or 128-byte
+ * cachelines. The upper field stores units minus one. In particular, a
+ * 128-byte layer is encoded as zero; it is not a missing array stride.
+ * Witness: layered-zls native682, including sub-page Z32 and S8 arrays. */
+static uint32_t
+agx_zls_layer_stride(struct agx_device *dev, const struct ail_layout *layout,
+                     bool single_layer)
+{
+   if (dev->chip == AGX_CHIP_G18G && layout->policy == AIL_LAYOUT_POLICY_M5) {
+      if (single_layer)
+         return 0;
+
+      uint64_t stride = layout->layer_stride_B;
+      bool pages = util_is_aligned(stride, AIL_PAGESIZE);
+      unsigned unit = pages ? AIL_PAGESIZE : AIL_CACHELINE;
+      assert(stride && util_is_aligned(stride, unit));
+      assert((stride / unit - 1) <= (UINT32_MAX >> 14));
+      return ((stride / unit - 1) << 14) | pages;
+   }
+
+   assert((layout->depth_px == 1 ||
+           util_is_aligned(layout->layer_stride_B, AIL_PAGESIZE)) &&
+          "Page aligned Z/S layers");
+   unsigned pages = layout->layer_stride_B / AIL_PAGESIZE;
+   return ((pages - 1) << 14) | 1;
+}
+
 static void
 agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
            struct agx_pool *pool, struct agx_batch *batch,
@@ -1382,18 +1688,14 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
 
       unsigned level = zsbuf->level;
       unsigned first_layer = zsbuf->first_layer;
+      const bool single_layer =
+         MAX2(util_framebuffer_get_num_layers(framebuffer), 1) == 1;
 
       if (zres) {
          c->depth.base = agx_map_texture_gpu(zres, first_layer) +
                          ail_get_level_offset_B(&zres->layout, level);
 
-         /* Main stride in pages */
-         assert((zres->layout.depth_px == 1 ||
-                 util_is_aligned(zres->layout.layer_stride_B, AIL_PAGESIZE)) &&
-                "Page aligned Z layers");
-
-         unsigned stride_pages = zres->layout.layer_stride_B / AIL_PAGESIZE;
-         c->depth.stride = ((stride_pages - 1) << 14) | 1;
+         c->depth.stride = agx_zls_layer_stride(dev, &zres->layout, single_layer);
 
          if (zres->layout.compressed) {
             c->depth.comp_base =
@@ -1425,12 +1727,7 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
          c->stencil.base = agx_map_texture_gpu(sres, first_layer) +
                            ail_get_level_offset_B(&sres->layout, level);
 
-         /* Main stride in pages */
-         assert((sres->layout.depth_px == 1 ||
-                 util_is_aligned(sres->layout.layer_stride_B, AIL_PAGESIZE)) &&
-                "Page aligned S layers");
-         unsigned stride_pages = sres->layout.layer_stride_B / AIL_PAGESIZE;
-         c->stencil.stride = ((stride_pages - 1) << 14) | 1;
+         c->stencil.stride = agx_zls_layer_stride(dev, &sres->layout, single_layer);
 
          if (sres->layout.compressed) {
             c->stencil.comp_base =
@@ -1466,9 +1763,26 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
 
    /* G17P treats an absent ZLS allocation as an inactive depth surface.  Its
     * native render command keeps the clear register at 1.0 in that state;
-    * zero is only a real clear value when depth or stencil storage exists. */
-   if (agx_native_graphics(dev) && !zres && !sres)
+    * zero is only a real clear value when depth or stencil storage exists.
+    * Honeykrisp submits M5 renders on the G17 runtime the same way
+    * (hk_drm_g17p_depth_clear). */
+   if ((agx_native_graphics(dev) || dev->chip == AGX_CHIP_G18G ||
+        agx_m5_render_resources(dev)) && !zres &&
+       !sres)
       c->isp_bgobjdepth = fui(1.0f);
+
+   /* Neither AGX3 generation publishes the ISP's depth/stencil dimensions the
+    * way AGX2 does, and the two do not agree with each other either, so take
+    * the packing from the shared witness rather than the AGX2 struct. The
+    * Gallium path had been publishing G17P's 15-bit pair on G17G, which the
+    * kernel's M5 depth admission refused as soon as a render actually carried
+    * a depth attachment. */
+   if (dev->chip == AGX_CHIP_G18G || dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip)) {
+      c->isp_zls_pixels =
+         agx_zls_pixels(dev->chip, c->width_px, c->height_px, c->depth.base,
+                        c->depth.comp_base, c->stencil.base,
+                        c->stencil.comp_base);
+   }
 
    if ((dev->debug & AGX_DBG_NOCLUSTER) && dev->chip != AGX_CHIP_G17P)
       c->flags |= DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING;
@@ -1494,6 +1808,23 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
 
    agx_tilebuffer_set_drm_cmd(c, tib);
 
+   /* The depth/stencil half of the render command is the part the M5 kernel
+    * validates and the part no CTS failure can otherwise be read from. */
+   if (dev->debug & AGX_DBG_FAULTTRACE) {
+      fprintf(stderr,
+              "M5_RENDER %ux%u cbufs=%u zs=%s zls=%#llx pixels=%#x "
+              "clear=%#x depth=%#llx/%#llx stencil=%#llx/%#llx "
+              "load=%#x clear_mask=%#x resolve=%#x\n",
+              c->width_px, c->height_px, framebuffer->nr_cbufs,
+              util_format_name(framebuffer->zsbuf.format),
+              (unsigned long long)c->zls_ctrl, c->isp_zls_pixels,
+              c->isp_bgobjdepth, (unsigned long long)c->depth.base,
+              (unsigned long long)c->depth.comp_base,
+              (unsigned long long)c->stencil.base,
+              (unsigned long long)c->stencil.comp_base, batch->load,
+              batch->clear, batch->resolve);
+   }
+
    c->samples = tib->nr_samples;
    c->layers = MAX2(util_framebuffer_get_num_layers(framebuffer), 1);
 
@@ -1508,7 +1839,8 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
    c->isp_dbias_base = depth_bias_ptr;
    c->isp_oclqry_base = visibility_result_ptr;
 
-   if (batch->sampler_heap.bo) {
+   if (batch->sampler_heap.bo &&
+       !agx_stream_sampler_state(dev)) {
       c->sampler_heap = batch->sampler_heap.bo->va->addr;
       c->sampler_count = batch->sampler_heap.count;
    }
@@ -1541,7 +1873,10 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
       c->fragment_helper.binary = agx_helper_program(&batch->ctx->bg_eot);
    }
 
-   if (batch->timestamps.size > 0) {
+   /* ASAHI_MESA_DEBUG=stats times every render (agx_batch_print_stats()). */
+   if (batch->timestamps.size > 0 ||
+       ((agx_device(batch->ctx->base.screen)->debug & AGX_DBG_STATS) &&
+        batch->ctx->timestamps)) {
       c->ts_vtx.start.handle = batch->ctx->timestamp_handle;
       c->ts_frag.end.handle = batch->ctx->timestamp_handle;
       c->ts_vtx.start.offset = timestamp_offset(batch, vtx_start);
@@ -1673,6 +2008,11 @@ agx_flush_compute(struct agx_context *ctx, struct agx_batch *batch,
       .sampler_count = batch->sampler_heap.count,
    };
 
+   if (agx_stream_sampler_state(dev)) {
+      cmdbuf->sampler_heap = 0;
+      cmdbuf->sampler_count = 0;
+   }
+
    if (batch->cs_scratch) {
       // The commented out lines *may* be related to subgroup-level preemption,
       // which we can't support without implementing threadgroup memory in the
@@ -1685,11 +2025,14 @@ agx_flush_compute(struct agx_context *ctx, struct agx_batch *batch,
       cmdbuf->helper.binary = agx_helper_program(&batch->ctx->bg_eot);
    }
 
-   if (batch->timestamps.size > 0) {
+   const bool stats = (agx_device(ctx->base.screen)->debug & AGX_DBG_STATS) &&
+                      ctx->timestamps;
+   if (batch->timestamps.size > 0 || stats) {
       cmdbuf->ts.start.handle = ctx->timestamp_handle;
       cmdbuf->ts.end.handle = ctx->timestamp_handle;
       cmdbuf->ts.start.offset = timestamp_offset(batch, comp_start);
-      cmdbuf->ts.end.offset = timestamp_offset(batch, comp_start);
+      cmdbuf->ts.end.offset = stats ? timestamp_offset(batch, comp_end)
+                                    : timestamp_offset(batch, comp_start);
    }
 }
 
@@ -1717,6 +2060,16 @@ agx_flush_render(struct agx_context *ctx, struct agx_batch *batch,
       agx_build_bg_eot(batch, false, true);
 
    struct asahi_bg_eot pipeline_store = agx_build_bg_eot(batch, true, false);
+
+   /* The render submits the eot program for both its final and its partial
+    * store (agx_cmdbuf), so these three are every tile program it runs. */
+   if (agx_m5_render_resources(dev)) {
+      const struct asahi_bg_eot *const tile_programs[] = {
+         &pipeline_background, &pipeline_background_partial, &pipeline_store,
+      };
+      agx_batch_set_m5_tile_program(batch, tile_programs,
+                                    ARRAY_SIZE(tile_programs));
+   }
 
    bool clear_pipeline_textures =
       agx_tilebuffer_spills(&batch->tilebuffer_layout);
@@ -1764,6 +2117,18 @@ agx_flush_batch(struct agx_context *ctx, struct agx_batch *batch)
    struct drm_asahi_cmd_compute compute;
    bool has_vdm = false, has_cdm = false;
 
+   /* After a GPU recovery failed this context's VM, every submission fails
+    * and the reset is already reported through robustness. Drop the batch
+    * instead of encoding it: a batch begun after the loss can be half built
+    * (Zen reached agx_build_bg_eot with a 0-sample, 0 px tile layout, which
+    * the native descriptor check aborts on). Retire it as a failed submit,
+    * so the BOs it writes are released from the writer table.
+    */
+   if (unlikely(ctx->any_faults)) {
+      agx_batch_retire_faulted(ctx, batch);
+      return;
+   }
+
    if (batch->cdm.bo) {
       agx_flush_compute(ctx, batch, &compute);
       has_cdm = true;
@@ -1796,6 +2161,9 @@ agx_destroy_context(struct pipe_context *pctx)
     * ensure everything is cleaned up properly.
     */
    agx_sync_all(ctx, "destroy context");
+   agx_xfb_cpu_destroy(ctx);
+   agx_swtnl_destroy(ctx);
+
    if (ctx->submit_quarantined)
       return;
 
@@ -1806,6 +2174,7 @@ agx_destroy_context(struct pipe_context *pctx)
       util_blitter_destroy(ctx->blitter);
 
    util_unreference_framebuffer_state(&ctx->framebuffer);
+   util_unreference_framebuffer_state(&ctx->zs_merge_real);
 
    agx_bg_eot_cleanup(&ctx->bg_eot);
    agx_destroy_meta_shaders(ctx);
@@ -1825,8 +2194,10 @@ agx_destroy_context(struct pipe_context *pctx)
          drmSyncobjDestroy(dev->fd, ctx->batches.slots[i].syncobj);
    }
 
-   dev->ops.bo_unbind_object(dev, ctx->timestamp_handle);
-   agx_bo_unreference(dev, ctx->timestamps);
+   if (ctx->timestamps) {
+      dev->ops.bo_unbind_object(dev, ctx->timestamp_handle);
+      agx_bo_unreference(dev, ctx->timestamps);
+   }
 
    u_rwlock_wrunlock(&screen->destroy_lock);
 
@@ -1924,11 +2295,12 @@ static struct pipe_context *
 agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 {
    struct agx_context *ctx = rzalloc(NULL, struct agx_context);
-   struct pipe_context *pctx = &ctx->base;
    int ret;
 
    if (!ctx)
       return NULL;
+
+   struct pipe_context *pctx = &ctx->base;
 
    pctx->screen = screen;
    pctx->priv = priv;
@@ -1938,7 +2310,7 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 
    pctx->stream_uploader = u_upload_create_default(pctx);
    if (!pctx->stream_uploader) {
-      FREE(pctx);
+      ralloc_free(ctx);
       return NULL;
    }
    pctx->const_uploader = pctx->stream_uploader;
@@ -1952,7 +2324,7 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 
    ctx->queue_id = agx_create_command_queue(agx_device(screen), priority);
 
-   /* Kernels grant HIGH only on G17, to CAP_SYS_NICE or DRM-master callers;
+   /* HIGH requires backend support and CAP_SYS_NICE or DRM master;
     * otherwise fall back to MEDIUM.
     */
    if (ctx->queue_id == UINT32_MAX && priority == DRM_ASAHI_PRIORITY_HIGH) {
@@ -1964,6 +2336,14 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
       ralloc_free(ctx);
       return NULL;
    }
+   if (agx_device(screen)->debug & AGX_DBG_1QUEUE)
+      priority = agx_device(screen)->queue_priority;
+
+   pctx->context_priority = priority == DRM_ASAHI_PRIORITY_LOW
+                               ? PIPE_CONTEXT_PRIORITY_LOW
+                               : priority == DRM_ASAHI_PRIORITY_HIGH
+                                    ? PIPE_CONTEXT_PRIORITY_HIGH
+                                    : PIPE_CONTEXT_PRIORITY_MEDIUM;
    ctx->virt_ring_idx = priority + 1;
 
    pctx->destroy = agx_destroy_context;
@@ -1971,6 +2351,8 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    pctx->clear = agx_clear;
    pctx->resource_copy_region = agx_resource_copy_region;
    pctx->blit = agx_blit;
+   if (agx_chip_g17_m5(agx_device(screen)->chip))
+      pctx->generate_mipmap = agx_generate_mipmap_g17g;
    pctx->flush_resource = agx_flush_resource;
 
    pctx->buffer_map = u_transfer_helper_transfer_map;
@@ -1981,7 +2363,7 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 
    pctx->buffer_subdata = u_default_buffer_subdata;
    pctx->clear_buffer = asahi_clear_buffer;
-   pctx->texture_subdata = u_default_texture_subdata;
+   pctx->texture_subdata = agx_texture_subdata;
    pctx->set_debug_callback = u_default_set_debug_callback;
    pctx->get_sample_position = u_default_get_sample_position;
    pctx->invalidate_resource = agx_invalidate_resource;
@@ -2004,16 +2386,18 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->compute_blitter.blit_cs = asahi_blit_key_table_create(ctx);
 
    struct agx_device *dev = agx_device(screen);
-   size_t timestamps_size = sizeof(struct agx_timestamps) * AGX_MAX_BATCHES;
+   if (screen->caps.query_timestamp || screen->caps.query_time_elapsed) {
+      size_t timestamps_size = sizeof(struct agx_timestamps) * AGX_MAX_BATCHES;
 
-   /* The kernel requires that timestamp buffers are SHARED */
-   ctx->timestamps =
-      agx_bo_create(dev, timestamps_size, 0, AGX_BO_WRITEBACK | AGX_BO_SHARED,
-                    "Timestamp buffer");
-   assert(ctx->timestamps);
+      /* The kernel requires that timestamp buffers are SHARED. */
+      ctx->timestamps =
+         agx_bo_create(dev, timestamps_size, 0, AGX_BO_WRITEBACK | AGX_BO_SHARED,
+                       "Timestamp buffer");
+      assert(ctx->timestamps);
 
-   ret = agx_bind_timestamps(dev, ctx->timestamps, &ctx->timestamp_handle);
-   assert(!ret);
+      ret = agx_bind_timestamps(dev, ctx->timestamps, &ctx->timestamp_handle);
+      assert(!ret);
+   }
 
    /* Sync object/FD used for NATIVE_FENCE_FD. */
    ctx->in_sync_fd = -1;
@@ -2190,6 +2574,29 @@ agx_init_compute_caps(struct pipe_screen *pscreen)
    caps->max_subgroups = caps->max_variable_threads_per_block / 32;
 }
 
+/*
+ * Whether the kernel binds a timestamp object: timer queries and the
+ * per-context timestamp buffer need DRM_ASAHI_GEM_BIND_OBJECT with
+ * DRM_ASAHI_BIND_OBJECT_USAGE_TIMESTAMPS. Asked of the kernel with a
+ * throwaway binding rather than assumed.
+ */
+static bool
+agx_kernel_binds_timestamps(struct agx_device *dev)
+{
+   struct agx_bo *bo =
+      agx_bo_create(dev, sizeof(struct agx_timestamps) * AGX_MAX_BATCHES, 0,
+                    AGX_BO_WRITEBACK | AGX_BO_SHARED, "Timestamp probe");
+   if (!bo)
+      return false;
+
+   uint32_t handle = 0;
+   const bool bound = agx_bind_timestamps(dev, bo, &handle) == 0;
+   if (bound)
+      dev->ops.bo_unbind_object(dev, handle);
+   agx_bo_unreference(dev, bo);
+   return bound;
+}
+
 static void
 agx_init_screen_caps(struct pipe_screen *pscreen)
 {
@@ -2197,6 +2604,9 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
    struct agx_screen *screen = agx_screen(pscreen);
 
    u_init_pipe_screen_caps(pscreen, 1);
+
+   /* G17G generates mipmaps on the CPU (agx_generate_mipmap_g17g). */
+   caps->generate_mipmap = agx_chip_g17_m5(agx_device(pscreen)->chip);
 
    caps->clip_halfz = true;
    caps->prefer_real_buffer_in_constbuf0 = true;
@@ -2214,14 +2624,35 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
    caps->glsl_tess_levels_as_inputs = true;
    caps->doubles = true;
 
+   /* Every G18G stage, compute included, publishes its own native texture
+    * and sampler tables (agx_upload_textures/agx_upload_samplers), so GL's
+    * combined unit count is their sum, as GLES already reports. No stage
+    * binds more than max_texture_samplers.
+    */
+   caps->combined_texture_units_all_stages =
+      agx_device(pscreen)->chip == AGX_CHIP_G18G;
+
    caps->max_render_targets = caps->fbfetch = 8;
    caps->fbfetch_coherent = true;
 
    caps->max_dual_source_render_targets = 1;
 
    caps->occlusion_query = true;
-   caps->query_timestamp = true;
-   caps->query_time_elapsed = true;
+   /* Timer queries are not optional for GL 3.3 (ARB_timer_query), which
+    * gates every later desktop GL version, so on M6 (G18G), whose kernel
+    * contract is still being written, and on the M5 Pro and M5 Max (G17S,
+    * G17C), whose G17 runtime maps timestamp objects, follow
+    * whether the kernel binds a timestamp object rather than assuming or
+    * refusing it.
+    */
+   struct agx_device *dev = agx_device(pscreen);
+   const bool timestamps =
+      agx_params_g18g_bringup_supported(&dev->params) ||
+            dev->chip == AGX_CHIP_G17S || dev->chip == AGX_CHIP_G17C
+         ? agx_kernel_binds_timestamps(dev)
+         : !agx_params_m5_supported(&dev->params);
+   caps->query_timestamp = timestamps;
+   caps->query_time_elapsed = timestamps;
    caps->query_so_overflow = true;
    caps->query_memory_info = true;
    caps->primitive_restart = true;
@@ -2326,7 +2757,23 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
 
    caps->max_vertex_element_src_offset = 0xffff;
 
-   caps->texture_transfer_modes = PIPE_TEXTURE_TRANSFER_BLIT;
+   /* On AGX3, advertising blit-based transfers routes a format-mismatched
+    * glReadPixels through u_blitter.  In particular, the WSI-native
+    * B8G8R8A8_UNORM -> API R8G8B8A8_UNORM conversion silently returns zero on
+    * G17P even though the same drawable is byte-exact through a dma-buf CPU
+    * map after both CPU upload and GPU clear.  Keep using the ordinary mapped
+    * transfer path, which performs the format conversion on the CPU, until
+    * the AGX3 render-blitter pixel path is hardware-grounded.
+    *
+    * This is correctness-critical for every default EGL surface: the DRI
+    * pbuffer/window colour buffer is BGRA while GLES glReadPixels(GL_RGBA)
+    * requests RGBA.  AGX2 retains its established accelerated path.
+    */
+   caps->texture_transfer_modes =
+      agx_chip_command_stream_generation(agx_device(pscreen)->chip) ==
+            AGX_CS_GENERATION_AGX2
+         ? PIPE_TEXTURE_TRANSFER_BLIT
+         : PIPE_TEXTURE_TRANSFER_DEFAULT;
 
    caps->device_type = PIPE_DEVICE_TYPE_INTEGRATED_GPU;
    caps->endianness = PIPE_ENDIAN_LITTLE;
@@ -2385,8 +2832,14 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
    caps->tes_layer_viewport = true;
 
    caps->context_priority_mask =
-      PIPE_CONTEXT_PRIORITY_LOW | PIPE_CONTEXT_PRIORITY_MEDIUM |
-      PIPE_CONTEXT_PRIORITY_HIGH | PIPE_CONTEXT_PRIORITY_REALTIME;
+      PIPE_CONTEXT_PRIORITY_LOW | PIPE_CONTEXT_PRIORITY_MEDIUM;
+
+   /* A chip/HAL match cannot establish the caller's authorization. The probe
+    * uses a private queue and immediately destroys it, without submitting work.
+    * Recheck creation normally: credentials/master can change after this probe.
+    */
+   if (agx_probe_high_priority(agx_device(pscreen)))
+      caps->context_priority_mask |= PIPE_CONTEXT_PRIORITY_HIGH;
 
    caps->min_line_width = caps->min_line_width_aa = caps->min_point_size =
       caps->min_point_size_aa = 1;
@@ -2420,7 +2873,10 @@ agx_is_format_supported(struct pipe_screen *pscreen, enum pipe_format format,
    if (sample_count > 1 && sample_count != 4 && sample_count != 2)
       return false;
 
-   if (sample_count > 1 && agx_device(pscreen)->debug & AGX_DBG_NOMSAA)
+   if (sample_count > 1 &&
+       ((agx_device(pscreen)->chip == AGX_CHIP_G18G &&
+         !agx_g18_msaa4_enabled()) ||
+        (agx_device(pscreen)->debug & AGX_DBG_NOMSAA)))
       return false;
 
    if (MAX2(sample_count, 1) != MAX2(storage_sample_count, 1))
@@ -2654,7 +3110,10 @@ agx_screen_create(int fd, struct renderonly *ro,
 
    /* parse driconf configuration now for device specific overrides */
    driParseConfigFiles(config->options, config->options_info,
-                       &(driConfigFileParseParams) { .driverName = "asahi" });
+                       &(driConfigFileParseParams) {
+                          .driverName = "aurora",
+                          .driverNameAlias = "asahi",
+                       });
 
    agx_screen->dev.fd = fd;
    agx_screen->dev.ro = ro;
@@ -2670,6 +3129,13 @@ agx_screen_create(int fd, struct renderonly *ro,
     * since agx_open_device sets debug.
     */
    if (driQueryOptionb(config->options, "asahi_no_fp16"))
+      agx_screen->dev.debug |= AGX_DBG_NO16;
+
+   /* G18G's packer has grounded half-precision forms for only part of what
+    * mediump lowering produces (half FSEL/ADD/FMA with immediates or abs
+    * sources), and one refused instruction drops the whole shader. mediump
+    * is a precision floor: evaluate it at full precision on G18G. */
+   if (agx_screen->dev.chip == AGX_CHIP_G18G)
       agx_screen->dev.debug |= AGX_DBG_NO16;
 
    int ret =
@@ -2707,8 +3173,16 @@ agx_screen_create(int fd, struct renderonly *ro,
    screen->get_disk_shader_cache = agx_get_disk_shader_cache;
    screen->get_cl_cts_version = agx_get_cl_cts_version;
 
+   /* G17G iterates no varying with a register coefficient index: have
+    * nir_lower_io_passes lower dynamically indexed fragment inputs. */
+   static nir_shader_compiler_options g17g_nir_options;
+   g17g_nir_options = agx_nir_options;
+   g17g_nir_options.support_indirect_inputs &=
+      ~BITFIELD_BIT(MESA_SHADER_FRAGMENT);
    for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
-      screen->nir_options[i] = &agx_nir_options;
+      screen->nir_options[i] = agx_chip_g17_m5(agx_screen->dev.chip)
+                                  ? &g17g_nir_options
+                                  : &agx_nir_options;
 
    screen->resource_create = u_transfer_helper_resource_create;
    screen->resource_destroy = u_transfer_helper_resource_destroy;

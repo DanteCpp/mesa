@@ -87,10 +87,10 @@ enum hk_sync_kind {
     * alias other resources, and in its pre- and post-graphics streams; a
     * render without any of those writes only its attachments, which a later
     * pre-rasterization stage can read only through an image (HK_SYNC_GFX_IMG).
-    * Every stream of another kind is counted too. On M5 a dependency from
-    * graphics work to pre-rasterization stages orders a render's vertex half
-    * only after the latest such stream on the render subqueue
-    * (hk_sync_barrier()). */
+    * Every stream of another kind is counted too. On M5 and G17P a
+    * dependency from graphics work to pre-rasterization stages orders a
+    * render's vertex half only after the latest such stream on the render
+    * subqueue (hk_sync_barrier()). */
    HK_SYNC_GFX_MEM = 1 << 5,
 };
 
@@ -340,6 +340,9 @@ struct hk_sync_state {
    struct hk_cs *pass_tile_wait[HK_SYNC_NUM_SQ];
    /* Attachment producers, including a compute replacement of a clear. */
    struct hk_cs *pass_tile_first, *pass_tile_last;
+   /* The last attachment producer of a suspended pass instance, which the
+    * resuming instance continues from. */
+   struct hk_cs *suspended_last;
 };
 
 /* Per-queue state: kinds of streams ever submitted on each subqueue. A
@@ -349,9 +352,16 @@ struct hk_sync_queue {
    bool exact_prior;
    /* G13/G14 retain upstream's order after both preceding engine prefixes. */
    bool serialize;
+   /* Serialized queue that still records dependencies so a render whose
+    * vertex half depends on no earlier render can order only its fragment
+    * half after the serialized prefix (HK_G13_STAGE_OVERLAP=0 disables). */
+   bool stage_overlap;
    uint64_t submitted[HK_SYNC_NUM_SQ];
    uint64_t last_absolute[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
    uint64_t tail[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
+   /* G17P: the largest whole render prefix of a render submitted without
+    * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS (hk_drm_g17p_tiling_ordered()). */
+   uint64_t ta_cover;
 
    /* Tile hazards across submissions: a ring of the footprints recently
     * submitted on this queue. An entry is live until the queue timeline
@@ -468,7 +478,7 @@ void hk_sync_order_xfer(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 /* Render pass instance boundaries. */
 void hk_sync_begin_rendering(struct hk_cmd_buffer *cmd, bool resuming);
 void hk_sync_first_render_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
-void hk_sync_end_rendering(struct hk_cmd_buffer *cmd);
+void hk_sync_end_rendering(struct hk_cmd_buffer *cmd, bool suspending);
 
 /* A new render pass instance continues in cs, the render stream of the
  * instance that just ended, instead of a stream of its own: the stream takes

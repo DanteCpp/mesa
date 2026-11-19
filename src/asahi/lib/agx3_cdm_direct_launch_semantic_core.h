@@ -39,10 +39,10 @@ struct agx3_cdm_direct_template_fields {
    bool subkernel_x_target_workitems;
 };
 
-/* Inputs to the exact ComputeProgramVariant::finalize transforms: the
- * constant program's thread-invariant (TI) resources, AGCCodeTranslator
- * ShaderInfo fields 31 and 37 (vtable +0x42 and +0x4e), the same pair the
- * vertex and fragment variants publish in their stage state. */
+/* Inputs to the exact direct-template transforms: the constant
+ * program's thread-invariant (TI) resources, the TI spill and TI IPR byte
+ * counts the compiler reports, the same pair the vertex and fragment
+ * programs carry in their stage state. */
 struct agx3_cdm_direct_template_sources {
    /* thread_invariant_spill_buffer_bytes: the constant program's TPS frame. */
    uint32_t ti_spill_bytes;
@@ -66,8 +66,8 @@ struct agx3_cdm_direct_launch_info {
    uint64_t pipeline;
    uint8_t dimensions;
 
-   /* DeviceConstants::hasMultipleAGCs supplies word 3 bit 31 only in the
-    * aggregate G15X emitter (G15S, G15C and G15D here). */
+   /* Word 3 bit 31 is set for multi-cluster parts, and only on the
+    * aggregate G15X family (G15S, G15C and G15D here). */
    bool g15x_has_multiple_agcs;
 
    uint32_t global_size[3];
@@ -81,6 +81,10 @@ bool agx3_cdm_direct_launch_target_grounded(enum agx_chip chip);
 bool agx3_cdm_direct_grid_resolve(
    enum agx3_cdm_direct_grid_source source, const uint32_t input_size[3],
    const uint32_t local_size[3], uint32_t global_size[3]);
+
+bool agx3_cdm_direct_template_build(
+   const struct agx3_cdm_direct_template_fields *fields,
+   struct agx3_cdm_direct_template *result);
 
 bool agx3_cdm_direct_template_build_from_sources(
    const struct agx3_cdm_direct_template_sources *sources,
@@ -96,6 +100,10 @@ bool agx3_cdm_direct_template_sources_compute(
    bool uses_resource_info_query, bool uses_ray_traversal,
    bool ray_traversal_depth_nonzero,
    struct agx3_cdm_direct_template_sources *sources);
+
+bool agx3_cdm_direct_template_decode(
+   const struct agx3_cdm_direct_template *template_words,
+   struct agx3_cdm_direct_template_fields *fields);
 
 /* Pack one canonical 40-byte record.  `packed` is cleared on every failure. */
 bool agx3_cdm_direct_launch_pack(

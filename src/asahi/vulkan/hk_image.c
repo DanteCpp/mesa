@@ -23,6 +23,7 @@
 #include "agx_bo.h"
 #include "hk_buffer.h"
 #include "hk_device.h"
+#include "hk_queue.h"
 #include "hk_device_memory.h"
 #include "hk_entrypoints.h"
 #include "hk_g17p_meta_copy_core.h"
@@ -540,11 +541,13 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
  * compressed PBE descriptors, and an input attachment reads it as a sampled
  * colour attachment does. Bits 0-10 select RGBA16F, RG16F, R16F, R32F, RG32F, RGBA32F,
  * RGBA8 UNORM, the other RGBA16 formats, the other RG16 formats, the other
- * RGBA8 formats and the other R16 formats, respectively; bit 12 admits
- * mipmapped images, whose levels compress as those of colour attachments
- * do. Zero retains the uncompressed diagnostic control. */
+ * RGBA8 formats and the other R16 formats, respectively; bit 11 selects
+ * B10G11R11, whose end-of-tile store keeps its class on M5
+ * (agx_rt0_pbe_format); bit 12 admits mipmapped images, whose levels
+ * compress as those of colour attachments do. Zero retains the uncompressed
+ * diagnostic control. */
 DEBUG_GET_ONCE_NUM_OPTION(m5_storage_compression,
-                         "ASAHI_M5_STORAGE_COMPRESSION", 6143)
+                         "ASAHI_M5_STORAGE_COMPRESSION", 8191)
 
 static bool
 hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
@@ -563,6 +566,14 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
       (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && ext &&
       ext->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO &&
       !ext->pNext;
+
+   /* G17P storage images stay uncompressed. hk does not initialize the
+    * compression metadata of a storage image whose contents are discarded
+    * (a transition from UNDEFINED), so an image bound to memory that held
+    * other data keeps that memory's tile words, and reads back wrong texels
+    * even after shader stores have written every texel. */
+   if (dev->chip == AGX_CHIP_G17P)
+      return false;
 
    if (dev->chip != AGX_CHIP_G17S || plane ||
        (info->pNext && !format_list_only) ||
@@ -589,7 +600,10 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    case VK_FORMAT_R16G16_SFLOAT: bit = 2; break;
    case VK_FORMAT_R16_SFLOAT: bit = 4; break;
    case VK_FORMAT_R32_SFLOAT:
-      if (float_image_atomics)
+      /* A mutable R32F image may list R32_UINT or R32_SINT views (the R32
+       * channel layout of hk_can_compress()), which have image atomics. */
+      if (float_image_atomics ||
+          (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
          return false;
       bit = 8;
       break;
@@ -611,6 +625,7 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    case VK_FORMAT_R16_SNORM:
    case VK_FORMAT_R16_UINT:
    case VK_FORMAT_R16_SINT: bit = 1024; break;
+   case VK_FORMAT_B10G11R11_UFLOAT_PACK32: bit = 2048; break;
    default: return false;
    }
    /* A mutable image's views may be FLOAT when the image is not: the list
@@ -623,7 +638,8 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
 static bool
 hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
                             const VkImageCreateInfo *info,
-                            bool float_image_atomics, bool srgb_pair_views);
+                            bool float_image_atomics, bool srgb_pair_views,
+                            bool multiview);
 
 /* Whether shaders of this device may use atomics on R32_SFLOAT images. */
 static bool
@@ -636,16 +652,17 @@ hk_float_image_atomics(const struct hk_device *dev)
 }
 
 /* Compressed data is only decodable through its own channel class. Every
- * G17P writer of a colour image is a PBE; the end-of-tile PBE may store a
- * different format from the image (agx_g17p_rt0_pbe_format packs
- * R11G11B10/RGB9E5 into R32_UINT words). Never compress an image whose store
- * class would differ from the class its textures read. */
+ * G17P/M5 writer of a colour image is a PBE; the end-of-tile PBE may store a
+ * different format from the image (hk_eot_pbe_format(): G17P packs
+ * R11G11B10/RGB9E5 into R32_UINT words, M4 Pro and M5 store R11G11B10 in its
+ * own class). Never compress an image whose store class would differ from the
+ * class its textures read. */
 static bool
 hk_g17p_store_class_matches(const struct agx_device *dev, VkFormat format)
 {
    const enum pipe_format p_format = hk_format_to_pipe_format(format);
-   const enum pipe_format store = agx_g17p_rt0_pbe_format(
-      util_format_linear(hk_padded_image_format(p_format)));
+   const enum pipe_format store = hk_eot_pbe_format(
+      dev, util_format_linear(hk_padded_image_format(p_format)));
    if (ail_formats_compatible(p_format, store))
       return true;
 
@@ -1197,7 +1214,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
          if (pImageFormatInfo->tiling == VK_IMAGE_TILING_OPTIMAL) {
             for (unsigned plane = 0; plane < plane_count; ++plane) {
                can_compress |= hk_can_compress_create_info(
-                  &pdev->dev, plane, &device_copy_info, false, false);
+                  &pdev->dev, plane, &device_copy_info, false, false, false);
             }
          }
 
@@ -1296,10 +1313,23 @@ hk_GetPhysicalDeviceSparseImageFormatProperties2(
    }
 }
 
+/* A multiview pass keeps multisample colour to an eight-byte budget in the
+ * tilebuffer (the uncovered-tile defect), and G17P cannot spill a compressed
+ * target: with more compressed 2x colour than that, the pass could only fail.
+ * A 2x colour image cannot know whether it will meet such a pass, so it stays
+ * plain on a device that enabled multiview. Depth is not in that budget. */
+static bool
+hk_g17p_multiview_spill_risk(const VkImageCreateInfo *info, bool multiview)
+{
+   return multiview && info->samples != VK_SAMPLE_COUNT_1_BIT &&
+          !vk_format_is_depth_or_stencil(info->format);
+}
+
 static bool
 hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
                             const VkImageCreateInfo *info,
-                            bool float_image_atomics, bool srgb_pair_views)
+                            bool float_image_atomics, bool srgb_pair_views,
+                            bool multiview)
 {
    /* AGX3: G17P compresses every image hk_g17p_compression.h admits. Other
     * AGX3 chips stay plain until their packets are recovered. */
@@ -1318,8 +1348,10 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
          debug_get_option_m5_depth_msaa_transfer()) ||
       hk_g17p_color_msaa_compression_eligible(
          dev->chip, dev->params.chip_id, plane, info) ||
-      m5_storage || hk_hal200_compression_eligible(dev->chip, plane, info,
-                                                  agx_is_m4_pro(dev)) ||
+      m5_storage ||
+      (hk_hal200_compression_eligible(dev->chip, plane, info,
+                                      agx_is_m4_pro(dev)) &&
+       !hk_g17p_multiview_spill_risk(info, multiview)) ||
       hk_g17p_shared_compression_eligible(dev->chip, plane, info) ||
       hk_m5_color_compression_eligible(dev->chip, plane, info) ||
       hk_m5_depth_compression_eligible(dev->chip, plane, info);
@@ -1366,7 +1398,8 @@ hk_map_compression(struct hk_device *dev, const VkImageCreateInfo *info,
       return hk_can_compress_create_info(
          &dev->dev, plane, info, hk_float_image_atomics(dev),
          hk_physical_device_instance(hk_device_physical(dev))
-            ->drirc.misc.mutable_format_srgb_pair);
+            ->drirc.misc.mutable_format_srgb_pair,
+         dev->vk.enabled_features.multiview);
 
    case VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT:
       return ail_is_drm_modifier_compressed(modifier);
@@ -1417,7 +1450,8 @@ choose_drm_format_mod(struct hk_device *dev, uint8_t plane_count,
 
    for (uint8_t plane = 0; plane < plane_count; plane++) {
       if (!hk_can_compress_create_info(&dev->dev, plane, info,
-                                       hk_float_image_atomics(dev), false))
+                                       hk_float_image_atomics(dev), false,
+                                       dev->vk.enabled_features.multiview))
          can_compress = false;
    }
 
@@ -1452,6 +1486,10 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
               const VkImageCreateInfo *pCreateInfo)
 {
    vk_image_init(&dev->vk, &image->vk, pCreateInfo);
+   image->swapchain_memory =
+      vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA) ||
+      vk_find_struct_const(pCreateInfo->pNext,
+                           IMAGE_SWAPCHAIN_CREATE_INFO_KHR);
 
    if ((image->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
@@ -1661,19 +1699,40 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
    return VK_SUCCESS;
 }
 
+/* VK_EXT_descriptor_buffer capture/replay: an address that replays, the
+ * captured one if there is one. */
+static struct agx_va *
+hk_image_replay_va(struct hk_device *dev, uint64_t size_B, uint64_t fixed_addr)
+{
+   enum agx_va_flags flags = fixed_addr ? AGX_VA_FIXED : 0;
+   if (dev->dev.replay_heap_initialized)
+      flags |= AGX_VA_CAPTURE_REPLAY;
+   return agx_va_alloc(&dev->dev, size_B, AIL_PAGESIZE, flags, fixed_addr);
+}
+
 static VkResult
 hk_image_plane_alloc_vma(struct hk_device *dev, struct hk_image_plane *plane,
-                         VkImageCreateFlags create_flags)
+                         VkImageCreateFlags create_flags,
+                         const struct hk_image_capture *replay, unsigned p)
 {
    const bool sparse_bound = create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT;
    const bool sparse_resident =
       create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
+   const bool capture_replay =
+      create_flags & VK_IMAGE_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT;
    assert(sparse_bound || !sparse_resident);
 
    if (sparse_bound) {
       size_t size = align(plane->layout.size_B, HK_SPARSE_ALIGN_B);
-      plane->va = agx_va_alloc(&dev->dev, size, AIL_PAGESIZE, 0, 0);
+      plane->va = capture_replay
+                     ? hk_image_replay_va(dev, size,
+                                          replay ? replay->plane_va[p] : 0)
+                     : agx_va_alloc(&dev->dev, size, AIL_PAGESIZE, 0, 0);
       if (!plane->va) {
+         if (replay && replay->plane_va[p])
+            return vk_errorf(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+                             "Capture/replay address %#llx is in use",
+                             (unsigned long long)replay->plane_va[p]);
          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Sparse VMA allocation failed");
       }
@@ -1727,6 +1786,24 @@ hk_image_plane_alloc_vma(struct hk_device *dev, struct hk_image_plane *plane,
                           "Sparse residency map mapping failed");
       }
       memset(map, 0, plane->layout.sparse_table_size_B);
+      plane->sparse_map_addr = plane->sparse_map->va->addr;
+
+      if (capture_replay) {
+         const uint64_t size_B = plane->sparse_map->size;
+         const uint64_t fixed_addr = replay ? replay->sparse_map_va[p] : 0;
+         plane->sparse_map_va = hk_image_replay_va(dev, size_B, fixed_addr);
+         if (!plane->sparse_map_va)
+            return vk_errorf(dev,
+                             fixed_addr ? VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS
+                                        : VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "Sparse map capture/replay VA allocation failed");
+         if (agx_bo_bind(&dev->dev, plane->sparse_map,
+                         plane->sparse_map_va->addr, size_B, 0,
+                         DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE))
+            return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "Sparse map capture/replay bind failed");
+         plane->sparse_map_addr = plane->sparse_map_va->addr;
+      }
    }
 
    return VK_SUCCESS;
@@ -1745,6 +1822,10 @@ hk_image_plane_finish(struct hk_device *dev, struct hk_image_plane *plane,
    hk_release_sparse_scratch(dev, plane->sparse_scratch_B);
    plane->sparse_scratch_B = 0;
 
+   if (plane->sparse_map_va) {
+      agx_va_free(&dev->dev, plane->sparse_map_va, true);
+      plane->sparse_map_va = NULL;
+   }
    agx_bo_unreference(&dev->dev, plane->sparse_map);
 }
 
@@ -1813,9 +1894,20 @@ hk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
          image->planes[0].layout.compressed, views);
    }
 
+   const VkOpaqueCaptureDescriptorDataCreateInfoEXT *replay_info =
+      (pCreateInfo->flags &
+       VK_IMAGE_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT)
+         ? vk_find_struct_const(pCreateInfo->pNext,
+                                OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT)
+         : NULL;
+   struct hk_image_capture replay;
+   if (replay_info)
+      memcpy(&replay, replay_info->opaqueCaptureDescriptorData, sizeof(replay));
+
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
       result = hk_image_plane_alloc_vma(dev, &image->planes[plane],
-                                        image->vk.create_flags);
+                                        image->vk.create_flags,
+                                        replay_info ? &replay : NULL, plane);
       if (result != VK_SUCCESS) {
          hk_image_finish(dev, image, pAllocator);
          vk_free2(&dev->vk.alloc, pAllocator, image);
@@ -1837,6 +1929,8 @@ hk_DestroyImage(VkDevice device, VkImage _image,
 
    if (!image)
       return;
+
+   hk_device_quiesce_lost_submissions(dev);
 
    hk_image_finish(dev, image, pAllocator);
    vk_free2(&dev->vk.alloc, pAllocator, image);
@@ -2167,7 +2261,7 @@ hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
       const uint64_t mem_size_B =
          mem->vk.size ? MIN2(mem->bo->size, mem->vk.size) : mem->bo->size;
       uint64_t bo_offset_B;
-      if (!hk_image_plane_binding(mem->bo->va->addr, mem_size_B,
+      if (!hk_image_plane_binding(hk_device_memory_addr(mem), mem_size_B,
                                   memory_offset_B, plane->offset_B,
                                   plane->layout.size_B, &plane->addr,
                                   &bo_offset_B))
@@ -2583,5 +2677,23 @@ hk_TransitionImageLayoutEXT(
    const VkHostImageLayoutTransitionInfoEXT *transitions)
 {
    /* We don't do anything with layouts so this should be a no-op */
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetImageOpaqueCaptureDescriptorDataEXT(
+   VkDevice device, const VkImageCaptureDescriptorDataInfoEXT *pInfo,
+   void *pData)
+{
+   VK_FROM_HANDLE(hk_image, image, pInfo->image);
+
+   struct hk_image_capture capture = {0};
+   for (unsigned p = 0; p < image->plane_count; ++p) {
+      const struct hk_image_plane *plane = &image->planes[p];
+      capture.plane_va[p] = plane->va ? plane->va->addr : 0;
+      capture.sparse_map_va[p] =
+         plane->sparse_map_va ? plane->sparse_map_va->addr : 0;
+   }
+   memcpy(pData, &capture, sizeof(capture));
    return VK_SUCCESS;
 }

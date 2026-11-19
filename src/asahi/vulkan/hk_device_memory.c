@@ -7,8 +7,10 @@
 #include "hk_device_memory.h"
 
 #include "hk_device.h"
+#include "hk_queue.h"
 #include "hk_entrypoints.h"
 #include "hk_image.h"
+#include "hk_instance.h"
 #include "hk_physical_device.h"
 
 #include "asahi/lib/agx_bo.h"
@@ -16,8 +18,45 @@
 #include "util/u_debug.h"
 #include "vk_common_entrypoints.h"
 
+#include "asahi/lib/agx_device.h"
+#include "util/log.h"
+#include "util/os_misc.h"
+
+#include <errno.h>
 #include <inttypes.h>
+#include <string.h>
 #include <sys/mman.h>
+
+/* GPU memory is system memory that the kernel cannot evict or swap, and
+ * heapBudget is only advisory, so the heap limit alone lets a process (or
+ * several) take every free page and invoke the OOM killer on the desktop.
+ * Refuse an allocation of 1 MiB or more that would leave less than
+ * max(1 GiB, 2% of RAM) available. Applications that allocate per tensor
+ * (tens of MiB per call) are covered. Smaller allocations always pass:
+ * below the reserve every vkAllocateMemory would fail, including ones the
+ * compositor needs.
+ */
+#define HK_MEMORY_RESERVE_MIN   (1ull << 30)
+#define HK_MEMORY_CHECK_MIN     (1ull << 20)
+
+static bool
+hk_system_memory_fits(uint64_t size)
+{
+   uint64_t available, total;
+
+   if (size < HK_MEMORY_CHECK_MIN)
+      return true;
+
+   /* If the kernel does not tell us, only the heap limit applies. */
+   if (!os_get_available_system_memory(&available))
+      return true;
+
+   uint64_t reserve = HK_MEMORY_RESERVE_MIN;
+   if (os_get_total_physical_memory(&total))
+      reserve = MAX2(reserve, total / 50);
+
+   return available >= size + reserve;
+}
 
 /* Supports opaque fd only */
 const VkExternalMemoryProperties hk_opaque_fd_mem_props = {
@@ -37,6 +76,13 @@ const VkExternalMemoryProperties hk_dma_buf_mem_props = {
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
    .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+};
+
+/* Host allocations can be imported, nothing can be exported from them. */
+const VkExternalMemoryProperties hk_host_ptr_mem_props = {
+   .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+   .exportFromImportedHandleTypes = 0,
+   .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
 };
 
 static enum agx_bo_flags
@@ -159,6 +205,67 @@ hk_GetMemoryFdPropertiesKHR(VkDevice device,
    return VK_SUCCESS;
 }
 
+/* Memory priority 1.0 asks the kernel to release the memory after the VM's
+ * other BOs when it reclaims idle memory; any other priority leaves it to the
+ * kernel's default policy. */
+static void
+hk_set_memory_priority(struct hk_device *dev, struct hk_device_memory *mem,
+                       float priority)
+{
+   const bool keep = priority >= 1.0f;
+   if (keep == mem->keep_resident)
+      return;
+
+   int ret = agx_bo_set_resident(&dev->dev, mem->bo, keep);
+   if (ret) {
+      mesa_logw("memory priority %.2f: GEM_RESIDENCY failed: %s", priority,
+                strerror(-ret));
+      return;
+   }
+
+   mem->keep_resident = keep;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_SetDeviceMemoryPriorityEXT(VkDevice device, VkDeviceMemory memory,
+                              float priority)
+{
+   VK_FROM_HANDLE(hk_device, dev, device);
+   VK_FROM_HANDLE(hk_device_memory, mem, memory);
+
+   hk_set_memory_priority(dev, mem, priority);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetMemoryHostPointerPropertiesEXT(
+   VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType,
+   const void *pHostPointer,
+   VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
+{
+   VK_FROM_HANDLE(hk_device, dev, device);
+   struct hk_physical_device *pdev = hk_device_physical(dev);
+
+   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
+       !agx_has_userptr(&dev->dev))
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   const uint64_t alignment =
+      pdev->vk.properties.minImportedHostPointerAlignment;
+   if ((uintptr_t)pHostPointer % alignment)
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   /* The application's own mapping is cacheable, and the GPU coherent with
+    * it: offer the cached types. */
+   uint32_t type_bits = 0;
+   for (unsigned t = 0; t < pdev->mem_type_count; t++) {
+      if (pdev->mem_types[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+         type_bits |= 1u << t;
+   }
+
+   pMemoryHostPointerProperties->memoryTypeBits = type_bits;
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
                   const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMem)
@@ -175,6 +282,11 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    const VkMemoryOpaqueCaptureAddressAllocateInfo *capture_info =
       vk_find_struct_const(pAllocateInfo->pNext,
                            MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO);
+   const VkImportMemoryHostPointerInfoEXT *host_info = vk_find_struct_const(
+      pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
+   const VkMemoryPriorityAllocateInfoEXT *priority_info =
+      vk_find_struct_const(pAllocateInfo->pNext,
+                           MEMORY_PRIORITY_ALLOCATE_INFO_EXT);
    const VkMemoryType *type = &pdev->mem_types[pAllocateInfo->memoryTypeIndex];
 
    VkExternalMemoryHandleTypeFlagBits handle_types = 0;
@@ -232,6 +344,39 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          goto fail_alloc;
       }
       assert(!(flags & ~mem->bo->flags));
+   } else if (host_info && host_info->handleType) {
+      /* The pointer and the size are multiples of
+       * minImportedHostPointerAlignment (VUID-VkImportMemoryHostPointerInfoEXT-
+       * pHostPointer-01749, VUID-VkMemoryAllocateInfo-allocationSize-01745).
+       * Memory the kernel cannot pin for writing (a read-only mapping of a
+       * file) is refused: nothing in the API keeps a buffer bound to it from
+       * being a transfer destination or a storage buffer the GPU writes. An
+       * application that only reads such memory on the GPU asks for it with
+       * hk_host_memory_read_only. With hk_host_memory_import_read_only only
+       * such a range is taken, and a range the kernel can pin for writing is
+       * refused, also with hk_host_memory_read_only: the GPU then writes
+       * through no host import (hk_cdm_alias_scope()).
+       */
+      assert(host_info->handleType ==
+             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT);
+      const struct hk_instance *instance = hk_physical_device_instance(pdev);
+      const enum agx_host_ptr_access access =
+         instance->drirc.misc.host_memory_import_read_only
+            ? AGX_HOST_PTR_READ_ONLY
+         : instance->drirc.misc.host_memory_read_only ? AGX_HOST_PTR_ANY
+                                                       : AGX_HOST_PTR_WRITABLE;
+      mem->bo = agx_bo_import_host_ptr(&dev->dev, host_info->pHostPointer,
+                                       pAllocateInfo->allocationSize, access);
+      if (mem->bo == NULL) {
+         const int err = errno;
+         result = vk_errorf(dev,
+                            err == ENOMEM ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                                          : VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "importing %" PRIu64 " bytes of host memory at %p: %s",
+                            (uint64_t)pAllocateInfo->allocationSize,
+                            host_info->pHostPointer, strerror(err));
+         goto fail_alloc;
+      }
    } else {
       enum agx_bo_flags flags = 0;
       if (handle_types)
@@ -244,17 +389,69 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
          flags |= AGX_BO_WRITEBACK;
 
-      mem->bo = agx_bo_create(&dev->dev, aligned_size, 0, flags, "App memory");
+      /* A BO from the cache allocates nothing new. If the kernel purged it
+       * meanwhile, one allocation can still pass the check. */
+      if (!hk_system_memory_fits(aligned_size) &&
+          !agx_bo_cache_has(&dev->dev, aligned_size, 64 * 1024, flags)) {
+         result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                            "Not enough free system memory for %" PRIu64
+                            " MiB", aligned_size >> 20);
+         goto fail_alloc;
+      }
+
+      /* D3D12 promises 64 KiB alignment for heap addresses, and this costs
+       * only virtual address space. */
+      mem->bo = agx_bo_create(&dev->dev, aligned_size, 64 * 1024, flags,
+                              "App memory");
       if (!mem->bo) {
          result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
          goto fail_alloc;
       }
    }
 
+   /* VK_EXT_descriptor_buffer capture/replay: image descriptors embed the
+    * address of the image's memory, so memory allocated for capture/replay
+    * also maps at an address in the capture/replay region, the captured one
+    * on replay when that is one. Buffers and images bound to it take that
+    * address (hk_device_memory_addr()); buffers with a capture/replay address
+    * of their own keep it. */
+   if ((mem->vk.alloc_flags &
+        VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) &&
+       dev->vk.enabled_features.descriptorBufferCaptureReplay &&
+       dev->dev.replay_heap_initialized) {
+      const uint64_t fixed_addr =
+         capture_info ? capture_info->opaqueCaptureAddress : 0;
+      mem->replay_va = agx_va_alloc(
+         &dev->dev, mem->bo->size, 64 * 1024,
+         AGX_VA_CAPTURE_REPLAY | (fixed_addr ? AGX_VA_FIXED : 0), fixed_addr);
+      if (mem->replay_va &&
+          (agx_bo_bind(&dev->dev, mem->bo, mem->replay_va->addr,
+                       mem->bo->size, 0,
+                       DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE) ||
+           agx_bo_bind(&dev->dev, mem->bo,
+                       agx_rw_addr_to_ro(&dev->dev, mem->replay_va->addr),
+                       mem->bo->size, 0, DRM_ASAHI_BIND_READ))) {
+         agx_va_free(&dev->dev, mem->replay_va, true);
+         mem->replay_va = NULL;
+         agx_bo_unreference(&dev->dev, mem->bo);
+         mem->bo = NULL;
+         result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         goto fail_alloc;
+      }
+      /* An address this region cannot take was not captured with the
+       * feature (on a device without it, it is the BO's own address): keep
+       * buffer device address replay as it was, through the buffers' own
+       * capture/replay addresses. */
+      /* The memory is reached through two read-write addresses now. */
+      if (mem->replay_va)
+         p_atomic_inc(&dev->va_alias_resources);
+   }
+
    if (mem->vk.alloc_flags &
        VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) {
       mem->opaque_capture_address =
-         capture_info && capture_info->opaqueCaptureAddress
+         mem->replay_va ? mem->replay_va->addr
+         : capture_info && capture_info->opaqueCaptureAddress
             ? capture_info->opaqueCaptureAddress
             : mem->bo->va->addr;
    }
@@ -273,6 +470,9 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
 
    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
       hk_add_ext_bo(dev, mem->bo);
+
+   if (priority_info)
+      hk_set_memory_priority(dev, mem, priority_info->priority);
 
    uint64_t heap_used = p_atomic_add_return(heap->used, mem->bo->size);
    if (heap_used > heap->size) {
@@ -315,6 +515,8 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
    if (!mem)
       return;
 
+   hk_device_quiesce_lost_submissions(dev);
+
    const VkMemoryType *type = &pdev->mem_types[mem->vk.memory_type_index];
    struct hk_memory_heap *heap = &pdev->mem_heaps[type->heapIndex];
    p_atomic_add(heap->used, -((int64_t)mem->bo->size));
@@ -326,6 +528,14 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
     * the BO; an owned one belongs to this object alone. */
    if (mem->map_owned)
       agx_bo_unmap_owned(mem->bo, mem->map, mem->map_size);
+
+   /* The BO may outlive this object in the BO cache. */
+   hk_set_memory_priority(dev, mem, 0.5f);
+
+   if (mem->replay_va) {
+      agx_va_free(&dev->dev, mem->replay_va, true);
+      p_atomic_dec(&dev->va_alias_resources);
+   }
 
    agx_bo_unreference(&dev->dev, mem->bo);
 
@@ -378,6 +588,13 @@ hk_MapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
    if (mem->map != NULL) {
       return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
                        "Memory object already mapped.");
+   }
+
+   /* Host memory the kernel could only pin read-only has no mapping the
+    * application may write through, and Vulkan has no read-only mapping. */
+   if ((mem->bo->flags & AGX_BO_HOST_PTR) && (mem->bo->flags & AGX_BO_READONLY)) {
+      return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                       "read-only host memory cannot be mapped");
    }
 
    /* Bound a placed mapping by the memory object, not the BO: the BO cache
@@ -436,6 +653,13 @@ hk_UnmapMemory2KHR(VkDevice device,
       mem->map = NULL;
       mem->map_size = 0;
       mem->map_owned = false;
+      return VK_SUCCESS;
+   }
+
+   /* Imported host memory stays mapped where the application put it
+    * (VUID-VkMemoryUnmapInfo-flags-09579 excludes reserving it). */
+   if (mem->bo->flags & AGX_BO_HOST_PTR) {
+      mem->map = NULL;
       return VK_SUCCESS;
    }
 

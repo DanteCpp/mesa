@@ -10,7 +10,10 @@
  * already uses, and the shader binding table selects between the inlined
  * copies with a comparison on the group index.  There is no indirect shader
  * call, no resume shader and no shader-call stack: recursion is bounded by
- * maxPipelineRayRecursionDepth at compile time and unrolled.
+ * maxPipelineRayRecursionDepth at compile time and unrolled.  Pipelines deeper
+ * than HK_RT_INLINE_MAX_RAY_RECURSION_DEPTH instead split their stages at
+ * every call and run them as continuations from one scheduler loop, with
+ * return records on the invocation's scratch stack.
  *
  * This is the shape lavapipe uses, and it is used here for the same reason:
  * the AGX3 backend has no way to branch to an address the command stream
@@ -31,6 +34,7 @@
 extern const struct vk_pipeline_ops hk_ray_tracing_pipeline_ops;
 
 struct hk_api_shader;
+struct vk_pipeline_cache_object;
 struct hk_device;
 struct nir_shader;
 
@@ -50,6 +54,9 @@ struct hk_ray_tracing_pipeline {
    struct vk_pipeline_layout *layout;
 
    uint8_t binary_key[32];
+   /* This pipeline's pipeline cache entry. The device's memory cache holds
+    * entries only while something references them. */
+   struct vk_pipeline_cache_object *cache_object;
 
    uint32_t stage_count;
    uint32_t group_count;
@@ -86,6 +93,8 @@ struct hk_ray_tracing_pipeline {
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_ray_tracing_pipeline, base.base, VkPipeline,
                                VK_OBJECT_TYPE_PIPELINE);
+
+void hk_rt_device_finish(struct hk_device *dev);
 
 static inline struct hk_ray_tracing_pipeline *
 hk_pipeline_to_ray_tracing(struct vk_pipeline *pipeline)

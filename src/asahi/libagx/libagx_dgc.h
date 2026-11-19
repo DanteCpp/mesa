@@ -470,6 +470,116 @@ agx_vdm_draw(GLOBAL uint32_t *out, enum agx_chip chip, struct agx_draw draw,
    return out;
 }
 
+/* agx_vdm_draw for G18G's callers, which also accepts AGX_CHIP_G18G (packed
+ * as G17G's records). `unk2` is the HAL300 Index List word the pipeline
+ * selects (agx_vdm_index_list_hal300_unk2); other generations ignore it. */
+static inline GLOBAL uint32_t *
+agx_vdm_draw_unk2(GLOBAL uint32_t *out, enum agx_chip chip,
+                  struct agx_draw draw, enum agx_primitive topology,
+                  uint32_t restart_index, uint32_t unk2)
+{
+   uint64_t ib = draw.indexed ? agx_draw_index_buffer(draw) : 0;
+
+   if (agx_vdm_index_list_indexed_or_indirect_supported_inline(chip)) {
+      if (agx_is_indirect(draw.b)) {
+         uint32_t size_word = 0;
+         const bool size_valid =
+            !draw.indexed ||
+            agx_draw_indirect_index_buffer_size_word(draw, &size_word);
+         struct agx_vdm_index_list_indirect_words words;
+         const bool valid =
+            size_valid && agx_vdm_index_list_indirect_pack_words_unk2(
+                             chip, (uint8_t)topology, draw.indexed,
+                             draw.restart, (uint8_t)draw.index_size, ib,
+                             draw.b.ptr, draw.indexed ? restart_index : 0,
+                             size_word, unk2, &words);
+         assert(valid);
+         if (!valid)
+            return out;
+
+         for (unsigned i = 0; i < words.count; ++i)
+            *out++ = words.words[i];
+         return out;
+      } else {
+         struct agx_vdm_index_list_direct_words words;
+         const bool valid = agx_vdm_index_list_direct_pack_words_unk2(
+            chip, (uint8_t)topology, draw.indexed, draw.restart,
+            (uint8_t)draw.index_size, ib, draw.b.count[0], draw.b.count[1],
+            draw.indexed ? draw.index_bias : draw.start,
+            draw.indexed ? (uint32_t)(agx_index_fetch_window_B(
+                               ib, agx_draw_index_range_B(draw)) >> 2)
+                         : 0,
+            unk2, &words);
+         assert(valid);
+         if (!valid)
+            return out;
+
+         for (unsigned i = 0; i < words.count; ++i)
+            *out++ = words.words[i];
+         return out;
+      }
+   }
+
+   assert(agx_vdm_draw_supported(chip, draw, topology));
+   if (!agx_vdm_draw_supported(chip, draw, topology))
+      return out;
+
+   agx_push(out, INDEX_LIST, cfg) {
+      cfg.primitive = topology;
+
+      if (agx_is_indirect(draw.b)) {
+         cfg.indirect_buffer_present = true;
+      } else {
+         cfg.instance_count_present = true;
+         cfg.index_count_present = true;
+         cfg.start_present = true;
+      }
+
+      if (draw.indexed) {
+         cfg.restart_enable = draw.restart;
+         cfg.index_buffer_hi = ib >> 32;
+         cfg.index_size = draw.index_size;
+
+         cfg.index_buffer_present = true;
+         cfg.index_buffer_size_present = true;
+      }
+   }
+
+   if (draw.indexed) {
+      agx_push(out, INDEX_LIST_BUFFER_LO, cfg) {
+         cfg.buffer_lo = ib;
+      }
+   }
+
+   if (agx_is_indirect(draw.b)) {
+      agx_push(out, INDEX_LIST_INDIRECT_BUFFER, cfg) {
+         cfg.address_hi = draw.b.ptr >> 32;
+         cfg.address_lo = draw.b.ptr & BITFIELD_MASK(32);
+      }
+   } else {
+      agx_push(out, INDEX_LIST_COUNT, cfg) {
+         cfg.count = draw.b.count[0];
+      }
+
+      agx_push(out, INDEX_LIST_INSTANCES, cfg) {
+         cfg.count = draw.b.count[1];
+      }
+
+      agx_push(out, INDEX_LIST_START, cfg) {
+         cfg.start = draw.indexed ? draw.index_bias : draw.start;
+      }
+   }
+
+   if (draw.indexed) {
+      agx_push(out, INDEX_LIST_BUFFER_SIZE, cfg) {
+         cfg.size =
+            agx_index_fetch_window_B(ib, agx_draw_index_range_B(draw));
+      }
+   }
+
+   return out;
+}
+
 static inline uint32_t
 agx_vdm_draw_size(enum agx_chip chip, struct agx_draw draw)
 {
@@ -548,11 +658,12 @@ agx_vdm_draw_size(enum agx_chip chip, struct agx_draw draw)
 static inline GLOBAL uint32_t *
 agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
 {
-   /* CommandEncodingNext emits this exact type-1 memory-barrier word on every
+   /* The AGX3 encoding uses this exact type-1 memory-barrier word on every
     * byte-witnessed G15--G17 identity.  Do not feed those chips through the
     * legacy genxml packet below: that packet is AGX2 and has a different
     * opcode/field layout.  Keep the unwitnessed G16P/G17A identities closed
-    * instead of guessing from their neighbouring families. */
+    * instead of guessing from their neighbouring families.  G18G memory
+    * barriers use the same word. */
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -565,6 +676,7 @@ agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G18G:
       *out++ = 0x21000960u;
       return out;
 
@@ -990,6 +1102,27 @@ struct libagx_robust_index_draw {
 };
 static_assert(sizeof(struct libagx_robust_index_draw) == 32,
               "robust index batch host/device ABI");
+
+/* Software task stage (G17P): one record per task draw. The task kernel
+ * stores each workgroup's child grid and payload in its entry, and raises
+ * max_children to its child count; the mesh object and mesh shader read them
+ * back. An entry is the child grid (16 B) followed by the payload.
+ */
+struct libagx_task_record {
+   uint32_t max_children;
+   uint32_t task_count;
+   uint32_t stride_B;
+   /* Invocations per mesh workgroup, for the mesh invocation statistic. */
+   uint32_t mesh_threads;
+   uint64_t entries;
+   /* Task kernel grid in workgroups, for indirect launches. */
+   uint32_t dispatch[3];
+   uint32_t pad2;
+};
+static_assert(sizeof(struct libagx_task_record) == 40,
+              "task record host/device ABI");
+
+#define LIBAGX_TASK_ENTRY_PAYLOAD_B 16
 
 static inline unsigned
 libagx_remap_adj_count(unsigned count, enum mesa_prim prim)

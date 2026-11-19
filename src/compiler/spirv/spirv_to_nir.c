@@ -4626,6 +4626,9 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
                                           SpvImageOperandsMakeTexelVisibleMask);
          semantics = SpvMemorySemanticsMakeVisibleMask;
          scope = vtn_constant_uint(b, w[arg]);
+         /* The split barrier below only covers later reads; this read is
+          * itself made visible. */
+         access |= ACCESS_COHERENT;
       }
 
       if (operands & SpvImageOperandsLodMask) {
@@ -4669,6 +4672,9 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
                                           SpvImageOperandsMakeTexelAvailableMask);
          semantics = SpvMemorySemanticsMakeAvailableMask;
          scope = vtn_constant_uint(b, w[arg]);
+         /* The split barrier below is placed before the write and only
+          * covers earlier writes; this write is itself made available. */
+         access |= ACCESS_COHERENT;
       }
 
       if (operands & SpvImageOperandsLodMask) {
@@ -6995,21 +7001,19 @@ vtn_handle_hit_object(struct vtn_builder *b, SpvOp opcode,
       return;
 
    case SpvOpHitObjectRecordFromQueryEXT: {
-      nir_def *hit_kind = vtn_ssa_value(b, w[count >= 6 ? 5 : 4])->def;
-      nir_def *attributes = NULL;
-      if (count >= 6) {
-         unsigned words;
-         nir_deref_instr *deref = vtn_hit_object_attribute_deref(b, w[4], &words);
-         attributes = nir_load_deref(nb, deref);
-      }
+      /* The attributes are required; the hit kind is the optional operand. */
+      unsigned words;
+      nir_deref_instr *deref = vtn_hit_object_attribute_deref(b, w[4], &words);
+      nir_def *attributes = nir_load_deref(nb, deref);
+      nir_def *hit_kind = count >= 6 ? vtn_ssa_value(b, w[5])->def : nir_imm_int(nb, 0);
       nir_intrinsic_instr *intrin = nir_intrinsic_instr_create(
          nb->shader, nir_intrinsic_hit_object_record_from_query);
       intrin->src[0] = nir_src_for_ssa(&vtn_nir_deref(b, w[1])->def);
       intrin->src[1] = nir_src_for_ssa(&vtn_nir_deref(b, w[2])->def);
       intrin->src[2] = nir_src_for_ssa(vtn_ssa_value(b, w[3])->def);
       intrin->src[3] = nir_src_for_ssa(hit_kind);
-      intrin->src[4] = nir_src_for_ssa(attributes ? attributes : nir_undef(nb, 1, 32));
-      intrin->num_components = attributes ? attributes->num_components : 1;
+      intrin->src[4] = nir_src_for_ssa(attributes);
+      intrin->num_components = attributes->num_components;
       nir_builder_instr_insert(nb, &intrin->instr);
       return;
    }

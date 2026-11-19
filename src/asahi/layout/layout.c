@@ -172,16 +172,42 @@ ail_initialize_gpu_tiled(struct ail_layout *layout)
       /* Live M5 allocation corpus: single layers are never padded; small
        * arrays use a 2 KiB granule only when compression metadata exists;
        * arrays larger than one GPU page keep the 16 KiB granule. Shader-write
-       * usage by itself does not force page alignment on this family. */
+       * usage by itself does not force page alignment on this family, except
+       * for mipmapped arrays (below). */
       layout->layer_stride_B =
          ail_m5_layer_stride_B(offset_B, layout->depth_px, layout->compressed);
       layout->page_aligned_layers =
          layout->depth_px > 1 && offset_B >= AIL_PAGESIZE;
       /* ZLS layer strides use page units even when color/texture arrays can
        * use compact strides. A sub-page depth/stencil layer cannot be
-       * represented by the render submission's ZLS descriptor. */
-      if (layout->depth_px > 1 && layout->renderable &&
+       * represented by the render submission's ZLS descriptor.
+       *
+       * G18G keeps compact depth/stencil layers: its ZLS array stride is
+       * encoded in 128-byte cachelines below a page (agx_zls_layer_stride),
+       * except for the writeable mipmapped arrays below, whose page-sized
+       * layers it can encode too. */
+      if (!layout->g18g && layout->depth_px > 1 && layout->renderable &&
           util_format_is_depth_or_stencil(layout->format)) {
+         layout->page_aligned_layers = true;
+         layout->layer_stride_B = ALIGN_POT(offset_B, AIL_PAGESIZE);
+      }
+      /* The exception to the above: mipmapped arrays the GPU can write. A
+       * store to a layer of an array is described as a 3D store on the chips
+       * that encode layered stores in z (G17G and G17S in Honeykrisp and
+       * Gallium, G18G in Gallium; hk_image_view.c, agx_state.c), with the
+       * depth scaled by the level. The 3D slice stride follows a mip chain as
+       * deep as the described depth. That chain can have more levels than the
+       * array's, and a compact stride cannot hold the difference; a
+       * page-aligned one can.
+       *
+       * Both drivers mark every uncompressed image writeable, and
+       * Honeykrisp's buffer-to-image copies store through such a layered
+       * view, so this pads every uncompressed mipmapped array under this
+       * policy, including on G17C, which keeps the array form. Do not narrow
+       * it to shader-storage usage: uploads to small mipmapped arrays and
+       * cube maps would land in the wrong layer again. */
+      if (layout->writeable_image && layout->depth_px > 1 &&
+          layout->levels > 1) {
          layout->page_aligned_layers = true;
          layout->layer_stride_B = ALIGN_POT(offset_B, AIL_PAGESIZE);
       }
@@ -320,10 +346,7 @@ ail_initialize_compression(struct ail_layout *layout)
 
    layout->metadata_offset_B = layout->size_B;
 
-   const struct ail_tile metadata_tile =
-      layout->policy == AIL_LAYOUT_POLICY_M5 && !layout->mipmapped_z
-         ? ail_m5_compression_tile_size(util_format_get_blocksize(layout->format))
-         : (struct ail_tile){16, 16};
+   const struct ail_tile metadata_tile = ail_metadata_tile(layout);
 
    width_sa = ALIGN_POT(width_sa, metadata_tile.width_el);
    height_sa = ALIGN_POT(height_sa, metadata_tile.height_el);

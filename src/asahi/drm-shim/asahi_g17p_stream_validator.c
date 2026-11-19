@@ -54,12 +54,10 @@ decode_pipeline_pair(const uint8_t pair[8])
    const uint32_t high = load_le32(pair);
    const uint32_t low = load_le32(pair + 4);
 
-   /* The high word's low 22 bits are the stage-program template, not
-    * address. A fragment with a constant program carries its
-    * thread-invariant spill quads in bits 3..20
-    * (agx_ppp_hal200_fragment_ti_resources, the native
-    * FragmentProgramVariantESLState::finalize layout); nothing sets the
-    * remaining template bits. */
+   /* The high word's low 22 bits are the stage-program template, not address.
+    * A fragment with a constant program carries its thread-invariant spill
+    * quads in bits 3..20 (agx_ppp_hal200_fragment_ti_resources, the native
+    * fragment record layout); nothing sets the remaining template bits. */
    if (high & UINT32_C(0x003fffff) & ~UINT32_C(0x001ffff8))
       return 0;
 
@@ -611,6 +609,11 @@ asahi_g17p_compute_validate(
 {
    struct asahi_g17p_compute_stats local = {0};
    bool need_barrier = false;
+   /* need_barrier was set by a direct launch. Honeykrisp's batched
+    * tessellation stages (hk_tess_batch.h) put the direct launches of one
+    * stage back to back; anything else after a launch still needs a barrier
+    * first. */
+   bool direct_tail = false;
    bool followed_link = false;
 
    if (stats)
@@ -664,6 +667,7 @@ asahi_g17p_compute_validate(
 
          local.launches++;
          need_barrier = true;
+         direct_tail = false;
          cursor += AGX3_CDM_INDIRECT_LAUNCH_SIZE;
          continue;
       }
@@ -675,7 +679,8 @@ asahi_g17p_compute_validate(
 
       switch (record.kind) {
       case AGX3_CDM_RECORD_LAUNCH: {
-         if (need_barrier || (record.data.launch.word0_payload >> 27) != 0 ||
+         if ((need_barrier && !direct_tail) ||
+             (record.data.launch.word0_payload >> 27) != 0 ||
              (record.data.launch.pipeline & 63) ||
              !record.data.launch.pipeline ||
              record.length != G17P_CDM_DIRECT_LAUNCH_SIZE ||
@@ -696,10 +701,12 @@ asahi_g17p_compute_validate(
             return fail_at(cursor, "compute launch Ioto program is invalid");
 
          local.launches++;
+         local.unbarriered_launches += need_barrier;
          local.two_dimensional_launches +=
             record.data.launch.global_size[1] > 1 &&
             record.data.launch.global_size[2] == 1;
          need_barrier = true;
+         direct_tail = true;
          break;
       }
 
@@ -1155,6 +1162,12 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
    bool have_state = false;
    bool tessellation_state_seen = false;
    bool restart_seen = false;
+   /* Honeykrisp re-emits the restart State Update only when the restart
+    * index changes, and forgets it where the driver does: after an indirect
+    * packet (indexed ones write their own) and at a stream link, which also
+    * covers an empty robust-index draw's jump. A non-empty robust-index draw
+    * carries its own record. */
+   bool restart_held = false;
    /* Cleared by every draw body, set by every barrier record.  A state
     * republication seen while this is false is a draw installing fresh VDM
     * pointers over the ones an earlier draw in this same stream may still be
@@ -1264,6 +1277,7 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
             if (restart_seen)
                return fail_at(cursor, "duplicate indexed restart record");
             restart_seen = true;
+            restart_held = true;
             cursor += 8;
             continue;
          }
@@ -1334,7 +1348,8 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
             : draw->index_size == AGX_VDM_INDEX_LIST_INDEX_SIZE_U16 ? 2
                                                                   : 4;
          const uint64_t bytes_needed = (uint64_t)draw->count * index_size;
-         if (!have_state || !restart_seen || bytes_needed > SIZE_MAX ||
+         if (!have_state || !(restart_seen || restart_held) ||
+             bytes_needed > SIZE_MAX ||
              !memory->owned(memory->data, draw->index_buffer,
                             (size_t)bytes_needed))
             return fail_at(cursor, "indexed draw buffer is not owned");
@@ -1360,6 +1375,7 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
             return fail_at(cursor, "stream-link target is invalid or unowned");
          cursor = target;
          local.links++;
+         restart_held = false;
          break;
       }
 
@@ -1385,6 +1401,7 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
          local.primitive_mask |= UINT32_C(1) <<
                                  record.data.index_list_indirect_nonindexed.primitive;
          local.indirect_nonindexed = true;
+         restart_held = false;
          cursor += record.length;
          break;
       }
@@ -1407,6 +1424,7 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
          local.restart_enabled |= draw->restart_enable;
          local.restart_disabled |= !draw->restart_enable;
          local.indirect_indexed = true;
+         restart_held = false;
          cursor += record.length;
          break;
       }

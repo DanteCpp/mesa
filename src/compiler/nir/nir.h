@@ -3845,7 +3845,9 @@ typedef struct nir_loop_info {
    /* Estimated cost (in number of instructions) of the loop */
    unsigned instr_cost;
 
-   /* Contains fp64 ops that will be lowered */
+   /* Contains fp64 ops that will be lowered, or constant local initializers
+    * which can expose their inputs before software lowering.
+    */
    bool has_soft_fp64;
 
    /* Guessed trip count based on array indexing */
@@ -7191,6 +7193,10 @@ typedef struct nir_opt_peephole_select_options {
    unsigned limit; /* Set to max to flatten all control flow. */
    bool indirect_load_ok;
    bool expensive_alu_ok;
+   /* With expensive_alu_ok, flatten an if holding expensive ALU only up to
+    * this many instructions. Zero means no such limit.
+    */
+   unsigned expensive_limit;
    bool discard_ok;
 } nir_opt_peephole_select_options;
 
@@ -7678,6 +7684,11 @@ struct nir_calc_tensor_info {
    nir_tensor_clamp_mode clamp_mode;
    nir_if *clipped_if;
    nir_def *do_clamp;
+   /* Where the element must not be accessed, and a load's value there (NULL
+    * with the clamp mode undefined).
+    */
+   nir_def *skip;
+   nir_def *skip_value;
    nir_function *decode_fnptr;
 };
 
@@ -7686,6 +7697,8 @@ void nir_calc_tensor_derefs_init(nir_builder *b, struct nir_calc_tensor_info *in
 nir_def *nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
                                 nir_def *row, nir_def *col,
                                 nir_deref_instr **iter_deref_p);
+nir_def *nir_cap_tensor_index(nir_builder *b, nir_deref_instr *ptr,
+                              nir_def *idx, unsigned bytes, unsigned count);
 
 #include "nir_inline_helpers.h"
 

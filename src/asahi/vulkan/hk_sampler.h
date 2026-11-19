@@ -16,6 +16,10 @@
 
 #include "vk_format.h"
 
+/* LOD has six fractional bits, so one step moves x.5 to the upper level
+ * (hk_d3d_nearest_mip). */
+#define HK_D3D_NEAREST_MIP_BIAS (1.0f / 64.0f)
+
 struct hk_sampler {
    struct vk_sampler vk;
    VkClearColorValue custom_border;
@@ -41,3 +45,10 @@ struct hk_sampler {
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_sampler, vk.base, VkSampler,
                                VK_OBJECT_TYPE_SAMPLER)
+
+/* VK_EXT_descriptor_buffer capture/replay data of a sampler: each plane's
+ * sampler heap indices plus one, 0 for none. */
+struct hk_sampler_capture {
+   uint16_t hw[2];
+   uint16_t unbiased[2];
+};

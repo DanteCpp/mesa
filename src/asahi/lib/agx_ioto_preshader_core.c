@@ -43,6 +43,52 @@ agx_ioto_preshader_target_encoding(enum agx_chip chip)
    }
 }
 
+bool
+agx_ioto_preshader_program_size(uint32_t start, uint32_t end32,
+                                uint64_t alternate_end, size_t *size)
+{
+   if (!size)
+      return false;
+
+   uint64_t length;
+   if (end32 > start) {
+      length = (uint32_t)(end32 - start);
+   } else {
+      if (alternate_end < start)
+         return false;
+      length = alternate_end - start;
+   }
+
+   if (length > SIZE_MAX)
+      return false;
+
+   *size = (size_t)length;
+   return true;
+}
+
+bool
+agx_ioto_preshader_bind_range(const void *binary, size_t binary_size,
+                              uint64_t binary_va, size_t gpu_size,
+                              size_t offset, size_t size,
+                              struct agx_ioto_preshader_desc *desc)
+{
+   const uint64_t va_limit = UINT64_C(1) << 48;
+   if (!binary || !desc || !size || ((offset | size | binary_va) & 1) ||
+       offset > binary_size || size > binary_size - offset ||
+       offset > gpu_size || size > gpu_size - offset ||
+       binary_va >= va_limit || offset >= va_limit - binary_va)
+      return false;
+
+   const uint64_t address = binary_va + offset;
+   if (size > va_limit - address)
+      return false;
+
+   desc->code = (const uint8_t *)binary + offset;
+   desc->code_size = size;
+   desc->external_va = address;
+   return true;
+}
+
 static void
 agx_ioto_preshader_set_bit(uint8_t *bytes, unsigned bit, bool value)
 {
@@ -258,12 +304,10 @@ agx_ioto_constant_program_emit(
 
    if (staged.mode == AGX_IOTO_PRESHADER_MODE_EXTERNAL &&
        program->absolute_branch) {
-      /* Current G17P finish() places absolute code_va at object bits 1..48
-       * and sets object bit 0. AGXIotoInstruction_B_0::emit deposits that
-       * selector at instruction bit 24 (f11); target bits occupy 25..71.
-       * cloneProgramInfo changes the code VA without subtracting a B PC.
-       * Witnesses: 0x218780f48/f4c, 0x218737b8c, 0x2188416d8/e0/e4 in
-       * AGXMetalG17P UUID 4A1B0ACE-B7E3-3B5B-A594-84289B937288. */
+      /* On G17P the absolute code_va sits at object bits 1..48 with object bit
+       * 0 set. The B instruction carries that selector at instruction bit 24
+       * (f11); target bits occupy 25..71. Relocating the program changes the
+       * code VA without subtracting a B PC. */
       if (!agx_chip_g17_m5(chip))
          staged.bytes[staged.branch_offset + 3] |= 1;
       else

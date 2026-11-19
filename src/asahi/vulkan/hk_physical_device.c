@@ -19,6 +19,9 @@
 #include "git_sha1.h"
 #include "hk_buffer.h"
 #include "hk_buffer_view.h"
+#include "hk_descriptor_set_layout.h"
+#include "hk_image_view.h"
+#include "hk_sampler.h"
 #include "hk_entrypoints.h"
 #include "hk_image.h"
 #include "hk_instance.h"
@@ -225,6 +228,9 @@ hk_get_device_extensions(const struct agx_device *dev,
       .KHR_zero_initialize_workgroup_memory = true,
       .EXT_4444_formats = true,
       .EXT_attachment_feedback_loop_layout = true,
+      /* Qualified on G17P; the draw-time selection is shared with M5. */
+      .EXT_attachment_feedback_loop_dynamic_state =
+         dev->chip == AGX_CHIP_G17P,
       .EXT_blend_operation_advanced = true,
       .EXT_border_color_swizzle = true,
       .EXT_buffer_device_address = true,
@@ -234,8 +240,12 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_custom_border_color = true,
       .EXT_debug_marker = true,
       .EXT_depth_bias_control = true,
-      .EXT_depth_clip_control = false,
+      /* Tested on G17P only. */
+      .EXT_depth_clip_control = dev->chip == AGX_CHIP_G17P,
       .EXT_depth_clip_enable = true,
+      /* Qualified on G17P only (the whole binding_model.descriptor_buffer
+       * group); other chips share the code but need their own run. */
+      .EXT_descriptor_buffer = dev->chip == AGX_CHIP_G17P,
       .EXT_descriptor_indexing = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = false,
@@ -245,6 +255,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_extended_dynamic_state2 = true,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
+      .EXT_external_memory_host = agx_has_userptr(dev),
+      .EXT_fragment_shader_interlock = agx_native_graphics(dev),
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -262,9 +274,14 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_load_store_op_none = true,
       .EXT_map_memory_placed = true,
       .EXT_memory_budget = native_agx3,
+      .EXT_memory_priority = agx_has_residency_control(dev),
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
+      /* Qualified on G17P and G17S; nested replay is shared code. */
+      .EXT_nested_command_buffer =
+         dev->chip == AGX_CHIP_G17P || dev->chip == AGX_CHIP_G17S,
       .EXT_non_seamless_cube_map = true,
+      .EXT_pageable_device_local_memory = agx_has_residency_control(dev),
       .EXT_pipeline_creation_cache_control = true,
       .EXT_pipeline_creation_feedback = true,
       .EXT_pipeline_protected_access = true,
@@ -336,11 +353,14 @@ hk_get_device_features(
       .tessellationShader = true,
 
       
-      .taskShader = dev->chip == AGX_CHIP_G17S &&
-                    supported_extensions->EXT_mesh_shader &&
-                    hk_m5_task_record(dev->params.features),
+      .taskShader = supported_extensions->EXT_mesh_shader &&
+                    (dev->chip == AGX_CHIP_G17P ||
+                     (dev->chip == AGX_CHIP_G17S &&
+                      hk_m5_task_record(dev->params.features))),
       .meshShader = supported_extensions->EXT_mesh_shader,
-      .multiviewMeshShader = false,
+      /* G17P replays a multiview mesh draw per view, as other draws. */
+      .multiviewMeshShader = dev->chip == AGX_CHIP_G17P &&
+                             supported_extensions->EXT_mesh_shader,
       .primitiveFragmentShadingRateMeshShader = false,
       .meshShaderQueries =
          !agx_chip_g17_m5(dev->chip) && supported_extensions->EXT_mesh_shader,
@@ -435,6 +455,17 @@ hk_get_device_features(
       .shaderBFloat16Type = supported_extensions->KHR_shader_bfloat16,
       .shaderBFloat16CooperativeMatrix = supported_extensions->KHR_shader_bfloat16,
       .shaderBFloat16DotProduct = false,
+
+      /* VK_NV_cooperative_matrix2: each feature is enabled where it is
+       * implemented. */
+      .cooperativeMatrixWorkgroupScope = false,
+      .cooperativeMatrixFlexibleDimensions = supported_extensions->NV_cooperative_matrix2,
+      .cooperativeMatrixReductionsNV = supported_extensions->NV_cooperative_matrix2,
+      .cooperativeMatrixConversionsNV = supported_extensions->NV_cooperative_matrix2,
+      .cooperativeMatrixPerElementOperationsNV = supported_extensions->NV_cooperative_matrix2,
+      .cooperativeMatrixTensorAddressing = supported_extensions->NV_cooperative_matrix2,
+      .cooperativeMatrixBlockLoads = supported_extensions->NV_cooperative_matrix2,
+
       .shaderInt8 = true,
       .descriptorIndexing = true,
       .shaderInputAttachmentArrayDynamicIndexing = true,
@@ -655,6 +686,10 @@ hk_get_device_features(
       /* VK_EXT_attachment_feedback_loop_layout */
       .attachmentFeedbackLoopLayout = true,
 
+      /* VK_EXT_attachment_feedback_loop_dynamic_state */
+      .attachmentFeedbackLoopDynamicState =
+         supported_extensions->EXT_attachment_feedback_loop_dynamic_state,
+
       /* VK_EXT_border_color_swizzle */
       .borderColorSwizzle = true,
       .borderColorSwizzleFromImage = false,
@@ -670,6 +705,16 @@ hk_get_device_features(
       .inheritedConditionalRendering =
          supported_extensions->EXT_conditional_rendering,
 
+      /* VK_EXT_fragment_shader_interlock */
+      .fragmentShaderSampleInterlock =
+         supported_extensions->EXT_fragment_shader_interlock,
+      /* Pixel ordering covers only the samples a fragment covers, so two
+       * pixel-rate fragments splitting one MSAA pixel overlap
+       * (fragment_shader_interlock.basic.*.pixel_*.4xaa.no_sample_shading).
+       */
+      .fragmentShaderPixelInterlock = false,
+      .fragmentShaderShadingRateInterlock = false,
+
       /* VK_EXT_custom_border_color */
       .customBorderColors = true,
       .customBorderColorWithoutFormat = true,
@@ -680,11 +725,22 @@ hk_get_device_features(
       .floatRepresentation = false,
       .depthBiasExact = true,
 
-      /* VK_EXT_depth_clip_control */
-      .depthClipControl = false,
+      /* VK_EXT_depth_clip_control, tested on G17P only */
+      .depthClipControl = dev->chip == AGX_CHIP_G17P,
 
       /* VK_EXT_depth_clip_enable */
       .depthClipEnable = true,
+
+      /* VK_EXT_descriptor_buffer. Descriptors never depend on the image
+       * layout, and push descriptors keep their own command-buffer storage.
+       */
+      .descriptorBuffer = supported_extensions->EXT_descriptor_buffer,
+      .descriptorBufferCaptureReplay =
+         supported_extensions->EXT_descriptor_buffer,
+      .descriptorBufferImageLayoutIgnored =
+         supported_extensions->EXT_descriptor_buffer,
+      .descriptorBufferPushDescriptors =
+         supported_extensions->EXT_descriptor_buffer,
 
       /* VK_EXT_dynamic_rendering_unused_attachments */
       .dynamicRenderingUnusedAttachments = true,
@@ -718,7 +774,8 @@ hk_get_device_features(
       .extendedDynamicState3ProvokingVertexMode = true,
       .extendedDynamicState3LineRasterizationMode = true,
       .extendedDynamicState3LineStippleEnable = false,
-      .extendedDynamicState3DepthClipNegativeOneToOne = false,
+      .extendedDynamicState3DepthClipNegativeOneToOne =
+         dev->chip == AGX_CHIP_G17P,
       .extendedDynamicState3ViewportWScalingEnable = false,
       .extendedDynamicState3ViewportSwizzle = false,
       .extendedDynamicState3CoverageToColorEnable = false,
@@ -756,6 +813,12 @@ hk_get_device_features(
       .memoryMapRangePlaced = false,
       .memoryUnmapReserve = true,
 
+      /* VK_EXT_memory_priority */
+      .memoryPriority = agx_has_residency_control(dev),
+
+      /* VK_EXT_pageable_device_local_memory */
+      .pageableDeviceLocalMemory = agx_has_residency_control(dev),
+
       /* VK_EXT_multi_draw */
       .multiDraw = true,
 
@@ -764,6 +827,16 @@ hk_get_device_features(
 
       /* VK_EXT_non_seamless_cube_map */
       .nonSeamlessCubeMap = true,
+
+      /* VK_EXT_nested_command_buffer: secondaries are recorded into the
+       * common command queue and replayed into the primary, so a nested
+       * vkCmdExecuteCommands is one more replayed command at any depth.
+       */
+      .nestedCommandBuffer = supported_extensions->EXT_nested_command_buffer,
+      .nestedCommandBufferRendering =
+         supported_extensions->EXT_nested_command_buffer,
+      .nestedCommandBufferSimultaneousUse =
+         supported_extensions->EXT_nested_command_buffer,
 
       /* VK_EXT_pipeline_protected_access */
       .pipelineProtectedAccess = true,
@@ -935,7 +1008,12 @@ hk_get_device_features(
       const bool sparse = dev->chip == AGX_CHIP_G17P;
       features->shaderResourceResidency = sparse;
       features->sparseBinding = sparse;
-      features->sparseResidencyAliased = false;
+      /* A memory range may back several sparse VAs, including several
+       * locations within one resource. The common binder preserves the BO
+       * offset for each mapping and its RO shadow; G17P's transactional
+       * VM_BIND path retains each mapping independently. Residency metadata
+       * is per resource VA, not per backing allocation. */
+      features->sparseResidencyAliased = sparse;
       features->sparseResidencyImage2D = sparse;
       /* The sparse binder and SSTT use the same slice layout for 3D images
        * as for 2D arrays. Report the nonstandard, one-slice block shape rather
@@ -959,10 +1037,11 @@ hk_get_device_features(
        * layer/viewport UVS scalar.  The public bit is backed by the exact
        * two-instance/two-layer image qualification. */
       features->shaderOutputLayer = true;
-      /* VK_KHR_shader_quad_control permits quad operations and derivatives
-       * inside divergent control flow.  The ordinary subgroup quad shuffles
-       * exposed below do not establish that stronger execution guarantee. */
-      features->shaderQuadControl = false;
+      /* G17P uses the common reconvergence and subgroup lowering with AGX3
+       * quad encodings. The execution modes also select helper-capable
+       * fragment entry and prevent merging triangles across derivative quads.
+       */
+      features->shaderQuadControl = dev->chip == AGX_CHIP_G17P;
 
       /* Qualified on A18 Pro only. */
       if (dev->chip == AGX_CHIP_G17P) {
@@ -973,7 +1052,7 @@ hk_get_device_features(
    }
 
    /* Compute derivatives are NIR quad-swap lowering plus explicit-gradient
-    * samples, both available on M5; quad control stays off as on G17P. */
+    * samples, both available on M5; quad control remains restricted to G17P. */
    if (agx_chip_g17_m5(dev->chip)) {
       features->computeDerivativeGroupQuads = true;
       features->computeDerivativeGroupLinear = true;
@@ -993,6 +1072,11 @@ hk_get_device_features(
       features->robustImageAccess2 = true;
    }
 }
+
+#define HK_RAY_TRACING_STAGES                                                 \
+   (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |         \
+    VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |       \
+    VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR)
 
 /* Stages a pipeline or shader object may contain on this device. Every
  * shader-stage mask reported in the properties must stay inside this set.
@@ -1018,6 +1102,11 @@ hk_supported_shader_stages(const struct vk_features *features)
    if (features->meshShader)
       stages |= VK_SHADER_STAGE_MESH_BIT_EXT;
 
+   /* Ray tracing stages are inlined into compute kernels, which run subgroup
+    * operations like any other compute code. */
+   if (features->rayTracingPipeline)
+      stages |= HK_RAY_TRACING_STAGES;
+
    return stages;
 }
 
@@ -1032,11 +1121,17 @@ hk_get_device_properties(const struct agx_device *dev,
    const bool texel_buffer_single_texel_alignment =
       hk_descriptor_generation_is_agx2(descriptor_generation) ||
       agx_chip_native_agx3(dev->chip);
+   /* G17P: what agx_nir_lower_gen1_mesh accepts and the CTS runs there
+    * (misc.maximize_invocations_256); no larger mesh workgroup was run. */
+   const uint32_t mesh_threads = dev->chip == AGX_CHIP_G17P ? 256 : 1024;
 
    /* Note: update nir_shader_compiler_options.max_samples when changing this. */
    const VkSampleCountFlagBits sample_counts =
-      VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT |
-      (agx_chip_g17_m5(dev->chip) ? VK_SAMPLE_COUNT_8_BIT : 0);
+      dev->chip == AGX_CHIP_G18G
+         ? VK_SAMPLE_COUNT_1_BIT
+         : (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+            VK_SAMPLE_COUNT_4_BIT |
+            (agx_chip_g17_m5(dev->chip) ? VK_SAMPLE_COUNT_8_BIT : 0));
 
    /* Integer colour attachments and sampled multisample images use the same
     * native tile store/reload and texel-fetch paths as other colour formats.
@@ -1071,6 +1166,8 @@ hk_get_device_properties(const struct agx_device *dev,
    *properties = (struct vk_properties){
       .cooperativeMatrixSupportedStages = features->cooperativeMatrix
          ? VK_SHADER_STAGE_COMPUTE_BIT : 0,
+      .cooperativeMatrixFlexibleDimensionsMaxDimension =
+         features->cooperativeMatrixFlexibleDimensions ? 256 : 0,
       .apiVersion = hk_get_vk_version(),
       .driverVersion = vk_get_driver_version(),
       .vendorID = instance->drirc.debug.force_vk_vendor ?: VK_VENDOR_ID_MESA,
@@ -1097,18 +1194,23 @@ hk_get_device_properties(const struct agx_device *dev,
                                (agx_chip_native_agx3(dev->chip) ? 15 : 0),
       .maxUniformBufferRange = 65536,
 
-      /* From a hardware perspective, storage buffers are lowered to global
-       * address arithmetic so there is no hard limit. However, making efficient
-       * use of the hardware addressing modes depends on no signed wrapping in
-       * any `amul` operations, which are themselves bounded by
-       * maxStorageBufferRange. Therefore, limit storage buffers to INT32_MAX
-       * bytes instead of UINT32_MAX. This is believed to be acceptable for
-       * Direct3D.
+      /* Storage buffers are lowered to global address arithmetic with a
+       * zero-extended 32-bit offset, so the whole 32-bit range works. Direct3D
+       * views reach just under 4 GiB.
+       *
+       * M5 and later fold constant index addends into a signed byte offset
+       * (agx_nir_lower_address() with byte_offsets), which sign-extends a
+       * scaled index and relies on every valid offset staying below 2^31.
+       * Keep them at INT32_MAX; G13/G14 and G17P take the full range.
        */
-      .maxStorageBufferRange = INT32_MAX,
+      .maxStorageBufferRange =
+         agx_chip_isa_encoding(dev->chip) == AGX_ISA_ENCODING_AGX2 ||
+               agx_chip_isa_encoding(dev->chip) == AGX_ISA_ENCODING_AGX3B
+            ? UINT32_MAX
+            : INT32_MAX,
       .maxPushConstantsSize = HK_MAX_PUSH_SIZE,
       .maxMemoryAllocationCount = 4096,
-      .maxSamplerAllocationCount = 4000,
+      .maxSamplerAllocationCount = 1 << 20,
       .bufferImageGranularity = 0x400,
       .sparseAddressSpaceSize = agx_chip_g17_m5(dev->chip)
                                    ? HK_M5_SPARSE_ADDR_SPACE_SIZE
@@ -1136,15 +1238,15 @@ hk_get_device_properties(const struct agx_device *dev,
       .minAccelerationStructureScratchOffsetAlignment = 128,
 
       /* VK_KHR_ray_tracing_pipeline.  shaderGroupHandleSize is fixed at 32 by
-       * the specification.  The base and handle alignments are the
-       * specification's minima -- nothing in the megakernel's SBT fetch
-       * requires more, because every record address arrives as a device
-       * address the shader adds a stride to.
+       * the specification.  The base alignment is the largest the
+       * specification allows. G17P's SBT fetch takes records at any byte
+       * address (hk_load_sbt_entry), so it reports a handle alignment of 1;
+       * other chips keep the largest allowed, 32.
        *
-       * Trace recursion is unrolled into the megakernel at compile time.
-       * G17P supports three levels until trace continuations can be shared.
-       * KHR requires at least one level; legacy generations retain their
-       * limit of three.
+       * Trace recursion is unrolled into the megakernel at compile time up
+       * to three levels. G17P runs deeper pipelines as continuations
+       * (hk_rt_cont_split) and reports the specification's maximum of 31;
+       * legacy generations retain their limit of three.
        *
        * maxRayDispatchInvocationCount is bounded by what one compute dispatch
        * can launch, since the launch is exactly a compute dispatch. */
@@ -1155,7 +1257,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .shaderGroupBaseAlignment = 64,
       .shaderGroupHandleCaptureReplaySize = sizeof(uint32_t),
       .maxRayDispatchInvocationCount = 1u << 30,
-      .shaderGroupHandleAlignment = 32,
+      .shaderGroupHandleAlignment = dev->chip == AGX_CHIP_G17P ? 1 : 32,
       .maxRayHitAttributeSize = HK_RAY_HIT_ATTRIBS_SIZE,
 
       .rayTracingInvocationReorderReorderingHint =
@@ -1213,8 +1315,8 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxTaskPayloadAndSharedMemorySize = 32768,
       .maxMeshWorkGroupTotalCount = 1u << 22,
       .maxMeshWorkGroupCount = {65535, 65535, 65535},
-      .maxMeshWorkGroupInvocations = 1024,
-      .maxMeshWorkGroupSize = {1024, 1024, 1024},
+      .maxMeshWorkGroupInvocations = mesh_threads,
+      .maxMeshWorkGroupSize = {mesh_threads, mesh_threads, mesh_threads},
       .maxMeshSharedMemorySize = 28672,
       .maxMeshPayloadAndSharedMemorySize = 28672 + 16384,
       .maxMeshOutputMemorySize = 32768,
@@ -1223,7 +1325,11 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxMeshOutputVertices = 256,
       .maxMeshOutputPrimitives = 256,
       .maxMeshOutputLayers = 8,
-      .maxMeshMultiviewViewCount = 1,
+      /* A multiview mesh draw replays once per view (hk_foreach_view), which
+       * works up to HK_MAX_MULTIVIEW_VIEW_COUNT. Temporarily 16: CTS
+       * mesh_shader.ext.properties.max_view_index builds its view mask as
+       * (1u << count) - 1, undefined at 32. Raise it once the CTS is fixed. */
+      .maxMeshMultiviewViewCount = features->multiviewMeshShader ? 16 : 1,
       .meshOutputPerVertexGranularity = 32,
       .meshOutputPerPrimitiveGranularity = 32,
       .maxPreferredTaskWorkGroupInvocations = 32,
@@ -1324,7 +1430,8 @@ hk_get_device_properties(const struct agx_device *dev,
          VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
          VK_SUBGROUP_FEATURE_ROTATE_CLUSTERED_BIT_KHR,
       .subgroupQuadOperationsInAllStages = true,
-      .meshAndTaskShaderDerivatives = false,
+      .meshAndTaskShaderDerivatives =
+         dev->chip == AGX_CHIP_G17P && features->meshShader,
       .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_USER_CLIP_PLANES_ONLY,
       .maxMultiviewViewCount = HK_MAX_MULTIVIEW_VIEW_COUNT,
       .maxMultiviewInstanceIndex = UINT32_MAX,
@@ -1354,7 +1461,8 @@ hk_get_device_properties(const struct agx_device *dev,
       .shaderSignedZeroInfNanPreserveFloat32 = true,
       .shaderSignedZeroInfNanPreserveFloat64 = false,
       .shaderDenormPreserveFloat16 = true,
-      .shaderDenormPreserveFloat32 = false,
+      /* agx_nir_lower_denorm_preserve() computes flushed cases exactly. */
+      .shaderDenormPreserveFloat32 = dev->chip == AGX_CHIP_G17P,
       .shaderDenormPreserveFloat64 = false,
       .shaderDenormFlushToZeroFloat16 = false,
       .shaderDenormFlushToZeroFloat32 = true,
@@ -1408,7 +1516,15 @@ hk_get_device_properties(const struct agx_device *dev,
       .minSubgroupSize = 32,
       .maxSubgroupSize = 32,
       .maxComputeWorkgroupSubgroups = 1024 / 32,
-      .requiredSubgroupSizeStages = 0,
+      /* The only subgroup size is 32, so requiring it is always satisfied,
+       * also in ray tracing stages, which are inlined into compute kernels,
+       * and in G17P task (compute) and mesh stages. */
+      .requiredSubgroupSizeStages =
+         VK_SHADER_STAGE_COMPUTE_BIT |
+         (features->rayTracingPipeline ? HK_RAY_TRACING_STAGES : 0) |
+         (dev->chip == AGX_CHIP_G17P && features->meshShader
+             ? VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT
+             : 0),
       .maxInlineUniformBlockSize = HK_MAX_INLINE_UNIFORM_BLOCK_SIZE,
       .maxPerStageDescriptorInlineUniformBlocks = 32,
       .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 32,
@@ -1434,7 +1550,70 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxPushDescriptors = HK_MAX_PUSH_DESCRIPTORS,
 
       /* VK_EXT_custom_border_color */
-      .maxCustomBorderColorSamplers = 4000,
+      .maxCustomBorderColorSamplers = 1 << 20,
+
+      /* VK_EXT_descriptor_buffer. A descriptor-buffer set is the same memory
+       * a descriptor pool hands out, so every size is the binding stride of
+       * that type, and set offsets keep the 64-byte inline-uniform and
+       * 32-byte storage PBE record alignment pool sets have. Push descriptors
+       * keep their own command-buffer storage; the push buffer the
+       * application then binds is never read. Embedded samplers and samplers
+       * share the device sampler heap.
+       */
+      .combinedImageSamplerDescriptorSingleArray = true,
+      .bufferlessPushDescriptors = false,
+      .allowSamplerImageViewPostSubmitCreation = false,
+      .descriptorBufferOffsetAlignment = HK_MIN_UBO_ALIGNMENT,
+      .maxDescriptorBufferBindings = HK_MAX_DESCRIPTOR_BUFFERS,
+      .maxResourceDescriptorBufferBindings = HK_MAX_DESCRIPTOR_BUFFERS,
+      .maxSamplerDescriptorBufferBindings = HK_MAX_DESCRIPTOR_BUFFERS,
+      .maxEmbeddedImmutableSamplerBindings = HK_MAX_DESCRIPTOR_BUFFERS,
+      .maxEmbeddedImmutableSamplers = 2032,
+      /* Capture/replay: memory, buffers and images keep their addresses, an
+       * image view its heap textures and a sampler its heap samplers. An
+       * acceleration structure descriptor is its buffer's address. */
+      .bufferCaptureReplayDescriptorDataSize =
+         sizeof(struct hk_buffer_capture),
+      .imageCaptureReplayDescriptorDataSize = sizeof(struct hk_image_capture),
+      .imageViewCaptureReplayDescriptorDataSize =
+         sizeof(struct hk_image_view_capture),
+      .samplerCaptureReplayDescriptorDataSize =
+         sizeof(struct hk_sampler_capture),
+      .accelerationStructureCaptureReplayDescriptorDataSize = 0,
+      .EDBsamplerDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_SAMPLER),
+      .combinedImageSamplerDescriptorSize = hk_descriptor_buffer_size(
+         dev, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+      .sampledImageDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
+      .storageImageDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
+      .uniformTexelBufferDescriptorSize = hk_descriptor_buffer_size(
+         dev, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER),
+      .robustUniformTexelBufferDescriptorSize = hk_descriptor_buffer_size(
+         dev, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER),
+      .storageTexelBufferDescriptorSize = hk_descriptor_buffer_size(
+         dev, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER),
+      .robustStorageTexelBufferDescriptorSize = hk_descriptor_buffer_size(
+         dev, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER),
+      .uniformBufferDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER),
+      .robustUniformBufferDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER),
+      .storageBufferDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+      .robustStorageBufferDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+      .inputAttachmentDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT),
+      .accelerationStructureDescriptorSize = hk_descriptor_buffer_size(
+         dev, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR),
+      .maxSamplerDescriptorBufferRange = HK_MAX_DESCRIPTOR_SET_SIZE,
+      .maxResourceDescriptorBufferRange = HK_MAX_DESCRIPTOR_SET_SIZE,
+      /* Descriptor buffers may live anywhere in the application's VA. */
+      .samplerDescriptorBufferAddressSpaceSize = dev->main_heap_size,
+      .resourceDescriptorBufferAddressSpaceSize = dev->main_heap_size,
+      .descriptorBufferAddressSpaceSize = dev->main_heap_size,
 
       /* VK_EXT_extended_dynamic_state3 */
       .dynamicPrimitiveTopologyUnrestricted = true,
@@ -1488,8 +1667,15 @@ hk_get_device_properties(const struct agx_device *dev,
       /* VK_EXT_map_memory_placed */
       .minPlacedMemoryMapAlignment = os_page_size,
 
+      /* VK_EXT_external_memory_host: whole pages of both the CPU and the
+       * GPU, which binds in 16 KiB pages. */
+      .minImportedHostPointerAlignment = MAX2(os_page_size, 16384),
+
       /* VK_EXT_multi_draw */
       .maxMultiDrawCount = UINT16_MAX,
+
+      /* VK_EXT_nested_command_buffer */
+      .maxCommandBufferNestingLevel = UINT32_MAX,
 
       /* VK_KHR_pipeline_binary
        *
@@ -1557,6 +1743,28 @@ hk_get_device_properties(const struct agx_device *dev,
       .advancedBlendAllOperations = true,
    };
 
+   /* Strict residency on M5 relies on soft faults; see
+    * hk_sparse_buffer_unmapped(). */
+   if (agx_chip_g17_m5(dev->chip))
+      properties->sparseResidencyNonResidentStrict = agx_has_soft_fault(dev);
+
+   /* G17P maps unbound pages to a zeroed fill page, so they read zero, but
+    * the page is writable: a store or copy into an unbound page is read back
+    * afterwards, which strict residency forbids. Report it only where the
+    * driconf asks (vkd3d-proton, for tiled resources tier 2). */
+   if (dev->chip == AGX_CHIP_G17P)
+      properties->sparseResidencyNonResidentStrict =
+         instance->drirc.misc.sparse_strict_residency;
+
+   /* G13 and G14 back the writable alias of an unbound page with the shared
+    * fill page, as G17P does: a store or copy into an unbound page is read
+    * back afterwards, and through the writable alias any unbound page returns
+    * what another one received.  Same rule as G17P. */
+   if (dev->chip == AGX_CHIP_G13G || dev->chip == AGX_CHIP_G13X ||
+       dev->chip == AGX_CHIP_G14G || dev->chip == AGX_CHIP_G14X)
+      properties->sparseResidencyNonResidentStrict =
+         instance->drirc.misc.sparse_strict_residency;
+
    if (agx_chip_native_agx3(dev->chip)) {
       /* Measured per operation under the G17P drm-shim:
        *
@@ -1570,11 +1778,11 @@ hk_get_device_properties(const struct agx_device *dev,
        *   QUAD              g08_subgroup_quad           encodes
        *   ROTATE/CLUSTERED  g24_subgroup_rotate         encodes
        *
-       * Quad broadcasts and swaps are now grounded for the compute and
-       * fragment stages.  Keep subgroupQuadOperationsInAllStages false until
-       * every other advertised graphics stage is independently witnessed. */
-      properties->subgroupQuadOperationsInAllStages = false;
-      properties->sparseResidencyNonResidentStrict = false;
+       * G17P uses the same lane instructions in native vertex/fragment
+       * programs and the compute programs implementing tessellation and
+       * geometry. Other AGX3 targets retain their stage restriction. */
+      properties->subgroupQuadOperationsInAllStages =
+         dev->chip == AGX_CHIP_G17P;
    }
 
    snprintf(properties->deviceName, sizeof(properties->deviceName), "%s",
@@ -1661,13 +1869,13 @@ hk_env_cmp(const void *a, const void *b)
    return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-static uint64_t
+uint64_t
 hk_codegen_env_hash(void)
 {
    static const char *const runtime_only[] = {
       "TRACE", "DUMP", "_LOG", "PERF", "VERBOSE", "DEBUG_OBJECT", "SLOW_DRAW",
       "DISK_CACHE_ID", "LAZY_GENERIC", "FORCE_GENERIC", "BIND_PREDICT",
-      "VARIANT_TRACE", "SLOW_SUBMIT", "PROLOG_DISK_CACHE",
+      "VARIANT_TRACE", "SLOW_SUBMIT", "PROLOG_DISK_CACHE", "FRAME_ANATOMY",
    };
    const char *list[512];
    unsigned n = 0;
@@ -1683,7 +1891,13 @@ hk_codegen_env_hash(void)
          for (size_t o = 0; o + l <= name_len && !skip; ++o)
             skip = !strncmp(*e + o, runtime_only[i], l);
       }
-      if (!skip)
+      /* HK_PERFTEST includes code-generation choices such as noborder.
+       * HK_FRAME_ANATOMY_DUMP writes NIR only for shaders it compiles, so a
+       * warm cache would leave the dump empty. */
+      if (!skip || (name_len == strlen("HK_PERFTEST") &&
+                    !strncmp(*e, "HK_PERFTEST", name_len)) ||
+          (name_len == strlen("HK_FRAME_ANATOMY_DUMP") &&
+           !strncmp(*e, "HK_FRAME_ANATOMY_DUMP", name_len)))
          list[n++] = *e;
    }
    qsort(list, n, sizeof(list[0]), hk_env_cmp);
@@ -1927,7 +2141,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       goto fail_fd;
    }
 
-   bool is_asahi = (strcmp(version->name, "asahi") == 0);
+   bool is_asahi = agx_is_native_drm_driver(version->name);
    is_asahi |= strcmp(version->name, "virtio_gpu") == 0;
    drmFreeVersion(version);
 
@@ -1990,31 +2204,35 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.KHR_ray_tracing_position_fetch = true;
    }
 
-   /* Explicit bring-up profile; query/pipeline features remain disabled until
-    * their complete runtime contract is available. */
-   if (agx_chip_g17_m5(pdev->dev.chip) &&
-       debug_get_bool_option("ASAHI_M5_NATIVE_AS", false)) {
+   /* The native M5 builder is available by default. Traversal is not
+    * implemented for this format, so ray queries and ray pipelines stay off. */
+   if (agx_chip_g17_m5(pdev->dev.chip)) {
       supported_extensions.KHR_acceleration_structure = true;
       supported_extensions.KHR_deferred_host_operations = true;
-      supported_extensions.KHR_ray_query = hk_m5_rq_assets_available();
-      /* Explicit pipeline qualification profile; the default remains gated. */
-      bool native_rt = supported_extensions.KHR_ray_query &&
-         debug_get_bool_option("ASAHI_M5_NATIVE_RT", false);
-      supported_extensions.KHR_ray_tracing_pipeline = native_rt;
-      supported_extensions.KHR_ray_tracing_maintenance1 = native_rt;
-      supported_extensions.KHR_pipeline_library = native_rt;
    }
+   /* The implemented cooperative-matrix paths are selected by ISA, without
+    * a process-wide feature opt-in. */
+   const bool m5_cmat = agx_chip_g17_m5(pdev->dev.chip);
    supported_extensions.KHR_cooperative_matrix =
-      agx_chip_g17_m5(pdev->dev.chip) &&
-      debug_get_bool_option("ASAHI_M5_COOPERATIVE_MATRIX", true);
+      agx_chip_cooperative_matrix_supported(pdev->dev.chip);
 
+   /* bf16 inputs ride the same 8x8 matmad form on AGX3B: a bf16 value
+    * widens to f32 exactly, so a bf16 product accumulated in f32 matches an
+    * f32 matmad of the same values bit for bit. bf16 therefore follows the
+    * cooperative matrix paths on both encodings. */
    supported_extensions.KHR_shader_bfloat16 =
-      supported_extensions.KHR_cooperative_matrix &&
-      debug_get_bool_option("ASAHI_M5_BFLOAT16", true);
+      agx_chip_cooperative_matrix_supported(pdev->dev.chip);
 
-   /* Hardware-qualified on M5 only. */
+   /* Most of VK_NV_cooperative_matrix2 (flexible dimensions, tensor
+    * addressing, block loads, per-element operations, reductions) is lowered
+    * for the M5 only, so an AGX3B part that enables the 8x8
+    * VK_KHR_cooperative_matrix does not advertise it. */
+   supported_extensions.NV_cooperative_matrix2 = m5_cmat;
+
+   /* Counted by the pre-graphics helpers, which every native chip runs;
+    * hardware-qualified on M5 and G17P. */
    supported_extensions.EXT_primitives_generated_query =
-      agx_chip_g17_m5(pdev->dev.chip);
+      agx_chip_g17_m5(pdev->dev.chip) || pdev->dev.chip == AGX_CHIP_G17P;
 
    supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
       hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE &&
@@ -2025,9 +2243,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       agx_chip_sampler_generation(pdev->dev.chip) == AGX_SAMPLER_GENERATION_GEN5;
 
    if (agx_native_graphics(&pdev->dev)) {
-      /* This extension controls divergent quad derivatives, not the standard
-       * subgroup quad shuffle operations exposed above. */
-      supported_extensions.KHR_shader_quad_control = false;
+      supported_extensions.KHR_shader_quad_control =
+         pdev->dev.chip == AGX_CHIP_G17P;
    }
 
    /* VK_KHR_shader_fma makes shaderFmaFloat32 mandatory. */
@@ -2056,8 +2273,9 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    }
 
    struct vk_features supported_features;
+   /* G17P runs mesh shaders natively and task shaders in software. */
    if (pdev->dev.chip == AGX_CHIP_G17P)
-      supported_extensions.EXT_mesh_shader = hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE;
+      supported_extensions.EXT_mesh_shader = true;
    hk_get_device_features(&pdev->dev, instance, &supported_extensions,
                           &supported_features);
 
@@ -2370,7 +2588,6 @@ static const VkQueueGlobalPriorityKHR hk_global_queue_priorities[] = {
    VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR,
    VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR,
    VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR,
-   VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR,
 };
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2398,9 +2615,11 @@ hk_GetPhysicalDeviceQueueFamilyProperties2(
          if (prio) {
             STATIC_ASSERT(ARRAY_SIZE(hk_global_queue_priorities) <=
                           VK_MAX_GLOBAL_PRIORITY_SIZE_KHR);
-            prio->priorityCount = ARRAY_SIZE(hk_global_queue_priorities);
+            /* The native kernel reserves REALTIME and only accepts HIGH on
+             * M5. Report the same classes that queue creation can admit. */
+            prio->priorityCount = agx_chip_g17_m5(pdev->dev.chip) ? 3 : 2;
             memcpy(&prio->priorities, hk_global_queue_priorities,
-                   sizeof(hk_global_queue_priorities));
+                   prio->priorityCount * sizeof(hk_global_queue_priorities[0]));
          }
       }
    }
@@ -2447,7 +2666,12 @@ hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
             .scope = VK_SCOPE_SUBGROUP_KHR,
          };
       }
-      unsigned max_size = (pdev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX) ? 16 : 8;
+      /* The 16x16 GEMM form that the kernel COMPUTE_MATRIX feature unlocks is
+       * AGX3C (M5) only; AGX3B offers just the 8x8 matmad, so cap it at 8 even
+       * if a kernel were to report the feature there. */
+      unsigned max_size =
+         ((pdev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX) &&
+          agx_chip_isa_encoding(pdev->dev.chip) == AGX_ISA_ENCODING_AGX3C) ? 16 : 8;
       for (unsigned size = max_size; size >= 8; size /= 2) {
          const VkComponentTypeKHR types[] = {VK_COMPONENT_TYPE_FLOAT16_KHR,
             VK_COMPONENT_TYPE_BFLOAT16_KHR};
@@ -2486,6 +2710,50 @@ hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
                }
             }
          }
+      }
+   }
+   return vk_outarray_status(&out);
+}
+
+/* The 16x16x16 configurations, at subgroup scope, in multiples of 16 in
+ * each dimension: the compiler splits such a matrix into 16x16 pieces.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
+   VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount,
+   VkCooperativeMatrixFlexibleDimensionsPropertiesNV *pProperties)
+{
+   VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
+   VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixFlexibleDimensionsPropertiesNV,
+                          out, pProperties, pPropertyCount);
+   if (!pdev->vk.supported_features.cooperativeMatrixFlexibleDimensions ||
+       !(pdev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX))
+      return vk_outarray_status(&out);
+
+   const bool bf16 = pdev->vk.supported_features.shaderBFloat16CooperativeMatrix;
+   const struct {
+      VkComponentTypeKHR a, b, c;
+   } configs[] = {
+      {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
+      {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
+      {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR},
+      {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
+      {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(configs); ++i) {
+      if (!bf16 && (configs[i].a == VK_COMPONENT_TYPE_BFLOAT16_KHR ||
+                    configs[i].b == VK_COMPONENT_TYPE_BFLOAT16_KHR))
+         continue;
+      vk_outarray_append_typed(VkCooperativeMatrixFlexibleDimensionsPropertiesNV, &out, p) {
+         *p = (VkCooperativeMatrixFlexibleDimensionsPropertiesNV) {
+            .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_FLEXIBLE_DIMENSIONS_PROPERTIES_NV,
+            .MGranularity = 16, .NGranularity = 16, .KGranularity = 16,
+            .AType = configs[i].a, .BType = configs[i].b,
+            .CType = configs[i].c, .ResultType = configs[i].c,
+            .saturatingAccumulation = VK_FALSE,
+            .scope = VK_SCOPE_SUBGROUP_KHR,
+            .workgroupInvocations = 0,
+         };
       }
    }
    return vk_outarray_status(&out);

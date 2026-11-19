@@ -130,6 +130,36 @@ TEST_F(Optimizer, G17PPreservesHalfNotAfterBitwise)
    }
 }
 
+/* AGX3 FMA has no form with two immediate multiplicands: the first constant
+ * folds as the minifloat multiplier, the second stays in its register. */
+TEST_F(Optimizer, AGX3FmaInlinesOneConstantMultiplicand)
+{
+   for (enum agx_isa_encoding encoding :
+        {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      agx_builder *actual = agx_test_builder(mem_ctx);
+      agx_builder *expected = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = encoding;
+      actual->shader->key = &key;
+      expected->shader->key = &key;
+
+      agx_index one = agx_mov_imm(actual, 16, 0x3c00);
+      agx_index two = agx_mov_imm(actual, 16, 0x4000);
+      agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+      agx_ffma_to(actual, out, one, two, wx);
+      agx_unit_test(actual, out);
+
+      agx_temp(expected->shader, AGX_SIZE_16); /* the dead mov of 1.0 */
+      two = agx_mov_imm(expected, 16, 0x4000);
+      out = agx_temp(expected->shader, AGX_SIZE_32);
+      agx_ffma_to(expected, out, agx_immediate_f(1.0f), two, wx);
+      agx_unit_test(expected, out);
+
+      agx_optimize_and_dce(actual->shader);
+      ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+   }
+}
+
 TEST_F(Optimizer, G17PPreservesNarrowingAfterAdd)
 {
    agx_builder *actual = agx_test_builder(mem_ctx);
@@ -202,6 +232,70 @@ TEST_F(Optimizer, G17PPreservesHalfWidenBeforeFltnorm)
 
    agx_optimize_and_dce(actual->shader);
    ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+TEST_F(Optimizer, G18GPreservesEpilogConversions)
+{
+   /* A G18G mediump fragment epilog widens half exports, blends in f32, then
+    * packs normalized color. All three boundaries must keep their widths. */
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.emit_agx3d = true;
+   for (agx_builder *b : {actual, expected}) {
+      b->shader->key = &key;
+      agx_index wide = agx_temp(b->shader, AGX_SIZE_32);
+      agx_fmov_to(b, wide, hx);
+      agx_index sum = agx_fadd(b, wide, wy);
+      agx_index narrow = agx_temp(b->shader, AGX_SIZE_16);
+      agx_fmov_to(b, narrow, sum);
+      agx_unit_test(b, narrow);
+      agx_index packed = agx_temp(b->shader, AGX_SIZE_16);
+      agx_fltnorm_agx3_to(b, packed, wide, sum, AGX_FORMAT_U8NORM);
+      agx_unit_test(b, packed);
+   }
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+/*
+ * The projective multiply and reciprocal only have a plain 32-bit destination
+ * and no saturating form. A mediump perspective varying narrows the product to
+ * 16 bits and clamp() saturates it; both moves have to stay separate on every
+ * AGX3 encoding (G17S refused `persp_mul_agx3 d16, r32, r32`).
+ */
+TEST_F(Optimizer, AGX3KeepsMovesAfterProjectiveMultiply)
+{
+   const struct {
+      enum agx_isa_encoding encoding;
+      bool emit_agx3d;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, false},
+      {AGX_ISA_ENCODING_AGX3C, false},
+      {AGX_ISA_ENCODING_AGX3C, true},
+   };
+
+   for (const auto &target : targets) {
+      for (bool saturate : {false, true}) {
+         agx_builder *actual = agx_test_builder(mem_ctx);
+         agx_builder *expected = agx_test_builder(mem_ctx);
+         struct agx_shader_key key = {};
+         key.dev.encoding = target.encoding;
+         key.dev.emit_agx3d = target.emit_agx3d;
+         for (agx_builder *b : {actual, expected}) {
+            b->shader->key = &key;
+            agx_index rcp = agx_persp_rcp_agx3(b, wx, 3);
+            agx_index product = agx_persp_mul_agx3(b, wy, rcp, 4);
+            agx_index out =
+               agx_temp(b->shader, saturate ? AGX_SIZE_32 : AGX_SIZE_16);
+            agx_fmov_to(b, out, product)->saturate = saturate;
+            agx_unit_test(b, out);
+         }
+         agx_optimize_and_dce(actual->shader);
+         ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+      }
+   }
 }
 
 /*
@@ -743,6 +837,34 @@ TEST_F(Optimizer, AddSourceSignExtend)
       agx_iadd_to(b, out, wx, hy, 1));
 }
 
+TEST_F(Optimizer, ProductSourceSignExtend)
+{
+   /* A signed 64-bit product extends the half itself. */
+   CASE64(
+      {
+         agx_index t = agx_temp(b->shader, AGX_SIZE_32);
+         agx_signext_to(b, t, hy);
+         agx_imad_to(b, out, t, wx, agx_zero(), 0);
+      },
+      agx_imad_to(b, out, hy, wx, agx_zero(), 0));
+
+   /* An unsigned one zero-extends its sources (abs), so the sign-extended
+    * word stays: the half in its place would lose bits 16..31. */
+   NEGCASE(
+      {
+         agx_index t = agx_temp(b->shader, AGX_SIZE_32);
+         agx_signext_to(b, t, hy);
+         agx_imad_to(b, out, agx_abs(t), agx_abs(wx), agx_zero(), 0);
+      },
+      64);
+
+   NEGCASE32({
+      agx_index t = agx_temp(b->shader, AGX_SIZE_32);
+      agx_signext_to(b, t, hy);
+      agx_iadd_to(b, out, wx, agx_abs(t), 0);
+   });
+}
+
 TEST_F(Optimizer, SubInlineImmediate)
 {
    CASE16(agx_iadd_to(b, out, hx, agx_mov_imm(b, 16, -2), 0),
@@ -879,6 +1001,61 @@ TEST_F(Optimizer, G17PBallotOfTwoRegistersKeepsTheComparison)
    ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
 }
 
+/* Astro Bot's mesh shader: ballot(x < 6), signed. AGX3B has no immediate
+ * ballot form for a signed comparison against a nonzero constant. */
+TEST_F(Optimizer, G17PBallotOfSignedCompareWithConstantKeepsTheComparison)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_ballot_to(actual, out,
+                 agx_icmp(actual, wx, agx_immediate(6), AGX_ICOND_SLT, false));
+   agx_unit_test(actual, out);
+
+   out = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_temp(expected->shader, AGX_SIZE_16);
+   agx_index opposite = agx_temp(expected->shader, AGX_SIZE_16);
+   agx_icmp_to(expected, opposite, wx, agx_immediate(6), AGX_ICOND_SLT, true);
+   agx_icmp_ballot_to(expected, out, opposite, agx_zero(), AGX_ICOND_UEQ,
+                      false);
+   agx_unit_test(expected, out);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+/* Astro Bot's fragment preambles: ballot(x != 0) of a 16-bit x. A 16-bit
+ * ballot source has only the equal-to-zero form on AGX3B. */
+TEST_F(Optimizer, G17PBallotOfHalfNotZeroKeepsTheComparison)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_ballot_to(actual, out, agx_icmp(actual, hx, agx_zero(), AGX_ICOND_UEQ, true));
+   agx_unit_test(actual, out);
+
+   out = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_temp(expected->shader, AGX_SIZE_16);
+   agx_index opposite = agx_temp(expected->shader, AGX_SIZE_16);
+   agx_icmp_to(expected, opposite, hx, agx_zero(), AGX_ICOND_UEQ, false);
+   agx_icmp_ballot_to(expected, out, opposite, agx_zero(), AGX_ICOND_UEQ,
+                      false);
+   agx_unit_test(expected, out);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
 TEST_F(Optimizer, G17PBallotOfHalfPredicateWidens)
 {
    agx_builder *actual = agx_test_builder(mem_ctx);
@@ -899,6 +1076,31 @@ TEST_F(Optimizer, G17PBallotOfHalfPredicateWidens)
    agx_get_sr_coverage_to(expected, active, AGX_SR_IS_ACTIVE_THREAD);
    agx_index wide = agx_temp(expected->shader, AGX_SIZE_32);
    agx_mov_to(expected, wide, active);
+   agx_ballot_to(expected, out, wide);
+   agx_unit_test(expected, out);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+/* Astro Bot's fragment shaders with a constant program: ballot of a 16-bit
+ * value the preamble computed, so a uniform by the time the optimizer runs. */
+TEST_F(Optimizer, G17PBallotOfHalfUniformWidens)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_ballot_to(actual, out, agx_uniform(6, AGX_SIZE_16));
+   agx_unit_test(actual, out);
+
+   out = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_index wide = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_mov_to(expected, wide, agx_uniform(6, AGX_SIZE_16));
    agx_ballot_to(expected, out, wide);
    agx_unit_test(expected, out);
 

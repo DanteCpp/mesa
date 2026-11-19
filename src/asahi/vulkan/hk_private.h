@@ -20,7 +20,7 @@
 #define HK_MAX_PUSH_SIZE                 256
 #define HK_MAX_DYNAMIC_BUFFERS           64
 #define HK_MAX_RTS                       8
-#define HK_MIN_SSBO_ALIGNMENT            16
+#define HK_MIN_SSBO_ALIGNMENT            4
 #define HK_MIN_TEXEL_BUFFER_ALIGNMENT    16
 #define HK_MIN_UBO_ALIGNMENT             64
 #define HK_MAX_VIEWPORTS                 16
@@ -30,12 +30,17 @@
  */
 #define HK_MAX_DESCRIPTOR_SIZE           96
 #define HK_MAX_PUSH_DESCRIPTORS          32
+#define HK_MAX_DESCRIPTOR_BUFFERS        32
 #define HK_MAX_DESCRIPTOR_SET_SIZE       (1u << 30)
 #define HK_MAX_INLINE_UNIFORM_BLOCK_SIZE (1u << 16)
 #define HK_MAX_DESCRIPTORS               (1 << 20)
 #define HK_PUSH_DESCRIPTOR_SET_SIZE                                            \
    (HK_MAX_PUSH_DESCRIPTORS * HK_MAX_DESCRIPTOR_SIZE)
-#define HK_SSBO_BOUNDS_CHECK_ALIGNMENT 4
+/* Storage buffer descriptors hold the exact byte range and every bounds check
+ * (explicit I/O lowering, check_in_bounds) tests offset + size - 1 < range,
+ * so ranges are not rounded up for robustBufferAccess2.
+ */
+#define HK_SSBO_BOUNDS_CHECK_ALIGNMENT 1
 #define HK_MAX_MULTIVIEW_VIEW_COUNT    32
 
 #define HK_SPARSE_ADDR_SPACE_SIZE (1ull << 39)
@@ -50,6 +55,15 @@
 #define HK_M5_SPARSE_ADDR_SPACE_SIZE (1ull << 34)
 #define HK_MAX_BUFFER_SIZE        (1ull << 37)
 #define HK_MAX_SHARED_SIZE        (32 * 1024)
+
+/* Device slabs of command memory, one kind per BO placement. */
+enum hk_cmd_slab_class {
+   HK_CMD_SLAB_VDM,
+   HK_CMD_SLAB_MAIN,
+   HK_CMD_SLAB_USC,
+   HK_CMD_SLAB_IOTO,
+   HK_CMD_SLAB_COUNT,
+};
 
 struct hk_addr_range {
    uint64_t addr;
@@ -82,8 +96,7 @@ hk_g17p_rt_enabled(const struct agx_device *dev)
 {
    return dev->chip == AGX_CHIP_G17P &&
           (dev->params.features & HK_G17P_RT_KERNEL_FEATURES) ==
-             HK_G17P_RT_KERNEL_FEATURES &&
-          !debug_get_bool_option("ASAHI_G17P_RT_DISABLE", false);
+             HK_G17P_RT_KERNEL_FEATURES;
 }
 
 /* T6040's 25G83 firmware does not yet admit intersection/SCS commands. AS
@@ -98,8 +111,7 @@ hk_g16s_as_enabled(const struct agx_device *dev)
    const uint64_t required = DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS |
                              DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD;
    return agx_is_m4_pro(dev) &&
-          (dev->params.features & required) == required &&
-          !debug_get_bool_option("ASAHI_G17P_RT_DISABLE", false);
+          (dev->params.features & required) == required;
 }
 
 static inline bool

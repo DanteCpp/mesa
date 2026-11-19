@@ -106,7 +106,10 @@ struct hk_shader_info {
           * or writes the sample mask. */
          bool may_kill;
          bool m5_inline_sample_shading;
-         uint8_t _pad[2];
+         /* G17P: the main part applies alpha-to-coverage in the coverage
+          * update that tests (agx_fs_epilog_key::a2c_in_main). */
+         bool a2c_in_main;
+         uint8_t _pad[1];
       } fs;
 
       struct {
@@ -166,12 +169,19 @@ struct hk_shader_info {
    unsigned agx3_root_uniform;
    bool agx3_txf_texture_valid;
    bool agx3_storage_image_valid;
+   /* G18G compute: image access left on the AGX2 bindless form, which
+    * silently did nothing on G18G when tested. Refused at dispatch. */
+   bool g18_unlowered_image;
    bool agx3_sampled_storage_valid;
    bool agx3_indexed_sampler_valid;
    bool agx3_indexed_storage_valid;
    struct agx_g17p_combined_sampler_binding agx3_combined_sampler;
    struct agx_g17p_txf_binding agx3_txf_texture;
    struct agx_g17p_storage_image_binding agx3_storage_image;
+   /* G18G: textures + storage images through per-dispatch tables (implies
+    * agx3_storage_image_valid). */
+   bool agx3_g18_tables_valid;
+   struct agx_g18g_table_binding agx3_g18_tables;
    struct agx_g17p_sampled_storage_binding agx3_sampled_storage;
    struct agx_g17p_indexed_storage_binding agx3_indexed_storage;
 
@@ -193,6 +203,12 @@ struct hk_shader_info {
  * general case where the linked shader is already ready.
  */
 struct hk_fast_link_key_vs {
+   /* For a relocatable UVS layout (agx_unlinked_uvs_layout::relocatable),
+    * the fragment shader's flat and linear inputs among the varyings the
+    * vertex shader writes, which place them. Otherwise zero. First, so the
+    * key gains no padding. */
+   uint64_t uvs_flat, uvs_linear;
+
    struct agx_vs_prolog_key prolog;
 };
 
@@ -209,6 +225,11 @@ struct hk_shader {
    /* G17P-only root prefix; serialized separately in its version-35 payload.
     * Keep hk_shader_info and version-34 payloads unchanged on other chips. */
    uint32_t root_descriptor_size;
+   /* G17P mesh: 32-bit words each varying slot takes in the per-primitive
+    * record (agx_gen1_mesh_record_layout()), serialized like the root prefix.
+    * A fragment shader compiled without this mesh shader reads its
+    * per-primitive inputs through hk_mesh_fs_twin(). */
+   uint8_t g17p_mesh_primitive_comps[64];
    struct agx_fragment_face_2_packed frag_face;
    struct agx_counts_packed counts;
 
@@ -250,6 +271,11 @@ struct hk_shader {
     * Union with the cache to save some space?
     */
    struct hk_linked_shader *only_linked;
+
+   /* For a relocatable UVS layout linked without a prolog, the only_linked
+    * program linked for each fragment layout (hk_only_linked_for_fs()),
+    * keyed by struct hk_uvs_fs_key under linked.lock. */
+   struct hash_table *uvs_linked;
 
    /* Address to the uploaded preamble section. Preambles are uploaded
     * separately from fast-linked main shaders.
@@ -419,6 +445,24 @@ struct hk_api_shader {
     * there, so a cache never hands it out unneeded). */
    bool border_emulating;
 
+   /* Compiled with agx_nir_lower_clip_m1_1 where it rasterizes; a mesh shader
+    * sets it when its device enabled depthClipControl (serialized: a binary
+    * without it is refused by a device that enabled the feature). */
+   bool clip_m1_1;
+
+   /* G17P: non-NULL for a fragment shader compiled without its mesh shader
+    * that reads per-primitive inputs, gl_PrimitiveID, gl_Layer or
+    * gl_ViewportIndex. A mesh shader stores those in per-primitive records
+    * whose layout it alone knows, so mesh draws use a twin compiled for that
+    * layout from this source (same inputs as a border source); mesh_twins
+    * holds the twins built so far, under mesh_source->lock. */
+   struct hk_border_source *mesh_source;
+   struct hk_mesh_fs_twin *mesh_twins;
+
+   /* Non-NULL for a fragment shader whose depth/stencil feedback loop is only
+    * known at draw time: what its zs_self_dep twin compiles from. */
+   struct hk_border_source *fbl_source;
+
    struct hk_shader variants[];
 };
 
@@ -426,6 +470,19 @@ struct hk_api_shader {
  * on first use. Thread-safe; NULL if it cannot be built. */
 struct hk_api_shader *hk_border_twin(struct hk_device *dev,
                                      struct hk_api_shader *obj);
+
+/* The twin of a fragment shader with a feedback-loop source, compiled for a
+ * depth/stencil feedback loop and built on first use. Thread-safe; NULL if it
+ * cannot be built. */
+struct hk_api_shader *hk_fbl_twin(struct hk_device *dev,
+                                  struct hk_api_shader *obj);
+
+/* The twin of a fragment shader with a mesh source that reads per-primitive
+ * inputs from the records of this G17P mesh variant, built on first use.
+ * Thread-safe; *out is NULL if it cannot be built. */
+VkResult hk_mesh_fs_twin(struct hk_device *dev, struct hk_api_shader *obj,
+                         const struct hk_shader *mesh,
+                         struct hk_api_shader **out);
 
 /* Make the `samples` variant of a dynamic-sample-count G17P fragment shader
  * available to hk_fs_variant(). Thread-safe; a no-op for other shaders. */
@@ -500,9 +557,13 @@ hk_any_variant(struct hk_api_shader *obj)
 /* Link a complete pipeline's fragment shader for the state the pipeline
  * fixes, so its first draw finds the linked program. */
 void hk_prelink_pipeline_fragment(struct hk_device *dev,
-                                  struct hk_api_shader *vs,
+                                  const struct hk_shader *hw_vs,
                                   struct hk_api_shader *fs,
                                   const struct vk_graphics_pipeline_state *state);
+void hk_prelink_object_fragment(struct hk_device *dev,
+                                struct hk_api_shader *fs);
+void hk_prelink_vertex(struct hk_device *dev, struct hk_api_shader *vs,
+                       bool hw_program, bool sw_program);
 
 static inline struct hk_shader *
 hk_fs_variant(struct hk_api_shader *obj, unsigned samples)
@@ -560,6 +621,10 @@ hk_rast_mesh_variant(struct hk_api_shader *obj)
 struct hk_linked_shader {
    struct agx_linked_shader b;
 
+   /* A specialized fragment executable may own a different constant program
+    * and uniform layout. Its launch source lives as long as this executable. */
+   struct hk_shader *variant_source;
+
    /* Immutable G17P compute-program templates keyed by uniform-range shape.
     * Entries are published lock-free while command buffers record in
     * parallel and are released with this linked executable. */
@@ -612,6 +677,15 @@ struct hk_linked_shader {
    } usc;
 };
 
+/* Executable resource requirements may differ from the API shader's after
+ * specialization. Use this for both loader and surrounding launch records. */
+static inline struct hk_shader *
+hk_linked_shader_source(struct hk_shader *source,
+                        const struct hk_linked_shader *linked)
+{
+   return linked && linked->variant_source ? linked->variant_source : source;
+}
+
 /* `main_part`, when non-NULL, replaces main->b as the linked main part
  * (the inline-blend monolithic fragment program); main still supplies the
  * API shader's uniform and resource layout. */
@@ -620,7 +694,8 @@ struct hk_linked_shader *hk_fast_link_part(struct hk_device *dev, bool fragment,
                                            struct agx_shader_part *main_part,
                                            struct agx_shader_part *prolog,
                                            struct agx_shader_part *epilog,
-                                           unsigned nr_samples_shaded);
+                                           unsigned nr_samples_shaded,
+                                           const uint8_t *uvs_map);
 /* A copy of `api` whose code, uniform layout and constant program are
  * `part`'s (an inline-blend program with its own constant program); takes
  * ownership of part->binary. */
@@ -633,6 +708,28 @@ struct hk_linked_shader *hk_fast_link(struct hk_device *dev, bool fragment,
                                       struct agx_shader_part *prolog,
                                       struct agx_shader_part *epilog,
                                       unsigned nr_samples_shaded);
+
+/* Link a non-fragment program. A hardware vertex program with a relocatable
+ * UVS layout (agx_unlinked_uvs_layout::relocatable) places its varyings for
+ * a fragment shader with these flat and linear inputs. */
+struct hk_linked_shader *hk_fast_link_vertex(struct hk_device *dev,
+                                             struct hk_shader *main,
+                                             struct agx_shader_part *prolog,
+                                             uint64_t flat, uint64_t linear);
+
+/* A relocatable hardware vertex program that links without a prolog (the
+ * post-tessellation or geometry raster program) linked for a fragment shader
+ * with these flat and linear inputs, cached on the shader. Otherwise
+ * shader->only_linked. */
+struct hk_linked_shader *hk_only_linked_for_fs(struct hk_device *dev,
+                                               struct hk_shader *shader,
+                                               uint64_t flat, uint64_t linear);
+
+struct hk_linked_shader *
+hk_fast_link_fragment_variant(struct hk_device *dev,
+                              const struct hk_shader *source,
+                              const struct agx_shader_part *part,
+                              const struct agx_fs_epilog_key *key);
 
 extern const struct vk_device_shader_ops hk_device_shader_ops;
 
@@ -701,8 +798,11 @@ hk_nir_lower_descriptors(nir_shader *nir,
                          uint32_t set_layout_count,
                          struct vk_descriptor_set_layout *const *set_layouts,
                          bool sparse_buffer_residency,
+                         bool sparse_soft_unmapped,
                          uint64_t sparse_ro_offset, bool scaled_sampling,
-                         bool sampler_has_lod_bias);
+                         bool sampler_has_lod_bias, bool d3d_nearest_mip,
+                         bool coherent_images_in_memory,
+                         bool m5_store_window);
 
 VkResult hk_compile_shader(struct hk_device *dev,
                            struct vk_shader_compile_info *info,

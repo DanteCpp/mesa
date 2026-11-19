@@ -8,6 +8,7 @@
 #pragma once
 
 #include "asahi/layout/layout.h"
+#include "asahi/lib/agx_bg_eot_key.h"
 #include "vulkan/vulkan_core.h"
 
 #include "hk_private.h"
@@ -68,6 +69,20 @@ struct hk_image_plane {
     * secondary page table. Otherwise, this map is NULL.
     */
    struct agx_bo *sparse_map;
+
+   /* The address texture descriptors give the sparse map: its own, or for
+    * VK_EXT_descriptor_buffer capture/replay a mapping of it at an address
+    * that replays (sparse_map_va). */
+   uint64_t sparse_map_addr;
+   struct agx_va *sparse_map_va;
+};
+
+/* VK_EXT_descriptor_buffer capture/replay data of an image: the VAs of a
+ * sparse image's planes and residency maps (memory-bound planes take the
+ * memory's address, which replays by itself). */
+struct hk_image_capture {
+   uint64_t plane_va[3];
+   uint64_t sparse_map_va[3];
 };
 
 struct hk_image {
@@ -81,6 +96,13 @@ struct hk_image {
 
    uint8_t plane_count;
    struct hk_image_plane planes[3];
+
+   /** True for a swapchain image and for an image bound to swapchain memory.
+    *
+    * Such memory can be aliased by other images only, never by a buffer, so
+    * work reads what it holds only through an image.
+    */
+   bool swapchain_memory;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_image, vk.base, VkImage, VK_OBJECT_TYPE_IMAGE)
@@ -235,6 +257,28 @@ hk_agx2_packed_float_copy(enum agx_chip chip, VkFormat format)
    return agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX2 &&
           (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
            format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32);
+}
+
+/* The format an end-of-tile PBE stores a target through. M4 Pro stores
+ * R11G11B10F through its own class, under the lane class of packed 32-bit
+ * formats (see hk_eot_key_format()): only that class can write it compressed,
+ * and the stored bytes are the same as through R32_UINT. */
+static inline enum pipe_format
+hk_eot_pbe_format(const struct agx_device *dev, enum pipe_format format)
+{
+   return format == PIPE_FORMAT_R11G11B10_FLOAT && agx_is_m4_pro(dev)
+             ? format
+             : agx_rt0_pbe_format(dev->chip, format);
+}
+
+/* The format an end-of-tile program stores a target as, which only selects
+ * its IMGWBLK lane class. */
+static inline enum pipe_format
+hk_eot_key_format(const struct agx_device *dev, enum pipe_format format)
+{
+   return format == PIPE_FORMAT_R11G11B10_FLOAT && agx_is_m4_pro(dev)
+             ? PIPE_FORMAT_R10G10B10A2_UNORM
+             : format;
 }
 
 static inline VkFormat

@@ -234,6 +234,8 @@ records_replace_stream(struct hk_cmd_buffer *cmd, struct hk_cs *from,
       cmd->sync.pass_tile_first = to;
    if (cmd->sync.pass_tile_last == from)
       cmd->sync.pass_tile_last = to;
+   if (cmd->sync.suspended_last == from)
+      cmd->sync.suspended_last = to;
 }
 
 /*
@@ -549,19 +551,21 @@ hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    barrier_source_dependencies(cmd, src_kinds, dep);
 
-   /* M5: of the renders this dependency orders pre-rasterization work after,
-    * only those that wrote memory other than their attachments
-    * (HK_SYNC_GFX_MEM) can hand that work anything it reads without an
-    * image. Order the vertex half (HK_SYNC_GFX) after the latest of them;
-    * the fragment half and image-reading vertex work keep the whole
-    * dependency. The compute subqueue's requirement is unchanged: the kernel
-    * orders both halves after compute work either way. */
-   if ((src_kinds & HK_SYNC_GFX) && (dst_kinds & HK_SYNC_GFX) &&
-       agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)) {
+   /* M5 and G17P: of the renders this dependency orders pre-rasterization
+    * work after, graphics or transfer, only those that wrote memory other
+    * than their attachments (HK_SYNC_GFX_MEM) can hand that work anything it
+    * reads without an image. Order the vertex half (HK_SYNC_GFX) after the
+    * latest of them; the fragment half and image-reading vertex work keep the
+    * whole dependency. The compute subqueue's requirement is unchanged: the
+    * kernel orders both halves after compute work either way. */
+   const uint8_t render_kinds = HK_SYNC_GFX | HK_SYNC_XFER;
+   const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
+   if ((src_kinds & render_kinds) && (dst_kinds & HK_SYNC_GFX) &&
+       (agx_chip_g17_m5(chip) || chip == AGX_CHIP_G17P)) {
       struct hk_sync_dep vtx = dep[HK_SYNC_VDM];
       vtx.cut = memory_cut(vtx.cut);
-      if (vtx.prior & HK_SYNC_GFX)
-         vtx.prior = (vtx.prior & ~HK_SYNC_GFX) | HK_SYNC_GFX_MEM;
+      if (vtx.prior & render_kinds)
+         vtx.prior = (vtx.prior & ~render_kinds) | HK_SYNC_GFX_MEM;
       const unsigned gfx = util_logbase2(HK_SYNC_GFX);
       dep_max(&cmd->sync.req[gfx][HK_SYNC_VDM], &vtx);
       dep_max(&cmd->sync.req[gfx][HK_SYNC_CDM], &dep[HK_SYNC_CDM]);
@@ -725,7 +729,9 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    struct hk_cs *gfx = cmd->current_cs.gfx;
    const bool pre_gfx = compute && slot == &cmd->current_cs.pre_gfx && gfx &&
                         gfx != cs;
-   if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
+   /* Unit-test fixtures have no device. */
+   const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (unlikely(dev && dev->frame_anatomy)) {
       cs->anatomy_api_barriers = cmd->anatomy_bar.count;
       cs->anatomy_api_mem = cmd->anatomy_bar.mem;
       cs->anatomy_api_buf = cmd->anatomy_bar.buf;
@@ -751,8 +757,17 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    cs->sync.kind = stream_kind(cmd, slot, compute);
-   if (cs->sync.kind != HK_SYNC_GFX || slot == &cmd->current_cs.pre_gfx ||
-       slot == &cmd->current_cs.post_gfx)
+   /* A transfer render writes its attachments, like any render; the draws
+    * it records mark it if they write other memory
+    * (hk_m5_note_render_resources). */
+   const bool xfer_render = !compute && cs->sync.kind == HK_SYNC_XFER;
+   if ((cs->sync.kind != HK_SYNC_GFX && !xfer_render) ||
+       slot == &cmd->current_cs.pre_gfx || slot == &cmd->current_cs.post_gfx)
+      cs->sync.kind |= HK_SYNC_GFX_MEM;
+   /* Attachment stores (clears, resolves) reach memory other resources can
+    * read whenever the attachments can alias them (hk_begin_rendering()),
+    * whether or not the stream records a draw. */
+   if (!compute && cmd->state.gfx.render.m5_attachments_reach_memory)
       cs->sync.kind |= HK_SYNC_GFX_MEM;
    cs->sync.prev_mem =
       st->last[util_logbase2(HK_SYNC_GFX_MEM)][hk_sync_sq(cs)];
@@ -830,8 +845,13 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          struct hk_sync_dep cont[HK_SYNC_NUM_SQ] = {0};
          if (st->pass_tile_last)
             cont[hk_sync_sq(st->pass_tile_last)].cut = st->pass_tile_last;
-         if (st->resume_pending)
+         /* An empty suspended instance may have been replaced by compute
+          * clears (hk_optimize_empty_vdm()), so graphics work on either
+          * subqueue can be a producer of what this instance continues. */
+         if (st->resume_pending) {
             cont[HK_SYNC_VDM].prior = HK_SYNC_GFX;
+            cont[HK_SYNC_CDM].prior = HK_SYNC_GFX;
+         }
          hk_sync_stream_wait(cs, cont);
          st->resume_pending = false;
       }
@@ -973,7 +993,8 @@ hk_sync_check_cs(struct hk_cmd_buffer *cmd)
       cs->sync.kind |= HK_SYNC_GFX_MEM;
    note_last(cmd, cs);
 
-   if (agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
+   if ((agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
+        agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)) &&
        cmd->sync.pending_start_ts.handle && !cs->timestamp.start.handle &&
        !cs->timestamp.end.handle) {
       cs->timestamp.start = cmd->sync.pending_start_ts;
@@ -1197,7 +1218,9 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
  * dependency whose first scope is all earlier commands in the given stage
  * and whose second scope is the timestamp write itself. TOP_OF_PIPE in a
  * first scope is NONE, so such a stamp may be taken at any time; it becomes
- * the start stamp of the next command. Every other stage orders the stamp
+ * the start stamp of the next command, except on chips whose start stamps
+ * latch before a command's waits (start_stamps_ordered()), where it ends the
+ * last command like any other stamp. Every other stage orders the stamp
  * after earlier work of its class, and the stamp becomes the end stamp of
  * the last command, which is then ordered after that work.
  *
@@ -1235,6 +1258,29 @@ stamp_wait(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    } else {
       stream_wait_frag(cs, dep);
    }
+}
+
+/* G17P latches a command's start stamps when the firmware takes the command,
+ * before its barriers resolve: a vkCmdResetQueryPool dispatch followed by a
+ * full ALL_COMMANDS barrier still overwrites the next render's vertex start
+ * stamp most of the time, and dependent start stamps read earlier than the
+ * previous end. Only end stamps are ordered after a command's waits, so
+ * every stamp rides on a command's end: a top-of-pipe stamp (Vulkan 1.3,
+ * 17.5: no first scope) on the end of the last recorded work, which may
+ * latch it at any logically later point.
+ *
+ * M5 latches start stamps the same way: on G17S a top-of-pipe or host stamp
+ * after a full ALL_COMMANDS barrier reads a few microseconds before the end
+ * stamp written ahead of the barrier. Its end stamps are ordered, so it
+ * takes the same end-only path.
+ */
+static bool
+start_stamps_ordered(const struct hk_cmd_buffer *cmd)
+{
+   const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   return !((agx_native_graphics(&dev->dev) &&
+             dev->dev.chip == AGX_CHIP_G17P) ||
+            agx_chip_g17_m5(dev->dev.chip));
 }
 
 static struct hk_cs *
@@ -1297,9 +1343,11 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
 
    if (st->in_pass && gfx) {
       /* Inside a render pass instance the stamp belongs to the render.
-       * Vertex start for an unordered stamp, fragment end otherwise; a
-       * second end stamp is copied from the first after the render. */
-      if (!src_kinds && !gfx->timestamp.start.handle) {
+       * Vertex start for an unordered stamp where start stamps are ordered
+       * (start_stamps_ordered()), fragment end otherwise; a second end
+       * stamp is copied from the first after the render. */
+      if (!src_kinds && !gfx->timestamp.start.handle &&
+          start_stamps_ordered(cmd)) {
          gfx->timestamp.start = req;
          return;
       }
@@ -1328,10 +1376,14 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       return;
    }
 
-   if (!src_kinds) {
+   if (!src_kinds && start_stamps_ordered(cmd)) {
       hk_sync_flush_pending_timestamp(cmd);
       st->pending_start_ts = req;
-      if (agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+      /* A query reset or earlier dispatch may have left a reusable stream.
+       * Consume the start stamp before recording work into it too, rather
+       * than resolving it as an end stamp at the next timestamp write. */
+      if (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
+          agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
          st->cs_check_pending = true;
       return;
    }
@@ -1377,6 +1429,13 @@ hk_sync_begin_rendering(struct hk_cmd_buffer *cmd, bool resuming)
    st->pass_fp_count = 0;
    memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
    st->pass_tile_first = st->pass_tile_last = NULL;
+
+   /* A resuming instance is the same render pass instance as the suspended
+    * one before it: its first stream waits on that instance's last producer,
+    * which can be a compute stream on the other subqueue. */
+   if (resuming)
+      st->pass_tile_last = st->suspended_last;
+   st->suspended_last = NULL;
 }
 
 void
@@ -1391,10 +1450,11 @@ hk_sync_first_render_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 }
 
 void
-hk_sync_end_rendering(struct hk_cmd_buffer *cmd)
+hk_sync_end_rendering(struct hk_cmd_buffer *cmd, bool suspending)
 {
    struct hk_sync_state *st = &cmd->sync;
    st->epoch++;
+   st->suspended_last = suspending ? st->pass_tile_last : NULL;
    pass_footprints_commit(cmd);
    st->in_pass = false;
    memset(st->pass_req, 0, sizeof(st->pass_req));
@@ -1444,6 +1504,7 @@ hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    st->pass_fp_count = 0;
    memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
    st->pass_tile_first = st->pass_tile_last = cs;
+   st->suspended_last = NULL;
 }
 
 void
@@ -1664,10 +1725,17 @@ recent_add(struct hk_sync_queue *q, const struct hk_sync_footprint *fp,
    q->recent_max = MAX2(q->recent_max, point);
 }
 
-/* Raise a resolved barrier field to at least v (-1 none, 0 earlier ioctls). */
+/* Raise a resolved barrier field to at least v (-1 none, 0 earlier ioctls).
+ * With exact priors, a position past the 16-bit field raises the absolute
+ * prior instead (see resolve_one). */
 static void
-barrier_at_least(uint16_t *barrier, hk_sync_value v)
+barrier_at_least(const struct hk_queue *queue, unsigned sq, uint16_t *barrier,
+                 uint64_t *prior, hk_sync_value v)
 {
+   if (queue->sync.exact_prior && v >= DRM_ASAHI_BARRIER_NONE) {
+      *prior = MAX2(*prior, queue->sync.submitted[sq] + (uint64_t)v);
+      return;
+   }
    const hk_sync_value cur =
       *barrier == DRM_ASAHI_BARRIER_NONE ? HK_SYNC_NONE : *barrier;
    if (v > cur)
@@ -1694,7 +1762,10 @@ resolve_one(const struct submit_state *ss, unsigned sq,
       u_foreach_bit(k, kinds)
          v = MAX2(v, ss->carry_absolute[k][sq]);
       const uint64_t base = ss->queue->sync.submitted[sq];
-      if (v > base) {
+      /* A command too far back for the 16-bit field is in an earlier ioctl
+       * of this submission (at most max_commands_per_submit() each), already
+       * submitted when this one is: name it by its ordinal. */
+      if (v > base && v - base < DRM_ASAHI_BARRIER_NONE) {
          *barrier = (uint16_t)(v - base);
       } else {
          *barrier = DRM_ASAHI_BARRIER_NONE;
@@ -1715,16 +1786,14 @@ hk_sync_resolve_submit(struct hk_queue *queue,
                        uint64_t completed)
 {
    /* Validate all ordinal arithmetic before mutating command or queue state.
-    * Relative fields reserve UINT16_MAX for NONE. Historical ordinals use
-    * zero for absence, so wrapping either representation is invalid. */
+    * Historical ordinals use zero for absence, so wrapping them is invalid.
+    * Positions past the 16-bit relative fields become ordinals
+    * (resolve_one), so a submission may hold any number of commands. */
    if (queue->sync.exact_prior) {
       uint64_t added[HK_SYNC_NUM_SQ] = {0, first_cdm_is_flush ? 1 : 0};
       for (unsigned i = 0; i < count; ++i) {
-         list_for_each_entry(struct hk_cs, cs, &cmdbufs[i]->control_streams, node) {
-            const unsigned sq = hk_sync_sq(cs);
-            if (++added[sq] >= DRM_ASAHI_BARRIER_NONE)
-               return false;
-         }
+         list_for_each_entry(struct hk_cs, cs, &cmdbufs[i]->control_streams, node)
+            ++added[hk_sync_sq(cs)];
       }
       for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
          if (queue->sync.submitted[sq] > UINT64_MAX - added[sq])
@@ -1857,7 +1926,8 @@ hk_sync_resolve_submit(struct hk_queue *queue,
             if (v[sq] == HK_SYNC_NONE && (recent & BITFIELD_BIT(sq)))
                v[sq] = 0;
             if (v[sq] != HK_SYNC_NONE)
-               barrier_at_least(&rec->first->sync.barrier[sq], v[sq]);
+               barrier_at_least(queue, sq, &rec->first->sync.barrier[sq],
+                                &rec->first->sync.prior[sq], v[sq]);
          }
       }
       util_dynarray_foreach(&cmd->sync_pass_records,
@@ -1974,6 +2044,16 @@ hk_sync_resolve_submit(struct hk_queue *queue,
                    sizeof(cs->sync.prior_ta));
             continue;
          }
+         /* M5: tiling whose pre-rasterization programs keep state in
+          * thread-private storage corrupts that state when it overlaps an
+          * earlier render's fragment work (Counter-Strike 2: one-frame
+          * garbage geometry and blocks, only for such renders). Such a
+          * render's vertex half keeps the whole render-subqueue prefix;
+          * its compute prefix may still be narrower. */
+         if (cs->m5_vertex_tps) {
+            cs->sync.barrier_ta[HK_SYNC_VDM] = cs->sync.barrier[HK_SYNC_VDM];
+            cs->sync.prior_ta[HK_SYNC_VDM] = cs->sync.prior[HK_SYNC_VDM];
+         }
          for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
             cs->sync.ta_split |=
                cs->sync.barrier_ta[sq] != cs->sync.barrier[sq] ||
@@ -1985,7 +2065,7 @@ hk_sync_resolve_submit(struct hk_queue *queue,
    /* Every footprint of this ioctl stays live on the queue until the
     * timeline point it signals (queue_submit has already advanced it).
     * Serialized queues order the next submission after this one whole. */
-   if (!queue->sync.serialize) {
+   if (!queue->sync.serialize || queue->sync.stage_overlap) {
       if (direct_footprints) {
          util_dynarray_foreach(&cmdbufs[0]->sync_pass_records,
                                struct hk_sync_pass_record, rec) {

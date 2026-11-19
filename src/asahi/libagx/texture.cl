@@ -239,6 +239,39 @@ libagx_image_texel_address(constant const struct agx_pbe_packed *ptr,
              (uint64_t)total_sa * bytes_per_sample_B;
 }
 
+/* Software view metadata, independent of the native texture/PBE packet:
+ * base: address lo/hi, linear row pitch B (zero if tiled), tiled stride el;
+ * layout: tile width/height el, layer stride B lo/hi. Tile coordinates count
+ * pixels; MS samples are interleaved within each pixel. Runtime validation
+ * restricts MS to tiled raw32-lane storage. The caller applied image robustness. */
+uint64_t
+libagx_bound_image_texel_address(uint4 base, uint4 layout, uint4 coord,
+                                uint samples, uint sample_idx,
+                                uint bytes_per_texel, bool is_1d,
+                                bool is_layered)
+{
+   const uint64_t address = (uint64_t)base.x | ((uint64_t)base.y << 32);
+   const uint64_t layer_stride =
+      (uint64_t)layout.z | ((uint64_t)layout.w << 32);
+   uint64_t offset;
+
+   if (is_1d) {
+      offset = (uint64_t)coord.x * bytes_per_texel;
+   } else if (base.z) {
+      offset = (uint64_t)coord.y * base.z +
+               (uint64_t)coord.x * bytes_per_texel;
+   } else {
+      const uint64_t pixel = libagx_twiddle_coordinates_gen9(
+         convert_ushort2(coord.xy), layout.x, layout.y, base.w);
+      offset = (pixel * samples + sample_idx) * bytes_per_texel;
+   }
+
+   if (is_layered)
+      offset += (uint64_t)coord[is_1d ? 1 : 2] * layer_stride;
+
+   return address + offset;
+}
+
 uint64_t
 libagx_image_texel_address_gen9(
    constant const struct agx_pbe_gen9_packed *ptr,
@@ -362,6 +395,42 @@ libagx_buffer_texture_offset(constant struct agx_texture_packed *ptr, uint x)
    agx_unpack(NULL, ptr, TEXTURE, d);
 
    return x + d.buffer_offset_sw;
+}
+
+/*
+ * Whether texel x of a texel buffer lies in an unbound sparse page, from the
+ * device-wide map of non-resident pages: a 16-byte header, then one bit per
+ * 16 KiB page of [heap_base, heap_base + heap_size), set while the page is
+ * not resident.  The descriptor is the plain linear 2D texture hk builds over
+ * the buffer's read-only alias, AGX_TEXTURE_BUFFER_WIDTH texels wide, so the
+ * texel size is its row stride over its width.  Out-of-bounds texels, RGB32
+ * views and buffers outside the heap count as resident.
+ */
+uint
+libagx_buffer_texture_nonresident(constant struct agx_texture_packed *ptr,
+                                  uint x, constant uint *map,
+                                  uint64_t heap_base, uint64_t heap_size,
+                                  uint64_t ro_offset)
+{
+   agx_unpack(NULL, ptr, TEXTURE, d);
+
+   if (map == NULL || x >= d.buffer_size_sw ||
+       d.channels == AGX_CHANNELS_R32G32B32_EMULATED)
+      return 0;
+
+   uint texel_B = (d.stride + 16) / d.width;
+   uint64_t addr = (d.address & ~ro_offset) +
+                   (uint64_t)(x + d.buffer_offset_sw) * texel_B;
+   uint64_t offset = addr - heap_base;
+   if (offset >= heap_size)
+      return 0;
+
+   uint64_t page = offset >> 14;
+   uint word = map[4 + (page >> 5)];
+
+   /* A variable mask rather than (word >> page) & 1, which would fold into a
+    * bitfield extract whose offset is not masked to 0..31. */
+   return (word & (1u << (uint)(page & 31))) != 0;
 }
 
 uint
@@ -534,6 +603,40 @@ libagx_texture_levels_gen9(constant struct agx_texture_gen9_packed *ptr)
       return 0;
    else
       return (d.last_level - d.first_level) + 1;
+}
+
+/*
+ * The same workaround against a Gen10 descriptor. Without it a G17G texel
+ * fetch unpacked its descriptor with the AGX2 field positions, read a
+ * nonsense level range, and translated every fetch into the out-of-bounds
+ * coordinate -- which is how the depth blitter, whose fragment shader is one
+ * txf, wrote nothing at all.
+ */
+uint
+libagx_lower_txf_robustness_gen10(constant struct agx_texture_gen10_packed *ptr,
+                            bool check_lod, ushort lod, bool check_min_lod,
+                            ushort min_lod, bool check_layer, uint layer,
+                            uint x)
+{
+   agx_unpack(NULL, ptr, TEXTURE_GEN10, d);
+
+   bool valid = true;
+
+   if (check_lod)
+      valid &= lod <= (d.last_level - d.first_level);
+
+   if (check_min_lod)
+      valid &= lod >= min_lod;
+
+   if (check_layer) {
+      bool linear = (d.layout == AGX_LAYOUT_LINEAR);
+      valid &= layer < (linear ? d.depth_linear : d.depth);
+   }
+
+   /* The maximum tail offset is 0xF so by returning 0xFFF0 for out-of-bounds we
+    * stay under 0xFFFF and keep robustness after offsetting.
+    */
+   return valid ? x : 0xFFF0;
 }
 
 uint

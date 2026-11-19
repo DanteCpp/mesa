@@ -37,6 +37,7 @@ struct hk_shader_binary_cache_entry;
 struct vk_pipeline_cache;
 
 #define HK_SHADER_BINARY_CACHE_MAX 16
+#define HK_CMD_SYNCOBJ_POOL 64
 
 typedef void (*hk_internal_builder_t)(struct nir_builder *b, const void *key);
 
@@ -73,6 +74,10 @@ struct hk_rc_sampler {
 
    /* Index of this hardware sampler in the hardware sampler heap */
    uint16_t index;
+
+   /* A VK_EXT_descriptor_buffer capture/replay sampler uses it: the index
+    * goes back to the replay pool (hk_descriptor_table_remove_replay()). */
+   bool replay;
 };
 
 struct hk_sampler_heap {
@@ -121,6 +126,7 @@ struct hk_gen1_as_window {
    uint32_t live;
 };
 struct hk_frame_anatomy;
+struct hk_compute_kick;
 
 struct hk_device {
    struct vk_device vk;
@@ -131,12 +137,26 @@ struct hk_device {
     * (sparse binding, capture/replay buffers), atomic. Their memory is also
     * mapped at another address, see hk_cdm_alias_scope(). */
    uint32_t va_alias_resources;
+   /* Whether anything this device enabled can map memory at a second GPU
+    * virtual address, decided at creation (hk_device_may_alias_memory()).
+    * M5 uses it in place of va_alias_resources, see hk_cdm_alias_scope(). */
+   bool may_alias_memory;
    /* One bit per main-heap page: only unbound sparse buffer pages are set. */
    struct agx_bo *physical_sparse_map;
+   /* The zeroed page every unbound sparse page maps, read-write (the
+    * read-only shadow maps the zero page). It is no write sink of the
+    * driver's, unlike the scratch page, so it stays zero for strict
+    * residency. shortcut: an application store to an unbound page lands
+    * here and later reads of unbound pages see it; guard stores with the
+    * residency map if that ever matters. */
+   struct agx_bo *sparse_fill;
    struct agxdecode_ctx *decode_ctx;
    /* Opt-in frame anatomy profiler (hk_frame_anatomy.h); NULL unless the
     * HK_FRAME_ANATOMY environment variable is set. */
    struct hk_frame_anatomy *frame_anatomy;
+   /* Compute kick (hk_compute_kick.h); NULL unless G17C with
+    * hk_compute_kick_ms set. */
+   struct hk_compute_kick *compute_kick;
 
    struct hk_descriptor_table occlusion_queries;
    struct hk_sampler_heap samplers;
@@ -147,7 +167,14 @@ struct hk_device {
     */
    struct hk_descriptor_table sampled_images;
 
+   /* VK_EXT_descriptor_buffer texel-buffer textures (hk_buffer_view.c),
+    * NULL unless the device enables descriptorBuffer. */
+   struct hk_texel_windows *texel_windows;
+
    struct vk_meta_device meta;
+   /* G17P PBE buffer fills recorded so far, atomic. Their sweep direction
+    * alternates, see hk_g17p_fill_buffer_pbe(). */
+   uint32_t g17p_fills;
 
    /* Parameters for Mesa's common acceleration-structure builder. */
    struct vk_acceleration_structure_build_args accel_struct_args;
@@ -193,9 +220,6 @@ struct hk_device {
       VkCommandPool pool;
    } host_as;
    bool m5_native_as;
-   /* Explicit diagnostic runtime, loaded only from the caller's capture. */
-   bool m5_native_rq;
-   bool m5_rq_instances;
    simple_mtx_t m5_as_lock;
    struct util_dynarray m5_ases;
    /* Stable native AS-ID -> address table. VA is reserved once; backing
@@ -207,18 +231,6 @@ struct hk_device {
     * Binding publishes their final addresses without a submit-time walk. */
    struct util_dynarray m5_pending_as_ids;
    uint32_t m5_pending_as_count;
-   struct agx_bo *m5_rq_code;
-   struct agx_va *m5_rq_code_alias;
-   struct agx_bo *m5_rq_ift;
-   struct agx_bo *m5_rq_diag;
-   /* Device-lifetime SCS state block (hk_cmd_dispatch.c). */
-   struct agx_bo *m5_rt_state_bo;
-   uint64_t m5_rt_state_packed, m5_rt_state_size;
-   char *m5_rq_diag_dump;
-   void *m5_rq_user_image;
-   uint32_t m5_rq_uniforms[80];
-   uint64_t m5_rq_default_program;
-   uint64_t m5_rq_default_control;
    struct agx_bg_eot_cache bg_eot;
    /* frg-codegen v4 BG/EOT device cache (hk_cmd_draw.c). */
    struct hk_g17p_bg_eot_dev_cache *g17p_bg_eot_dev_cache;
@@ -229,6 +241,15 @@ struct hk_device {
     * starts at one: zero is the value an unwritten shader binding table
     * record has, and no group may collide with it. */
    uint32_t rt_group_handle_alloc;
+
+   /* Own group handles of each RT pipeline library content key created on
+    * this device, so a library loaded from a pipeline cache takes the handles
+    * an identical library got here rather than ones from another device.
+    * Created on first use (hk_ray_tracing_pipeline.c). */
+   struct {
+      simple_mtx_t lock;
+      struct hash_table *table;
+   } rt_library_handles;
 
    /* Device-lifetime templates for precompiled G17P meta compute programs.
     * The libagx programs and their executable BOs have the same lifetime. */
@@ -284,12 +305,27 @@ struct hk_device {
          *entries[HK_SHADER_BINARY_CACHE_MAX];
    } shader_binary_cache;
 
-   /* Device-wide compact VDM backing. Command buffers from different pools
-    * suballocate immutable spans from the same finite G17P aperture. */
+   /* Device-wide command memory. Command buffers from different pools
+    * suballocate immutable spans: compact VDM backing from the same finite
+    * G17P aperture, and the first span of each uploader. A slab that refused
+    * an allocation waits on full until one of its spans is freed. */
    struct {
       simple_mtx_t lock;
-      struct list_head slabs;
+      struct list_head slabs[HK_CMD_SLAB_COUNT];
+      struct list_head full[HK_CMD_SLAB_COUNT];
+      /* The next slab's size: a process that records little pins little. */
+      uint32_t next_size[HK_CMD_SLAB_COUNT];
    } vdm;
+
+   bool cmd_pending_ready;
+   simple_mtx_t cmd_pending_lock;
+   /* Queues with pending submissions (hk_queue::cmd_link). */
+   struct list_head cmd_pending_queues;
+   /* Submissions that completed with an error: kept until destruction. */
+   struct list_head cmd_pending_failed;
+   /* Completion syncobjs of retired submissions, for reuse. */
+   uint32_t cmd_syncobjs[HK_CMD_SYNCOBJ_POOL];
+   unsigned cmd_syncobj_count;
 
    /* Native G17P indirect compute grid helper.  A compact indirect helper
     * record carries no dimensions and no resource table, so the only way a
@@ -355,22 +391,51 @@ enum hk_perftest {
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)
 
-/* G17P GPU caches are tagged by virtual address: a strong CDM flush makes a
- * write visible only to reads through the same mapping. While any resource
- * maps memory at a second address, an application dependency between
- * compute or transfer work in one stream needs the memory-scope flush
- * (hk_cdm_visibility_flush()). Devices that never create such a resource
- * keep the ordinary strong flush.
+/* G17P and M5 GPU caches are tagged by virtual address: a strong CDM flush
+ * makes a write visible only to reads through the same mapping. While memory
+ * may be read through a second address, an application dependency between
+ * compute or transfer work needs the memory-scope flush
+ * (hk_cdm_visibility_flush()). Devices without such memory keep the ordinary
+ * strong flush.
  *
- * The state is read when a barrier is recorded. A resource the command
- * buffer references exists by then, and it counts from creation, so later
- * sparse binds are covered; the flush writes back every dirty line, so it
- * also covers writes recorded in earlier command buffers. Not covered: a
- * resource created after recording and reached only through a device
- * address the command buffer reads indirectly. */
+ * On M5 this is decided once, when the device is created
+ * (hk_device_may_alias_memory()): a device that enabled no feature or
+ * extension through which memory can get a second GPU address (sparse
+ * binding, capture/replay, fd imports, writable host imports) never has such
+ * memory, and every other device flushes with memory scope at every
+ * dependency, also in command buffers recorded before such memory existed
+ * or that reach it only while they run.
+ *
+ * On G17P the state is read when a barrier is recorded: live sparse and
+ * capture/replay resources. A resource the command buffer references exists
+ * by then, and it counts from creation, so later sparse binds are covered.
+ * Not covered on G17P: a resource created after the command buffer was
+ * recorded and reached through a path recording did not see, that is a
+ * device address the command buffer reads indirectly, or a descriptor set
+ * bound at recording and updated after it (descriptorBinding*UpdateAfterBind),
+ * and memory imports.
+ *
+ * The flush goes into the open compute stream, and only when that stream
+ * already holds work (hk_cdm_visibility_flush_needed()). It writes back every
+ * dirty line, so the writes it covers include those of earlier streams and
+ * earlier command buffers. A barrier recorded with no open compute stream
+ * holding work records no flush. This includes the first barrier of a
+ * command buffer and barriers after the stream was closed, for example by a
+ * timestamp or query copy; the compute and transfer writes before it were
+ * flushed with memory scope at the end of their stream
+ * (hk_cdm_end_stream_flush()). When the open stream holds work unrelated to
+ * the source, the flush goes at its end, but a graphics destination is still
+ * ordered only after the source's stream, so it can start before the flush.
+ * Graphics-only sources also do not request memory scope: attachment or
+ * shader writes through a sparse image followed by transfer or compute reads
+ * through a plain alias receive the ordinary post-graphics strong flush. That
+ * case has not been hardware-tested. */
 static inline bool
 hk_cdm_alias_scope(const struct hk_device *dev)
 {
+   if (agx_chip_g17_m5(dev->dev.chip))
+      return dev->may_alias_memory;
+
    return dev->dev.chip == AGX_CHIP_G17P &&
           p_atomic_read(&dev->va_alias_resources) != 0;
 }
@@ -392,6 +457,13 @@ VkResult hk_sampler_heap_add(struct hk_device *dev,
                              const struct hk_native_sampler_descriptor *desc,
                              struct hk_rc_sampler **out);
 
+VkResult
+hk_sampler_heap_add_capture(struct hk_device *dev,
+                            const struct hk_native_sampler_descriptor *desc,
+                            struct hk_rc_sampler **out);
+VkResult hk_sampler_heap_add_at(struct hk_device *dev,
+                                const struct hk_native_sampler_descriptor *desc,
+                                uint32_t index, struct hk_rc_sampler **out);
 void hk_sampler_heap_remove(struct hk_device *dev, struct hk_rc_sampler *rc);
 
 static inline struct agx_scratch *

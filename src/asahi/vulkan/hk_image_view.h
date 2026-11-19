@@ -44,6 +44,8 @@ struct hk_image_view {
 
       struct hk_native_pbe_descriptor storage, eot, layered_eot, emrt_pbe;
       uint64_t storage_atomic_sw;
+      /* M5 store window record (hk_native_descriptor.h), zero if unused. */
+      uint32_t storage_window[4];
       uint64_t emrt_atomic_sw;
       uint32_t emrt_aligned_width;
       bool storage_pbe_valid, eot_pbe_valid, layered_eot_pbe_valid,
@@ -53,3 +55,18 @@ struct hk_image_view {
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_image_view, vk.base, VkImageView,
                                VK_OBJECT_TYPE_IMAGE_VIEW)
+
+/* VK_EXT_descriptor_buffer capture/replay data of an image view: the device
+ * heap index of each of its textures, 0 for none. */
+enum hk_view_heap {
+   HK_VIEW_HEAP_SAMPLED,
+   HK_VIEW_HEAP_FILTERABLE,
+   HK_VIEW_HEAP_STORAGE,
+   HK_VIEW_HEAP_INPUT,
+   HK_VIEW_HEAP_EMRT_READ,
+   HK_VIEW_HEAP_COUNT,
+};
+
+struct hk_image_view_capture {
+   uint32_t index[HK_MAX_PLANES][HK_VIEW_HEAP_COUNT];
+};

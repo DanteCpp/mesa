@@ -18,6 +18,7 @@ extern "C" {
 #endif
 
 struct agx_g17p_graphics_template;
+struct agx_m5_graphics_template;
 
 struct agx_linked_shader {
    /* Mapped executable memory */
@@ -26,6 +27,9 @@ struct agx_linked_shader {
    /* Gallium-owned, bounded Ioto template cache. Entries are ralloc children
     * of this linked shader and contain no live batch allocations. */
    struct agx_g17p_graphics_template *g17p_graphics_templates;
+
+   /* The same for the M5 family's native programs (agx_state.c). */
+   struct agx_m5_graphics_template *m5_graphics_templates;
 
    /* Exact executable byte count. BO allocations are page-rounded, so the
     * BO size is not a safe disassembler bound. */
@@ -88,12 +92,16 @@ struct agx_linked_shader {
 void agx3_build_container_lead(uint8_t *image, enum agx_chip chip,
                                unsigned cores_per_cluster);
 void agx3_build_usc_base_page(uint8_t *image, size_t size, enum agx_chip chip,
-                              unsigned cores_per_cluster);
+                              unsigned cores_per_cluster,
+                              unsigned num_clusters);
 
+/* `uvs_map` (agx_uvs_relocation_map()) places the varyings of a vertex
+ * program with a relocatable UVS layout, which cannot link without it. */
 bool agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
                    bool fragment, struct agx_shader_part *main,
                    struct agx_shader_part *prolog,
-                   struct agx_shader_part *epilog, unsigned nr_samples_shaded);
+                   struct agx_shader_part *epilog, unsigned nr_samples_shaded,
+                   const uint8_t *uvs_map);
 
 /* These parts of the vertex element affect the generated code */
 struct agx_velem_key {
@@ -125,6 +133,11 @@ struct agx_vs_prolog_key {
    /* If !hw and the draw call is indexed, the index size */
    uint8_t sw_index_size_B;
 
+   /* If !hw, fetch by the instance ID plus poly_vertex_params::instance_offset
+    * while still exporting the dispatch's instance ID.
+    */
+   bool sw_instance_offset;
+
    /* Adjacency primitive to emulate */
    enum mesa_prim adjacency;
 
@@ -138,6 +151,9 @@ struct agx_fs_prolog_key {
 
    /* Number of cull planes requiring lowering */
    uint8_t cull_distance_size;
+
+   /* Raw G18 constant planes carry a marker rather than zero derivatives. */
+   bool native_cull_constant_planes;
 
    /* Need to count FRAGMENT_SHADER_INVOCATIONS */
    bool statistics;
@@ -320,6 +336,10 @@ struct agx_fs_epilog_key {
     * this epilog before ordinary API blending. */
    bool smooth_line_alpha;
 
+   /* The main fragment shader applied alpha-to-coverage in the coverage update
+    * that tests, so this epilog neither kills nor tests for it. */
+   bool a2c_in_main;
+
    /* Colour attachment remapping for Vulkan. Negative values indicate that an
     * attachment is discarded. Positive values indicate the output location we
     * want to store at the indexed colour attachment.
@@ -342,13 +362,28 @@ struct agx_fs_epilog_key {
    uint16_t max_samples_per_tile;
    bool force_small_tile;
    bool preserve_zero_mask;
+   /* Execute resident MRT preservation separately for each MSAA sample. */
+   bool sample_loop_mrt;
+   bool lower_srgb;
+   bool lower_r11g11b10;
+   /* The layout keeps attachment 0 alone in the tilebuffer and spills the
+    * others (agx_build_tilebuffer_layout_rt0_resident). */
+   bool rt0_resident;
+   /* Pixel classes the main part already holds (agx_shader_info::
+    * agx3_pixel_held); the epilog does not wait for them again. */
+   uint8_t main_pixel_held;
    /* M5: the epilog's coverage update is the single native testing form
     * (agx_nir_lower_sample_mask_m5). */
    bool m5_coverage;
    /* G17P tile storage: sRGB as U8NORM bytes converted by the native packs,
     * R11G11B10/RGB9E5 as one raw 32-bit word. */
    bool g17p_tile_formats;
+   /* G18G builds the native epilog without G17P's tile formats. */
+   bool native_epilog;
    bool native_spills;
+   /* Zero retains the Gen9 private-table consumer. Gen10 uses the same
+    * software tail with its own native descriptors and texture queries. */
+   uint8_t native_spill_generation;
    /* Absolute uniform-half address of the private native spill table. */
    uint16_t emrt_heap_base;
 
@@ -380,6 +415,13 @@ struct agx_fs_epilog_key {
     * source clamp nir_lower_blend inserts for UNORM targets is an identity
     * and is dropped. Occupies the key's former tail padding byte. */
    uint8_t colour_unit_range;
+
+   /* The render pass uses a G18 single-sample mixed-format tile
+    * (agx_build_tilebuffer_layout_g18_mixed, run 1139): build the epilog's
+    * layout the same way and store exactly what Apple's fragments store -- a
+    * target whose write mask selects none of its channels is neither loaded
+    * nor stored. Set by the driver; zero elsewhere. */
+   uint8_t g18_native_mixed;
 };
 
 /* Apply framebuffer rules which are properties of the hardware generation,
@@ -416,6 +458,8 @@ bool agx_nir_lower_fs_output_to_epilog(nir_shader *s,
 /* True if every colour output component of this (not yet lowered) fragment
  * shader is a float provably in [0, 1]. Conservative: unknown is false. */
 bool agx_nir_fs_colour_outputs_unit_range(nir_shader *s);
+bool agx_nir_lower_fs_output_to_epilog_g17p(
+   nir_shader *s, struct agx_fs_epilog_link_info *out);
 bool agx_nir_lower_fs_output_to_epilog_for_device(
    nir_shader *s, enum agx_chip chip, struct agx_fs_epilog_link_info *out);
 
@@ -431,6 +475,13 @@ void agx_nir_gather_fs_colour_exports(const nir_shader *s,
                                       uint32_t *colour_comps);
 
 bool agx_nir_lower_g17p_tile_samples(nir_shader *s, unsigned nr_samples);
+bool agx_nir_lower_g17p_1x_tile_samples(nir_shader *s);
+
+/* msaa163 (AGX_G18_MSAA4): the four-sample G18G form of the lowering above.
+ * The live coverage is the 16-bit load_active_samples_agx, which the G18G
+ * backend reads as W16 SR39 -- Apple's G18 4x fragment passes that register
+ * straight to lstcol. Only four samples are admitted; callers gate it. */
+bool agx_nir_lower_g18_tile_samples(nir_shader *s, unsigned nr_samples);
 
 /* G17P currently exposes only single-sample rasterization. Collapse API
  * sample shading before split FS lowering so fast-linking never needs the

@@ -686,6 +686,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_global_2x32:
    case nir_intrinsic_load_global_offset:
    case nir_intrinsic_load_global_nv:
+   case nir_intrinsic_load_agx:
    case nir_intrinsic_load_deref: {
       if (load_may_tear(state, instr)) {
          is_divergent = true;
@@ -708,6 +709,10 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_deref_buffer_address:
       is_divergent = src_divergent(instr->src[0], state) &&
                      (nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM);
+      break;
+
+   case nir_intrinsic_deref_buffer_offset:
+      is_divergent = src_divergent(instr->src[0], state);
       break;
 
    case nir_intrinsic_image_samples_identical:
@@ -1095,6 +1100,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_cmat_extract:
    case nir_intrinsic_cmat_muladd_amd:
    case nir_intrinsic_cmat_muladd_pan:
+   case nir_intrinsic_cmat_muladd_agx:
    case nir_intrinsic_dpas_intel:
    case nir_intrinsic_convert_cmat_intel:
    case nir_intrinsic_load_coverage_mask_intel:
@@ -1133,7 +1139,6 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_sample_mask:
    case nir_intrinsic_load_active_samples_agx:
    case nir_intrinsic_quad_ballot_agx:
-   case nir_intrinsic_load_agx:
    case nir_intrinsic_load_shared_lock_nv:
    case nir_intrinsic_store_shared_unlock_nv:
    case nir_intrinsic_match_any_nv:
