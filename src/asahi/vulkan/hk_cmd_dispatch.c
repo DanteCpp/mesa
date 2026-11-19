@@ -1585,10 +1585,15 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
 }
 
 /* Largest per-thread scratch frame of a kernel that may overlap the
- * application dispatches around it. 64 unordered dispatches of 4096 threads
- * take as long as ordered ones with 512 bytes per thread and five times as
- * long with 1 KB. */
-#define HK_M5_OVERLAP_MAX_SCRATCH_B 512
+ * application dispatches around it (agx_chip_elide_app_dispatch_barrier()).
+ * It bounds the scratch working set of the threads in flight: overlapping
+ * launches put more threads in flight, and once their frames outgrow the
+ * caches every thread pays for it.  Measured on the M5 Max (G17C, 112f9a499f3):
+ * 64 dispatches of 4096 threads take 3.2 ms unordered against 3.8 ms ordered
+ * with 512 bytes per thread, but 22 ms against 4.4 ms with 1 KB.  No other
+ * chip has a measurement and no device property models the cliff, so this is
+ * one shared default for every chip that elides the barrier. */
+#define HK_OVERLAP_MAX_SCRATCH_B 512
 
 static void
 hk_m5_compute_resources(struct hk_cs *cs, uint32_t scratch_B,
@@ -1966,7 +1971,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    const bool app_dispatch =
       !cmd->in_meta && !internal && !agx_is_indirect(grid) &&
       !cmd->state.cs.descriptors.root.cs.trace_rays_addr &&
-      desc.scratch_size <= HK_M5_OVERLAP_MAX_SCRATCH_B &&
+      desc.scratch_size <= HK_OVERLAP_MAX_SCRATCH_B &&
       agx_chip_elide_app_dispatch_barrier(dev->dev.chip);
    if (app_dispatch && cs->app_dispatch_end &&
        cs->current == cs->app_dispatch_end &&
@@ -2509,14 +2514,14 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    /* Two application dispatches in a row need no barrier between them: drop
     * the previous one's weak tail, which nothing else has followed or
     * strengthened, and let this launch's own tail end the stream instead.
-    * As on M5, a kernel with a large per-thread scratch frame keeps its
-    * barrier. */
+    * As on M5, a kernel with a large per-thread scratch frame
+    * (HK_OVERLAP_MAX_SCRATCH_B) keeps its barrier. */
    const bool app_dispatch =
       (!cmd->in_meta && s && s->info.stage == MESA_SHADER_COMPUTE &&
        linked &&
        MAX3(s->b.info.scratch_size, linked->b.scratch_size,
             linked->b.agx3_spectpr_scratch_size) <=
-          HK_M5_OVERLAP_MAX_SCRATCH_B &&
+          HK_OVERLAP_MAX_SCRATCH_B &&
        agx_chip_elide_app_dispatch_barrier(dev->dev.chip)) ||
       /* An acceleration-structure build orders every launch that depends on
        * another with a pipeline barrier, which strengthens the earlier

@@ -517,21 +517,6 @@ agx_chip_cdm_wide_visibility(enum agx_chip chip)
    return agx_chip_native_g15(chip);
 }
 
-/* Whether consecutive application dispatches of one CDM stream may omit the
- * ordering barrier between them.  Vulkan orders dispatches only through
- * explicit barriers; every other record (internal or indirect launch, cache
- * flush, link, stream end) still follows a barrier.  On the M5 Max (G17C)
- * the barrier holds the next launch until every kernel launched before it
- * has finished; without it the threadgroups of consecutive launches run
- * side by side.  The M4 Pro (G17P) takes the same rule.  G17G and G17S keep
- * the barrier: the change is not measured there. */
-static inline bool
-agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
-{
-   return agx_chip_native_g15(chip) || chip == AGX_CHIP_G17C ||
-          chip == AGX_CHIP_G17P;
-}
-
 /* Number of helper-table slots in the USC code-container lead block.  G15
  * and G16 parts have ten; with six their fragment programs of 256x256 and
  * larger walk past the lead into the guard page.  On G17P the state loader's
@@ -748,6 +733,37 @@ agx_chip_g17_m5(enum agx_chip chip)
 {
    return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
           chip == AGX_CHIP_G17C;
+}
+
+/*
+ * Whether consecutive application dispatches of one CDM stream may omit the
+ * ordering barrier between them.  The reason is the API, not the chip: Vulkan
+ * orders dispatches only through explicit barriers, so the barrier the driver
+ * puts after every launch is not needed between two application dispatches.
+ * Every other record (internal or indirect launch, cache flush, link, stream
+ * end) still follows a barrier, and a pipeline barrier strengthens the last
+ * tail in place, which waits for every launch before it.  On the M5 Max
+ * (G17C) and the M4 Pro (G17P) the barrier holds the next launch until every
+ * kernel launched before it has finished; without it the threadgroups of
+ * consecutive launches run side by side.
+ *
+ * What makes the elision possible is an encoding property: the launch record
+ * carries its own weak ordering barrier as its tail, separate from the strong
+ * cache flush, so the previous launch's tail can be dropped without losing a
+ * flush.  That holds for every native AGX3 launch (hk_dispatch_g17p_native(),
+ * G15, G16G, G17P) and every M5 launch (hk_dispatch_m5_native(), G17G, G17S,
+ * G17C).  It does not hold for:
+ *  - AGX2 (G13, G14): a launch has no ordering tail; the driver appends one
+ *    standalone CDM barrier that is also the full cache flush and texture
+ *    cache invalidate (agx_cdm_barrier()), and internal blits depend on it
+ *    between their dispatches.  There is no weak record to drop.
+ *  - G18G: its launches chain with the strong flags=5 tail; flag-free chained
+ *    launches hung the CDM (hk_dispatch_g17g_native()).
+ */
+static inline bool
+agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
+{
+   return agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip);
 }
 
 /* Every AGX3B part carries the 8x8 f16/f32 matmad backing a subgroup-scope
