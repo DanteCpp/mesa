@@ -1462,11 +1462,11 @@ agx_ilp_schedule(agx_context *ctx)
        * a time, as it would for samples. A copy block keeps its own
        * schedule. M5 only: not G18G, which compiles as AGX3C with
        * emit_agx3d. */
-      const bool compute_loads = m5_compute && !ctx->key->dev.emit_agx3d &&
-                                 !m5_full && m5_samples && !copy;
+      const bool compute_loads = (m5_compute || m5_fragment) && !ctx->key->dev.emit_agx3d &&
+                                 !m5_full && (m5_samples || m5_fragment) && !copy;
       const unsigned loads = compute_loads ? ilp_block_device_loads(block) : 0;
-      if ((m5_compute && !m5_full) || copy || loop_samples) {
-         if ((m5_samples || copy || loop_samples) &&
+      if ((m5_compute && !m5_full) || (m5_fragment && loads) || copy || loop_samples) {
+         if ((m5_samples || m5_fragment || copy || loop_samples) &&
              (!in_loop[block->index] || m5_sample_probe || copy ||
               loop_samples || loads) &&
              ilp_block_samples(ctx, block) + loads >=
