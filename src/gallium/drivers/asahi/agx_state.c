@@ -15702,6 +15702,12 @@ agx_draw_multi(struct pipe_context *pctx, const struct pipe_draw_info *info,
    struct agx_context *ctx = agx_context(pctx);
    struct agx_device *dev = agx_device(pctx->screen);
 
+   /* The skip below appends only the legacy index-list record for each
+    * sub-draw. M5 (G17G/G17S/G17C) and G18G encode draw state through their
+    * own state stream instead (agx_encode_native_g17g_state() and
+    * agx_encode_g17g_state() in agx_encode_state()), so a clean context there
+    * does not mean "emit nothing but the index list": those chips take the
+    * full path. */
    if (indirect || !agx_native_graphics(dev) || agx_chip_g17_m5(dev->chip) ||
        dev->chip == AGX_CHIP_G18G || !debug_get_option_fast_multidraw()) {
       util_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
