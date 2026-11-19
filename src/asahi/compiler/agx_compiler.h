@@ -708,8 +708,9 @@ typedef struct {
    /* M5 CEM owns halves 8..15, beyond CF/shuffle/parallel-copy scratch. */
    bool agx3_cem_low_scratch;
 
-   /* The remat-only spiller had to spill a value to scratch; register
-    * allocation must finish with real spilling under the full budget. */
+   /* The remat-only spiller spilled a value to scratch. It keeps every value
+    * it cannot rematerialize in a register, so this stays false; register
+    * allocation would finish with real spilling under the full budget. */
    bool remat_fallback_spilled;
    unsigned spill_pcopy_base;
 
@@ -1332,7 +1333,6 @@ bool agx_fold_m5_spill_constant_phis(agx_context *ctx);
 void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
-void agx_ra_without_remat(agx_context *ctx);
 bool agx3_is_async(const agx_instr *I);
 unsigned agx_calc_register_demand(agx_context *ctx, bool remat);
 unsigned agx3_tile_store_bank(agx_context *ctx);
