@@ -15,6 +15,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
 #include "hk_queue.h"
+#include "hk_query_oq.h"
 
 #include "libagx_dgc.h"
 #include "libagx_shaders.h"
@@ -896,6 +897,15 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       cs->timestamp.start = st->pending_start_ts;
       st->pending_start_ts = (struct agx_timestamp_req){0};
    }
+
+   /* One waiting for the next render's vertex end
+    * (hk_sync_write_timestamp()). Other streams never see it: getting one
+    * resolves the stamp first (hk_cmd_buffer_get_cs_general()). */
+   if (st->pending_vtx_ts.handle && slot == &cmd->current_cs.gfx &&
+       cs->type == HK_CS_VDM) {
+      cs->timestamp.vtx_end = st->pending_vtx_ts;
+      st->pending_vtx_ts = (struct agx_timestamp_req){0};
+   }
 }
 
 /* Whether the open general compute stream may receive work of the given
@@ -1220,9 +1230,11 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
  * first scope is NONE, so such a stamp may be taken at any time; it becomes
  * the start stamp of the next command, except on chips whose start stamps
  * latch before a command's waits (start_stamps_ordered()), where it ends the
- * last command like any other stamp. Every other stage orders the stamp
- * after earlier work of its class, and the stamp becomes the end stamp of
- * the last command, which is then ordered after that work.
+ * last command like any other stamp, or, when that end is taken, the vertex
+ * half of a render (render_vtx_end_stamps()): the open render, or the next
+ * render if one is recorded before anything else. Every other stage orders
+ * the stamp after earlier work of its class, and the stamp becomes the end
+ * stamp of the last command, which is then ordered after that work.
  *
  * A later stamp with a first scope must not read a lower value than an
  * earlier stamp, since the earlier write is in its scope. A pending
@@ -1283,6 +1295,21 @@ start_stamps_ordered(const struct hk_cmd_buffer *cmd)
             agx_chip_g17_m5(dev->dev.chip));
 }
 
+/* Renders on these chips have a second end stamp: the vertex end, written
+ * by the kernel at retirement from the firmware's vertex end record, like
+ * every slot but the fragment end (hk_query_oq.h,
+ * hk_oq_render_stamps_supported()). It is an end stamp, so it is ordered
+ * after the render's waits, and the vertex half ends before the fragment
+ * half, so it never reads later than the fragment end. A top-of-pipe stamp
+ * may take it instead of a command of its own or a post-render copy.
+ */
+static bool
+render_vtx_end_stamps(const struct hk_cmd_buffer *cmd)
+{
+   return !start_stamps_ordered(cmd) &&
+          hk_oq_render_stamps_supported(hk_cmd_buffer_device(cmd)->dev.chip);
+}
+
 static struct hk_cs *
 last_stream(struct hk_cmd_buffer *cmd)
 {
@@ -1301,10 +1328,51 @@ timestamp_only_stream(struct hk_cmd_buffer *cmd,
    return cs;
 }
 
+/* An end stamp on the last recorded command if its end is free, otherwise
+ * on a command of its own ordered after dep. */
+static void
+stamp_last_end(struct hk_cmd_buffer *cmd, struct hk_cs *tail,
+               const struct hk_sync_dep dep[HK_SYNC_NUM_SQ],
+               struct agx_timestamp_req req)
+{
+   if (tail && !tail->timestamp.end.handle) {
+      tail->timestamp.end = req;
+      stamp_wait(cmd, tail, dep);
+
+      /* Later compute would move the stamp past itself; keep the stream
+       * boundary so the stamp stays at the recorded position. */
+      if (tail == cmd->current_cs.cs) {
+         stamp_carrier_launch(cmd);
+         hk_cmd_buffer_end_compute(cmd);
+      }
+      return;
+   }
+
+   struct hk_cs *cs = timestamp_only_stream(cmd, dep);
+   if (!cs)
+      return;
+   cs->timestamp.end = req;
+   stamp_carrier_launch(cmd);
+   hk_cmd_buffer_end_compute(cmd);
+}
+
 void
 hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
 {
    struct hk_sync_state *st = &cmd->sync;
+
+   /* No render came: the stamp ends the last command, or a command of its
+    * own, as it would have when recorded. Only a meta helper's work can
+    * have been recorded since (hk_cmd_buffer_get_cs_general()), and its end
+    * is as valid a place as any later one. */
+   if (st->pending_vtx_ts.handle) {
+      const struct agx_timestamp_req req = st->pending_vtx_ts;
+      st->pending_vtx_ts = (struct agx_timestamp_req){0};
+      st->epoch++;
+      const struct hk_sync_dep none[HK_SYNC_NUM_SQ] = {{0}, {0}};
+      stamp_last_end(cmd, last_stream(cmd), none, req);
+   }
+
    if (!st->pending_start_ts.handle)
       return;
 
@@ -1344,11 +1412,19 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
    if (st->in_pass && gfx) {
       /* Inside a render pass instance the stamp belongs to the render.
        * Vertex start for an unordered stamp where start stamps are ordered
-       * (start_stamps_ordered()), fragment end otherwise; a second end
+       * (start_stamps_ordered()). Where they are not, the vertex end
+       * (render_vtx_end_stamps()) for an unordered stamp that is the
+       * render's first: any later stamp of the render takes the fragment
+       * end, which reads no earlier. Fragment end otherwise; a second end
        * stamp is copied from the first after the render. */
       if (!src_kinds && !gfx->timestamp.start.handle &&
           start_stamps_ordered(cmd)) {
          gfx->timestamp.start = req;
+         return;
+      }
+      if (!src_kinds && !gfx->timestamp.end.handle &&
+          !gfx->timestamp.vtx_end.handle && render_vtx_end_stamps(cmd)) {
+         gfx->timestamp.vtx_end = req;
          return;
       }
 
@@ -1391,28 +1467,22 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
    hk_sync_flush_pending_timestamp(cmd);
 
    struct hk_cs *tail = last_stream(cmd);
-   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, src_kinds, tail, dep);
 
-   if (tail && !tail->timestamp.end.handle) {
-      tail->timestamp.end = req;
-      stamp_wait(cmd, tail, dep);
-
-      /* Later compute would move the stamp past itself; keep the stream
-       * boundary so the stamp stays at the recorded position. */
-      if (tail == cmd->current_cs.cs) {
-         stamp_carrier_launch(cmd);
-         hk_cmd_buffer_end_compute(cmd);
-      }
+   /* A top-of-pipe stamp with no free end to ride on would need a command
+    * of its own. A render recorded next is logically later and has a free
+    * vertex end: wait for it (pending_vtx_ts). Anything else recorded first
+    * resolves the stamp here after all (hk_sync_flush_pending_timestamp()).
+    * Typical: the bracket of a pass, [top stamp, pass, bottom stamp], after
+    * earlier work whose end already carries a stamp. */
+   if (!src_kinds && (!tail || tail->timestamp.end.handle) &&
+       render_vtx_end_stamps(cmd)) {
+      st->pending_vtx_ts = req;
       return;
    }
 
-   struct hk_cs *cs = timestamp_only_stream(cmd, dep);
-   if (!cs)
-      return;
-   cs->timestamp.end = req;
-   stamp_carrier_launch(cmd);
-   hk_cmd_buffer_end_compute(cmd);
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+   hk_sync_src_dep(cmd, src_kinds, tail, dep);
+   stamp_last_end(cmd, tail, dep, req);
 }
 
 void

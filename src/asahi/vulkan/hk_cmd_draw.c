@@ -4041,13 +4041,14 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
        cmd->in_meta || cs->stats.cmds == 0 || cmd->sync.pass_vdm != cs ||
        cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx ||
        cmd->uses_heap || cs->timestamp.start.handle ||
-       cs->timestamp.end.handle) {
+       cs->timestamp.end.handle || cs->timestamp.vtx_end.handle) {
       if (msaa_enabled)
          hk_frame_anatomy_note(dev,
             "MSAA pass merge refused: pre=%u post=%u heap=%u draws=%u timestamp=%u",
             cmd->current_cs.pre_gfx != NULL, cmd->current_cs.post_gfx != NULL,
             cmd->uses_heap, cs->stats.cmds,
-            cs->timestamp.start.handle != 0 || cs->timestamp.end.handle != 0);
+            cs->timestamp.start.handle != 0 || cs->timestamp.end.handle != 0 ||
+               cs->timestamp.vtx_end.handle != 0);
       return false;
    }
 
@@ -4534,7 +4535,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    if (cmd->in_meta || cmd->state.deferred_clear_count ||
        cmd->current_cs.gfx || cmd->current_cs.pre_gfx ||
        cmd->current_cs.post_gfx || cmd->sync.in_pass ||
-       cmd->sync.pending_start_ts.handle)
+       cmd->sync.pending_start_ts.handle || cmd->sync.pending_vtx_ts.handle)
       why = "state";
    else if (list_is_empty(&cmd->control_streams) ||
             list_last_entry(&cmd->control_streams, struct hk_cs, node) != cs)
@@ -4546,7 +4547,8 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
             (m->open_cs && m->open_cs->current != m->open_cs_current))
       why = "compute";
    else if (cs->current != m->after_current || cs->end != m->end ||
-            cs->timestamp.start.handle || cs->timestamp.end.handle)
+            cs->timestamp.start.handle || cs->timestamp.end.handle ||
+            cs->timestamp.vtx_end.handle)
       why = "stream";
    else if (info->flags & (VK_RENDERING_SUSPENDING_BIT |
                            VK_RENDERING_RESUMING_BIT |

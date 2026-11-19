@@ -169,27 +169,124 @@ test_timestamp_reused_compute(void)
    }
 }
 
-/* G17P and M5: a TOP_OF_PIPE stamp inside a render pass instance ends the
- * render (fragment end), never its vertex start: start stamps latch before the
- * render's waits, so a query reset before the pass could overwrite one. */
+static struct hk_cs *
+add_render(struct hk_cmd_buffer *cmd)
+{
+   struct hk_cs *render = test_alloc(sizeof(*render));
+   render->type = HK_CS_VDM;
+   list_addtail(&render->node, &cmd->control_streams);
+   hk_sync_stream_created(cmd, render, &cmd->current_cs.gfx, false);
+   cmd->current_cs.gfx = render;
+   render->stats.cmds++;
+   return render;
+}
+
+static void
+top_timestamp(struct hk_cmd_buffer *cmd, uint32_t query)
+{
+   const struct agx_timestamp_req req = {
+      .handle = 1, .addr = 0x10000 + 8 * query, .offset_B = 8 * query};
+   hk_sync_write_timestamp(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, req);
+}
+
+static bool
+stamp_is(const struct agx_timestamp_req *req, uint32_t query)
+{
+   return req->handle == 1 && req->offset_B == 8 * query;
+}
+
+/* G17P and M5: a TOP_OF_PIPE stamp inside a render pass instance never takes
+ * the render's vertex start: start stamps latch before the render's waits,
+ * so a query reset before the pass could overwrite one. The render's first
+ * stamp takes its vertex end (kernel-written at retirement, after the
+ * render's waits); the next one its fragment end, which reads no earlier,
+ * instead of a post-render copy command. */
 static void
 test_timestamp_top_in_pass(void)
 {
    for (unsigned c = 0; c < ARRAY_SIZE(end_stamp_chips); ++c) {
       struct hk_cmd_buffer *cmd = timestamp_cmd(end_stamp_chips[c], true);
       hk_sync_begin_rendering(cmd, false);
-      struct hk_cs *render = test_alloc(sizeof(*render));
-      render->type = HK_CS_VDM;
-      list_addtail(&render->node, &cmd->control_streams);
-      hk_sync_stream_created(cmd, render, &cmd->current_cs.gfx, false);
-      cmd->current_cs.gfx = render;
-      render->stats.cmds++;
-      const struct agx_timestamp_req top = {.handle = 1, .addr = 0x10000, .offset_B = 0};
-      hk_sync_write_timestamp(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, top);
-      T("in-pass top stamp ends the render",
-        render->timestamp.end.handle == 1 && render->timestamp.end.offset_B == 0);
+      struct hk_cs *render = add_render(cmd);
+      top_timestamp(cmd, 0);
+      T("in-pass top stamp ends the render's vertex half",
+        stamp_is(&render->timestamp.vtx_end, 0) && !render->timestamp.end.handle);
       T("in-pass top stamp takes no vertex start", !render->timestamp.start.handle);
+      top_timestamp(cmd, 1);
+      T("second in-pass top stamp ends the render",
+        stamp_is(&render->timestamp.end, 1) &&
+        stamp_is(&render->timestamp.vtx_end, 0));
+      T("in-pass stamps add no command", list_is_singular(&cmd->control_streams));
+
+      /* An in-pass bottom stamp after the top one: fragment end. */
+      cmd = timestamp_cmd(end_stamp_chips[c], true);
+      hk_sync_begin_rendering(cmd, false);
+      render = add_render(cmd);
+      top_timestamp(cmd, 0);
+      end_timestamp(cmd, 1);
+      T("in-pass top/bottom pair rides one render",
+        stamp_is(&render->timestamp.vtx_end, 0) &&
+        stamp_is(&render->timestamp.end, 1) && !render->timestamp.start.handle &&
+        list_is_singular(&cmd->control_streams));
    }
+}
+
+/* G17P and M5: the bracket of a pass after earlier work whose end already
+ * carries a stamp, [top stamp, pass, bottom stamp]. The top stamp has no
+ * free end to ride on; rather than a command of its own it waits for the
+ * render and takes its vertex end, never a start stamp. */
+static void
+test_timestamp_top_before_pass(void)
+{
+   for (unsigned c = 0; c < ARRAY_SIZE(end_stamp_chips); ++c) {
+      struct hk_cmd_buffer *cmd = timestamp_cmd(end_stamp_chips[c], true);
+      struct hk_cs *work = add(cmd, true);
+      cmd->current_cs.cs = work;
+      work->stats.cmds++;
+      end_timestamp(cmd, 0);
+      T("bottom stamp ends the earlier work", stamp_is(&work->timestamp.end, 0));
+
+      top_timestamp(cmd, 1);
+      T("top stamp waits for a render", stamp_is(&cmd->sync.pending_vtx_ts, 1) &&
+                                           !cmd->sync.pending_start_ts.handle);
+      T("waiting top stamp adds no command",
+        list_length(&cmd->control_streams) == 1);
+
+      hk_sync_begin_rendering(cmd, false);
+      struct hk_cs *render = add_render(cmd);
+      T("next render's vertex end carries the top stamp",
+        stamp_is(&render->timestamp.vtx_end, 1) &&
+        !cmd->sync.pending_vtx_ts.handle);
+      T("bracketed render takes no start stamp", !render->timestamp.start.handle);
+      hk_sync_end_rendering(cmd, false);
+      cmd->current_cs.gfx = NULL;
+
+      end_timestamp(cmd, 2);
+      T("bottom stamp ends the render",
+        stamp_is(&render->timestamp.end, 2));
+      T("bracket adds no stamp command", list_length(&cmd->control_streams) == 2);
+      T("bracketed pass resolves", submit(new_queue(true), cmd));
+
+      /* Only a render takes the waiting stamp. */
+      cmd = timestamp_cmd(end_stamp_chips[c], true);
+      work = add(cmd, true);
+      work->stats.cmds++;
+      end_timestamp(cmd, 0);
+      top_timestamp(cmd, 1);
+      struct hk_cs *dispatch = add(cmd, true);
+      T("compute does not take the waiting stamp",
+        !dispatch->timestamp.start.handle && !dispatch->timestamp.end.handle &&
+        stamp_is(&cmd->sync.pending_vtx_ts, 1));
+   }
+
+   /* Chips whose start stamps are ordered keep the next command's start. */
+   struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G13G, true);
+   top_timestamp(cmd, 0);
+   T("ordered-start chip keeps a pending start stamp",
+     stamp_is(&cmd->sync.pending_start_ts, 0) && !cmd->sync.pending_vtx_ts.handle);
+   struct hk_cs *render = add_render(cmd);
+   T("ordered-start chip stamps the render's start",
+     stamp_is(&render->timestamp.start, 0) && !render->timestamp.vtx_end.handle);
 }
 
 /* Exercise actual timestamp placement, barriers and the submission resolver.
@@ -1517,6 +1614,7 @@ main(void)
    test_timestamp_execution_scopes();
    test_timestamp_reused_compute();
    test_timestamp_top_in_pass();
+   test_timestamp_top_before_pass();
    {
       /* A submission longer than the 16-bit barrier field: a wait on a
        * command past it is named by its ordinal (that command went in an

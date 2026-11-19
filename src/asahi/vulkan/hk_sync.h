@@ -332,6 +332,14 @@ struct hk_sync_state {
     * start timestamp. */
    struct agx_timestamp_req pending_start_ts;
 
+   /* Chips whose stamps only ride on command ends (hk_sync.c,
+    * start_stamps_ordered()): a top-of-pipe timestamp with no free end to
+    * ride on, waiting for the next render to carry it as its vertex end. Any
+    * other stream, query command, timestamp or the end of the command buffer
+    * resolves it the way it would have been resolved when recorded
+    * (hk_sync_flush_pending_timestamp()). */
+   struct agx_timestamp_req pending_vtx_ts;
+
    /* Tile hazards: attachment footprints of the open pass instance and
     * the latest earlier render stream it shares a tile with. The command
     * buffer keeps the recorded instances (hk_cmd_buffer::sync_pass_records). */

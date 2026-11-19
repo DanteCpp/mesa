@@ -4714,7 +4714,8 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
 
    /* A timestamp rides on this exact command; replacing the render with
     * image clears would drop it. Keep the render. */
-   if (cs->timestamp.start.handle || cs->timestamp.end.handle)
+   if (cs->timestamp.start.handle || cs->timestamp.end.handle ||
+       cs->timestamp.vtx_end.handle)
       return false;
 
    /* M5: a multisample clear-only pass stays a render. As compute it is a

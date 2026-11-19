@@ -1356,11 +1356,14 @@ struct hk_cs {
 
    /* Timestamp writes: the start of the command (compute start, render
     * vertex start) and its end (compute end, render fragment end). The
-    * kernel writes both from the firmware's native pass record.
+    * kernel writes both from the firmware's native pass record. Renders on
+    * chips whose stamps only ride on command ends may also carry a
+    * top-of-pipe stamp on their vertex end (hk_sync_write_timestamp()).
     */
    struct {
       struct agx_timestamp_req start;
       struct agx_timestamp_req end;
+      struct agx_timestamp_req vtx_end;
    } timestamp;
 
    /* Render only: occlusion availability slots written by the kernel at
@@ -2311,6 +2314,15 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
    if (*ptr && (*ptr)->g18_dispatch_sealed)
       *ptr = NULL;
 
+   /* A top-of-pipe stamp waiting for the next render's vertex end
+    * (hk_sync_state::pending_vtx_ts): other work comes first, so the stamp
+    * is resolved before it, where it was recorded, rather than latching
+    * after that work too. A meta helper's or pinned stream is left alone;
+    * any later point is still a valid place for the stamp. */
+   if (unlikely(cmd->sync.pending_vtx_ts.handle) &&
+       ptr != &cmd->current_cs.gfx && !cmd->sync.pin_cs && !cmd->in_meta)
+      hk_sync_flush_pending_timestamp(cmd);
+
    /* A recorded dependency may have ordered the open general compute stream
     * after work that follows it in the list. It is then ended, and the work
     * goes into a stream positioned after that requirement. Work of a new
@@ -2468,7 +2480,8 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
        * the submission list. A stream that only carries a timestamp stays:
        * that is the one job the stamp can ride on. */
       if (cs->stats.cmds == 0 && cs->stats.flushes == 0 &&
-          !cs->timestamp.end.handle && !cs->timestamp.start.handle) {
+          !cs->timestamp.end.handle && !cs->timestamp.start.handle &&
+          !cs->timestamp.vtx_end.handle) {
          hk_sync_forget_stream(cmd, cs);
          list_del(&cs->node);
          hk_cs_destroy(cs);
