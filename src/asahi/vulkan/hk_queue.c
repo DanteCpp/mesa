@@ -2662,8 +2662,10 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
             hk_cdm_visibility_flush(dev, cs, last || hk_cdm_alias_scope(dev));
          } else if (!last) {
             /* HAL200: the member's ordering barrier becomes the strong
-             * flush, or its strong flush stays. */
-            hk_cdm_visibility_flush(dev, cs, false);
+             * flush, or its strong flush stays; with memory scope while
+             * memory may be reached through a second address (on G16G the
+             * member's end already has it, hk_cdm_end_stream_flush()). */
+            hk_cdm_visibility_flush(dev, cs, hk_cdm_alias_scope(dev));
          }
 
          hk_pack_fold_member(cmd, cs, source, item, last, &preceding_kinds);

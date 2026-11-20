@@ -20,12 +20,13 @@
  *   flush, DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: only then does every
  *   stream end with the strong memory-scoped flush a boundary keeps
  *   (hk_EndCommandBuffer()). This holds for every M5 part.
- * - G16 (HAL200) streams pack where the strong flush is the whole visibility
- *   record. G17P differs: its caches are tagged by virtual address and its
- *   strong flush also has a memory-scoped form, which memory reached through
- *   a second address needs (hk_cdm_alias_scope()); no boundary of this kind
- *   asks for it. G17A, the other HAL200 part, sits between G17P and M5,
- *   which both have that form; until its caches are known it has no
+ * - G16 (HAL200) streams pack at the strong flush, which a boundary asks
+ *   for with memory scope while memory may be reached through a second
+ *   address (hk_cdm_alias_scope()); on G16G that scope is the wide word
+ *   (hk_cdm_memory_scope_wide()). G17P differs: its strong flush has a
+ *   separate memory-scoped form whose state the boundary would have to read
+ *   at submission, as on M5. G17A, the other HAL200 part, sits between G17P
+ *   and M5, which both have that form; until its caches are known it has no
  *   boundary either.
  * - G15: the boundary would be the wide barrier its in-stream dependencies
  *   get (agx_chip_cdm_wide_visibility()), but packing there (the kernel's

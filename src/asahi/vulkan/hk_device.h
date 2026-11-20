@@ -397,14 +397,18 @@ enum hk_perftest {
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)
 
-/* G17P and M5 GPU caches are tagged by virtual address: a strong CDM flush
- * makes a write visible only to reads through the same mapping. While memory
- * may be read through a second address, an application dependency between
- * compute or transfer work needs the memory-scope flush
+/* G17P, M5 and G16G GPU caches are tagged by virtual address: a strong CDM
+ * flush makes a write visible only to reads through the same mapping. While
+ * memory may be read through a second address, an application dependency
+ * between compute or transfer work needs the memory-scope flush
  * (hk_cdm_visibility_flush()). Devices without such memory keep the ordinary
- * strong flush.
+ * strong flush. On G16G (measured on the M4 with a capture/replay buffer
+ * over another buffer's memory) a read through the second address returned
+ * the memory as it was before a write through the first, also across
+ * separate commands; the wide-visibility word, whose bits 4:2 write back,
+ * made it visible (hk_cdm_memory_scope_wide()).
  *
- * On M5 this is decided once, when the device is created
+ * On M5 and G16G this is decided once, when the device is created
  * (hk_device_may_alias_memory()): a device that enabled no feature or
  * extension through which memory can get a second GPU address (sparse
  * binding, capture/replay, fd imports, writable host imports) never has such
@@ -449,7 +453,8 @@ hk_cdm_alias_scope(const struct hk_device *dev)
 
 /* Whether the CDM strong flush has a memory-scoped form, which memory
  * reached through a second address needs (hk_cdm_alias_scope()): on G17P
- * and M5. The other HAL200 parts (G16) have only the plain strong flush. */
+ * and M5. G16G gets memory scope from its wide-visibility word instead
+ * (hk_cdm_memory_scope_wide()). */
 static inline bool
 hk_cdm_memory_scope_form(const struct hk_device *dev)
 {
