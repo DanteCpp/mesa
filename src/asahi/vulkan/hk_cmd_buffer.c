@@ -3785,7 +3785,7 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
             agx3_transcode_agx3d_ioto(&code, 0, &ioto, &why, &at) &&
             code.size <= reserve_capacity;
          if (!ok) {
-            mesa_loge("hk: G18G Ioto program not re-encoded: %s at +0x%x",
+            mesa_loge("borealis: G18G Ioto program not re-encoded: %s at +0x%x",
                       why ? why : "longer than the reservation", at);
             util_dynarray_fini(&code);
             vk_command_buffer_set_error(&cmd->vk,
@@ -4052,7 +4052,7 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
           !prog->b.workgroup.z ||
           agx_is_indirect(grid) || !grid.count[0] || !grid.count[1] ||
           !grid.count[2]) {
-         mesa_loge("hk: refusing precompiled G18G program %u shape "
+         mesa_loge("borealis: refusing precompiled G18G program %u shape "
                    "(preamble_gprs=%u scratch=%u tps=%u local=%u "
                    "staging_known=%u indirect=%u)",
                    idx, prog->info.nr_preamble_gprs, scratch_bytes,
@@ -4117,7 +4117,7 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       if (!agx_va_in_usc_window(&dev->dev, program_t.gpu) ||
           !agx_va_in_usc_window(&dev->dev,
                                 prog->ptr + prog->entry_offset)) {
-         mesa_loge("hk: G18G helper %u: program %" PRIx64 " or entry %" PRIx64
+         mesa_loge("borealis: G18G helper %u: program %" PRIx64 " or entry %" PRIx64
                    " outside the USC window (base %" PRIx64 ")",
                    idx, (uint64_t)program_t.gpu,
                    (uint64_t)(prog->ptr + prog->entry_offset),
@@ -4140,7 +4140,7 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       struct agx3_g17p_graphics_program generated;
       if (!agx3_g18g_compute_program_generate(&desc, &generated) ||
           generated.length > AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE) {
-         mesa_loge("hk: G18G compute program %u generation failed", idx);
+         mesa_loge("borealis: G18G compute program %u generation failed", idx);
          vk_command_buffer_set_error(&cmd->vk,
                                      VK_ERROR_FEATURE_NOT_PRESENT);
          return;
@@ -4159,7 +4159,7 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
          agx3_transcode_agx3d_ioto(&code, 0, &ioto, &why, &at) &&
          code.size <= AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE;
       if (!ok) {
-         mesa_loge("hk: G18G compute program %u not re-encoded: %s at "
+         mesa_loge("borealis: G18G compute program %u not re-encoded: %s at "
                    "+0x%x", idx, why ? why : "too long", at);
          util_dynarray_fini(&code);
          vk_command_buffer_set_error(&cmd->vk,
@@ -4178,13 +4178,13 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       if (!agx3_cdm_direct_template_sources_compute(false, false, false,
                                                     &bind_desc.launch_sources) ||
           !agx3_g17g_native_compute_program_bind(&bind_desc, &launch)) {
-         mesa_loge("hk: G18G compute program %u bind failed", idx);
+         mesa_loge("borealis: G18G compute program %u bind failed", idx);
          vk_command_buffer_set_error(&cmd->vk,
                                      VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
       /* w7C/w7P: the helper's identity and size, for the stream decodes. */
-      mesa_logi("hk: G18G precomp helper %u dispatch: main_size=%u "
+      mesa_logi("borealis: G18G precomp helper %u dispatch: main_size=%u "
                 "generated=%u grid=%ux%ux%u wg=%ux%ux%u",
                 idx, prog->info.main_size, (unsigned)generated.length,
                 grid.count[0], grid.count[1], grid.count[2],
@@ -4220,7 +4220,7 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       if (!launched ||
           !agx3_cdm_stream_terminate_pack(dev->dev.chip, terminate) ||
           sink.capacity - sink.length < sizeof(terminate)) {
-         mesa_loge("hk: G18G compute program %u dispatch append failed",
+         mesa_loge("borealis: G18G compute program %u dispatch append failed",
                    idx);
          vk_command_buffer_set_error(&cmd->vk,
                                      VK_ERROR_FEATURE_NOT_PRESENT);

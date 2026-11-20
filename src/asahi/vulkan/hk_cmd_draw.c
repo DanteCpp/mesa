@@ -2182,7 +2182,7 @@ hk_build_g17g_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
          memcpy(program.bytes, code.data, code.size);
          program.length = code.size;
       } else {
-         mesa_loge("hk: G18G tile Ioto not re-encoded: %s at +0x%x",
+         mesa_loge("borealis: G18G tile Ioto not re-encoded: %s at +0x%x",
                    why ? why : "longer than the reservation", at);
       }
       util_dynarray_fini(&code);
