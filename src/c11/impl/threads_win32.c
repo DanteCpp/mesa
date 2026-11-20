@@ -276,7 +276,9 @@ thrd_create(thrd_t *thr, thrd_start_t func, void *arg)
     if (!pack) return thrd_nomem;
     pack->func = func;
     pack->arg = arg;
-    handle = _beginthreadex(NULL, 0, impl_thrd_routine, pack, CREATE_SUSPENDED, NULL);
+    /* An explicit 8 MiB reserve (not commit) instead of the executable's default: inside dwm.exe the default is too small. */
+    handle = _beginthreadex(NULL, 8 * 1024 * 1024, impl_thrd_routine, pack,
+                            CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (handle == 0) {
         free(pack);
         if (errno == EAGAIN || errno == EACCES)
