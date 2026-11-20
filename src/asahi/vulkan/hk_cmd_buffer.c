@@ -4400,9 +4400,12 @@ hk_primary_note_render(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    hk_drm_attachment_set_init(&set);
    hk_cs_capture_fragment_attachments(dev, &cmd->state.gfx.render, &set, true);
    cs->primary_writes.observed = true;
-   if (!set.complete || cs->m5_shader_writes_memory ||
-       cmd->state.gfx.shaders_write_memory || cmd->state.gfx.xfb_enabled)
-      cs->primary_writes.incomplete = true;
+   if (!set.complete)
+      agx_primary_write_refuse(&cs->primary_writes, AGX_PRIMARY_WRITE_CAUSE_ATTACHMENT);
+   if (cs->m5_shader_writes_memory || cmd->state.gfx.shaders_write_memory)
+      agx_primary_write_refuse(&cs->primary_writes, AGX_PRIMARY_WRITE_CAUSE_SHADER_WRITES);
+   if (cmd->state.gfx.xfb_enabled)
+      agx_primary_write_refuse(&cs->primary_writes, AGX_PRIMARY_WRITE_CAUSE_XFB);
    for (unsigned i = 0; i < set.count; i++)
       agx_primary_write_add(&cs->primary_writes, set.list[i].pointer, set.list[i].size);
 }

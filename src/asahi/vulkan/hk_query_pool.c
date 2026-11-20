@@ -258,7 +258,7 @@ hk_CmdWriteAccelerationStructuresPropertiesKHR(
       }
       if (vk_command_buffer_has_error(&cmd->vk))
          return;
-      hk_queue_write(cmd, hk_query_available_addr(pool, firstQuery + i), 1, false);
+      hk_queue_write_bo(cmd, pool->bo, hk_query_available_addr(pool, firstQuery + i), 1, false);
    }
 }
 
@@ -313,7 +313,10 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       return;
    }
 
+   /* Private only if every queued word was proven when it was queued. */
+   hk_primary_private_begin(cmd, !cs->imm_writes_unproven);
    libagx_write_u32s(cmd, agx_1d(count), AGX_BARRIER_ALL | AGX_POSTGFX, params);
+   hk_primary_private_end(cmd);
 }
 
 void
@@ -334,6 +337,10 @@ hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
       }
 
       util_dynarray_append(&cs->imm_writes, imm);
+      /* Queued now, dispatched at the end of the stream: remember whether
+       * this word was proven private (hk_dispatch_imm_writes()). */
+      if (!cmd->primary_private.depth || cmd->primary_private.unproven)
+         cs->imm_writes_unproven = true;
       return;
    }
 
@@ -355,6 +362,18 @@ hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
    }
 
    libagx_write_u32(cmd, agx_1d(1), AGX_BARRIER_ALL, address, value);
+}
+
+/* Version-6 contract: the same write, inside a helper-write scope whose proof
+ * is the destination BO's own class (hk_primary_private_proof()). Emits
+ * exactly what hk_queue_write() emits; the scope is bookkeeping only. */
+void
+hk_queue_write_bo(struct hk_cmd_buffer *cmd, const struct agx_bo *bo,
+                  uint64_t address, uint32_t value, bool after_gfx)
+{
+   hk_primary_private_begin(cmd, hk_primary_private_proof(bo, address, sizeof(value)));
+   hk_queue_write(cmd, address, value, after_gfx);
+   hk_primary_private_end(cmd);
 }
 
 /* Publish @value after the pre-graphics helpers already recorded for the
@@ -380,7 +399,7 @@ hk_cmd_end_query_stamped(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
                          uint32_t query)
 {
    const uint32_t render_seq = cmd->current_cs.gfx->sync.seq;
-   hk_queue_write(cmd, hk_query_available_addr(pool, query), 1, true);
+   hk_queue_write_bo(cmd, pool->bo, hk_query_available_addr(pool, query), 1, true);
 
    struct hk_cs *cs = cmd->current_cs.post_gfx;
    if (!cs || vk_command_buffer_has_error(&cmd->vk))
@@ -1025,16 +1044,19 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
        * Only native AGX3 occlusion pools have a bound availability buffer
        * (pool->handle, see hk_CreateQueryPool()); M5 transform feedback
        * queries publish after their pre-graphics helpers. */
-      if (pre_gfx)
-         hk_queue_write_pre_gfx(cmd, hk_query_available_addr(pool, query), 1);
-      else if (pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION && pool->handle &&
+      if (pre_gfx) {
+         const uint64_t avail = hk_query_available_addr(pool, query);
+         hk_primary_private_begin(cmd, hk_primary_private_proof(pool->bo, avail, sizeof(uint32_t)));
+         hk_queue_write_pre_gfx(cmd, avail, 1);
+         hk_primary_private_end(cmd);
+      } else if (pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION && pool->handle &&
                cmd->current_cs.gfx &&
                cmd->current_cs.gfx->sync.seq ==
                   cmd->state.gfx.occlusion.begin_render_seq)
          hk_cmd_end_query_stamped(cmd, pool, query);
       else
-         hk_queue_write(cmd, hk_query_available_addr(pool, query), 1,
-                        graphics);
+         hk_queue_write_bo(cmd, pool->bo, hk_query_available_addr(pool, query), 1,
+                           graphics);
    }
 }
 

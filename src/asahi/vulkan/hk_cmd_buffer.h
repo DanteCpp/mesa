@@ -1244,6 +1244,9 @@ struct hk_cs {
     * accelerates queries. Implies CDM.
     */
    struct util_dynarray imm_writes;
+   /* Version-6 contract: some queued write above was not proven to land in a
+    * never-shared driver BO (hk_queue_write outside a proven helper scope). */
+   bool imm_writes_unproven;
 
    /* Native private-memory profiles for every dispatch in this stream. */
    struct util_dynarray compute_resources;
@@ -1892,6 +1895,15 @@ struct hk_cmd_buffer {
    /* Does the command buffer use the geometry heap? */
    bool uses_heap;
 
+   /* Version-6 primary-write contract only: an open helper-write scope
+    * (hk_primary_private_begin/end). Bookkeeping for hk_primary_note_compute
+    * alone; it changes nothing that is recorded or emitted. unproven is set
+    * when any scope in the nest could not prove its destination private. */
+   struct {
+      uint32_t depth;
+      bool unproven;
+   } primary_private;
+
    /* Owned BOs and retained references needed by recorded commands. */
    struct util_dynarray large_bos;
    /* Direct-mapped temporal cache avoids rescanning large_bos for the linked
@@ -2011,11 +2023,49 @@ hk_primary_note_compute(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    if (!hk_cmd_buffer_device(cmd)->dev.primary_write_contract) return;
    const struct hk_sync_xfer_dst *d = &cmd->sync.xfer_dst;
    cs->primary_writes.observed = true;
+   /* An open API transfer scope wins: declared or refused exactly as before.
+    * Only outside any transfer, a helper-write scope (an event or query word
+    * in one of the driver's own BOs) is observed and declares nothing --
+    * provided it proved its destination. */
+   if (!cmd->sync.xfer_depth && cmd->primary_private.depth) {
+      agx_primary_write_note_private(&cs->primary_writes, !cmd->primary_private.unproven);
+      return;
+   }
    if (!cmd->sync.xfer_depth || !d->valid || d->device_address || d->lo >= d->hi) {
-      cs->primary_writes.incomplete = true;
+      agx_primary_write_refuse(&cs->primary_writes,
+                               !cmd->sync.xfer_depth ? AGX_PRIMARY_WRITE_CAUSE_COMPUTE_NO_SCOPE
+                                                     : AGX_PRIMARY_WRITE_CAUSE_TRANSFER_DST);
       return;
    }
    agx_primary_write_add(&cs->primary_writes, d->lo, d->hi - d->lo);
+}
+
+/* A helper write's destination is private when [address, address + size)
+ * lies inside one of the driver's own BOs that is neither shared nor
+ * shareable: such a BO can never be a primary. */
+static inline bool
+hk_primary_private_proof(const struct agx_bo *bo, uint64_t address, uint64_t size)
+{
+   return bo != NULL && bo->va != NULL && size != 0 && size <= bo->size &&
+          (bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) == 0 &&
+          address >= bo->va->addr && address - bo->va->addr <= bo->size - size;
+}
+
+static inline void
+hk_primary_private_begin(struct hk_cmd_buffer *cmd, bool proven)
+{
+   if (cmd->primary_private.depth++ == 0)
+      cmd->primary_private.unproven = !proven;
+   else
+      cmd->primary_private.unproven |= !proven;
+}
+
+static inline void
+hk_primary_private_end(struct hk_cmd_buffer *cmd)
+{
+   assert(cmd->primary_private.depth > 0);
+   if (--cmd->primary_private.depth == 0)
+      cmd->primary_private.unproven = false;
 }
 
 void hk_primary_note_render(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
@@ -2975,6 +3025,10 @@ uint64_t hk_apply_conditional_rendering(struct hk_cmd_buffer *cmd,
 
 void hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
                     bool after_gfx);
+/* hk_queue_write into a word of a known BO, inside a helper-write scope that
+ * is proven private when the BO is the driver's own and never shared. */
+void hk_queue_write_bo(struct hk_cmd_buffer *cmd, const struct agx_bo *bo,
+                       uint64_t address, uint32_t value, bool after_gfx);
 bool hk_ensure_occlusion_query_for_draw(struct hk_cmd_buffer *cmd);
 
 /* Dispatch the native G17P raw-address fill meta shader into an explicitly

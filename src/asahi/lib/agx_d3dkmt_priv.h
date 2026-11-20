@@ -119,7 +119,31 @@ struct agx_d3dkmt_winsys {
    /* KMTQAITYPE_UMDRIVERPRIVATE payload: the AGX params blob verbatim. */
    void *params;
    uint32_t params_size;
+
+   /* Version-6 diagnostics to stderr (J813 first draw, round 3). Set only on a
+    * device that negotiated the primary-write contract; nothing is logged and
+    * nothing changes on any other device. Counters are updated atomically. */
+   bool v6_log;
+   uint32_t v6_submits;      /* submits seen (bounds the per-submit lines) */
+   uint32_t v6_kinds_logged; /* AGX_D3DKMT_V6_* first-of-kind bits already logged */
 };
+
+/* First-of-kind refusal lines of the version-6 path. */
+#define AGX_D3DKMT_V6_WRITE_SET   (1u << 0) /* the command's write set was incomplete */
+#define AGX_D3DKMT_V6_READ_SET    (1u << 1) /* the read list could not be built (more than 256 ranges) */
+#define AGX_D3DKMT_V6_VALIDATOR   (1u << 2) /* the shared validator refused the record */
+#define AGX_D3DKMT_V6_SUBMIT      (1u << 3) /* SubmitCommand failed */
+#define AGX_D3DKMT_V6_SIGNAL      (1u << 4) /* SignalSynchronizationObjectFromGpu failed */
+#define AGX_D3DKMT_V6_GPU_WAIT    (1u << 5) /* WaitForSynchronizationObjectFromGpu failed */
+#define AGX_D3DKMT_V6_FENCE_2S    (1u << 6) /* the first CPU fence wait over 2 s */
+
+/* True exactly once per winsys and kind, and only on a v6 device. */
+static inline bool
+agx_d3dkmt_v6_first(struct agx_d3dkmt_winsys *ws, uint32_t kind)
+{
+   return ws->v6_log &&
+          (__atomic_fetch_or(&ws->v6_kinds_logged, kind, __ATOMIC_RELAXED) & kind) == 0;
+}
 
 static inline void
 agx_d3dkmt_mark_device_lost(struct agx_d3dkmt_winsys *ws,

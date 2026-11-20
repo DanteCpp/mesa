@@ -1440,16 +1440,27 @@ d3dkmt_bo_sync_for_device(struct agx_device *dev, struct agx_bo *bo,
  * process may own it.  Whole-BO ranges deliberately trade a bounded amount of
  * cache maintenance for completeness across executable pools, command pools,
  * descriptors, vertex/index/uniform/texture/indirect data, events and buffer
- * device addresses. */
+ * device addresses.
+ *
+ * That is the version-3 rule. Under the version-6 primary-write contract
+ * (dev->primary_write_contract) the list names only shared and shareable BOs,
+ * whole: on the J813 path the kernel uses the v6 read list for nothing but
+ * standard primaries (always shareable), copying each named one in at
+ * publication, and refuses a submit when any declared page is unmapped at
+ * acquire or remapped before publication. The selection is the one predicate
+ * agx_d3dkmt_read_set_names_*() (agx_d3dkmt_core.c, host-tested), so the v3
+ * list is exactly what it was. *named_bos counts the BOs named. */
 static int
 d3dkmt_build_read_set(struct agx_device *dev, struct agx_bo *staging,
                       struct agxw_submit_read_range *ranges,
-                      uint32_t *range_count)
+                      uint32_t *range_count, uint32_t *named_bos)
 {
-   uint32_t count = 0;
+   const bool v6 = dev->primary_write_contract;
+   uint32_t count = 0, named = 0;
    uint64_t staging_va = staging->va->addr;
 
-   if (agx_d3dkmt_read_range_add_layout(
+   if (agx_d3dkmt_read_set_names_staging(v6) &&
+       agx_d3dkmt_read_range_add_layout(
           &agx_d3dkmt_ws(dev)->policy.layout, ranges, &count,
           AGXW_MAX_READ_RANGES_PER_SUBMIT,
           staging_va, staging->size) != AGX_D3DKMT_OK)
@@ -1461,8 +1472,9 @@ d3dkmt_build_read_set(struct agx_device *dev, struct agx_bo *staging,
       uint64_t gpu_va;
 
       if (bo->refcnt <= 0 || bo->va == NULL || bo->size == 0 ||
-          (bo->_map == NULL &&
-           (bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) == 0))
+          !agx_d3dkmt_read_set_names_bo(
+             v6, bo->_map != NULL,
+             (bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) != 0))
          continue;
       gpu_va = bo->va->addr;
       if (agx_d3dkmt_read_range_add_layout(
@@ -1473,10 +1485,30 @@ d3dkmt_build_read_set(struct agx_device *dev, struct agx_bo *staging,
          errno = ENOSPC;
          return -1;
       }
+      named++;
    }
    simple_mtx_unlock(&dev->bo_map_lock);
    *range_count = count;
+   if (named_bos)
+      *named_bos = named;
    return 0;
+}
+
+/* 16 KiB pages a sorted range vector touches (the validator's own count). */
+static uint64_t
+d3dkmt_v6_pages(const struct agxw_submit_read_range *r, uint32_t n)
+{
+   uint64_t pages = 0;
+   for (uint32_t i = 0; i < n; i++)
+      pages += ((r[i].gpu_va + r[i].length - 1u) >> 14) - (r[i].gpu_va >> 14) + 1u;
+   return pages;
+}
+
+/* The per-submit line: the first 20 submits and every hundredth after. */
+static bool
+d3dkmt_v6_sample(struct agx_d3dkmt_winsys *ws, uint32_t n)
+{
+   return ws->v6_log && (n <= 20 || n % 100 == 0);
 }
 
 /* -------------------------------------------------------------------------
@@ -1763,6 +1795,13 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    if (dev->primary_write_contract &&
        (!primary || !primary->observed || primary->incomplete ||
         primary->count > AGX_PRIMARY_WRITE_RANGES)) {
+      if (agx_d3dkmt_v6_first(ws, AGX_D3DKMT_V6_WRITE_SET))
+         d3dkmt_log_flushed("agxw-v6: refused kind=write-set where=winsys set=%s observed=%d "
+                            "incomplete=%d causes=0x%x ranges=%u\n",
+                            primary ? "yes" : "none", primary ? (int)primary->observed : 0,
+                            primary ? (int)primary->incomplete : 0,
+                            primary ? (unsigned)primary->causes : 0u,
+                            primary ? (unsigned)primary->count : 0u);
       errno = ENOTSUP;
       return -1;
    }
@@ -1848,10 +1887,16 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    }
    struct agxw_submit_read_range *read_ranges =
       (struct agxw_submit_read_range *)(priv + 1);
+   uint32_t named_bos = 0;
    if (d3dkmt_build_read_set(
           dev, staging,
-          read_ranges, &priv->read_range_count) != 0)
+          read_ranges, &priv->read_range_count, &named_bos) != 0) {
+      if (agx_d3dkmt_v6_first(ws, AGX_D3DKMT_V6_READ_SET))
+         d3dkmt_log_flushed("agxw-v6: refused kind=read-set errno=%d (more than %u ranges, "
+                            "or a range outside the user window)\n",
+                            errno, AGXW_MAX_READ_RANGES_PER_SUBMIT);
       goto out;
+   }
    /* The record built here is the v3 shape (base + read ranges). Name that
     * version explicitly: the contract's current AGXW_SUBMIT_PRIVATE_VERSION
     * has moved on to v5 (split clean set), and tagging a v3 struct with it
@@ -1883,6 +1928,16 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    }
    if (agxw_submit_private_validate_layout(&priv->base, priv_size,
                                            &ws->policy.layout) != 0) {
+      if (agx_d3dkmt_v6_first(ws, AGX_D3DKMT_V6_VALIDATOR)) {
+         const uint32_t w = dev->primary_write_contract ? primary->count : 0;
+         d3dkmt_log_flushed("agxw-v6: refused kind=validator reads=%u read_pages=%llu "
+                            "writes=%u write_pages=%llu bytes=%u\n",
+                            priv->read_range_count,
+                            (unsigned long long)d3dkmt_v6_pages(read_ranges, priv->read_range_count),
+                            w,
+                            (unsigned long long)d3dkmt_v6_pages(read_ranges + priv->read_range_count, w),
+                            priv_size);
+      }
       errno = EINVAL;
       goto out;
    }
@@ -1946,6 +2001,9 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
       };
       agx_kmt_status st = ws->fns.WaitForSynchronizationObjectFromGpu(&wait);
       if (!AGX_KMT_SUCCESS(st)) {
+         if (agx_d3dkmt_v6_first(ws, AGX_D3DKMT_V6_GPU_WAIT))
+            d3dkmt_log_flushed("agxw-v6: refused kind=gpu-wait status=0x%08x objects=%u\n",
+                               (unsigned)st, n_in);
          ret = agx_d3dkmt_fail(st);
          agx_d3dkmt_mark_device_lost(ws, ctx);
          goto out;
@@ -1963,6 +2021,28 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    };
 
    agx_kmt_status st = ws->fns.SubmitCommand(&cmd);
+   if (ws->v6_log) {
+      const uint32_t n = __atomic_add_fetch(&ws->v6_submits, 1u, __ATOMIC_RELAXED);
+      const struct agxw_submit_private_v6 *v6p = (const void *)priv;
+      const struct agxw_submit_read_range *w = read_ranges + v6p->read_range_count;
+      if (d3dkmt_v6_sample(ws, n)) {
+         d3dkmt_log_flushed("agxw-v6: submit n=%u version=%u reads=%u read_pages=%llu "
+                            "shared_bos=%u writes=%u write_pages=%llu status=0x%08x\n",
+                            n, v6p->base.version, v6p->read_range_count,
+                            (unsigned long long)d3dkmt_v6_pages(read_ranges, v6p->read_range_count),
+                            named_bos, v6p->primary_write_range_count,
+                            (unsigned long long)d3dkmt_v6_pages(w, v6p->primary_write_range_count),
+                            (unsigned)st);
+         for (uint32_t i = 0; i < v6p->primary_write_range_count; i++)
+            d3dkmt_log_flushed("agxw-v6:   write[%u] va=0x%llx len=0x%llx\n", i,
+                               (unsigned long long)w[i].gpu_va,
+                               (unsigned long long)w[i].length);
+      }
+      if (!AGX_KMT_SUCCESS(st) && agx_d3dkmt_v6_first(ws, AGX_D3DKMT_V6_SUBMIT))
+         d3dkmt_log_flushed("agxw-v6: refused kind=submit n=%u status=0x%08x reads=%u writes=%u\n",
+                            n, (unsigned)st, v6p->read_range_count,
+                            v6p->primary_write_range_count);
+   }
    if (!AGX_KMT_SUCCESS(st)) {
       ret = agx_d3dkmt_fail(st);
       agx_d3dkmt_mark_device_lost(ws, ctx);
@@ -1977,6 +2057,9 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    };
    st = ws->fns.SignalSynchronizationObjectFromGpu(&signal);
    if (!AGX_KMT_SUCCESS(st)) {
+      if (agx_d3dkmt_v6_first(ws, AGX_D3DKMT_V6_SIGNAL))
+         d3dkmt_log_flushed("agxw-v6: refused kind=signal status=0x%08x objects=%u\n",
+                            (unsigned)st, n_sig);
       /* The DMA is already in flight but its completion signals were not
        * queued. Poison the context so staging can never be reused unsafely. */
       ret = agx_d3dkmt_fail(st);
@@ -3076,6 +3159,13 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
    dev->primary_write_contract = identity.chip_id == 0x8142 &&
       identity.gpu_generation == 17 && identity.gpu_variant == 'G' &&
       identity.submit_private_max_version == AGXW_SUBMIT_PRIVATE_VERSION_V6;
+   ws->v6_log = dev->primary_write_contract;
+   d3dkmt_log_flushed("agxw-v6: device contract=%s chip=0x%x gen=%u variant=%c max_version=%u\n",
+                      dev->primary_write_contract ? "v6" : "off",
+                      (unsigned)identity.chip_id, (unsigned)identity.gpu_generation,
+                      identity.gpu_variant >= 0x20 && identity.gpu_variant < 0x7f
+                         ? (int)identity.gpu_variant : '?',
+                      (unsigned)identity.submit_private_max_version);
    if (enum_log_enabled())
       d3dkmt_log_flushed("NTAGX_ENUM open_device=ready\n");
    return true; /* caller then runs agx_open_device() */

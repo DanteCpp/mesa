@@ -18,6 +18,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+bool
+agx_d3dkmt_read_set_names_staging(bool primary_write_contract)
+{
+   return !primary_write_contract;
+}
+
+bool
+agx_d3dkmt_read_set_names_bo(bool primary_write_contract, bool cpu_mapped,
+                             bool shared_or_shareable)
+{
+   if (primary_write_contract)
+      return shared_or_shareable;
+   return cpu_mapped || shared_or_shareable;
+}
+
 int
 agx_d3dkmt_read_range_add(struct agxw_submit_read_range *ranges,
                           uint32_t *count, uint32_t capacity,

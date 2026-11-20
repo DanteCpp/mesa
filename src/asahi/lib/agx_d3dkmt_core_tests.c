@@ -16,6 +16,7 @@
  */
 
 #include "agx_d3dkmt_core.h"
+#include "agx_primary_write.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -1126,6 +1127,108 @@ test_read_range_canonicalization(void)
             AGX_D3DKMT_ERR_NOSPACE);
 }
 
+/* Round 3, A: which BOs a submit's read list names. Version 3 keeps the
+ * complete coherency declaration (staging, CPU-mapped, shared); version 6
+ * names only shared and shareable BOs (the kernel's J813 path uses the read
+ * list for standard primaries only, and those are always shareable). */
+static void
+test_read_set_selection_by_contract(void)
+{
+   /* v3: unchanged. */
+   CHECK(agx_d3dkmt_read_set_names_staging(false));
+   CHECK(agx_d3dkmt_read_set_names_bo(false, true, false));   /* mapped, private */
+   CHECK(agx_d3dkmt_read_set_names_bo(false, false, true));   /* shared, unmapped */
+   CHECK(agx_d3dkmt_read_set_names_bo(false, true, true));
+   CHECK(!agx_d3dkmt_read_set_names_bo(false, false, false)); /* private, unmapped */
+   /* v6: shared or shareable only; no staging, no mapped pools. */
+   CHECK(!agx_d3dkmt_read_set_names_staging(true));
+   CHECK(!agx_d3dkmt_read_set_names_bo(true, true, false));
+   CHECK(agx_d3dkmt_read_set_names_bo(true, false, true));
+   CHECK(agx_d3dkmt_read_set_names_bo(true, true, true));
+   CHECK(!agx_d3dkmt_read_set_names_bo(true, false, false));
+}
+
+/* Round 3, A3: a v6 record with no read range and one write range is legal
+ * for the shared validator (the kernel runs the same code). */
+static void
+test_v6_blob_without_reads(void)
+{
+   struct {
+      struct agxw_submit_private_v6 h;
+      struct agxw_submit_read_range w[1];
+   } b;
+   memset(&b, 0, sizeof(b));
+   b.h.base.version = AGXW_SUBMIT_PRIVATE_VERSION_V6;
+   b.h.base.struct_size = sizeof(b.h);
+   b.h.base.flags = AGXW_SUBMIT_READ_SET_COMPLETE |
+                    AGXW_SUBMIT_PRIMARY_WRITE_SET_COMPLETE;
+   b.h.read_range_count = 0;
+   b.h.primary_write_range_count = 1;
+   b.w[0] = (struct agxw_submit_read_range){0x1500000000ull, 0x4000};
+   CHECK_EQ(agxw_submit_private_validate(&b.h.base, (uint32_t)sizeof(b)), 0);
+   CHECK(agxw_submit_private_validate(&b.h.base, (uint32_t)sizeof(b) - 1) != 0);
+}
+
+/* Round 3, B: the primary-write set's private-helper rule and its causes. */
+static void
+test_primary_write_private_and_causes(void)
+{
+   struct agx_primary_write_set s;
+
+   /* B(i): a helper write proven to land in a never-shared driver BO is
+    * observed, declares nothing and does not mark the set incomplete. */
+   memset(&s, 0, sizeof(s));
+   agx_primary_write_note_private(&s, true);
+   CHECK(s.observed);
+   CHECK(!s.incomplete);
+   CHECK_EQ(s.count, 0);
+   CHECK_EQ(s.causes, 0);
+
+   /* A helper write whose destination is not proven refuses, by name. */
+   memset(&s, 0, sizeof(s));
+   agx_primary_write_note_private(&s, false);
+   CHECK(s.incomplete);
+   CHECK_EQ(s.causes, AGX_PRIMARY_WRITE_CAUSE_HELPER_UNPROVEN);
+
+   /* B(ii): a refusal records its cause; merging keeps every cause. */
+   struct agx_primary_write_set a, b;
+   memset(&a, 0, sizeof(a));
+   memset(&b, 0, sizeof(b));
+   agx_primary_write_refuse(&a, AGX_PRIMARY_WRITE_CAUSE_COMPUTE_NO_SCOPE);
+   agx_primary_write_refuse(&b, AGX_PRIMARY_WRITE_CAUSE_SHADER_WRITES);
+   agx_primary_write_merge(&a, &b);
+   CHECK(a.incomplete && a.observed);
+   CHECK_EQ(a.causes, AGX_PRIMARY_WRITE_CAUSE_COMPUTE_NO_SCOPE |
+                         AGX_PRIMARY_WRITE_CAUSE_SHADER_WRITES);
+
+   /* More than 20 disjoint ranges: incomplete, cause RANGES. */
+   memset(&s, 0, sizeof(s));
+   for (uint32_t i = 0; i < AGX_PRIMARY_WRITE_RANGES + 1; i++)
+      agx_primary_write_add(&s, 0x1500000000ull + (uint64_t)i * 0x10000, 0x4000);
+   CHECK(s.incomplete);
+   CHECK_EQ(s.causes, AGX_PRIMARY_WRITE_CAUSE_RANGES);
+   CHECK_EQ(s.count, AGX_PRIMARY_WRITE_RANGES);
+
+   /* A bad range: incomplete, cause RANGES. Touching ranges merge. */
+   memset(&s, 0, sizeof(s));
+   agx_primary_write_add(&s, 0, 0x4000);
+   CHECK_EQ(s.causes, AGX_PRIMARY_WRITE_CAUSE_RANGES);
+   memset(&s, 0, sizeof(s));
+   agx_primary_write_add(&s, 0x1500004000ull, 0x4000);
+   agx_primary_write_add(&s, 0x1500000000ull, 0x4000);
+   CHECK_EQ(s.count, 1);
+   CHECK_EQ(s.ranges[0].address, 0x1500000000ull);
+   CHECK_EQ(s.ranges[0].size, 0x8000);
+   CHECK(!s.incomplete);
+
+   /* Every cause has a name for the log line. */
+   CHECK(strcmp(agx_primary_write_cause_name(AGX_PRIMARY_WRITE_CAUSE_HELPER_UNPROVEN),
+                "helper-unproven") == 0);
+   CHECK(strcmp(agx_primary_write_cause_name(AGX_PRIMARY_WRITE_CAUSE_NOT_OBSERVED),
+                "not-observed") == 0);
+   CHECK(strcmp(agx_primary_write_cause_name(1u << 31), "unknown") == 0);
+}
+
 static void
 test_contract_blobs_we_emit(void)
 {
@@ -1579,6 +1682,9 @@ main(void)
    test_identity_parsing();
    test_alloc_flags();
    test_read_range_canonicalization();
+   test_read_set_selection_by_contract();
+   test_v6_blob_without_reads();
+   test_primary_write_private_and_causes();
    test_contract_blobs_we_emit();
    test_import_size_is_kmd_bounded();
    test_vm_status_refused_then_signalled();

@@ -106,7 +106,7 @@ hk_event_write(struct hk_cmd_buffer *cmd, struct hk_event *event,
    cmd->sync.kind_override = HK_SYNC_ALL;
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
    if (cs)
-      hk_queue_write(cmd, event->bo->va->addr, value, false);
+      hk_queue_write_bo(cmd, event->bo, event->bo->va->addr, value, false);
    cmd->sync.kind_override = 0;
 }
 

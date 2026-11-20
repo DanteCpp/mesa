@@ -552,6 +552,17 @@ int agx_d3dkmt_read_range_add_layout(const struct agxw_va_layout *layout,
                                      uint32_t *count, uint32_t capacity,
                                      uint64_t gpu_va, uint64_t length);
 
+/* Which BOs a submit's read list names. Version 3 (and every kernel without
+ * the primary-write contract): the staging DMA BO, every CPU-mapped BO and
+ * every shared or shareable BO -- the complete coherency declaration.
+ * Version 6 (primary_write_contract): shared and shareable BOs only. On the
+ * J813 path the kernel uses the v6 read list for standard primaries alone,
+ * which are always shareable; declaring anything else costs page walks, the
+ * 16,384-page vector cap and residency-change refusals, and buys nothing. */
+bool agx_d3dkmt_read_set_names_staging(bool primary_write_contract);
+bool agx_d3dkmt_read_set_names_bo(bool primary_write_contract, bool cpu_mapped,
+                                  bool shared_or_shareable);
+
 /* -------------------------------------------------------------------------
  * J813 (M5) VM reservations.
  *

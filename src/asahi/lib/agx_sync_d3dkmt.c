@@ -52,6 +52,7 @@
 #include "agx_d3dkmt_priv.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -216,6 +217,7 @@ d3dkmt_wait_common(struct util_sync_provider *p, uint32_t *handles,
 
    if (num_handles == 0)
       return 0;
+   const int64_t wait_start_ns = ws->v6_log ? now_nsec() : 0;
 
    kmt = malloc((size_t)num_handles * sizeof(*kmt));
    values = malloc((size_t)num_handles * sizeof(*values));
@@ -298,6 +300,21 @@ d3dkmt_wait_common(struct util_sync_provider *p, uint32_t *handles,
    ret = 0;
 
 out:
+   /* Version-6 diagnostics: the first CPU fence wait that took over 2 s
+    * (QueryPerformanceCounter, monotonic), once per winsys. */
+   if (ws->v6_log && wait_start_ns > 0) {
+      const int64_t waited = now_nsec() - wait_start_ns;
+      if (waited > 2000000000ll && agx_d3dkmt_v6_first(ws, AGX_D3DKMT_V6_FENCE_2S)) {
+         const int saved_errno = errno;
+         fprintf(stderr, "agxw-v6: fence-wait over 2 s: waited_ms=%lld handles=%u "
+                         "first_value=%llu first_current=%llu ret=%d\n",
+                 (long long)(waited / 1000000ll), num_handles,
+                 values ? (unsigned long long)values[0] : 0ull,
+                 current && current[0] ? (unsigned long long)*current[0] : 0ull, ret);
+         fflush(stderr);
+         errno = saved_errno;
+      }
+   }
    free(kmt);
    free(values);
    free(current);

@@ -588,6 +588,52 @@ max_commands_per_submit(struct hk_device *dev)
       dev->dev.params.max_commands_per_submission);
 }
 
+/* Version-6 primary-write contract diagnostics to stderr (mesa-stderr.log):
+ * the first refusal of each cause and the first device-lost reason, once per
+ * process. Only reached on a device with dev->dev.primary_write_contract. */
+static uint32_t hk_v6_causes_logged;
+static uint32_t hk_v6_lost_logged;
+
+static void
+hk_v6_log_refusal(const struct hk_cs *cs)
+{
+   uint32_t causes = cs->primary_writes.causes;
+   if (!cs->primary_writes.observed)
+      causes |= AGX_PRIMARY_WRITE_CAUSE_NOT_OBSERVED;
+   const uint32_t seen = __atomic_fetch_or(&hk_v6_causes_logged, causes, __ATOMIC_RELAXED);
+   if ((causes & ~seen) == 0)
+      return;
+   char names[256];
+   size_t used = 0;
+   names[0] = '\0';
+   for (uint32_t bit = 1; bit != 0; bit <<= 1) {
+      if (!(causes & bit) || used >= sizeof(names))
+         continue;
+      int k = snprintf(names + used, sizeof(names) - used, "%s%s", used ? "," : "",
+                       agx_primary_write_cause_name(bit));
+      if (k > 0)
+         used += (size_t)k;
+   }
+   const int saved_errno = errno;
+   fprintf(stderr, "agxw-v6: refused kind=write-set causes=%s cs=%s observed=%d ranges=%u\n",
+           names[0] ? names : "none", cs->type == HK_CS_CDM ? "cdm" : "vdm",
+           (int)cs->primary_writes.observed, cs->primary_writes.count);
+   fflush(stderr);
+   errno = saved_errno;
+}
+
+static void
+hk_v6_log_lost(const struct hk_device *dev, const char *why)
+{
+   if (!dev->dev.primary_write_contract ||
+       __atomic_fetch_or(&hk_v6_lost_logged, 1u, __ATOMIC_RELAXED) != 0)
+      return;
+   const int saved_errno = errno;
+   fprintf(stderr, "agxw-v6: device-lost reason=%s\n", why);
+   fflush(stderr);
+   errno = saved_errno;
+}
+
 static VkResult
 queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
                     unsigned ring_idx, struct hk_cmd_pending *pending,
@@ -639,6 +685,11 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
    if (ret) {
       /* ASAHI_MESA_DEBUG=trace decodes every command stream before it is
        * submitted, including one the kernel rejects. */
+      if (dev->dev.primary_write_contract) {
+         char why[96];
+         snprintf(why, sizeof(why), "submit failed: errno %d (%s)", errno, strerror(errno));
+         hk_v6_log_lost(dev, why);
+      }
       return vk_device_set_lost(&dev->vk,
                                 "DRM_IOCTL_ASAHI_SUBMIT failed: %m");
    }
@@ -2027,6 +2078,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             hk_sync_load_resolved(cs, resolved++);
          if (dev->dev.primary_write_contract) {
             if (!cs->primary_writes.observed || cs->primary_writes.incomplete) {
+               hk_v6_log_refusal(cs);
+               hk_v6_log_lost(dev, "untracked primary write (see the refused kind=write-set line)");
                util_dynarray_fini(&primary_sets);
                util_dynarray_fini(&payload);
                hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
@@ -2429,6 +2482,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
        util_dynarray_num_elements(&primary_sets, struct agx_primary_write_set) != command_count) {
       util_dynarray_fini(&primary_sets);
       util_dynarray_fini(&payload);
+      hk_v6_log_lost(dev, "primary write/command identity mismatch");
       hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
       return vk_device_set_lost(&dev->vk, "Primary write/command identity mismatch");
    }
