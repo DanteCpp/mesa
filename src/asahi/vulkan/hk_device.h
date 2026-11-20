@@ -440,7 +440,7 @@ enum hk_perftest {
 static inline bool
 hk_cdm_alias_scope(const struct hk_device *dev)
 {
-   if (agx_chip_g17_m5(dev->dev.chip))
+   if (agx_chip_g17_m5(dev->dev.chip) || dev->dev.chip == AGX_CHIP_G16G)
       return dev->may_alias_memory;
 
    return dev->dev.chip == AGX_CHIP_G17P &&
@@ -454,6 +454,15 @@ static inline bool
 hk_cdm_memory_scope_form(const struct hk_device *dev)
 {
    return dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip);
+}
+
+/* Whether memory scope takes the wide-visibility word instead: on G16G,
+ * whose wide word (AGX3_CDM_BARRIER_WIDE_VISIBILITY) carries the write-back
+ * bits 4:2 and has no separate memory-scoped form. */
+static inline bool
+hk_cdm_memory_scope_wide(const struct hk_device *dev)
+{
+   return dev->dev.chip == AGX_CHIP_G16G;
 }
 
 static inline struct hk_physical_device *

@@ -553,11 +553,13 @@ hk_cmd_resolve_compute_border(struct hk_cmd_buffer *cmd)
 }
 
 /* Whether a strong flush recorded for `dev` with this request has memory
- * scope: on request where the form exists (G17P and M5). */
+ * scope: on request where a form exists (G17P and M5: the memory-scoped
+ * record; G16G: the wide-visibility word). */
 static bool
 hk_cdm_flush_has_memory_scope(const struct hk_device *dev, bool memory)
 {
-   return memory && hk_cdm_memory_scope_form(dev);
+   return memory &&
+          (hk_cdm_memory_scope_form(dev) || hk_cdm_memory_scope_wide(dev));
 }
 
 bool
@@ -617,8 +619,9 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
       const struct agx3_cdm_barrier_info info = {
          .chip = dev->dev.chip,
          .flags = 0x5,
-         .wide_visibility = agx_chip_cdm_wide_visibility(dev->dev.chip),
-         .flush_memory = memory_scope,
+         .wide_visibility = agx_chip_cdm_wide_visibility(dev->dev.chip) ||
+                            (memory_scope && hk_cdm_memory_scope_wide(dev)),
+         .flush_memory = memory_scope && hk_cdm_memory_scope_form(dev),
       };
       uint8_t packed[AGX3_CDM_BARRIER_SIZE];
       if (!agx3_cdm_barrier_pack(&info, packed)) {
