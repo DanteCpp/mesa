@@ -20,13 +20,17 @@
  *   flush, DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: only then does every
  *   stream end with the strong memory-scoped flush a boundary keeps
  *   (hk_EndCommandBuffer()). This holds for every M5 part.
- * - HAL200 streams pack where the strong flush is the whole visibility
- *   record. G17P differs: its strong flush also has a memory-scoped form,
- *   which memory reached through a second address needs
- *   (hk_cdm_alias_scope()), and no boundary of this kind asks for it.
- * - G15 streams publish an in-stream dependency with the wide barrier
- *   (agx_chip_cdm_wide_visibility()), and AGX2 streams have neither terminate
- *   nor tail records this checks: neither has a boundary.
+ * - G16 (HAL200) streams pack where the strong flush is the whole visibility
+ *   record. G17P differs: its caches are tagged by virtual address and its
+ *   strong flush also has a memory-scoped form, which memory reached through
+ *   a second address needs (hk_cdm_alias_scope()); no boundary of this kind
+ *   asks for it. G17A, the other HAL200 part, sits between G17P and M5,
+ *   which both have that form; until its caches are known it has no
+ *   boundary either.
+ * - G15: the boundary would be the wide barrier its in-stream dependencies
+ *   get (agx_chip_cdm_wide_visibility()), but packing there (the kernel's
+ *   command deadline, attachment limits) is not qualified. AGX2 streams have
+ *   neither the terminate nor the tail records this checks.
  */
 enum hk_pack_boundary
 hk_pack_boundary(const struct hk_device *dev)
@@ -39,11 +43,19 @@ hk_pack_boundary(const struct hk_device *dev)
                 : HK_PACK_BOUNDARY_NONE;
    }
 
-   if (agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_HAL200 &&
-       !hk_cdm_memory_scope_form(dev))
+   /* The G16 parts, all HAL200. */
+   const bool g16 = chip == AGX_CHIP_G16P || chip == AGX_CHIP_G16G ||
+                    chip == AGX_CHIP_G16S || chip == AGX_CHIP_G16C;
+   if (g16 && !hk_cdm_memory_scope_form(dev))
       return HK_PACK_BOUNDARY_STRONG_FLUSH;
 
    return HK_PACK_BOUNDARY_NONE;
+}
+
+bool
+hk_pack_admits_strong_tail(enum hk_pack_boundary boundary)
+{
+   return boundary == HK_PACK_BOUNDARY_STRONG_FLUSH;
 }
 
 const struct hk_cs *
@@ -186,10 +198,10 @@ hk_pack_within_bounds(const struct hk_pack_member *m,
 /*
  * A packet waits for everything any member waits for, and its members run
  * in order. For the compute subqueue that adds nothing: one queue runs its
- * compute commands in order (M5), or the kernel one command of the device at
- * a time (G16), so earlier members already followed what a later member
- * waits for. A render wait is different: a later member's wait on a render
- * would hold the earlier members back too. So every member must wait for no
+ * compute commands in order (M5), and the G16 kernel every compute command
+ * of a VM in order on one firmware queue, so earlier members already
+ * followed what a later member waits for. A render wait is different: a
+ * later member's wait on a render would hold the earlier members back too. So every member must wait for no
  * render kind beyond those the first member waits for, counting the tails of
  * the members before it for the packet's kinds, which the packet waits for as
  * the separate commands would (hk_pack_fold_member()). Once the

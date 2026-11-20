@@ -83,6 +83,16 @@ enum hk_pack_boundary {
 
 enum hk_pack_boundary hk_pack_boundary(const struct hk_device *dev);
 
+/* Whether a member may end with a strong flush without memory scope, as an
+ * application barrier at the end of a command buffer leaves it: at the
+ * HAL200 boundary, which upgrades it in place. At the visible-completion
+ * boundary a member must end with the memory-scoped flush the kernel takes
+ * as its completion, which hk_EndCommandBuffer() gives a trailing dispatch
+ * but not a trailing barrier. hk_pack_run_member() accepts exactly that, and
+ * the packing trace reports it (strong_tails=), so tests know which
+ * barrier-ended command buffers must pack. */
+bool hk_pack_admits_strong_tail(enum hk_pack_boundary boundary);
+
 /* The single compute stream of `cmd` that a packet may copy, or NULL. */
 const struct hk_cs *hk_pack_run_member(const struct hk_device *dev,
                                        const struct hk_cmd_buffer *cmd,

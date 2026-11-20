@@ -480,7 +480,10 @@ test_boundary(void)
    T("G17P: memory-scoped flush form, no boundary",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
    dev->dev.chip = AGX_CHIP_G15S;
-   T("G15S: wide visibility, no boundary",
+   T("G15S: not qualified, no boundary",
+     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
+   dev->dev.chip = AGX_CHIP_G17A;
+   T("G17A: HAL200 but not G16, no boundary",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
    dev->dev.chip = AGX_CHIP_G14G;
    T("G14G: no boundary", hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
@@ -493,7 +496,26 @@ test_boundary(void)
      hk_pack_run_member(
         dev_with(AGX_CHIP_G17S, DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION),
         c, terminate, false));
+
+   /* A stream an application barrier ends: a strong flush without memory
+    * scope, so no visible completion. The member check takes it exactly
+    * where hk_pack_admits_strong_tail() says, which the trace reports. */
+   struct hk_cs *s = list_first_entry(&c->control_streams, struct hk_cs, node);
+   s->memory_flush_end = NULL;
+   s->visible_completion = false;
+   T("M5: no strong-flush tail, and the trace says so",
+     !hk_pack_run_member(
+        dev_with(AGX_CHIP_G17S, DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION),
+        c, terminate, false) &&
+        !hk_pack_admits_strong_tail(HK_PACK_BOUNDARY_VISIBLE_COMPLETION));
    chip = AGX_CHIP_G16G;
+   struct hk_cmd_buffer *g = plain(1);
+   s = list_first_entry(&g->control_streams, struct hk_cs, node);
+   s->strong_flush_end = s->weak_barrier_end;
+   s->weak_barrier_end = NULL;
+   T("G16G: a strong-flush tail, and the trace says so",
+     hk_pack_run_member(dev_with(AGX_CHIP_G16G, 0), g, terminate, false) &&
+        hk_pack_admits_strong_tail(HK_PACK_BOUNDARY_STRONG_FLUSH));
 }
 
 /* hk_sync_forget_stream() leaves a command buffer's latest render of a kind
@@ -528,6 +550,32 @@ test_forget(bool exact)
      wait_of(first_cs(c[1]), HK_SYNC_VDM, 0, exact) == 0 &&
         wait_of(first_cs(c[2]), HK_SYNC_VDM, 0, exact) != 0);
 #undef N
+}
+
+/* A render forgotten in an earlier submission on an exact-prior queue: the
+ * queue's latest positions (last_absolute), not the kinds it ran (ever), say
+ * which priors wait (from the fourth review of #488). */
+static void
+test_forget_history(void)
+{
+   struct hk_cmd_buffer *r = new_cmd();
+   r->sync.kind_override = HK_SYNC_XFER;
+   add(r, false);
+   r->sync.kind_override = 0;
+   struct hk_cs *gone = add(r, false);
+   hk_sync_forget_stream(r, gone);
+   list_del(&gone->node);
+   struct hk_queue *q = new_queue(true);
+   T("exact: earlier forget: history resolves", resolve(q, &r, 1));
+   struct hk_cmd_buffer *c[2] = {plain(1), after_render()};
+   struct hk_pack_run runs[4];
+   unsigned count;
+   plan_queue(q, c, 2, false, runs, &count);
+   T("exact: a render forgotten in an earlier submission splits", count == 0);
+   T("exact: earlier forget: resolves", resolve(q, c, 2));
+   T("exact: earlier forget: the resolver agrees",
+     wait_of(first_cs(c[0]), HK_SYNC_VDM, 0, true) == 0 &&
+        wait_of(first_cs(c[1]), HK_SYNC_VDM, 0, true) != 0);
 }
 
 /* A tail of a graphics destination class the packet's stream belongs to
@@ -1106,6 +1154,7 @@ main(void)
    test_folds();
    test_forget(false);
    test_forget(true);
+   test_forget_history();
    test_full_classes();
    test_random();
    test_history();
