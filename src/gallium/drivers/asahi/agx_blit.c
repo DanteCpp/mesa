@@ -8,7 +8,6 @@
  */
 
 #include <stdint.h>
-#include "asahi/compiler/agx_debug.h"
 #include "asahi/compiler/agx_nir_texture.h"
 #include "asahi/layout/layout.h"
 #include "compiler/nir/nir_builder.h"
@@ -825,8 +824,7 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
     * texture fetches and resolves. Store them first and use the render blitter
     * to fetch and average every sample until EOT can preserve both outputs. */
    const bool g18_msaa4 =
-      agx_device(ctx->base.screen)->chip == AGX_CHIP_G18G &&
-      agx_g18_msaa4_enabled();
+      agx_device(ctx->base.screen)->chip == AGX_CHIP_G18G;
 
    /* G17G resolves through u_blitter's sample fetches instead. Attaching
     * the resolve to the batch that drew the multisample image makes its EOT
@@ -1058,7 +1056,6 @@ agx_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst,
  * and uploads every level, 74 ms for a 3456x2160 RGBA8 texture on an M5 Pro
  * against 1 ms rendered. Such a texture goes to the generic path when every
  * level it would render into passes a dry run of that PBE.
- * ASAHI_M5_CPU_MIPMAP=1 keeps the CPU path, for comparison.
  */
 bool
 agx_generate_mipmap_g17g(struct pipe_context *pctx, struct pipe_resource *prsc,
@@ -1076,8 +1073,7 @@ agx_generate_mipmap_g17g(struct pipe_context *pctx, struct pipe_resource *prsc,
        !unpack || !unpack->unpack_rgba || !pack || !pack->pack_rgba_float)
       return false;
 
-   if (prsc->target == PIPE_TEXTURE_2D &&
-       !debug_get_bool_option("ASAHI_M5_CPU_MIPMAP", false)) {
+   if (prsc->target == PIPE_TEXTURE_2D) {
       bool renderable = true;
       for (unsigned level = base_level + 1;
            level <= last_level && renderable; ++level) {

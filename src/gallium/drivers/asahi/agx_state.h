@@ -38,34 +38,6 @@
 #include "agx_native_descriptor.h"
 #include "agx_nir_texture.h"
 
-/* Diagnostic environment switches. Some are tested on every draw or upload,
- * so each is read from the environment once and cached; getenv() scans the
- * whole environment on every call.
- */
-enum agx_env_flag {
-   AGX_ENV_NEO_DRAW_DIAGNOSTICS,
-   AGX_ENV_NEO_UNIFORM_DIAGNOSTICS,
-   AGX_ENV_NEO_BINARY_DIAGNOSTICS,
-   AGX_ENV_G18_RESOURCE_TRACE,
-   AGX_ENV_NO_STAGED_BUFFER_WRITES,
-   AGX_ENV_NO_M5_PROGRAM_CACHE,
-   AGX_ENV_M5_VERIFY_PROGRAM_CACHE,
-   AGX_ENV_FLAG_COUNT,
-};
-
-/* -1 until first read, then 0 or 1. */
-extern int agx_env_flags[AGX_ENV_FLAG_COUNT];
-
-bool agx_env_flag_init(enum agx_env_flag flag);
-
-static inline bool
-agx_env_flag(enum agx_env_flag flag)
-{
-   int v = p_atomic_read_relaxed(&agx_env_flags[flag]);
-
-   return likely(v >= 0) ? v : agx_env_flag_init(flag);
-}
-
 #ifdef __GLIBC__
 #include <errno.h>
 #define agx_msg(fmt, ...)                                                      \
@@ -546,11 +518,10 @@ struct agx_cdm_dispatch {
    /* G18G: the command carries DRM_ASAHI_COMPUTE_USES_TEXTURE_STATE. */
    bool texture_state;
    struct drm_asahi_g18_compute_resources resources;
-   /* CPU metadata for tracing and resolving empty indirect work after its
-    * dependencies retire; never serialized into a GPU command. */
-   uint32_t trace_mode, trace_global[3], trace_local[3], trace_program;
-   uint64_t trace_indirect, trace_shader;
-   uint64_t trace_tess_params, trace_vertex_params, trace_geometry_params;
+   /* CPU metadata for resolving empty indirect work after its dependencies
+    * retire; never serialized into a GPU command. */
+   uint32_t trace_mode;
+   uint64_t trace_indirect;
 };
 
 struct agx_encoder {
@@ -566,10 +537,13 @@ struct agx_encoder {
  * two 64K-primitive draws); 64K passed. Keep a margin below that. */
 #define AGX_G17G_RENDER_PRIMS (32 * 1024)
 
-/* Primitives per G17G render of draws without a tessellation stage. 512K
- * small depth-tested triangles in one render draw the image the split
- * renders draw, at 1024x1024 and at 3456x2160, on an M5 Pro; more has not
- * been tried. */
+/* Primitives per G17G render of draws without a tessellation stage.
+ * Measured on an M5 Pro (G17S) in 6cdff78a1ac: depth-tested small triangles
+ * in draws of 16000 give the image of the 32K-split renders at 64K, 128K,
+ * 256K and 512K at 1024x1024 (arrays and indexed) and at 128K and 512K at
+ * 3456x2160 (indexed); 128K at 3456x2160 takes 2.1 ms per frame in one
+ * render and 4.1 ms split. 512K is the largest tried, not a measured
+ * limit. */
 #define AGX_G17G_RENDER_PRIMS_PLAIN (512 * 1024)
 
 struct agx_batch {
