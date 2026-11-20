@@ -47,7 +47,7 @@ if with_tools.contains('drm-shim')
         prog_python,
         args : [
           files('vulkan/tests/run-dual-source-gpl.py'),
-          hk_dual_source_gpl_test, libvulkan_asahi, libasahi_noop_drm_shim,
+          hk_dual_source_gpl_test, libvulkan_borealis, libasahi_noop_drm_shim,
           dual_source_glslang.full_path(),
         ],
         suite : ['asahi'],
@@ -75,7 +75,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       'ASAHI_MESA_DEBUG=perf',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
-    depends : [_dev_icd, libvulkan_asahi],
+    depends : [_dev_icd, libvulkan_borealis],
     suite : ['asahi'],
   )
 
@@ -96,7 +96,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       'ASAHI_MESA_DEBUG=perf',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
-    depends : [_dev_icd, libvulkan_asahi],
+    depends : [_dev_icd, libvulkan_borealis],
     suite : ['asahi'],
   )
 
@@ -117,7 +117,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       'ASAHI_MESA_DEBUG=perf',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
-    depends : [_dev_icd, libvulkan_asahi],
+    depends : [_dev_icd, libvulkan_borealis],
     suite : ['asahi'],
   )
 
@@ -139,7 +139,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       'ASAHI_SHIM_G17P_EXPECT_BACK_TO_BACK=1',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
-    depends : [_dev_icd, libvulkan_asahi],
+    depends : [_dev_icd, libvulkan_borealis],
     suite : ['asahi'],
   )
 
@@ -160,7 +160,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
           'ASAHI_SHIM_CHIP=' + chip,
           'VK_DRIVER_FILES=' + _dev_icd.full_path(),
         ] + (policy == 'allow' ? [] : ['ASAHI_SHIM_HIGH_PRIORITY=' + policy]),
-        depends : [_dev_icd, libvulkan_asahi],
+        depends : [_dev_icd, libvulkan_borealis],
         suite : ['asahi'],
       )
     endforeach
@@ -179,7 +179,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       'ASAHI_SHIM_CHIP=g17p',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
-    depends : [_dev_icd, libvulkan_asahi],
+    depends : [_dev_icd, libvulkan_borealis],
     suite : ['asahi'],
   )
 
@@ -196,7 +196,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       'ASAHI_SHIM_CHIP=g17p',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
-    depends : [_dev_icd, libvulkan_asahi],
+    depends : [_dev_icd, libvulkan_borealis],
     suite : ['asahi'],
   )
 
@@ -213,7 +213,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       'ASAHI_SHIM_CHIP=g17p',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
-    depends : [_dev_icd, libvulkan_asahi],
+    depends : [_dev_icd, libvulkan_borealis],
     suite : ['asahi'],
   )
 
@@ -232,7 +232,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       'ASAHI_SHIM_CHIP=g17p',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
-    depends : [_dev_icd, libvulkan_asahi],
+    depends : [_dev_icd, libvulkan_borealis],
     suite : ['asahi'],
     timeout : 120,
   )
@@ -252,7 +252,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
         'ASAHI_SHIM_CHIP=' + chip,
         'VK_DRIVER_FILES=' + _dev_icd.full_path(),
       ],
-      depends : [_dev_icd, libvulkan_asahi],
+      depends : [_dev_icd, libvulkan_borealis],
       suite : ['asahi'],
     )
   endforeach

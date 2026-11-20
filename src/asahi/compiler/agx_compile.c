@@ -4369,7 +4369,7 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
        *   agx3_pack_binary.c:10028: no grounded AGX3 encoding for quad_shuffle
        *     [d16:reg13 s0=16:reg13 s1=32:reg2 ...]
        *   AGX3 refused shader during binary packing
-       *   hk: vkCreateComputePipelines refused pipeline 0 of 1: VK_ERROR_UNKNOWN
+       *   borealis: vkCreateComputePipelines refused pipeline 0 of 1: VK_ERROR_UNKNOWN
        *
        * Any quad broadcast whose lane is not a compile-time constant lands
        * here; s1 above is r1, the register agx_lower_divergent_shuffle()
