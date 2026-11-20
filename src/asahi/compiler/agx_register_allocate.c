@@ -3017,6 +3017,27 @@ ra_file_alignment(agx_context *ctx)
    return alignment;
 }
 
+/* Whether the workgroup size bounds a compute shader's registers through the
+ * occupancy table: not on the G17P chip (A18 Pro, M4 Pro, M4 Max), measured
+ * on the A18 Pro. AGX_WORKGROUP_REGISTER_BOUND=0/1 overrides that on AGX3,
+ * for A/B rows on one build.
+ */
+DEBUG_GET_ONCE_OPTION(workgroup_register_bound, "AGX_WORKGROUP_REGISTER_BOUND",
+                      NULL)
+
+static bool
+agx_workgroup_bounds_registers(const agx_context *ctx)
+{
+   if (!agx_isa_is_agx3(ctx->key->dev.encoding))
+      return true;
+
+   const char *opt = debug_get_option_workgroup_register_bound();
+   if (opt)
+      return debug_parse_bool_option(opt, true);
+
+   return ctx->key->dev.chip != AGX_CHIP_G17P;
+}
+
 static void
 agx_ra_impl(agx_context *ctx, bool disable_remat)
 {
@@ -3045,9 +3066,13 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    unsigned max_possible_regs = AGX_NUM_REGS;
 
    /* Compute shaders need to have their entire workgroup together, so our
-    * register usage is bounded by the workgroup size.
+    * register usage is bounded by the workgroup size. G17P has no static
+    * register split: its on-chip storage is allocated as threads use it
+    * (Dynamic Caching), and a 1024-thread workgroup with 192 halves per
+    * thread runs correctly there and faster than one spilling to 104.
     */
-   if (mesa_shader_stage_is_compute(ctx->stage)) {
+   if (mesa_shader_stage_is_compute(ctx->stage) &&
+       agx_workgroup_bounds_registers(ctx)) {
       unsigned threads_per_workgroup;
 
       /* If we don't know the workgroup size, worst case it. TODO: Optimize
