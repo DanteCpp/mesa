@@ -416,7 +416,7 @@ def api_code(old_query=False):
                   "VkResult\nvk_check_printf_status(") + "\n"
     code += block(source("src/vulkan/runtime/vk_device.h"),
                   "static inline VkResult\nvk_device_check_status(") + "\n"
-    device = source("src/asahi/vulkan/hk_device.c")
+    device = source("src/borealis/vulkan/hk_device.c")
     code += block(device, "static VkResult\nhk_check_status(") + "\n"
     for name in ["hk_GetFenceStatus", "hk_GetSemaphoreCounterValue"]:
         code += block(device, "VKAPI_ATTR VkResult VKAPI_CALL\n" + name + "(") + "\n"
@@ -424,7 +424,7 @@ def api_code(old_query=False):
                        ("vk_queue.c", "QueueWaitIdle"), ("vk_device.c", "DeviceWaitIdle")]:
         code += block(source("src/vulkan/runtime/" + path),
                       "VKAPI_ATTR VkResult VKAPI_CALL\nvk_common_" + name + "(") + "\n"
-    query = source("src/asahi/vulkan/hk_query_pool.c", BASE if old_query else None)
+    query = source("src/borealis/vulkan/hk_query_pool.c", BASE if old_query else None)
     code += block(query, "static VkResult\nhk_query_wait_for_available(") + "\n"
     code += block(query, "VKAPI_ATTR VkResult VKAPI_CALL\nhk_GetQueryPoolResults(") + "\n"
     return code + API_TESTS
@@ -472,7 +472,7 @@ def run(output, label, code, expected, args=()):
 
 
 def source_contracts():
-    draw = source("src/asahi/vulkan/hk_cmd_draw.c")
+    draw = source("src/borealis/vulkan/hk_cmd_draw.c")
     single = "".join(block(draw, "static void\nhk_emit_robust_index(").split())
     batch = "".join(block(draw, "static void\nhk_flush_robust_index_batch(").split())
     assert "target,hk_heap(cmd),dev->dev.printf_buffer_address,draw.b.ptr" in single
@@ -481,8 +481,8 @@ def source_contracts():
     assert "AGX_BARRIER_ALL|AGX_PREGFX" in batch
     # Heap reclamation cannot clear the sticky device abort word.
     assert "printf" not in block(draw, "static uint64_t\nhk_heap(")
-    paths = ["src/asahi/libagx/draws.cl", "src/asahi/vulkan/hk_cmd_draw.c",
-             "src/asahi/vulkan/hk_device.c", "src/asahi/vulkan/hk_query_pool.c",
+    paths = ["src/asahi/libagx/draws.cl", "src/borealis/vulkan/hk_cmd_draw.c",
+             "src/borealis/vulkan/hk_device.c", "src/borealis/vulkan/hk_query_pool.c",
              "src/asahi/lib/agx_device.c", "src/compiler/nir/nir_lower_printf.c",
              "src/util/u_printf.h", "src/vulkan/runtime/vk_debug_utils.c",
              "src/vulkan/runtime/vk_device.h", "src/vulkan/runtime/vk_device.c",

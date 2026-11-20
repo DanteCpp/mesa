@@ -2,7 +2,7 @@
 #include "asahi/compiler/agx_compile.h"
 #include "compiler/nir/nir_builder.h"
 extern "C" {
-#include "asahi/vulkan/hk_nir_widen_16bit_varyings.h"
+#include "borealis/vulkan/hk_nir_widen_16bit_varyings.h"
 }
 
 class PrimitiveVaryings : public ::testing::Test {

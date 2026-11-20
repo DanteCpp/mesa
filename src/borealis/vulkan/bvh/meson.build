@@ -1,7 +1,7 @@
 # Copyright 2026 Aurora Silicon
 # SPDX-License-Identifier: MIT
 
-hk_bvh_include_dir = dir_source_root + '/src/asahi/vulkan/bvh'
+hk_bvh_include_dir = dir_source_root + '/src/borealis/vulkan/bvh'
 
 hk_bvh_includes = files(
   'agx3_node.h',
@@ -44,7 +44,7 @@ foreach s : [['encode.comp', 'hk_encode'], ['write.comp', 'hk_bvh_write'],
     prog_glslang, '-V',
     '-I' + vk_bvh_include_dir,
     '-I' + hk_bvh_include_dir,
-    '-I' + dir_source_root + '/src/asahi/vulkan',
+    '-I' + dir_source_root + '/src/borealis/vulkan',
     '--target-env', 'spirv1.5', '-x', '-o', '@OUTPUT@', '@INPUT@',
   ]
   command += s.length() > 2 ? [s[2]] : []

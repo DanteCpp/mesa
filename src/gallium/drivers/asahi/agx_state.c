@@ -13,7 +13,7 @@
 #include "asahi/compiler/agx_debug.h"
 #include "asahi/compiler/agx3_compute_program.h"
 #include "asahi/compiler/agx3_graphics_program.h"
-#include "asahi/vulkan/hk_g17p_patch.h"
+#include "borealis/vulkan/hk_g17p_patch.h"
 #include "asahi/compiler/agx3_transcode.h"
 #include "asahi/compiler/agx_nir.h"
 #include "asahi/genxml/agx_pack.h"
