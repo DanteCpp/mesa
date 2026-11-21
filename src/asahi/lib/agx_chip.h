@@ -225,6 +225,8 @@ enum agx_chip_quirk {
    AGX_QUIRK_M5_PATHS = 1 << 12,
    AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS = 1 << 13,
    AGX_QUIRK_HW_TXF_BOUNDS = 1 << 14,
+   AGX_QUIRK_GEN9_COLOR_COMPRESSION = 1 << 15,
+   AGX_QUIRK_GEN9_EXTENDED_COMPRESSION = 1 << 16,
 };
 
 /* What the five native AGX3 chips share. */
@@ -241,7 +243,8 @@ enum agx_chip_quirk {
    (AGX_QUIRKS_NATIVE | AGX_QUIRK_NATIVE_RENDER_CONTEXT |                      \
     AGX_QUIRK_USC_HELPER_SLOT_PER_CORE |                                       \
     AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS |                                  \
-    AGX_QUIRK_IMAGE_LOAD_MISSES_OWN_STORE | AGX_QUIRK_NATIVE_PREAMBLE)
+    AGX_QUIRK_IMAGE_LOAD_MISSES_OWN_STORE | AGX_QUIRK_NATIVE_PREAMBLE |        \
+    AGX_QUIRK_GEN9_COLOR_COMPRESSION | AGX_QUIRK_GEN9_EXTENDED_COMPRESSION)
 
 /*
  * The chip table: one row per chip, and the only place that says what a chip
@@ -314,7 +317,8 @@ enum agx_chip_quirk {
      __VA_ARGS__)                                                              \
    X(G16G, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, CLASSIC, NATIVE_AGX3,    \
      AGX_RECORDS_G15_G17 | AGX_RECORD_CDM_BARRIER_WIDE_VISIBILITY,             \
-     AGX_QUIRKS_NATIVE_PRE_G17, __VA_ARGS__)                                   \
+     AGX_QUIRKS_NATIVE_PRE_G17 | AGX_QUIRK_GEN9_COLOR_COMPRESSION,             \
+     __VA_ARGS__)                                                              \
    X(G16S, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, DUAL, NONE,              \
      AGX_RECORDS_G15_G17, 0, __VA_ARGS__)                                      \
    X(G16C, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, DUAL, NONE,              \
@@ -1065,6 +1069,39 @@ static inline bool
 agx_chip_native_imageblock(enum agx_chip chip)
 {
    return agx_chip_info(chip)->quirks & AGX_QUIRK_NATIVE_IMAGEBLOCK;
+}
+
+/*
+ * Whether single-sample 2D colour images are losslessly compressed in the
+ * Gen9 form Borealis implements for G17P. The image is GPU-tiled, and 8 bytes
+ * of metadata per 16x16 tile follow it in the same allocation. The texture
+ * descriptor sets bit 59 (compressed) and bit 127 (extended) and carries the
+ * metadata address >> 4 in its third word. The PBE sets word 0 bit 59 and
+ * word 1 bit 63, with the same third word.
+ *
+ * G16G shares the Gen9 descriptor layout for single-sample 2D colour images
+ * (test-hk-native-descriptor.c check_gen9_compressed_rgba8_4k()). Single-sample
+ * depth/stencil, multisampled colour, and layered shapes stay gated behind
+ * agx_chip_gen9_extended_compression() (2x/4x MSAA depth plane 0 is admitted
+ * across native HAL200).
+ */
+static inline bool
+agx_chip_gen9_color_compression(enum agx_chip chip)
+{
+   return agx_chip_info(chip)->quirks & AGX_QUIRK_GEN9_COLOR_COMPRESSION;
+}
+
+/*
+ * The compressed shapes beyond single-sample colour, measured on the G17P
+ * parts (A18 Pro, M4 Pro, M4 Max):
+ *  - depth and stencil through the ZLS unit;
+ *  - 2x attachments;
+ *  - the M4 Pro's layered, cube and 3D shapes.
+ */
+static inline bool
+agx_chip_gen9_extended_compression(enum agx_chip chip)
+{
+   return agx_chip_info(chip)->quirks & AGX_QUIRK_GEN9_EXTENDED_COMPRESSION;
 }
 
 /*

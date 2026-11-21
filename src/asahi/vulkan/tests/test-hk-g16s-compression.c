@@ -118,9 +118,10 @@ check_shape(VkFormat format, bool is_zs)
    CHECK(ELIGIBLE(base));
 
    /* Chip and plane. */
+   /* G16G compresses single-sample colour, without the M4 Pro shapes. */
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
       CHECK(g16s_eligible((enum agx_chip)chip, 0, &base) ==
-            (chip == AGX_CHIP_G17P));
+            (chip == AGX_CHIP_G17P || (!is_zs && chip == AGX_CHIP_G16G)));
    /* Plane 1 is the stencil plane of D32_SFLOAT_S8_UINT alone. */
    CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &base) ==
          (format == VK_FORMAT_D32_SFLOAT_S8_UINT));
@@ -831,7 +832,7 @@ check_m4_max(void)
    d.arrayLayers = 4;
    CHECK(M4_MAX(d) && NEO(d));
 
-   /* Other chips never (except native HAL200 G16G for 2x/4x MSAA depth). */
+   /* Other chips never (except G16G for single-sample colour and 2x/4x MSAA depth). */
    CHECK(!runtime_m4_max(AGX_CHIP_G14G, 0, &c));
    d = image(VK_FORMAT_D32_SFLOAT, 1920, 1080, 1, ds);
    CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &d));

@@ -5098,7 +5098,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                   (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ||
                    load_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
 
-               if (dev->dev.chip == AGX_CHIP_G17P) {
+               if (agx_chip_gen9_color_compression(dev->dev.chip)) {
                   /* A resumed dynamic render pass preserves pixels rendered by
                    * the suspended pass even when the attachment's loadOp is
                    * CLEAR or DONT_CARE, so never drop existing tiles there. */
@@ -5115,7 +5115,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                         !dev->samplers.table.bo ||
                         !read_index ||
                         read_index >= dev->sampled_images.alloc))) {
-                     mesa_loge_once("G17P: spilled render pass with a compressed "
+                     mesa_loge_once("Gen9: spilled render pass with a compressed "
                                     "attachment (%s, %ux) is unsupported",
                                     util_format_short_name(layout->format),
                                     layout->sample_count_sa);

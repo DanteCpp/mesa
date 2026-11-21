@@ -103,10 +103,12 @@ check_shape_for_chip(VkFormat format, bool is_depth, uint32_t chip_id)
    CHECK(CHIP_ELIGIBLE(base));
 
    /* Chip and plane. */
+   /* G16G takes single-sample 1-8 byte colour shapes alone (check_g16g()). */
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
       CHECK(hk_hal200_compression_eligible((enum agx_chip)chip, chip_id, 0,
                                            &base) ==
-            (chip == AGX_CHIP_G17P));
+            (chip == AGX_CHIP_G17P ||
+             (!is_depth && !is_color_16b && chip == AGX_CHIP_G16G)));
    /* Plane 1 is the stencil plane of D32_SFLOAT_S8_UINT alone. */
    CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, chip_id, 1, &base) ==
          (format == VK_FORMAT_D32_SFLOAT_S8_UINT));
@@ -845,13 +847,112 @@ check_g16g_msaa_depth(void)
       CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &d));
    }
 
-   /* Colour images stay plain on G16G in this standalone depth-only policy. */
+   /* Single-sample colour compresses on G16G; 2x/4x MSAA colour stays plain. */
    VkImageCreateInfo c = image(VK_FORMAT_R8G8B8A8_UNORM, 1920, 1080, 1, color_usage);
-   CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &c));
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &c));
    c.samples = VK_SAMPLE_COUNT_2_BIT;
    CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &c));
    c.samples = VK_SAMPLE_COUNT_4_BIT;
    CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &c));
+}
+
+/* G16G (M4): the Gen9 colour packets and layout of G17P
+ * (agx_chip_gen9_color_compression()), taking single-sample 1-8 byte 2D colour
+ * shapes alongside 2x/4x MSAA depth plane 0 (check_g16g_msaa_depth()).
+ * Single-sample depth/stencil, 16-byte colour, MSAA colour, layered, cube and
+ * 3D shapes stay on G17P. */
+#define G16G(i)                                                               \
+   hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &(i))
+
+static void
+check_g16g(void)
+{
+   const VkImageUsageFlags transfer = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                      VK_IMAGE_USAGE_SAMPLED_BIT;
+   const VkImageUsageFlags color_usage =
+      transfer | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+   /* Single-sample 2D RGBA8 copy destination (4096x4096). */
+   VkImageCreateInfo i = image(VK_FORMAT_R8G8B8A8_UNORM, 4096, 4096, 1,
+                               transfer);
+   CHECK(G16G(i));
+   CHECK(G16G(i) == ELIGIBLE(i));
+
+   /* The G17P 1-8 byte colour formats and nothing else (no 16-byte colour). */
+   for (unsigned f = 1; f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; ++f) {
+      VkImageCreateInfo c = image((VkFormat)f, 64, 64, 1, color_usage);
+      CHECK(G16G(c) == hk_g17p_compression_color_format((VkFormat)f));
+   }
+   VkImageCreateInfo c16 =
+      image(VK_FORMAT_R32G32B32A32_SFLOAT, 64, 64, 1, color_usage);
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, AGX_CHIP_ID_A18_PRO, 0,
+                                        &c16));
+   CHECK(!G16G(c16));
+   CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, AGX_CHIP_ID_A18_PRO, 0,
+                                         &c16));
+
+   /* Single-sample depth and the stencil plane stay plain (2x/4x MSAA depth
+    * plane 0 is covered by check_g16g_msaa_depth()). */
+   VkImageCreateInfo d = image(VK_FORMAT_D32_SFLOAT_S8_UINT, 2408, 1508, 1,
+                               transfer |
+                                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+   CHECK(ELIGIBLE(d));
+   CHECK(!G16G(d));
+   CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 1, &d));
+   d.format = VK_FORMAT_D16_UNORM;
+   CHECK(ELIGIBLE(d) && !G16G(d));
+
+   /* Mip chains and the small-texture rule follow G17P. */
+   VkImageCreateInfo m = image(VK_FORMAT_R8G8B8A8_UNORM, 2048, 2048, 12,
+                               transfer);
+   CHECK(G16G(m) == ELIGIBLE(m));
+   m = image(VK_FORMAT_R8G8B8A8_UNORM, 128, 128, 1, transfer);
+   CHECK(G16G(m) == ELIGIBLE(m));
+   m.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   CHECK(G16G(m) && ELIGIBLE(m));
+
+   /* No 2x/4x MSAA colour, which G17P compresses. */
+   VkImageCreateInfo c = image(VK_FORMAT_R8G8B8A8_UNORM, 2408, 1508, 1,
+                               color_usage);
+   c.samples = VK_SAMPLE_COUNT_2_BIT;
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, 0x6041, 0, &c));
+   CHECK(!G16G(c));
+   c.usage = transfer;
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, 0x6040, 0, &c));
+   CHECK(!G16G(c));
+
+   /* No layered, cube or 3D colour, which G17P compresses. */
+   c = image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, color_usage);
+   c.arrayLayers = 2;
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, 0x6040, 0, &c));
+   CHECK(!G16G(c));
+   c = image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, color_usage);
+   c.arrayLayers = 6;
+   c.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, 0x6040, 0, &c));
+   CHECK(!G16G(c));
+   c = image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, color_usage);
+   c.imageType = VK_IMAGE_TYPE_3D;
+   c.extent.depth = 4;
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, 0x6040, 0, &c));
+   CHECK(!G16G(c));
+
+   /* Storage and shared images stay plain, as on G17P. */
+   c = image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1,
+             color_usage | VK_IMAGE_USAGE_STORAGE_BIT);
+   CHECK(!G16G(c));
+   const VkExternalMemoryImageCreateInfo external = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
+   c = image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, color_usage);
+   c.pNext = &external;
+   CHECK(!G16G(c));
+   c.pNext = NULL;
+   CHECK(G16G(c));
+   CHECK(!hk_g17p_shared_compression_shape(AGX_CHIP_G16G, c.format,
+                                           c.imageType, c.flags, c.usage));
 }
 
 int
@@ -879,6 +980,7 @@ main(void)
    check_m5_color();
    check_m5_msaa_color();
    check_m5_depth_msaa();
+   check_g16g();
    printf("G17P compression policy: %u checks passed\n", checks);
    return 0;
 }

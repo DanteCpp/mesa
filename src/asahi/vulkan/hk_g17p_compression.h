@@ -11,8 +11,8 @@
 #include <stddef.h>
 #include <string.h>
 
-/* HAL200 lossless compression policy (G17P full policy, plus 2x/4x MSAA depth
- * across native HAL200).
+/* HAL200 lossless compression policy (G17P full policy, plus single-sample
+ * colour and 2x/4x MSAA depth on G16G).
  *
  * The compressed Gen9 PBE (write) packet matches Apple's HAL200 StateFields
  * encoder byte-for-byte for GPU-tiled one-layer 2D images, the read
@@ -80,6 +80,12 @@
  *
  * This is the only HAL200 policy: every eligible image is compressed, with no
  * runtime opt-out.
+ *
+ * G16G (M4) has the same Gen9 colour packets and AIL layout
+ * (agx_chip_gen9_color_compression()) and takes the single-sample 1-8 byte
+ * colour shapes above, plus 2x/4x MSAA depth plane 0 via ZLS. Single-sample
+ * depth/stencil, 2x colour and the M4 Pro shapes stay on G17P
+ * (agx_chip_gen9_extended_compression()).
  */
 
 /* Colour formats admitted on G17P: plain single-plane formats of 1-8 bytes
@@ -185,7 +191,15 @@ static inline bool
 hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
                                unsigned plane, const VkImageCreateInfo *info)
 {
-   if (!agx_chip_native_hal200(chip) || !info ||
+   /* Chips without extended Gen9 compression (G16G) take single-sample 1-8 byte
+    * colour shapes (agx_chip_gen9_color_compression()) and 2x/4x MSAA depth
+    * plane 0 across native HAL200. Single-sample depth/stencil, 2x colour and
+    * the M4 Pro shapes need the shapes measured on G17P
+    * (agx_chip_gen9_extended_compression()). */
+   const bool extended = agx_chip_gen9_extended_compression(chip);
+   if ((!agx_chip_native_hal200(chip) &&
+        !agx_chip_gen9_color_compression(chip)) ||
+       !info ||
        (plane != 0 && !(plane == 1 &&
                         info->format == VK_FORMAT_D32_SFLOAT_S8_UINT)))
       return false;
@@ -211,7 +225,7 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
     * compression metadata encoding; missing there is a hardware run of the
     * 16-byte formats and their 8-MRT spill decompression path. */
    const bool color_16b =
-      chip_id == AGX_CHIP_ID_A18_PRO &&
+      extended && chip_id == AGX_CHIP_ID_A18_PRO &&
       hk_g17p_compression_color_format_16b(info->format);
    /* Not B10G11R11_UFLOAT: a compressed tile of its class reads NaN back as
     * zero, and a render or copy into the attachment must keep NaN. */
@@ -244,9 +258,9 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
    VkImageCreateFlags allowed_flags =
       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
       VK_IMAGE_CREATE_ALIAS_BIT;
-   if (color_1_8b && info->imageType == VK_IMAGE_TYPE_2D)
+   if (extended && color_1_8b && info->imageType == VK_IMAGE_TYPE_2D)
       allowed_flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-   if (color_1_8b && info->imageType == VK_IMAGE_TYPE_3D)
+   if (extended && color_1_8b && info->imageType == VK_IMAGE_TYPE_3D)
       allowed_flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
                        VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
    /* Zink marks every depth attachment sample-location compatible, including
@@ -283,7 +297,7 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
        * verified lossless on M4 (G16G) and A18 Pro (G17P); 2x depth was also
        * measured on M4 Pro / M4 Max (G17P). The S8 plane stays plain. */
       const bool depth_ms =
-         plane == 0 &&
+         agx_chip_native_hal200(chip) && plane == 0 &&
          (info->samples == VK_SAMPLE_COUNT_2_BIT ||
           info->samples == VK_SAMPLE_COUNT_4_BIT) &&
          depth &&
@@ -291,9 +305,10 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
                           VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)) &&
          !(info->flags &
            VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT);
-      /* Non-G17P HAL200 parts (G16G) only take 2x/4x MSAA depth here;
-       * single-sample depth stays plain until verified separately on G16G. */
-      if (chip != AGX_CHIP_G17P && !depth_ms)
+      /* Chips without extended Gen9 compression (G16G) only take 2x/4x MSAA
+       * depth here; single-sample depth stays plain until verified separately
+       * on G16G. */
+      if (!extended && !depth_ms)
          return false;
       /* Single-sample, single-level depth arrays across G17P. Every access to
        * one layer addresses its metadata at compression_layer_stride_B: ZLS
@@ -314,13 +329,13 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
       return depth && info->mipLevels == 1;
    }
 
-   /* Non-G17P HAL200 parts (G16G) keep colour plain here; G16G single-sample
-    * colour compression is gated separately (#638). */
-   if (chip != AGX_CHIP_G17P)
+   if (!agx_chip_gen9_color_compression(chip))
       return false;
 
-   /* 16-byte texels stay on the single-sample, single-layer 2D shape. */
-   if (color_16b && (three_d || multisampled || info->arrayLayers != 1))
+   /* 16-byte texels and chips without extended Gen9 compression (G16G) stay
+    * on the single-sample, single-layer 2D shape. */
+   if ((color_16b || !extended) &&
+       (three_d || multisampled || info->arrayLayers != 1))
       return false;
 
    if ((info->imageType != VK_IMAGE_TYPE_2D && !three_d) ||
