@@ -100,6 +100,18 @@ struct hk_addr_range {
 #define HK_G17P_RT_KERNEL_FEATURES                                             \
    (DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS | DRM_ASAHI_FEATURE_RENDER_RAY_QUERY)
 
+/* Whether the device exposes VK_EXT_mesh_shader on the GEN1 native mesh path
+ * (native mesh, software task). On G16G this requires the kernel to advertise
+ * DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT so tiler-heap protection is guaranteed
+ * wherever mesh shaders are exposed. */
+static inline bool
+hk_gen1_mesh_exposed(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G17P ||
+          (dev->chip == AGX_CHIP_G16G &&
+           (dev->params.features & DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT));
+}
+
 static inline bool
 hk_g17p_rt_enabled(const struct agx_device *dev)
 {

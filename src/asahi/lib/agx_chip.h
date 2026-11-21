@@ -766,6 +766,22 @@ agx_chip_has_native_render_context(enum agx_chip chip)
    return agx_chip_info(chip)->quirks & AGX_QUIRK_NATIVE_RENDER_CONTEXT;
 }
 
+/* Whether the chip takes the GEN1 native mesh path: the AGX3B mesh encodings
+ * (allocate_uvb and the FENCE_UVB_GEN1 export protocol), the HAL200 VDM
+ * mesh-state and mesh-dispatch records, and a software task stage. G17P is
+ * where the path was grounded and is qualified. G16G executes the same AGX3B
+ * encoding and writes the same HAL200 records (agx_chip_record_family), so
+ * G16G shares it. On G17P each mesh launch emits DRM_ASAHI_RENDER_MESH_OUTPUT
+ * when the kernel advertises DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT so tiler-heap
+ * pressure does not lose mesh-workgroup vertex output; Borealis gates G16G
+ * mesh exposure on that kernel feature (hk_gen1_mesh_exposed()). This helper
+ * answers what the encoders and record packers accept. */
+static inline bool
+agx_chip_gen1_mesh(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G16G;
+}
+
 /* Whether the native indirect compute pair (grid helper plus the 24-byte
  * mode-2 launch) is qualified.  G15 reads the same mode-2 record and the same
  * six-word geometry (three global thread counts, three local sizes); other
