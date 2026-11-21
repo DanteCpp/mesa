@@ -343,12 +343,20 @@ image_write_source_can_be_immediate(agx_instr *I, unsigned s)
  * native G17G code selects constants such as 1.0. Fold one whose bits
  * do not fit the integer immediate, opposite a selected register only: the
  * two-immediate form takes raw bits. Compare-select fusion creates most of
- * these selects after immediate inlining, so run it after fusing as well. */
+ * these selects after immediate inlining, so run it after fusing as well.
+ *
+ * Not on G18G (emit_agx3d): its compare-select packers take selected
+ * immediates as integer bit patterns and none reads
+ * fcmpsel_minifloat_select, so 1.0 folded to the minifloat 0x30 selected
+ * the integer 48, a denormal that reads as 0.0. That zeroed the coverage
+ * multiplier of Skia's FillRRectOp (Chromium canvas fillRect and arcs
+ * vanished). The constant stays in a register. */
 static void
 agx_optimizer_minifloat_select(agx_context *ctx, agx_instr **defs,
                                agx_instr *I)
 {
    if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       ctx->key->dev.emit_agx3d ||
        ctx->agx3_reg_float_consts ||
        I->op != AGX_OPCODE_FCMPSEL || I->nr_srcs != 4 ||
        I->fcmpsel_minifloat_select || I->saturate ||
@@ -536,6 +544,20 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
           !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B && s == 1 &&
             (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
              I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS)))
+         continue;
+      /* A G17P array comparison without an offset stages its level or bias
+       * beside the layer from a register; an immediate would share SMP's
+       * operand with that layer, which agx3_emit_texture_sample() refuses.
+       * A zero level or bias, and an explicit level in a stage the packer
+       * treats as vertex_explicit_lod, encode as immediates and keep them. */
+      if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && s == 1 && I->shadow &&
+          !I->offset && I->dim == AGX_DIM_2D_ARRAY &&
+          ctx->key->dev.chip == AGX_CHIP_G17P &&
+          (def->dest[0].size == AGX_SIZE_16 ? _mesa_half_to_float(def->imm)
+                                            : uif(def->imm)) != 0.0f &&
+          !(I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
+            agx3_vertex_explicit_lod_stage(ctx->stage,
+                                           AGX_ISA_ENCODING_AGX3B)))
          continue;
       /* AGX3 sampler indices past 15 have only a register form. */
       if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && s == 4 &&
@@ -914,15 +936,14 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
           !def->saturate) {
          const agx_index lo = def->src[0], hi = def->src[1];
          const bool m5_uniform_base =
-            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-            debug_get_bool_option("ASAHI_M5_HIGH_UNIFORM_LOAD", true);
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
 
-         /* G17P scalar W8 and four packed W8 components both return one
-          * physical word, and their native LDDEV reads an aligned base
-          * directly from the low uniform file. */
-         const bool g17p_w8_uniform_base =
+         /* On AGX3B a scalar W8 load and four packed W8 components both
+          * return one physical word, and the LDDEV encoding reads an aligned
+          * base directly from the low uniform file. Both are properties of
+          * the encoding, so this holds on every AGX3B part. */
+         const bool agx3b_w8_uniform_base =
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-            ctx->key->dev.chip == AGX_CHIP_G17P &&
             ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
             ctx->nir && !ctx->nir->info.internal && !ctx->key->secondary &&
             I->format == AGX_FORMAT_I8 && !I->coherent &&
@@ -934,7 +955,7 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
             !lo.kill && !lo.cache && !lo.discard &&
             !hi.kill && !hi.cache && !hi.discard;
 
-         if ((m5_uniform_base || g17p_w8_uniform_base) &&
+         if ((m5_uniform_base || agx3b_w8_uniform_base) &&
              lo.type == AGX_INDEX_UNIFORM && hi.type == AGX_INDEX_UNIFORM &&
              lo.size == AGX_SIZE_32 && hi.size == AGX_SIZE_32 &&
              agx_channels(lo) == 1 && agx_channels(hi) == 1 &&
@@ -1050,7 +1071,6 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
          ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
          I->op == AGX_OPCODE_TEXTURE_LOAD && s == 3 &&
          def->src[0].type == AGX_INDEX_UNIFORM &&
-         debug_get_bool_option("ASAHI_M5_UNIFORM_TEXTURE_OPERANDS", true) &&
          agx_instr_accepts_uniform(ctx->key->dev.encoding, I->op, s,
                                   def->src[0].value, def->src[0].size);
 

@@ -18,7 +18,7 @@ struct nir_def;
 /* BASE bits4..6 carry the native packed element count (1..4). */
 #define AGX_NIR_MEMORY_PACKED_COUNT_SHIFT 4u
 #define AGX_NIR_MEMORY_PACKED_COUNT_MASK (7u << AGX_NIR_MEMORY_PACKED_COUNT_SHIFT)
-/* BASE bit7 marks a late G17P W8 load whose unsigned lanes are unpacked to
+/* BASE bit7 marks a late AGX3B W8 load whose unsigned lanes are unpacked to
  * words. It does not change the memory transaction or address. */
 #define AGX_NIR_MEMORY_UNPACK_W8_WORD (1u << 7)
 /* BASE bits16..31 carry a signed byte offset that AGX3C adds to the address
@@ -38,9 +38,10 @@ struct nir_def;
 #define AGX_NIR_SCS_TOUCH_FLAGS                                                \
    (AGX_NIR_SCS_TOUCH | AGX_NIR_SCS_TOUCH_FENCE_BEFORE |                       \
     AGX_NIR_SCS_TOUCH_FENCE_AFTER)
-/* byte_offsets: fold constant index addends into that byte offset. */
+/* byte_offsets: fold constant index addends into that byte offset.
+ * checked_offsets: see agx_shader_key::checked_offsets. */
 bool agx_nir_lower_address(struct nir_shader *shader, bool byte_indices,
-                           bool byte_offsets);
+                           bool byte_offsets, bool checked_offsets);
 bool agx_nir_preserve_position_order(struct nir_shader *shader);
 bool agx_nir_scalarize_int64(struct nir_shader *shader);
 bool agx_nir_lower_divmod64(struct nir_shader *shader, bool native_add64);
@@ -65,19 +66,21 @@ bool agx_nir_opt_sink_loop_sample_uses(struct nir_shader *shader);
 bool agx_nir_opt_hoist_loop_samples(struct nir_shader *shader);
 bool agx_nir_fuse_algebraic_late(struct nir_shader *shader);
 bool agx_nir_fuse_doubled_add(struct nir_shader *shader);
+bool agx_nir_fold_byte_to_float(struct nir_shader *shader);
+bool agx_nir_fold_ubyte_to_float(struct nir_shader *shader);
 bool agx_nir_fence_images(struct nir_shader *shader);
 bool agx_nir_lower_layer(struct nir_shader *s);
 bool agx_nir_lower_clip_distance(struct nir_shader *s);
 bool agx_nir_lower_subgroups(struct nir_shader *s);
 bool agx_nir_lower_subgroups_g17p(struct nir_shader *s);
 bool agx_nir_lower_subgroups_m5(struct nir_shader *s, bool native_shuffle_xor);
+bool agx_nir_flush_subgroup_minmax(struct nir_shader *s);
 bool agx_nir_lower_dynamic_shuffle_xor(struct nir_shader *s);
 bool agx_nir_lower_quad_derivative_ids(struct nir_shader *s);
 bool agx_nir_lower_compute_derivatives(struct nir_shader *s);
 bool agx_workgroup_split_size(const struct nir_shader *nir, uint16_t size[3]);
 bool agx_nir_lower_workgroup_split(struct nir_shader *nir,
                                    const uint16_t size[3]);
-bool agx_nir_compute_implicit_lod_diagnostic(void);
 struct nir_def *agx_nir_quad_ddx(struct nir_builder *b, struct nir_def *v);
 struct nir_def *agx_nir_quad_ddy(struct nir_builder *b, struct nir_def *v);
 
@@ -110,6 +113,14 @@ bool agx_nir_lower_texture(struct nir_shader *s);
  * agx_nir_lower_multisampled_image_store_for_generation(); the pass lowers
  * for the remaining descriptor generation (10). */
 #define AGX_NIR_TEXTURE_GENERATION_G18G (1u << 8)
+/* A caller whose Gen10 storage descriptors keep the image-atomic addressing
+ * word after the texture/PBE pair (AGX_G17P_IMAGE_ATOMIC_SW_OFFSET, as
+ * Honeykrisp's 96-byte storage record does) without the buffer-metadata
+ * record ORs this into the generation it passes to
+ * agx_nir_lower_texture_for_generation(). Without it, Gen10 image atomics
+ * read the word from the PBE's last eight bytes, where Gallium keeps it.
+ * Texel-buffer atomics are not affected. */
+#define AGX_NIR_TEXTURE_IMAGE_SIDEBAND (1u << 9)
 bool agx_nir_lower_texture_for_generation(struct nir_shader *s, unsigned generation);
 /* robust_formatless_images: formatless image loads have not been lowered for
  * view-bounds robustness and require it. */
@@ -128,7 +139,7 @@ typedef struct nir_def *(*agx_buffer_texture_metadata_cb)(
    struct nir_builder *b, struct nir_tex_instr *tex);
 bool agx_nir_lower_texture_with_buffer_metadata_cb(
    struct nir_shader *s, unsigned generation,
-   agx_buffer_texture_metadata_cb buffer_metadata);
+   agx_buffer_texture_metadata_cb buffer_metadata, bool robust_texel_fetch);
 bool agx_nir_lower_multisampled_image_store(struct nir_shader *s);
 bool agx_nir_lower_multisampled_image_store_for_generation(struct nir_shader *s,
                                                          unsigned generation);
@@ -190,12 +201,10 @@ agx_g17p_pack_image_atomic_sw(uint64_t level_offset_B, unsigned tile_width_px,
 /* Native texture/PBE pair, heap indices, address sideband, then padding. */
 #define AGX_G17P_EMRT_DESCRIPTOR_SIZE 96
 #define AGX_G17P_EMRT_ALIGNED_WIDTH_OFFSET 80
-/* Declines without changing the shader, so callers need no copy. */
-bool agx_nir_lower_g17p_indexed_samplers(struct nir_shader *s);
+/* Declines without changing the shader, so callers need no copy. g17p
+ * admits the shapes only G17P's backend encodes (agx_optimizer_inline_imm). */
+bool agx_nir_lower_g17p_indexed_samplers(struct nir_shader *s, bool g17p);
 bool agx_nir_lower_g17g_indexed_reads(struct nir_shader *s);
-/* Packed native32 array handles are byte offsets; sampler handles already
- * name their native entry, including the reserved texel-fetch sampler0. */
-bool agx_nir_lower_g17p_native32_samplers(struct nir_shader *s, uint8_t texture_set);
 
 struct agx_g17p_combined_sampler_binding {
    uint32_t texture_offset_B;
@@ -212,6 +221,14 @@ struct agx_g17p_combined_sampler_binding {
  * PBE and a sampler-shaped state record (native run112 kick 19 launch 1
  * loads exactly these 16 bytes into u0..u3). */
 #define AGX_G18G_STORAGE_ROOT_HALFS 8u
+/* Initializer of that 32-byte state record, shared by Gallium and hk. It is
+ * also entry 0 of the sampler table on the G18G image-write routes. Moved
+ * unchanged from Gallium's agx_g18g_native_write_state1 (agx_state.c), whose
+ * comment records where the value comes from and how it decodes. */
+#define AGX_G18G_WRITE_STATE1_INIT                                             \
+   {                                                                           \
+      0x00, 0x00, 0x0f, 0x08, 0x00, 0x07, 0x00, 0x00,                          \
+   }
 struct agx_g17p_txf_binding {
    uint32_t texture_offset_B;
 };
@@ -222,6 +239,11 @@ struct agx_g17p_storage_image_binding {
    uint32_t texture_offset_B;
    uint32_t pbe_offset_B;
    bool write_only;
+   /* G18G multi-image table: bytes from texture_offset_B the state table
+    * spans (0 = one image: 32 write-only, else 64). */
+   uint32_t table_size_B;
+   /* G18G: descriptor set holding the table (0 for the older routes). */
+   uint8_t set;
 };
 
 /* Apple's sampled-texture-to-write-image kernel ABI places a sampled texture,
@@ -254,16 +276,17 @@ bool agx_nir_lower_g17p_indexed_storage(
  */
 /* Whether agx_nir_lower_g17p_combined_sampler() may apply: a false result
  * is final, a true one can still be refused while lowering. */
-bool agx_nir_g17p_combined_sampler_candidate(const struct nir_shader *s);
+bool agx_nir_g17p_combined_sampler_candidate(const struct nir_shader *s,
+                                             bool g17p);
 
 bool agx_nir_lower_g17p_combined_sampler(
-   struct nir_shader *s, struct agx_g17p_combined_sampler_binding *binding);
+   struct nir_shader *s, struct agx_g17p_combined_sampler_binding *binding,
+   bool g17p);
 
 /* Gen10 shares the 32-byte texture/eight-byte sampler descriptor layout.
  * Initially admit only a single 2D float sample at explicit level zero. */
 bool agx_nir_lower_g17g_combined_sampler(
    struct nir_shader *s, struct agx_g17p_combined_sampler_binding *binding);
-bool agx_nir_lower_g17g_indexed_samplers(struct nir_shader *s);
 bool agx_nir_lower_g17g_indexed_reads(struct nir_shader *s);
 
 /* Turn the one statically indexed set-0 Gen9 texture used by the initial
@@ -278,6 +301,36 @@ bool agx_nir_lower_g17p_txf(
  * texture-state 0 / PBE-state 0. Every other image shape stays fail-closed. */
 bool agx_nir_lower_g17p_storage_image(
    struct nir_shader *s, struct agx_g17p_storage_image_binding *binding);
+
+/* G18G: the same state-0 route for one storage image of any colour format,
+ * write-only or read-write (a {texture, PBE} table of two entries). */
+bool agx_nir_lower_g18g_storage_image(
+   struct nir_shader *s, struct agx_g17p_storage_image_binding *binding);
+
+/* G18G: several storage images in one descriptor set through one state
+ * table spanning their descriptors (binding->table_size_B). */
+bool agx_nir_lower_g18g_storage_images(
+   struct nir_shader *shader, struct agx_g17p_storage_image_binding *binding);
+
+/* G18G per-dispatch native tables (agx_nir_lower_g18g_combined_tables):
+ * sampled textures and storage images in one compute shader, in any sets. */
+#define AGX_G18G_TABLE_MAX_TEXTURES 16
+#define AGX_G18G_TABLE_MAX_SAMPLERS 8
+struct agx_g18g_table_entry {
+   uint8_t set;
+   uint32_t offset_B;
+};
+struct agx_g18g_table_binding {
+   /* Texture-state entries: 32-byte copies from set memory. */
+   uint8_t texture_count;
+   /* Sampler entries 1..: heap records named by the published 16-bit index
+    * at (set, offset_B); entry 0 is the G18G write-state record. */
+   uint8_t sampler_count;
+   struct agx_g18g_table_entry textures[AGX_G18G_TABLE_MAX_TEXTURES];
+   struct agx_g18g_table_entry samplers[AGX_G18G_TABLE_MAX_SAMPLERS - 1];
+};
+bool agx_nir_lower_g18g_combined_tables(struct nir_shader *shader,
+                                        struct agx_g18g_table_binding *binding);
 
 /* Lower Gallium's exact write-only scalar-integer image state to native
  * G17P PBE state 0. The caller publishes the resolved PBE pointer and native

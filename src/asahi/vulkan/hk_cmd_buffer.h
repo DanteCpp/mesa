@@ -53,22 +53,6 @@
 
 #include <stdio.h>
 
-extern int hk_g17p_launch_trace_state;
-int hk_g17p_launch_trace_init(void);
-
-static inline bool
-hk_g17p_launch_trace_enabled(void)
-{
-   int enabled = hk_g17p_launch_trace_state;
-   if (unlikely(enabled < 0))
-      enabled = hk_g17p_launch_trace_init();
-   return enabled != 0;
-}
-void hk_g17p_trace_hexdump(const char *label, uint64_t base, const void *data,
-                           size_t len);
-void hk_g17p_trace_line(const char *label, uint64_t base, const void *data,
-                        size_t len);
-
 void *hk_cmd_buffer_emit_cdm_terminate(struct hk_cmd_buffer *cmd,
                                        void *current);
 void *hk_cmd_buffer_emit_vdm_terminate(struct hk_cmd_buffer *cmd,
@@ -198,7 +182,11 @@ struct hk_root_descriptor_table {
           * sample mask; they apply it before their own coverage update.
           * Sysval fields must sit at 4-byte offsets (root table loads). */
          uint16_t alpha_to_coverage;
-         uint16_t _pad7;
+
+         /* The pass has no attachments, so no storage backs its layers: the
+          * hardware sees layer zero, while a fragment shader reading the layer
+          * still gets what the vertex stage wrote. */
+         uint16_t no_attachments;
 
          /* Mapping from varying slots written by the last vertex stage to UVS
           * indices. This mapping must be compatible with the fragment shader.
@@ -710,10 +698,6 @@ struct hk_g17p_launch {
 };
 
 struct hk_g17p_graphics_ioto_cache_entry {
-   uint16_t m5_range_count;
-   uint16_t m5_tile_size_px;
-   uint8_t m5_sample_size_B;
-   uint8_t m5_nr_samples;
    /* The loader of the last draw, the program published from it and the
     * range addresses written into it (hk_g17p_publish_gfx_loader()). */
    const struct hk_g17p_gfx_loader *loader;
@@ -1179,6 +1163,28 @@ struct hk_cs {
    bool gen1_native_vertex_rq;
    bool m5_matrix_ops;
 
+   /* Threads of the application's direct dispatches in this stream, and
+    * whether it holds an indirect one (hk_queue::sib only takes streams with
+    * enough work to overlap). */
+   uint64_t sib_threads;
+   bool sib_indirect;
+
+   /* Submit packing (hk_pack_runs()): how many of the stream's launches are
+    * direct application dispatches, their threads, and the sum over them of
+    * threads times static native instructions. These bound the work one
+    * packed command may hold. The sums saturate at UINT64_MAX. */
+   uint32_t pack_dispatches;
+   uint64_t pack_threads;
+   uint64_t pack_static_work;
+   /* A dispatch in this stream runs a program with global atomics. */
+   bool uses_global_atomics;
+   /* A dispatch in this stream runs a program with a loop: pack_static_work
+    * does not bound its run time. */
+   bool pack_loops;
+   /* The stream calls another stream through a link with return; its bytes
+    * must stay where they were recorded. */
+   bool calls_stream;
+
    /* At least one AS-build dispatch or compute transfer is in this stream. */
    bool as_build;
    /* M5: a pre-rasterization program recorded in this CS keeps state in
@@ -1441,17 +1447,21 @@ void *hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
 
 /*
  * Helper to merge two compute control streams, concatenating the second control
- * stream to the first one. Must sync with hk_cs.
+ * stream, up to b_current, to the first one. Must sync with hk_cs.
+ *
+ * Submit packing (hk_pack_runs()) merges streams of other command buffers
+ * into a submission-owned stream, stopping before their terminate; it only
+ * merges inline, so the link path, which allocates from a's command buffer,
+ * is never taken for it.
  */
 static inline void
-hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
+hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
 {
    assert(a->type == HK_CS_CDM && b->type == HK_CS_CDM);
-   assert(a->cmd == b->cmd);
    assert(!a->timestamp.end.handle);
    a->m5_matrix_ops |= b->m5_matrix_ops;
 
-   const size_t b_size = (uint8_t *)b->current - (uint8_t *)b->start;
+   const size_t b_size = (uint8_t *)b_current - (uint8_t *)b->start;
    const size_t remaining = (uint8_t *)a->end - (uint8_t *)a->current;
    const bool inline_b = !a->stream_linked && !b->stream_linked &&
                          hk_cs_space_fits(remaining, b_size,
@@ -1516,7 +1526,7 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
       void *link_end =
          hk_cmd_buffer_emit_cs_jump(a->cmd, a->current, b->addr, false);
       const bool linked = link_end != a->current;
-      a->current = b->current;
+      a->current = b_current;
       a->end = b->end;
       a->chunk = b->chunk;
       a->stream_linked |= linked || b->stream_linked;
@@ -1529,6 +1539,15 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
    a->uses_sampler_heap |= b->uses_sampler_heap;
    a->gen1_native_rq |= b->gen1_native_rq;
    a->as_build |= b->as_build;
+   a->uses_global_atomics |= b->uses_global_atomics;
+   a->pack_loops |= b->pack_loops;
+   a->calls_stream |= b->calls_stream;
+   a->pack_dispatches += b->pack_dispatches;
+   a->pack_threads = b->pack_threads > UINT64_MAX - a->pack_threads
+                        ? UINT64_MAX : a->pack_threads + b->pack_threads;
+   a->pack_static_work =
+      b->pack_static_work > UINT64_MAX - a->pack_static_work
+         ? UINT64_MAX : a->pack_static_work + b->pack_static_work;
    a->scratch.cs.main |= b->scratch.cs.main;
    a->scratch.cs.preamble |= b->scratch.cs.preamble;
 
@@ -1569,6 +1588,53 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
    a->stats.query_reset_flushes += b->stats.query_reset_flushes;
    a->query_access |= b->query_access;
    assert(!a->query_reset_pending && !b->query_reset_pending);
+
+   /* Frame anatomy: the merged command runs b's programs too. Without them
+    * its whole duration is charged to a's programs alone. */
+   for (unsigned j = 0; j < HK_FA_FS_MAX && b->anatomy_fs[j].fs; ++j) {
+      unsigned i = 0;
+      while (i < HK_FA_FS_MAX && a->anatomy_fs[i].fs &&
+             a->anatomy_fs[i].fs != b->anatomy_fs[j].fs)
+         ++i;
+      if (i == HK_FA_FS_MAX) {
+         a->anatomy_fs_other += b->anatomy_fs[j].draws;
+         continue;
+      }
+      a->anatomy_fs[i].fs = b->anatomy_fs[j].fs;
+      a->anatomy_fs[i].draws += b->anatomy_fs[j].draws;
+      a->anatomy_fs[i].threads += b->anatomy_fs[j].threads;
+      a->anatomy_fs[i].groups += b->anatomy_fs[j].groups;
+      a->anatomy_fs[i].indirect += b->anatomy_fs[j].indirect;
+   }
+   a->anatomy_fs_other += b->anatomy_fs_other;
+
+   for (unsigned j = 0; j < HK_FA_FS_MAX && b->anatomy_precomp[j].dispatches;
+        ++j) {
+      unsigned i = 0;
+      while (i < HK_FA_FS_MAX && a->anatomy_precomp[i].dispatches &&
+             a->anatomy_precomp[i].program != b->anatomy_precomp[j].program)
+         ++i;
+      if (i == HK_FA_FS_MAX) {
+         a->anatomy_precomp_other += b->anatomy_precomp[j].dispatches;
+         continue;
+      }
+      const uint64_t t = b->anatomy_precomp[j].threads;
+      a->anatomy_precomp[i].threads =
+         a->anatomy_precomp[i].dispatches == 0 ? t
+         : (t == UINT64_MAX || a->anatomy_precomp[i].threads == UINT64_MAX)
+            ? UINT64_MAX
+            : a->anatomy_precomp[i].threads + t;
+      a->anatomy_precomp[i].program = b->anatomy_precomp[j].program;
+      a->anatomy_precomp[i].dispatches += b->anatomy_precomp[j].dispatches;
+   }
+   a->anatomy_precomp_other += b->anatomy_precomp_other;
+}
+
+static inline void
+hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
+{
+   assert(a->cmd == b->cmd);
+   hk_cs_merge_cdm_until(a, b, b->current);
 }
 
 static inline uint64_t
@@ -1611,14 +1677,6 @@ struct hk_ioto_arena {
    uint32_t programs;
    uint64_t program_bytes;
    uint64_t chunk_bytes;
-};
-
-struct hk_gen1_as_table_chunk {
-   struct list_head link;
-   struct agx_bo *tail;
-   struct agx_bo *bank;
-   struct agx_va *va;
-   uint32_t next, count;
 };
 
 #define HK_MAX_DEFERRED_CLEARS 8
@@ -1671,6 +1729,10 @@ struct hk_cmd_buffer {
 
       /* Suppress consumption of pending resets while recording another reset. */
       bool query_reset_recording;
+
+      /* An event is set, reset or waited on: the host or another queue can
+       * observe this recording before its submission completes. */
+      bool uses_events;
 
       /* Scoped around direct/indirect AS builds, including their meta blits. */
       bool as_build_recording;
@@ -1733,7 +1795,6 @@ struct hk_cmd_buffer {
    /* Most recently addressed span. Recording often references the current
     * 4 KiB VDM chunk many times before moving to the next one. */
    struct hk_vdm_allocation *g17p_vdm_last_allocation;
-   struct list_head gen1_as_table_chunks;
 
    /* List of all recorded control streams */
    struct list_head control_streams;
@@ -1779,9 +1840,9 @@ struct hk_cmd_buffer {
     * conditional rendering. */
    bool conditional_meta;
 
-   /* Single-kick vkCmdTraceRays* (ASAHI_M5_RT_SINGLE_KICK, default on): while set,
-    * hk_dispatch_m5_native writes the kernel's launch record (40-byte direct
-    * launch + barrier) here instead of into the control stream. */
+   /* Single-kick vkCmdTraceRays* on M5: while set, hk_dispatch_m5_native
+    * writes the kernel's launch record (40-byte direct launch + barrier) here
+    * instead of into the control stream. */
    uint8_t *m5_rt_capture;
    bool m5_rt_captured;
 

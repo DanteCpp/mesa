@@ -176,6 +176,27 @@ TEST_F(AGX3PackBinary, MeshExportFencesUseExactLivePhaseMasks)
              (std::vector<uint8_t>{0x0e,0,0,0}));
 }
 
+/* An in-place 32-bit NOT whose halves come from two loads in flight waits on
+ * two slots. Only the unary AGX3b `inv` form carries that wait in place: the
+ * NOT's ignored second bitop source must not keep it from that form
+ * (llama.cpp's q3_K mat-vec failed to compile). */
+TEST_F(AGX3PackBinary, InPlaceNotWaitingOnTwoSlotsPacks)
+{
+   agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+   key.dev.chip = AGX_CHIP_G17P;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_device_load_to(b, agx_register(0, AGX_SIZE_16),
+      agx_uniform(0, AGX_SIZE_64), agx_immediate(0), AGX_FORMAT_I16, 1, 0, false);
+   agx_device_load_to(b, agx_register(1, AGX_SIZE_16),
+      agx_uniform(0, AGX_SIZE_64), agx_immediate(2), AGX_FORMAT_I16, 1, 0, false);
+   agx_bitop_to(b, agx_register(0, AGX_SIZE_32), agx_register(0, AGX_SIZE_32),
+                agx_zero(), UTIL_LUT2(~a));
+   agx_device_store(b, agx_register(0, AGX_SIZE_32), agx_uniform(0, AGX_SIZE_64),
+                    agx_immediate(0), AGX_FORMAT_I32, 1, 0, false);
+   agx_stop(b);
+   EXPECT_FALSE(pack(b).empty());
+}
+
 TEST_F(AGX3PackBinary, MeshExportFenceDrainsBothPendingR0Halves)
 {
    agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
@@ -11086,7 +11107,7 @@ TEST_F(AGX3PackBinary, ByteAddressLoweringKeepsFullU32Offset)
       nir_def *value=nir_load_global(&b,1,32,
          nir_iadd(&b,base,nir_u2u64(&b,offset)),.align_mul=4);
       nir_store_global(&b,value,nir_imm_int64(&b,0x100000),.align_mul=4);
-      ASSERT_TRUE(agx_nir_lower_address(b.shader,enabled,false));
+      ASSERT_TRUE(agx_nir_lower_address(b.shader,enabled,false,false));
       unsigned found=0;
       nir_foreach_function_impl(impl,b.shader) {
          nir_foreach_block(block,impl) {
@@ -12158,65 +12179,6 @@ TEST_F(AGX3PackBinary, HalfMaximumRoutesLifetimesWithoutPhantomWait)
  *   fmax(a, 0.0f)   12 03 0a 81 00 c2
  *   fmax(a, 1.0f)   12 03 0a b1 00 c2
  */
-/* Diagnostic: enumerate the fcmpsel operand shape space and print refusals. */
-TEST_F(AGX3PackBinary, DISABLED_FcmpselShapeSurvey)
-{
-   static const char *kindname[] = {"h16", "r32", "#0", "#255"};
-   static const unsigned fconds[] = {0, 1, 2, 3, 5, 6, 7};
-   static const char *fcondname[] = {"eq", "lt", "gt", "ltn", "?", "ge",
-                                     "le", "gtn"};
-   unsigned refused = 0, total = 0;
-
-   for (unsigned dest_32 = 0; dest_32 < 2; ++dest_32) {
-   for (unsigned k0 = 0; k0 < 4; ++k0)
-   for (unsigned k1 = 0; k1 < 4; ++k1)
-   for (unsigned k2 = 0; k2 < 4; ++k2)
-   for (unsigned k3 = 0; k3 < 4; ++k3)
-   for (unsigned ci = 0; ci < ARRAY_SIZE(fconds); ++ci)
-   for (unsigned inv = 0; inv < 2; ++inv) {
-      const unsigned k[4] = {k0, k1, k2, k3};
-      /* A select needs at least one register operand somewhere. */
-      if (k0 >= 2 && k1 >= 2)
-         continue;
-
-      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
-      agx_index src[4];
-      for (unsigned i = 0; i < 4; ++i) {
-         switch (k[i]) {
-         case 0: src[i] = agx_register(2 + 2 * i, AGX_SIZE_16); break;
-         case 1: src[i] = agx_register(2 + 2 * i, AGX_SIZE_32); break;
-         case 2: src[i] = agx_immediate(0); break;
-         default: src[i] = agx_immediate(255); break;
-         }
-      }
-      /* Sources 2 and 3 are selected into the destination, so their width has
-       * to be the destination's. */
-      if ((k2 < 2 && (k2 == 1) != (dest_32 != 0)) ||
-          (k3 < 2 && (k3 == 1) != (dest_32 != 0)))
-         continue;
-
-      agx_index dest =
-         agx_register(0, dest_32 ? AGX_SIZE_32 : AGX_SIZE_16);
-      agx_instr *I = agx_fcmpsel_to(b, dest, src[0], src[1], src[2], src[3],
-                                    (enum agx_fcond)fconds[ci]);
-      I->invert_cond = inv;
-      agx_stop(b);
-
-      struct util_dynarray bin;
-      util_dynarray_init(&bin, mem_ctx);
-      ++total;
-      if (!agx3_pack_binary(b->shader, &bin)) {
-         ++refused;
-         fprintf(stderr, "REFUSED d%s = fcmpsel %s, %s, %s, %s, %s%s\n",
-                 dest_32 ? "32" : "16", kindname[k0], kindname[k1],
-                 kindname[k2], kindname[k3], fcondname[fconds[ci]],
-                 inv ? " (inverted)" : "");
-      }
-   }
-   }
-   fprintf(stderr, "fcmpsel survey: %u shapes, %u refused\n", total, refused);
-}
-
 TEST_F(AGX3PackBinary, F32TiedMaximumMatchesNativeRegisterForm)
 {
    for (bool maximum : {true, false}) {
@@ -13659,10 +13621,11 @@ TEST_F(AGX3PackBinary, IndexedShadowLevelZeroKeepsNativeHandles)
          /* A comparison stages a register level beside the operand its
           * dimension already owns -- the cube beside its face, the noncube
           * array beside its layer -- so both are native. An immediate
-          * nonzero level is not: it would have to share SMP's immediate
-          * slot with that same operand. */
-         const bool native = level == 0 || level == 2;
-         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader), native);
+          * nonzero level would have to share SMP's immediate slot with that
+          * same operand; the noncube array keeps it in a register instead
+          * (agx_optimizer_inline_imm), the cube has no such form. */
+         const bool native = level == 0 || level == 2 || !cube;
+         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader, true), native);
          if (native) {
             const int texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
             const int sampler = nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle);
@@ -13722,10 +13685,11 @@ TEST_F(AGX3PackBinary, IndexedShadowGradientAndRegisterBiasKeepNativeHandles)
                           .align_mul = 4);
          /* A per-lane bias is published beside the layer or CEM's face, so
           * both dimensions take it; a constant one would have to share SMP's
-          * immediate slot with that same operand. The gradient composes with
-          * the packed layer, and the cube has no gradient form at all. */
-         const bool native = grad ? !cube : kind == 0;
-         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader), native);
+          * immediate slot with that same operand, so the noncube array keeps
+          * it in a register and the cube refuses it. The gradient composes
+          * with the packed layer, and the cube has no gradient form at all. */
+         const bool native = grad ? !cube : kind == 0 || !cube;
+         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader, true), native);
          ralloc_free(b.shader);
       }
    }
@@ -16277,7 +16241,7 @@ TEST_F(AGX3PackBinary, IndexedGatherKeepsNativeHandles)
             nir_builder_instr_insert(&b, &tex->instr);
             nir_store_global(&b, &tex->def, nir_imm_int64(&b, 0x20000),
                              .align_mul = 4);
-            ASSERT_TRUE(agx_nir_lower_g17p_indexed_samplers(b.shader));
+            ASSERT_TRUE(agx_nir_lower_g17p_indexed_samplers(b.shader, true));
             const int texture = nir_tex_instr_src_index(
                tex, nir_tex_src_texture_offset);
             ASSERT_GE(texture, 0);
@@ -16569,5 +16533,107 @@ TEST_F(AGX3PackBinary, G18GWorkgroupBarriersKeepLoadsInFlight)
       ASSERT_GE(code.size(), tail.size());
       EXPECT_EQ(std::vector<uint8_t>(code.end() - tail.size(), code.end()),
                 tail);
+   }
+}
+
+/* G18G: the saturated register+minifloat add that hk's image-to-buffer copy
+ * uses to repack a UNORM texel, sat(x + -0.0), has wait fields for slots 1..6
+ * only. With seven or eight loads in flight its source comes back on slot 7
+ * or 8; that wait is retired through the band carrier on the destination and
+ * the add then waits on nothing. Up to slot 6 the add carries its own wait. */
+TEST_F(AGX3PackBinary, G18GSaturatedMinifloatAddRetiresLateSlots)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G18G;
+   key.dev.emit_agx3d = true;
+   for (unsigned loads : {6u, 7u, 8u}) {
+      SCOPED_TRACE(loads);
+      agx_builder *b = builder(enc);
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->nir = rzalloc(b->shader, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+      for (unsigned n = 0; n < loads; ++n)
+         agx_device_load_to(b, agx_register(8 + 4 * n, AGX_SIZE_32),
+                            agx_uniform(16, AGX_SIZE_64), agx_immediate(n),
+                            AGX_FORMAT_I32, 1, 0, false);
+      const unsigned src = 8 + 4 * (loads - 1);
+      agx_instr *add = agx_fadd_to(b, agx_register(2, AGX_SIZE_32),
+                                   agx_register(src, AGX_SIZE_32),
+                                   agx_immediate(0x80));
+      add->saturate = true;
+      agx_stop(b);
+      const auto code = pack(b);
+      ASSERT_FALSE(code.empty());
+
+      const uint16_t wait = 1u << (loads - 1);
+      std::vector<uint8_t> tail;
+      uint8_t bytes[AGX3_ALU_MAX_LENGTH], len;
+      if (wait & ~0x3fu) {
+         ASSERT_TRUE(agx3_alu_band_identity_wait(enc, 2, wait, bytes, &len));
+         append(tail, bytes, len);
+      }
+      ASSERT_TRUE(agx3_alu_fadd_minifloat_mod_g18g(
+         enc, 2, src, 0x80, false, true, AGX3_ALU_HINT_NONE, wait & 0x3f,
+         bytes, &len));
+      append(tail, bytes, len);
+      tail.insert(tail.end(), {0x0e, 0, 0, 0});
+      ASSERT_GE(code.size(), tail.size());
+      EXPECT_EQ(std::vector<uint8_t>(code.end() - tail.size(), code.end()),
+                tail);
+   }
+}
+
+/* No AGX3 table has an f32 add of two immediates: agx3c and agx3d refuse
+ * every such pair and agx3b folds only the unmodified, unclamped one.
+ * agx_lower_pseudo() lowers the pair on every AGX3 encoding, and the result
+ * packs on all of them; the agx3b fold keeps its bytes. */
+TEST_F(AGX3PackBinary, TwoImmediateFaddPacksAfterLoweringOnEveryAgx3)
+{
+   const struct {
+      enum agx_isa_encoding enc;
+      bool agx3d;
+   } encodings[] = {
+      {AGX_ISA_ENCODING_AGX3B, false},
+      {AGX_ISA_ENCODING_AGX3C, false},
+      {AGX_ISA_ENCODING_AGX3C, true},
+   };
+
+   for (auto e : encodings) {
+      /* 0: plain, 1: saturated, 2: negated, 3: |-x|, 4: second constant */
+      for (unsigned v = 0; v < 5; ++v) {
+         SCOPED_TRACE(e.enc * 100 + e.agx3d * 10 + v);
+         std::vector<uint8_t> unlowered;
+         for (unsigned lower = 0; lower < 2; ++lower) {
+            agx_builder *b = builder(e.enc);
+            key.dev.emit_agx3d = e.agx3d;
+            key.dev.chip = e.enc == AGX_ISA_ENCODING_AGX3B ? AGX_CHIP_G17P
+                                                           : AGX_CHIP_G17G;
+            agx_index a = agx_immediate(0x30);
+            agx_index c = v == 4 ? agx_immediate(0x38) : agx_negzero();
+            if (v == 2)
+               a = agx_neg(a);
+            if (v == 3)
+               a = agx_abs(agx_neg(a));
+            agx_instr *add =
+               agx_fadd_to(b, agx_register(4, AGX_SIZE_32), a, c);
+            add->saturate = v == 1;
+            agx_stop(b);
+
+            if (!lower) {
+               struct util_dynarray bin;
+               util_dynarray_init(&bin, mem_ctx);
+               if (agx3_pack_binary(b->shader, &bin))
+                  unlowered.assign((const uint8_t *)bin.data,
+                                   (const uint8_t *)bin.data + bin.size);
+               continue;
+            }
+
+            agx_lower_pseudo(b->shader);
+            std::vector<uint8_t> bytes = pack(b);
+            EXPECT_FALSE(bytes.empty());
+            if (e.enc == AGX_ISA_ENCODING_AGX3B && (v == 0 || v == 4))
+               EXPECT_EQ(bytes, unlowered);
+         }
+      }
    }
 }

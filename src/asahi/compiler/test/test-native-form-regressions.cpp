@@ -2274,7 +2274,7 @@ TEST(NativeForms, CubeArrayShadowZeroLodUsesNativeDescriptors)
          nir_def_init(&tex->instr, &tex->def, 1, 32);
          nir_builder_instr_insert(&b, &tex->instr);
          nir_store_ssbo(&b, &tex->def, nir_imm_int(&b, 0), nir_imm_int(&b, 0));
-         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader), lod == 0.0f);
+         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader, true), lod == 0.0f);
          ralloc_free(b.shader);
       }
    }
@@ -2311,7 +2311,7 @@ TEST(NativeForms, HeapIndexReadsSpeculateOnlyForConstantDescriptors)
       nir_def_init(&tex->instr, &tex->def, 1, 32);
       nir_builder_instr_insert(&b, &tex->instr);
       nir_store_ssbo(&b, &tex->def, nir_imm_int(&b, 0), nir_imm_int(&b, 0));
-      ASSERT_TRUE(agx_nir_lower_g17p_indexed_samplers(b.shader));
+      ASSERT_TRUE(agx_nir_lower_g17p_indexed_samplers(b.shader, true));
 
       unsigned reads = 0;
       nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
@@ -5257,15 +5257,8 @@ TEST(NativeForms, M5NativeTriangleMeshProbeCompiles)
    agx_shader_key key={};key.dev.chip=AGX_CHIP_G17S;
    key.dev.encoding=AGX_ISA_ENCODING_AGX3C;key.no_preamble=true;
    agx_shader_part part={};
-   bool compiled=agx_compile_shader_nir(b.shader,&key,&part);
-   EXPECT_TRUE(compiled)<<agx_last_compile_refusal();
-   if(compiled){
-      printf("native-triangle-mesh binary=%u gprs=%u shared=%u scratch=%u\n",
-        part.info.binary_size,part.info.nr_gprs,part.info.local_size,part.info.scratch_size);
-      FILE *f=fopen("native-triangle-mesh.bin","wb");
-      if(f){fwrite(part.binary,1,part.info.binary_size,f);fclose(f);}
-      free(part.binary);
-   }
+   EXPECT_TRUE(agx_compile_shader_nir(b.shader,&key,&part))<<agx_last_compile_refusal();
+   free(part.binary);
    ralloc_free(b.shader);
 }
 
@@ -7079,4 +7072,129 @@ TEST(NativeForms, CooperativeMatrixDefaultsFollowTheImplementedEncoding)
    /* M5 has the AGX3C path; AGX2 has neither implementation. */
    EXPECT_TRUE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G17G));
    EXPECT_FALSE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G13G));
+}
+
+/* A G17P 2D-array comparison keeps a nonzero constant level or bias in a
+ * register, since agx3_emit_texture_sample() refuses that immediate. Every
+ * form the packer already encoded keeps its immediate, so no shader that
+ * compiled before compiles differently. */
+TEST(NativeForms, G17PArrayShadowConstantLodKeepsEncodableImmediates)
+{
+   struct {
+      mesa_shader_stage stage;
+      enum agx_lod_mode lod_mode;
+      uint16_t value; /* fp16 */
+      bool offset;
+      enum agx_chip chip;
+      bool immediate;
+   } cases[] = {
+      /* The refused forms. */
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000 /* 2.0 */, false,
+       AGX_CHIP_G17P, false},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_AUTO_LOD_BIAS, 0x3800 /* 0.5 */,
+       false, AGX_CHIP_G17P, false},
+      {MESA_SHADER_COMPUTE, AGX_LOD_MODE_LOD_MIN, 0x4000, false, AGX_CHIP_G17P,
+       false},
+      /* Forms the packer encodes as immediates. */
+      {MESA_SHADER_VERTEX, AGX_LOD_MODE_LOD_MIN, 0x4000, false, AGX_CHIP_G17P,
+       true},
+      {MESA_SHADER_MESH, AGX_LOD_MODE_LOD_MIN, 0x4000, false, AGX_CHIP_G17P,
+       true},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x0000 /* 0.0 */, false,
+       AGX_CHIP_G17P, true},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x8000 /* -0.0 */, false,
+       AGX_CHIP_G17P, true},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_AUTO_LOD_BIAS, 0x8000, false,
+       AGX_CHIP_G17P, true},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000, true,
+       AGX_CHIP_G17P, true},
+      /* Other chips are unchanged. */
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000, false,
+       AGX_CHIP_G16G, true},
+   };
+   for (const auto &c : cases) {
+      SCOPED_TRACE(::testing::Message()
+                   << "stage=" << c.stage << " lod_mode=" << c.lod_mode
+                   << " value=" << c.value << " offset=" << c.offset
+                   << " chip=" << c.chip);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.chip = c.chip;
+      key.dev.encoding = agx_chip_isa_encoding(c.chip);
+      b->shader->key = &key;
+      b->shader->stage = c.stage;
+      agx_index coords = agx_register(8, AGX_SIZE_32);
+      coords.channels_m1 = 2;
+      agx_index lod = agx_mov_imm(b, 16, c.value);
+      agx_instr *I = agx_texture_sample_to(
+         b, agx_temp(b->shader, AGX_SIZE_16), coords, lod, agx_immediate(0),
+         agx_immediate(0), agx_immediate(0), agx_register(16, AGX_SIZE_32),
+         AGX_DIM_2D_ARRAY, c.lod_mode, 1, c.offset, true, false,
+         AGX_GATHER_NONE, false);
+      agx_optimizer_forward(b->shader);
+      EXPECT_EQ(I->src[1].type == AGX_INDEX_IMMEDIATE, c.immediate);
+      ralloc_free(mem);
+   }
+}
+
+/*
+ * AGX3B's 8-bit register fields accept halves 192..255 in the compose table,
+ * but its general register file ends at half 191 (192 halves). Bound 4-half
+ * (vec2 f32) operands to 188 and 2-half (vec2 f16) operands to 190 on AGX3B
+ * while preserving AGX3C's 252/254 bounds.
+ */
+TEST(NativeForms, Agx3bMatmad8x8EnforcesRegisterBounds)
+{
+   uint8_t out[14], length = 0;
+
+   struct agx3_matrix_mma8_desc f32_max = {
+      .dest = 188, .a = 188, .b = 188, .c = 188,
+      .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &f32_max, out,
+                                       &length));
+
+   for (unsigned field = 0; field < 4; ++field) {
+      struct agx3_matrix_mma8_desc over = f32_max;
+      if (field == 0)
+         over.dest = 190;
+      else if (field == 1)
+         over.a = 190;
+      else if (field == 2)
+         over.b = 190;
+      else
+         over.c = 190;
+      EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &over, out,
+                                           &length)) << field;
+      EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &over, out,
+                                          &length)) << field;
+   }
+
+   struct agx3_matrix_mma8_desc f16_max = {
+      .dest = 188, .a = 190, .b = 190, .c = 188,
+      .input_type = AGX3_MATRIX_INPUT_F16,
+   };
+   EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &f16_max, out,
+                                       &length));
+
+   struct agx3_matrix_mma8_desc f16_over = f16_max;
+   f16_over.a = 192;
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &f16_over, out,
+                                        &length));
+   f16_over = f16_max;
+   f16_over.b = 192;
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &f16_over, out,
+                                        &length));
+   f16_over = f16_max;
+   f16_over.dest = 192;
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &f16_over, out,
+                                        &length));
+
+   struct agx3_matrix_mma8_desc agx3c_max = {
+      .dest = 252, .a = 254, .b = 254, .c = 252,
+      .input_type = AGX3_MATRIX_INPUT_F16,
+   };
+   EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &agx3c_max, out,
+                                       &length));
 }

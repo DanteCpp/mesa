@@ -169,12 +169,19 @@ struct hk_shader_info {
    unsigned agx3_root_uniform;
    bool agx3_txf_texture_valid;
    bool agx3_storage_image_valid;
+   /* G18G compute: image access left on the AGX2 bindless form, which
+    * silently did nothing on G18G when tested. Refused at dispatch. */
+   bool g18_unlowered_image;
    bool agx3_sampled_storage_valid;
    bool agx3_indexed_sampler_valid;
    bool agx3_indexed_storage_valid;
    struct agx_g17p_combined_sampler_binding agx3_combined_sampler;
    struct agx_g17p_txf_binding agx3_txf_texture;
    struct agx_g17p_storage_image_binding agx3_storage_image;
+   /* G18G: textures + storage images through per-dispatch tables (implies
+    * agx3_storage_image_valid). */
+   bool agx3_g18_tables_valid;
+   struct agx_g18g_table_binding agx3_g18_tables;
    struct agx_g17p_sampled_storage_binding agx3_sampled_storage;
    struct agx_g17p_indexed_storage_binding agx3_indexed_storage;
 
@@ -599,13 +606,6 @@ hk_main_mesh_variant(struct hk_api_shader *obj)
    return &obj->variants[HK_MESH_VARIANT_MAIN];
 }
 
-static struct hk_shader *
-hk_rast_mesh_variant(struct hk_api_shader *obj)
-{
-   assert(obj->vk.stage == MESA_SHADER_MESH);
-   return &obj->variants[HK_MESH_VARIANT_RAST];
-}
-
 #define HK_MAX_LINKED_USC_SIZE                                                 \
    (AGX_USC_PRESHADER_LENGTH + AGX_USC_FRAGMENT_PROPERTIES_LENGTH +            \
     AGX_USC_REGISTERS_LENGTH + AGX_USC_SHADER_LENGTH + AGX_USC_SHARED_LENGTH + \
@@ -784,6 +784,10 @@ hk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness,
 
 bool hk_lower_uvs_index(nir_shader *s, mesa_shader_stage sw_stage,
                         unsigned nr_vbos, unsigned uniform_base);
+
+bool hk_nir_layout_has_descriptors(
+   const nir_shader *nir, uint32_t set_layout_count,
+   struct vk_descriptor_set_layout *const *set_layouts);
 
 bool
 hk_nir_lower_descriptors(nir_shader *nir,

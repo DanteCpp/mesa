@@ -26,7 +26,6 @@
 #include "hk_image.h"
 #include "hk_instance.h"
 #include "hk_m5_acceleration_structure.h"
-#include "hk_memory_budget_core.h"
 #include "hk_agx3_vdm_decode.h"
 #include "hk_native_descriptor.h"
 #include "hk_nir_lower_mesh.h"
@@ -1325,10 +1324,18 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxMeshOutputVertices = 256,
       .maxMeshOutputPrimitives = 256,
       .maxMeshOutputLayers = 8,
-      /* A multiview mesh draw replays once per view (hk_foreach_view), which
-       * works up to HK_MAX_MULTIVIEW_VIEW_COUNT. Temporarily 16: CTS
-       * mesh_shader.ext.properties.max_view_index builds its view mask as
-       * (1u << count) - 1, undefined at 32. Raise it once the CTS is fixed. */
+      /* A multiview mesh draw replays once per view (hk_foreach_view walks
+       * every bit of the 32-bit view mask) and writes the view index to the
+       * layer, so mesh shaders could take HK_MAX_MULTIVIEW_VIEW_COUNT views.
+       *
+       * Report 16 until VK-GL-CTS is fixed:
+       * dEQP-VK.mesh_shader.ext.properties.max_view_index draws with
+       * min(maxMeshMultiviewViewCount, 32) views and builds its subpass view
+       * mask as (1u << count) - 1u. At 32 views the shift is undefined; on
+       * AArch64 it shifts by count mod 32, the mask becomes 0, the pass is
+       * not multiview, only layer 0 is drawn and the case fails. Raise this
+       * once the CTS computes the mask without the overflowing shift.
+       */
       .maxMeshMultiviewViewCount = features->multiviewMeshShader ? 16 : 1,
       .meshOutputPerVertexGranularity = 32,
       .meshOutputPerPrimitiveGranularity = 32,
@@ -1875,7 +1882,7 @@ hk_codegen_env_hash(void)
    static const char *const runtime_only[] = {
       "TRACE", "DUMP", "_LOG", "PERF", "VERBOSE", "DEBUG_OBJECT", "SLOW_DRAW",
       "DISK_CACHE_ID", "LAZY_GENERIC", "FORCE_GENERIC", "BIND_PREDICT",
-      "VARIANT_TRACE", "SLOW_SUBMIT", "PROLOG_DISK_CACHE",
+      "VARIANT_TRACE", "SLOW_SUBMIT", "PROLOG_DISK_CACHE", "FRAME_ANATOMY",
    };
    const char *list[512];
    unsigned n = 0;
@@ -1891,9 +1898,13 @@ hk_codegen_env_hash(void)
          for (size_t o = 0; o + l <= name_len && !skip; ++o)
             skip = !strncmp(*e + o, runtime_only[i], l);
       }
-      /* HK_PERFTEST includes code-generation choices such as noborder. */
+      /* HK_PERFTEST includes code-generation choices such as noborder.
+       * HK_FRAME_ANATOMY_DUMP writes NIR only for shaders it compiles, so a
+       * warm cache would leave the dump empty. */
       if (!skip || (name_len == strlen("HK_PERFTEST") &&
-                    !strncmp(*e, "HK_PERFTEST", name_len)))
+                    !strncmp(*e, "HK_PERFTEST", name_len)) ||
+          (name_len == strlen("HK_FRAME_ANATOMY_DUMP") &&
+           !strncmp(*e, "HK_FRAME_ANATOMY_DUMP", name_len)))
          list[n++] = *e;
    }
    qsort(list, n, sizeof(list[0]), hk_env_cmp);
@@ -1981,6 +1992,15 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
    const uint64_t env_hash = hk_codegen_env_hash();
    _mesa_blake3_update(&blake3_ctx, &env_hash, sizeof(env_hash));
 
+   /* The kernel's feature bits select code paths at compile time: M5 native
+    * traversal or software ray queries, compute resources, RT-only render
+    * records. Key the caches on them so that a shader built against one
+    * kernel's features is never served on a kernel with others. They do not
+    * change the image layout, so they stay out of optimalTilingLayoutUUID.
+    */
+   const uint64_t features = pdev->dev.params.features;
+   _mesa_blake3_update(&blake3_ctx, &features, sizeof(features));
+
    unsigned char blake3[BLAKE3_KEY_LEN];
    _mesa_blake3_final(&blake3_ctx, blake3);
 
@@ -2006,9 +2026,13 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
    static_assert(sizeof(instance->driver_build_sha) >= 20);
    char timestamp[2 * 20 + 1];
    mesa_bytes_to_hex(timestamp, instance->driver_build_sha, id_bytes);
-   const uint64_t driver_flags = hk_physical_device_compiler_flags(pdev);
-   pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags ^
-      (env_hash * UINT64_C(0xff51afd7ed558ccd)));
+   /* The disk cache follows the same identity as pipelineCacheUUID: the
+    * build, the device's generation contract and kernel features, the
+    * compiler flags and the codegen environment.
+    */
+   uint64_t identity;
+   memcpy(&identity, blake3, sizeof(identity));
+   pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, identity);
    if (pdev->vk.disk_cache != NULL) {
       hk_border_emulation_recall(pdev);
       pdev->vk.properties.pipelineBinaryInternalCache = true;
@@ -2231,7 +2255,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       agx_chip_g17_m5(pdev->dev.chip) || pdev->dev.chip == AGX_CHIP_G17P;
 
    supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
-      hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE &&
       (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2);
 
    /* Gen5 adds native component-wise minimum/maximum sampler reduction. */
@@ -2611,11 +2634,13 @@ hk_GetPhysicalDeviceQueueFamilyProperties2(
          if (prio) {
             STATIC_ASSERT(ARRAY_SIZE(hk_global_queue_priorities) <=
                           VK_MAX_GLOBAL_PRIORITY_SIZE_KHR);
-            /* The native kernel reserves REALTIME and only accepts HIGH on
-             * M5. Report the same classes that queue creation can admit. */
-            prio->priorityCount = agx_chip_g17_m5(pdev->dev.chip) ? 3 : 2;
+            /* The kernel reserves REALTIME. HIGH is offered on every chip:
+             * the kernel decides at queue creation whether the GPU schedules
+             * it and whether the caller may use it, and a refusal is the
+             * VK_ERROR_NOT_PERMITTED the spec allows for a supported class. */
+            prio->priorityCount = ARRAY_SIZE(hk_global_queue_priorities);
             memcpy(&prio->priorities, hk_global_queue_priorities,
-                   prio->priorityCount * sizeof(hk_global_queue_priorities[0]));
+                   sizeof(hk_global_queue_priorities));
          }
       }
    }
