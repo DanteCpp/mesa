@@ -31,9 +31,10 @@ struct hk_vdm_slab {
 
 #include <errno.h>
 #include <string.h>
+#ifndef _WIN32
 #include <unistd.h>
-#include <xf86drm.h>
 #include "util/libsync.h"
+#endif
 #include "util/u_atomic.h"
 #include "vk_queue.h"
 
@@ -650,7 +651,7 @@ hk_cmd_pending_release(struct hk_device *dev, struct hk_cmd_pending *p,
    }
 
    for (unsigned i = 0; i < p->chunks; ++i)
-      drmSyncobjDestroy(dev->dev.fd, p->signals[i]);
+      dev->vk.sync->destroy(dev->vk.sync, p->signals[i]);
 
    vk_free(&dev->vk.alloc, p->signals);
    vk_free(&dev->vk.alloc, p);
@@ -692,20 +693,41 @@ hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p, bool wait)
    }
 
    if (unknown_count &&
-       drmSyncobjWait(dev->dev.fd, p->unknown, unknown_count, 0,
-                      DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL)) {
+       dev->vk.sync->wait(dev->vk.sync, p->unknown, unknown_count, 0,
+                          DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL)) {
       /* A syncobj without any fence never gets one: keep the memory, but
        * stop polling it.
        */
       return errno == EINVAL ? HK_PENDING_FAILED : HK_PENDING_BUSY;
    }
 
+#ifdef _WIN32
+   /* A D3DKMT monitored fence has a value, not an error status, and dxgkrnl
+    * also runs the signals queued behind a packet the KMD refused. The queue
+    * timeline's point does not order this submission's own fences either.
+    * So its fences are read here too, and all of them reached are a success
+    * only while the device status (VM_STATUS) says the device is not lost;
+    * otherwise the memory stays out of reuse.
+    */
+   for (unsigned i = 0; !wait && i < p->attempted; ++i) {
+      if (!p->succeeded[i])
+         p->unknown[unknown_count++] = p->signals[i];
+   }
+   if (!wait && unknown_count &&
+       dev->vk.sync->wait(dev->vk.sync, p->unknown, unknown_count, 0,
+                          DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL))
+      return errno == EINVAL ? HK_PENDING_FAILED : HK_PENDING_BUSY;
+   if (unknown_count && vk_device_check_status(&dev->vk) != VK_SUCCESS)
+      return HK_PENDING_FAILED;
+   for (unsigned i = 0; i < p->attempted; ++i)
+      p->succeeded[i] = true;
+#else
    for (unsigned i = 0; i < p->attempted; ++i) {
       if (p->succeeded[i])
          continue;
 
       int fd = -1;
-      if (drmSyncobjExportSyncFile(dev->dev.fd, p->signals[i], &fd))
+      if (dev->vk.sync->export_sync_file(dev->vk.sync, p->signals[i], &fd))
          return errno == EINVAL ? HK_PENDING_FAILED : HK_PENDING_BUSY;
 
       struct sync_file_info info = {0};
@@ -718,6 +740,7 @@ hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p, bool wait)
 
       p->succeeded[i] = true;
    }
+#endif
 
    return HK_PENDING_SUCCEEDED;
 }
@@ -744,7 +767,7 @@ hk_cmd_pending_reap_queue(struct hk_device *dev, struct hk_queue *queue,
                           struct list_head *ready)
 {
    uint64_t reached = 0;
-   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &reached, 1))
+   if (dev->vk.sync->query(dev->vk.sync, &queue->drm.syncobj, &reached, 1, 0))
       reached = 0;
 
    struct hk_cmd_pending *oldest =
@@ -847,7 +870,7 @@ hk_cmd_pending_begin(struct hk_device *dev,
    simple_mtx_unlock(&dev->cmd_pending_lock);
 
    for (; p->chunks < chunks; ++p->chunks) {
-      if (drmSyncobjCreate(dev->dev.fd, 0, &p->signals[p->chunks])) {
+      if (dev->vk.sync->create(dev->vk.sync, 0, &p->signals[p->chunks])) {
          simple_mtx_lock(&dev->cmd_pending_lock);
          hk_cmd_pending_recycle(dev, p);
          simple_mtx_unlock(&dev->cmd_pending_lock);
@@ -950,6 +973,6 @@ hk_cmd_pending_finish(struct hk_device *dev)
    }
 
    for (unsigned i = 0; i < dev->cmd_syncobj_count; ++i)
-      drmSyncobjDestroy(dev->dev.fd, dev->cmd_syncobjs[i]);
+      dev->vk.sync->destroy(dev->vk.sync, dev->cmd_syncobjs[i]);
    dev->cmd_syncobj_count = 0;
 }

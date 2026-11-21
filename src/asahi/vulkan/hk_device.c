@@ -1539,12 +1539,14 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    /* No submit thread is left to call into the kicker. */
    hk_compute_kick_finish(dev);
 
-   vk_device_finish(&dev->vk);
-
    /* All submit workers/queues are gone. No command bytes can be handed to
-    * a new recording during teardown. Kernel job pins retain failed work. */
+    * a new recording during teardown. Kernel job pins retain failed work.
+    * Before vk_device_finish(): the pending syncobjs are destroyed through
+    * dev->vk.sync, which it finalizes. */
    hk_cmd_pending_finish(dev);
    simple_mtx_destroy(&dev->cmd_pending_lock);
+
+   vk_device_finish(&dev->vk);
    hk_device_finish_vdm_slabs(dev);
    simple_mtx_destroy(&dev->vdm.lock);
 
