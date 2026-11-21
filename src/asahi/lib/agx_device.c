@@ -945,6 +945,51 @@ agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo)
    errno = ENOTSUP;
    return false;
 }
+
+/*
+ * GEM_USERPTR and GEM_RESIDENCY have no D3DKMT translation: the winsys never
+ * publishes DRM_ASAHI_FEATURE_USERPTR or _GEM_RESIDENCY
+ * (agx_d3dkmt_published_features), so agx_has_userptr() and
+ * agx_has_residency_control() are false and hk never reaches these. They
+ * answer as the DRM helpers do on a kernel without the feature.
+ */
+struct agx_bo *
+agx_bo_import_host_ptr(struct agx_device *dev, void *ptr, size_t size,
+                       enum agx_host_ptr_access access)
+{
+   (void)dev, (void)ptr, (void)size, (void)access;
+   errno = EOPNOTSUPP;
+   return NULL;
+}
+
+int
+agx_bo_set_resident(struct agx_device *dev, struct agx_bo *bo, bool keep)
+{
+   (void)dev, (void)bo, (void)keep;
+   return -EOPNOTSUPP;
+}
+
+/* The VM's sticky status as hk_check_status() asks it: GET_PARAMS
+ * VM_STATUS through the backend's simple_ioctl, which the D3DKMT winsys
+ * answers with a device escape. */
+bool
+agx_device_vm_failed(struct agx_device *dev)
+{
+   if (!(dev->params.features & DRM_ASAHI_FEATURE_VM_STATUS) ||
+       !dev->ops.simple_ioctl)
+      return false;
+
+   struct drm_asahi_vm_status status = {.vm_id = dev->vm_id};
+   struct drm_asahi_get_params params = {
+      .param_group = DRM_ASAHI_PARAM_GROUP_VM_STATUS,
+      .pointer = (uintptr_t)&status,
+      .size = sizeof(status),
+   };
+
+   if (dev->ops.simple_ioctl(dev, DRM_IOCTL_ASAHI_GET_PARAMS, &params))
+      return false;
+   return status.error != 0;
+}
 #endif /* HAVE_LIBDRM */
 
 static uint64_t
