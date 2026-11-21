@@ -536,11 +536,9 @@ static void
 insert_spill(agx_builder *b, struct spill_ctx *ctx, unsigned node)
 {
    if (!ctx->remat[node]) {
-      /* The remat-only budget is an estimate; when a value that cannot be
-       * rematerialized must leave the register file, spill it to scratch and
-       * let register allocation finish with real spilling under the full
-       * budget instead of failing the compile
-       * (ssbo.phys.layout.random.8bit.nested_structs_arrays.20). */
+      /* Values that cannot be rematerialized go to scratch. Only the full
+       * spill pass evicts them: the remat-only pass keeps them in registers
+       * (keep_in_registers()). */
       record_spill(ctx);
 
       agx_index idx = reconstruct_index(ctx, node);
@@ -983,7 +981,9 @@ min_algorithm(struct spill_ctx *ctx)
 
    /* Iterate each instruction in forward order */
    agx_foreach_instr_in_block(ctx->block, I) {
-      assert((ctx->nW <= ctx->k || ctx->remat_only) && "invariant");
+      assert((ctx->nW <= ctx->k ||
+              (ctx->remat_only && ctx->nW <= AGX_NUM_REGS)) &&
+             "invariant");
 
       /* Debug to check against our RA demand calculations */
       if (0) {
@@ -1302,7 +1302,8 @@ compute_w_entry_loop_header(struct spill_ctx *ctx)
       }
    }
 
-   assert(ctx->nW <= ctx->k || ctx->remat_only);
+   assert(ctx->nW <= ctx->k ||
+          (ctx->remat_only && ctx->nW <= AGX_NUM_REGS));
    free(used);
    free(candidates);
 }
@@ -1403,7 +1404,9 @@ compute_w_entry(struct spill_ctx *ctx)
       }
    }
 
-   assert((ctx->nW <= ctx->k || ctx->remat_only) && "invariant");
+   assert((ctx->nW <= ctx->k ||
+           (ctx->remat_only && ctx->nW <= AGX_NUM_REGS)) &&
+          "invariant");
 
    free(freq);
    free(candidates);

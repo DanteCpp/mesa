@@ -708,9 +708,10 @@ typedef struct {
    /* M5 CEM owns halves 8..15, beyond CF/shuffle/parallel-copy scratch. */
    bool agx3_cem_low_scratch;
 
-   /* The remat-only spiller spilled a value to scratch. It keeps every value
-    * it cannot rematerialize in a register, so this stays false; register
-    * allocation would finish with real spilling under the full budget. */
+   /* A remat-only spill pass left a value in memory. The remat-only spiller
+    * keeps every value it cannot rematerialize in a register, so this is a
+    * backstop for memory values that other paths create; when set, register
+    * allocation finishes with real spilling under the full budget. */
    bool remat_fallback_spilled;
    unsigned spill_pcopy_base;
 
