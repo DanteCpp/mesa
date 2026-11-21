@@ -7,9 +7,10 @@
  * attachment load/store configuration, the barriers exactly as submitted and
  * firmware GPU timestamps.
  *
- * Enabled only by HK_FRAME_ANATOMY=<path> (or "-" for stderr). Every
- * HK_FRAME_ANATOMY_EVERY-th queue submit is sampled (default 200).
- * HK_FRAME_ANATOMY_TS selects which commands of a sampled submit get profiler
+ * Enabled only by BRL_FRAME_ANATOMY=<path> (or "-" for stderr). The older
+ * HK_FRAME_ANATOMY* names are still read. Every
+ * BRL_FRAME_ANATOMY_EVERY-th queue submit is sampled (default 200).
+ * BRL_FRAME_ANATOMY_TS selects which commands of a sampled submit get profiler
  * timestamps: "all" (default), "edges" (first and last hardware command only)
  * or "none".
  *
@@ -25,9 +26,9 @@
  *   timing.
  * - A command's start stamp is taken before its barriers resolve, so a
  *   per-command duration includes the wait on its dependencies.
- * - Sampling costs time by itself: HK_FRAME_ANATOMY_EVERY=1 cost ~23 % fps
+ * - Sampling costs time by itself: BRL_FRAME_ANATOMY_EVERY=1 cost ~23 % fps
  *   on G17P in a game even apart from "all". Keep sampling sparse.
- * When HK_FRAME_ANATOMY is unset, brl_device::frame_anatomy stays NULL and
+ * When BRL_FRAME_ANATOMY is unset, brl_device::frame_anatomy stays NULL and
  * every hook below reduces to one predictable NULL test; no control stream,
  * shader or kernel command is changed.
  */
@@ -67,7 +68,7 @@ void brl_frame_anatomy_finish(struct brl_device *dev);
 
 /* One free-form "N <text>" line about a recording-time decision (not tied to
  * a sampled submit). Nothing unless the profiler is enabled; at most
- * HK_FRAME_ANATOMY_NOTES (default BRL_FA_NOTE_LIMIT) lines per device, so a
+ * BRL_FRAME_ANATOMY_NOTES (default BRL_FA_NOTE_LIMIT) lines per device, so a
  * hot path cannot flood the log; the end line counts the dropped ones. */
 #define BRL_FA_NOTE_LIMIT 4096
 void brl_frame_anatomy_note(struct brl_device *dev, const char *fmt, ...)
@@ -81,7 +82,7 @@ void brl_frame_anatomy_note_m5_fragment(struct brl_cs *cs);
 void brl_frame_anatomy_note_grid(struct brl_cs *cs, const struct brl_shader *cs_shader,
                                  uint64_t threads, uint64_t groups, bool indirect);
 
-/* HK_FRAME_ANATOMY_DUMP only: write the final NIR of a compiled fragment,
+/* BRL_FRAME_ANATOMY_DUMP only: write the final NIR of a compiled fragment,
  * compute, vertex or mesh program to <dir>/{fs,cs,vs,ms}-<binary hash>.nir. */
 struct nir_shader;
 void brl_frame_anatomy_dump_nir(struct brl_device *dev,

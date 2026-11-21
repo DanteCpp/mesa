@@ -4,6 +4,7 @@
  * Copyright 2022-2023 Collabora Ltd. and Red Hat Inc.
  * SPDX-License-Identifier: MIT
  */
+#include "brl_env.h"
 #include "brl_device.h"
 #include "brl_buffer_view.h"
 #include "brl_frame_anatomy.h"
@@ -1107,7 +1108,8 @@ brl_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_init;
    }
 
-   dev->perftest = debug_get_flags_option("HK_PERFTEST", brl_perf_options, 0);
+   dev->perftest = debug_parse_flags_option("BRL_PERFTEST", brl_env("PERFTEST"),
+                                            brl_perf_options, 0);
    dev->dev.compute_timeout_ms = instance->drirc.misc.compute_timeout_ms;
 
    /* Native graphics compiles the emulation in only once a custom border

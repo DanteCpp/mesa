@@ -117,7 +117,7 @@ single-record calls is a control and is not expected to improve.
 | Arm | Mesa | Robustness |
 | --- | --- | --- |
 | A | unmodified base | enabled, normal title configuration |
-| B | unmodified base | `HK_PERFTEST=norobust` |
+| B | unmodified base | `BRL_PERFTEST=norobust` |
 | C | candidate | enabled, normal title configuration |
 
 Keep other environment flags identical, including any flags required by the

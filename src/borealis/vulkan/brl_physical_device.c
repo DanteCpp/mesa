@@ -4,6 +4,7 @@
  * Copyright 2022-2023 Collabora Ltd. and Red Hat Inc.
  * SPDX-License-Identifier: MIT
  */
+#include "brl_env.h"
 #include "brl_physical_device.h"
 
 #include "asahi/compiler/agx_compile.h"
@@ -1864,7 +1865,7 @@ brl_get_device_properties(const struct agx_device *dev,
    }
 }
 
-/* Every AGX_*, HK_* and ASAHI_* environment variable that can change generated
+/* Every AGX_*, BRL_* (or HK_*) and ASAHI_* environment variable that can change generated
  * code or serialized objects is part of the cache identity, not only the bits
  * brl_physical_device_compiler_flags() packs. Variables that only print or pick
  * a runtime path are excluded so tracing keeps a warm cache. */
@@ -1886,7 +1887,7 @@ brl_codegen_env_hash(void)
    const char *list[512];
    unsigned n = 0;
    for (char **e = environ; e && *e && n < ARRAY_SIZE(list); ++e) {
-      if (strncmp(*e, "AGX_", 4) && strncmp(*e, "HK_", 3) &&
+      if (strncmp(*e, "AGX_", 4) && !brl_env_is_driver_var(*e) &&
           strncmp(*e, "ASAHI_", 6))
          continue;
       const char *eq = strchr(*e, '=');
@@ -1897,13 +1898,12 @@ brl_codegen_env_hash(void)
          for (size_t o = 0; o + l <= name_len && !skip; ++o)
             skip = !strncmp(*e + o, runtime_only[i], l);
       }
-      /* HK_PERFTEST includes code-generation choices such as noborder.
-       * HK_FRAME_ANATOMY_DUMP writes NIR only for shaders it compiles, so a
-       * warm cache would leave the dump empty. */
-      if (!skip || (name_len == strlen("HK_PERFTEST") &&
-                    !strncmp(*e, "HK_PERFTEST", name_len)) ||
-          (name_len == strlen("HK_FRAME_ANATOMY_DUMP") &&
-           !strncmp(*e, "HK_FRAME_ANATOMY_DUMP", name_len)))
+      /* BRL_PERFTEST includes code-generation choices such as noborder.
+       * BRL_FRAME_ANATOMY_DUMP writes NIR only for shaders it compiles, so a
+       * warm cache would leave the dump empty. (Also under the older HK_
+       * names.) */
+      if (!skip || brl_env_entry_is(*e, name_len, "PERFTEST") ||
+          brl_env_entry_is(*e, name_len, "FRAME_ANATOMY_DUMP"))
          list[n++] = *e;
    }
    qsort(list, n, sizeof(list[0]), brl_env_cmp);
@@ -2339,7 +2339,7 @@ brl_create_drm_physical_device(struct vk_instance *_instance,
 
    brl_physical_device_init_pipeline_cache(pdev);
 
-   const char *brl_sysmem = os_get_option("HK_SYSMEM");
+   const char *brl_sysmem = brl_env("SYSMEM");
    if (brl_sysmem) {
       uint64_t sysmem = strtoll(brl_sysmem, NULL, 10);
       if (sysmem != LLONG_MIN && sysmem != LLONG_MAX) {

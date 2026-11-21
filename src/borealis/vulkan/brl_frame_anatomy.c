@@ -17,6 +17,7 @@
  * flag, dmesg). So no such indicator is logged here; "pass" shows only the
  * userspace-visible split of an API render pass into several streams.
  */
+#include "brl_env.h"
 #include "brl_frame_anatomy.h"
 #include "nir.h"
 
@@ -102,10 +103,10 @@ struct brl_frame_anatomy {
    struct util_dynarray pending; /* struct brl_frame_anatomy_rec */
 
    /* Free-form notes written so far and dropped at the limit
-    * (brl_frame_anatomy_note); the limit is HK_FRAME_ANATOMY_NOTES. */
+    * (brl_frame_anatomy_note); the limit is BRL_FRAME_ANATOMY_NOTES. */
    uint32_t notes, notes_dropped, note_limit;
 
-   /* HK_FRAME_ANATOMY_DUMP=<dir>: each sampled fragment program's binary is
+   /* BRL_FRAME_ANATOMY_DUMP=<dir>: each sampled fragment program's binary is
     * written once to <dir>/fs-<hash>.bin. */
    const char *dump_dir;
    uint32_t dumped[1024];
@@ -145,7 +146,7 @@ brl_frame_anatomy_note(struct brl_device *dev, const char *fmt, ...)
       return;
 
    /* Render pass continuation notes arrive for nearly every pass; they are
-    * written only with HK_FRAME_ANATOMY_MERGE_NOTES so other notes fit. */
+    * written only with BRL_FRAME_ANATOMY_MERGE_NOTES so other notes fit. */
    if (!fa->merge_notes && (!strncmp(fmt, "pass-merge", 10) ||
                             !strncmp(fmt, "MSAA pass merge", 15)))
       return;
@@ -348,7 +349,7 @@ brl_frame_anatomy_init(struct brl_device *dev)
 {
    dev->frame_anatomy = NULL;
 
-   const char *path = os_get_option("HK_FRAME_ANATOMY");
+   const char *path = brl_env("FRAME_ANATOMY");
    if (!path || !*path)
       return;
 
@@ -356,25 +357,25 @@ brl_frame_anatomy_init(struct brl_device *dev)
    if (!fa)
       return;
 
-   int64_t every = debug_get_num_option("HK_FRAME_ANATOMY_EVERY", 200);
+   int64_t every = debug_parse_num_option(brl_env("FRAME_ANATOMY_EVERY"), 200);
    fa->every = every > 0 ? (uint64_t)every : 1;
-   int64_t notes = debug_get_num_option("HK_FRAME_ANATOMY_NOTES",
-                                        BRL_FA_NOTE_LIMIT);
+   int64_t notes = debug_parse_num_option(brl_env("FRAME_ANATOMY_NOTES"),
+                                          BRL_FA_NOTE_LIMIT);
    fa->note_limit = notes > 0 ? (uint32_t)MIN2(notes, INT32_MAX) : 0;
 
-   fa->merge_notes = debug_get_bool_option("HK_FRAME_ANATOMY_MERGE_NOTES", false);
-   fa->dump_dir = os_get_option("HK_FRAME_ANATOMY_DUMP");
+   fa->merge_notes = debug_parse_bool_option(brl_env("FRAME_ANATOMY_MERGE_NOTES"), false);
+   fa->dump_dir = brl_env("FRAME_ANATOMY_DUMP");
    if (fa->dump_dir && !*fa->dump_dir)
       fa->dump_dir = NULL;
 
-   const char *ts = os_get_option("HK_FRAME_ANATOMY_TS");
+   const char *ts = brl_env("FRAME_ANATOMY_TS");
    fa->ts_mode = BRL_FA_TS_ALL;
    if (ts && !strcmp(ts, "edges"))
       fa->ts_mode = BRL_FA_TS_EDGES;
    else if (ts && !strcmp(ts, "none"))
       fa->ts_mode = BRL_FA_TS_NONE;
    else if (ts && *ts && strcmp(ts, "all"))
-      mesa_logw("HK_FRAME_ANATOMY_TS=%s unknown; using all", ts);
+      mesa_logw("BRL_FRAME_ANATOMY_TS=%s unknown; using all", ts);
 
    if (!strcmp(path, "-") || !strcmp(path, "stderr")) {
       fa->file = stderr;
@@ -383,7 +384,7 @@ brl_frame_anatomy_init(struct brl_device *dev)
       fa->own_file = true;
    }
    if (!fa->file) {
-      mesa_logw("HK_FRAME_ANATOMY: cannot open %s: %s", path, strerror(errno));
+      mesa_logw("BRL_FRAME_ANATOMY: cannot open %s: %s", path, strerror(errno));
       free(fa);
       return;
    }
@@ -397,7 +398,7 @@ brl_frame_anatomy_init(struct brl_device *dev)
    if (!fa->ts_map ||
        agx_bind_timestamps(&dev->dev, fa->ts_bo, &fa->ts_handle) ||
        !fa->ts_handle) {
-      mesa_logw("HK_FRAME_ANATOMY: timestamp buffer setup failed; disabled");
+      mesa_logw("BRL_FRAME_ANATOMY: timestamp buffer setup failed; disabled");
       if (fa->ts_bo)
          agx_bo_unreference(&dev->dev, fa->ts_bo);
       if (fa->own_file)
@@ -423,7 +424,7 @@ brl_frame_anatomy_init(struct brl_device *dev)
       fprintf(fa->file,
               "# ts=all: cross-engine steps of sampled submits wait on the "
               "host, so cross-engine gaps and durations in sampled submits are "
-              "inflated; use HK_FRAME_ANATOMY_TS=edges or none for timing\n");
+              "inflated; use BRL_FRAME_ANATOMY_TS=edges or none for timing\n");
    fprintf(fa->file,
            "# S: sampled submit. R: render stream, C: compute stream; i: "
            "hardware command index in the submit.\n"

@@ -9,6 +9,7 @@
  * Copyright © 2015 Intel Corporation
  * SPDX-License-Identifier: MIT
  */
+#include "brl_env.h"
 #include "brl_queue.h"
 #include "brl_native_write_class.h"
 #include "brl_acceleration_structure.h"
@@ -1752,7 +1753,7 @@ queue_submit_recordings(struct brl_device *dev, struct brl_queue *queue,
                            queue, queue->drm.timeline_value);
    }
 
-   /* Opt-in frame anatomy profiler (HK_FRAME_ANATOMY): NULL unless enabled
+   /* Opt-in frame anatomy profiler (BRL_FRAME_ANATOMY): NULL unless enabled
     * and this submit is sampled, so the hooks below cost one NULL test. */
    struct brl_frame_anatomy_submit *anatomy =
       unlikely(dev->frame_anatomy)
@@ -2395,10 +2396,10 @@ queue_submit_recordings(struct brl_device *dev, struct brl_queue *queue,
  * command. A run past a bound starts a new packet.
  *
  * It is on wherever a boundary is defined (brl_pack_boundary()), which the
- * stream format and the kernel decide. HK_PACK_CDM_SUBMIT=0/1 (or the older
+ * stream format and the kernel decide. BRL_PACK_CDM_SUBMIT=0/1 (or HK_PACK_CDM_SUBMIT, or the older
  * ASAHI_M5_PACK_CDM_SUBMIT) turns it off or on there, for A/B rows.
  */
-DEBUG_GET_ONCE_OPTION(brl_pack_cdm_submit_opt, "HK_PACK_CDM_SUBMIT", NULL)
+BRL_GET_ONCE_ENV(debug_get_option_brl_pack_cdm_submit_opt, "PACK_CDM_SUBMIT")
 DEBUG_GET_ONCE_OPTION(m5_pack_cdm_submit_opt, "ASAHI_M5_PACK_CDM_SUBMIT", NULL)
 
 static bool
@@ -2406,7 +2407,7 @@ brl_pack_trace(void)
 {
    static int trace = -1;
    if (trace < 0)
-      trace = debug_get_bool_option("HK_PACK_CDM_TRACE", false) ||
+      trace = debug_parse_bool_option(brl_env("PACK_CDM_TRACE"), false) ||
               debug_get_bool_option("ASAHI_M5_PACK_CDM_TRACE", false);
    return trace;
 }
@@ -2440,15 +2441,15 @@ brl_pack_attachment_limit(const struct brl_device *dev)
  * of the device can run beside the packet. On M5, two kernel queues
  * running packed atomic chains on the same memory lost contributions (root
  * cause unknown), so such streams stay separate commands unless
- * ASAHI_M5_PACK_ATOMICS=1 (or HK_PACK_ATOMICS=1) and the device has a
+ * ASAHI_M5_PACK_ATOMICS=1 (or BRL_PACK_ATOMICS=1) and the device has a
  * single kernel queue, which runs its commands in order. A second kernel
  * queue created while a packet runs is not covered; unpacked atomic work
  * has the same exposure. The G16 kernel runs one command of the whole
  * device at a time, so nothing ever runs beside a packet there: G16G packs
- * them unless HK_PACK_ATOMICS=0. That is a property of the G16 kernel, the
+ * them unless BRL_PACK_ATOMICS=0. That is a property of the G16 kernel, the
  * only one for G16G, which no uAPI feature reports yet; the chip stands for
  * it until one does. */
-DEBUG_GET_ONCE_OPTION(brl_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
+BRL_GET_ONCE_ENV(debug_get_option_brl_pack_atomics_opt, "PACK_ATOMICS")
 DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
 
 static bool

@@ -1081,7 +1081,7 @@ shim_gpu_read(void *data, uint64_t address, void *dst, size_t size)
  * current contents (a single-page mapping hashes its one page). Two drivers
  * that emit identical GPU-visible bytes into identically placed allocations
  * produce identical files. The file is named after a hash of the command
- * line and the ASAHI_ / HK_ / AGX_ / MESA_ / BENCH_ environment, so the same
+ * line and the ASAHI_ / BRL_ / HK_ / AGX_ / MESA_ / BENCH_ environment, so the same
  * test run against two drivers lands in the same file name. Diagnostic only;
  * it changes no ioctl result.
  */
@@ -1151,7 +1151,8 @@ dump_submit_file(void)
    /* Order-independent over the selected variables. */
    uint64_t env_sum = 0;
    for (char **e = environ; e && *e; ++e) {
-      if (strncmp(*e, "ASAHI_", 6) && strncmp(*e, "HK_", 3) &&
+      if (strncmp(*e, "ASAHI_", 6) && strncmp(*e, "BRL_", 4) &&
+          strncmp(*e, "HK_", 3) &&
           strncmp(*e, "AGX_", 4) && strncmp(*e, "MESA_", 5) &&
           strncmp(*e, "BENCH_", 6))
          continue;

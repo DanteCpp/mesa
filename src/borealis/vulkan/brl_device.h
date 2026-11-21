@@ -195,7 +195,7 @@ struct brl_device {
    struct agx_bo *sparse_fill;
    struct agxdecode_ctx *decode_ctx;
    /* Opt-in frame anatomy profiler (brl_frame_anatomy.h); NULL unless the
-    * HK_FRAME_ANATOMY environment variable is set. */
+    * BRL_FRAME_ANATOMY environment variable is set. */
    struct brl_frame_anatomy *frame_anatomy;
    /* Compute kick (brl_compute_kick.h); NULL unless G17C with
     * hk_compute_kick_ms set. */

@@ -436,13 +436,21 @@ main(void)
    test_cache_key();
 
    /* A noborder run must never replace border-enabled disk-cache entries. */
+   unsetenv("BRL_PERFTEST");
    unsetenv("HK_PERFTEST");
    uint64_t normal_env = brl_codegen_env_hash();
-   setenv("HK_PERFTEST", "noborder", 1);
+   setenv("BRL_PERFTEST", "noborder", 1);
    T("noborder has a separate disk-cache identity",
      normal_env != brl_codegen_env_hash());
-   unsetenv("HK_PERFTEST");
+   unsetenv("BRL_PERFTEST");
    T("normal disk-cache identity returns", normal_env == brl_codegen_env_hash());
+   /* The pre-rename spelling is still honoured. */
+   setenv("HK_PERFTEST", "noborder", 1);
+   T("HK_PERFTEST noborder has a separate disk-cache identity",
+     normal_env != brl_codegen_env_hash());
+   unsetenv("HK_PERFTEST");
+   T("normal disk-cache identity returns after HK_PERFTEST",
+     normal_env == brl_codegen_env_hash());
 
    if (failures) {
       fprintf(stderr, "%u failure(s)\n", failures);

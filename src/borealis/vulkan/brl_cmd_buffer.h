@@ -484,7 +484,7 @@ struct brl_bg_eot {
       uint64_t rsrc_spec;
    };
    /* Frame anatomy profiler (brl_frame_anatomy.h): per-RT op summary of the
-    * program. Written only while HK_FRAME_ANATOMY is set; otherwise zero and
+    * program. Written only while BRL_FRAME_ANATOMY is set; otherwise zero and
     * never read. Not part of any hardware or kernel structure. */
    uint8_t anatomy_ops[BRL_MAX_RTS];
 };
@@ -545,7 +545,7 @@ struct brl_render_registers {
    } eot;
 
    /* Frame anatomy profiler only: bit i set when colour attachment i's image
-    * layout is compressed. Zero unless HK_FRAME_ANATOMY is set. */
+    * layout is compressed. Zero unless BRL_FRAME_ANATOMY is set. */
    uint8_t color_compressed_mask;
 };
 
@@ -1308,7 +1308,7 @@ struct brl_cs {
 
    /* Frame anatomy profiler only: the first fragment programs this stream
     * draws with and their draw counts; later programs are only counted.
-    * Zero unless HK_FRAME_ANATOMY is set. */
+    * Zero unless BRL_FRAME_ANATOMY is set. */
    struct {
       const struct brl_shader *fs;
       uint32_t draws;

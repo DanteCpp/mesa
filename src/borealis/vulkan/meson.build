@@ -1041,7 +1041,7 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
-  # Submit packing on hardware: run with HK_PACK_CDM_SUBMIT=0 and =1.
+  # Submit packing on hardware: run with BRL_PACK_CDM_SUBMIT=0 and =1.
   executable(
     'aurora-packtest',
     files('tests/aurora_packtest.c'),

@@ -7,14 +7,14 @@
  * buffer out of submit packing (timestamps, renders, events, indirect
  * dispatches). The GPU result is compared word for word, guards included,
  * with a CPU model of the same operations. Run it once with
- * HK_PACK_CDM_SUBMIT=0 and once with =1 (HK_PACK_CDM_TRACE=1 prints what was
+ * BRL_PACK_CDM_SUBMIT=0 and once with =1 (BRL_PACK_CDM_TRACE=1 prints what was
  * packed) to cover both paths. Plain dispatches run a program without loops,
  * heavy ones a looping program, which a packet holds at most one of.
  *
- * The driver's packing trace (HK_PACK_CDM_TRACE, turned on here) passes
+ * The driver's packing trace (BRL_PACK_CDM_TRACE, turned on here) passes
  * through to stderr as it is written, and each case reports how many command
- * buffers it says were packed. With HK_PACK_CDM_SUBMIT=1 a case that must
- * pack fails if nothing was packed, and with HK_PACK_CDM_SUBMIT=0 any case
+ * buffers it says were packed. With BRL_PACK_CDM_SUBMIT=1 a case that must
+ * pack fails if nothing was packed, and with BRL_PACK_CDM_SUBMIT=0 any case
  * fails if something was.
  *
  * usage: aurora-packtest ITERATIONS [CASE...]
@@ -901,7 +901,7 @@ trace_end(void)
 static void
 trace_begin(void)
 {
-   setenv("HK_PACK_CDM_TRACE", "1", 1);
+   setenv("BRL_PACK_CDM_TRACE", "1", 1);
    int fds[2];
    if (pipe(fds) < 0)
       return;
@@ -962,7 +962,9 @@ check_case(const char *name, unsigned iterations)
    const unsigned packed = trace_sync() - before;
    const bool must = must_pack(name);
    rendered |= has_render(&T) && !needs_feature(&T);
-   const char *mode = getenv("HK_PACK_CDM_SUBMIT");
+   const char *mode = getenv("BRL_PACK_CDM_SUBMIT");
+   if (!mode)
+      mode = getenv("HK_PACK_CDM_SUBMIT");
    const bool on = mode && mode[0] == '1', off = mode && mode[0] == '0';
    if (!tr.on) {
       /* Nothing to count: a must-pack check cannot pass. */
