@@ -4,6 +4,7 @@
 hk_bvh_include_dir = dir_source_root + '/src/asahi/vulkan/bvh'
 
 hk_bvh_includes = files(
+  'agx3_envelope.h',
   'agx3_node.h',
   'hk_build_interface.h',
   '../hk_bvh.h',
@@ -39,6 +40,7 @@ foreach s : [['encode.comp', 'hk_encode'], ['write.comp', 'hk_bvh_write'],
              ['agx3_envelope.comp', 'hk_agx3_gen1_envelope'],
              ['agx3_plan.comp', 'hk_agx3_gen1_plan'],
              ['agx3_plan.comp', 'hk_agx3_gen1_plan_pairs', '-DHK_AGX3_PLAN_PAIRS=1'],
+             ['agx3_plan_small.comp', 'hk_agx3_gen1_plan_small'],
              ['agx3_plan.comp', 'hk_agx3_gen1_plan_jobs', '-DHK_AGX3_PLAN_JOB_GRID=1'],
              ['agx3_plan.comp', 'hk_agx3_gen1_plan_pairs_jobs', '-DHK_AGX3_PLAN_PAIRS=1',
               '-DHK_AGX3_PLAN_JOB_GRID=1'],

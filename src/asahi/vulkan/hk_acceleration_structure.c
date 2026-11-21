@@ -92,6 +92,11 @@ static const uint32_t agx3_plan_spv[] = {
 #include "bvh/hk_agx3_gen1_plan.spv.h"
 };
 
+/* The one-workgroup plan, with the envelope, of small builds. */
+static const uint32_t agx3_plan_small_spv[] = {
+#include "bvh/hk_agx3_gen1_plan_small.spv.h"
+};
+
 /* The plans whose phase 3 runs a thread per job (HK_AGX3_PLAN_JOB_GRID). */
 static const uint32_t agx3_plan_jobs_spv[] = {
 #include "bvh/hk_agx3_gen1_plan_jobs.spv.h"
@@ -680,6 +685,12 @@ static_assert(sizeof(struct hk_agx3_leaf_job) == 64, "native node job ABI");
 static_assert(sizeof(struct hk_agx3_leaf_args) == 32, "native node push ABI");
 static_assert(sizeof(struct hk_agx3_envelope_job) == 48, "native envelope job ABI");
 static_assert(sizeof(struct hk_agx3_envelope_args) == 64, "native envelope push ABI");
+/* agx3_plan_small.comp declares these push constants member by member. */
+static_assert(offsetof(struct hk_agx3_plan_small_args, envelope_status) ==
+                 sizeof(struct hk_agx3_plan_args) &&
+              sizeof(struct hk_agx3_plan_args) == 120 &&
+              sizeof(struct hk_agx3_plan_small_args) == 136,
+              "native small plan push ABI");
 /* The GEN1 layout: the plan state, then the node encoding dispatch arguments
  * the plan writes for the indirect encode (bvh/agx3_plan.comp), a
  * 64-byte record slot per child including bounding boxes, 16 KiB images,
@@ -791,6 +802,16 @@ hk_agx3_plan_job_grid(const struct hk_device *dev, uint32_t leaf_bound)
    return leaf_bound >= HK_AGX3_PLAN_JOB_GRID_MIN_LEAVES;
 }
 
+/* A build whose nodes all fit the one workgroup of agx3_plan_small.comp
+ * plans in one launch, the envelope included, rather than in six. Pairing
+ * triangles is left to the five-phase plan. */
+static bool
+hk_agx3_plan_small(const struct hk_device *dev,
+                   const struct hk_agx3_plan_args *args)
+{
+   return !args->pairs && args->node_bound <= HK_AGX3_PLAN_SMALL_NODES;
+}
+
 VkResult
 hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                         const struct hk_agx3_plan_args *args,
@@ -821,6 +842,7 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                        sizeof(struct hk_agx3_leaf_args)}
       : (struct stage){"hk-agx3-node-encode", agx3_node_spv,
                        sizeof(agx3_node_spv), sizeof(struct hk_agx3_leaf_args)};
+   const bool small = hk_agx3_plan_small(dev, args);
    const bool job_grid = hk_agx3_plan_job_grid(dev, args->leaf_bound);
    const struct stage plan_stage = job_grid
       ? (struct stage){"hk-agx3-plan-jobs", agx3_plan_jobs_spv,
@@ -841,9 +863,11 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
       {"hk-agx3-node-encode-pairs", agx3_node_pairs_spv,
        sizeof(agx3_node_pairs_spv), sizeof(struct hk_agx3_leaf_args)},
       plan_pairs_stage,
+      {"hk-agx3-plan-small", agx3_plan_small_spv, sizeof(agx3_plan_small_spv),
+       sizeof(struct hk_agx3_plan_small_args)},
    };
-   VkPipeline pipeline[5];
-   VkPipelineLayout layout[5];
+   VkPipeline pipeline[ARRAY_SIZE(stages)];
+   VkPipelineLayout layout[ARRAY_SIZE(stages)];
    for (unsigned i = 0; i < ARRAY_SIZE(stages); ++i) {
       VkResult result = get_pipeline_spv(
          dev, stages[i].name, stages[i].code, stages[i].size,
@@ -861,6 +885,37 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
       .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
                        VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
    };
+   const struct hk_agx3_leaf_args encode = {
+      .jobs = args->jobs, .status = node_status, .job_count = args->node_bound,
+      .slot_bias = slot_bias, .counts = args->state,
+   };
+   if (small) {
+      /* One workgroup plans and runs the envelope; the encode follows. */
+      const struct hk_agx3_plan_small_args push = {
+         .plan = *args,
+         .envelope_status = envelope_status,
+         .envelope_reserved = dev->g17p_native_as ? 2 : 3,
+      };
+      vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                               pipeline[5]);
+      vk_common_CmdPushConstants(command_buffer, layout[5],
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                                &push);
+      hk_cmd_dispatch_unaligned(command_buffer, HK_AGX3_PLAN_SMALL_NODES / 2,
+                                1, 1);
+      vk_common_CmdPipelineBarrier(
+         command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+         0, 1, &barrier, 0, NULL, 0, NULL);
+      vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                               pipeline[1]);
+      vk_common_CmdPushConstants(command_buffer, layout[1],
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(encode),
+                                &encode);
+      hk_cmd_dispatch_indirect_addr(command_buffer,
+                                    args->state + HK_AGX3_PLAN_ENCODE_DISPATCH);
+      return VK_SUCCESS;
+   }
    for (unsigned phase = 0; phase < 5; ++phase) {
       struct hk_agx3_plan_args push = *args;
       push.phase = phase;
@@ -882,10 +937,6 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
          0, 1, &barrier, 0, NULL, 0, NULL);
    }
 
-   const struct hk_agx3_leaf_args encode = {
-      .jobs = args->jobs, .status = node_status, .job_count = args->node_bound,
-      .slot_bias = slot_bias, .counts = args->state,
-   };
    const struct hk_agx3_envelope_args finish = {
       .jobs = args->envelope, .status = envelope_status, .job_count = 1,
       .reserved = dev->g17p_native_as ? 2 : 3,

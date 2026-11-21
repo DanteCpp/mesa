@@ -416,6 +416,23 @@ struct hk_agx3_plan_args {
    uint32_t padding;
 };
 
+/* The one-workgroup plan (agx3_plan_small.comp) of a build of at most
+ * HK_AGX3_PLAN_SMALL_NODES nodes, which also runs the envelope: the plan's
+ * arguments (phase unused), then what the envelope takes besides them. */
+#define HK_AGX3_PLAN_SMALL_NODES 1024u
+
+struct hk_agx3_plan_small_args {
+#ifdef VULKAN
+   hk_agx3_plan_args plan;
+#else
+   struct hk_agx3_plan_args plan;
+#endif
+   REF(uint32_t) envelope_status;
+   /* hk_agx3_envelope_args.reserved */
+   uint32_t envelope_reserved;
+   uint32_t padding;
+};
+
 /* Bytes of an M5 native bounding-box record (record class 4 in root word0
  * bits 5..7), packed at this stride in the leaf's child region: the marker
  * word (leaf type 24) at 0, the minimum at 4, the maximum at 16, the geometry

@@ -1,0 +1,533 @@
+/* Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ *
+ * The plan of agx3_plan.comp (without triangle pairs) for a build of at most
+ * HK_AGX3_PLAN_SMALL_NODES nodes, in one workgroup and one launch, followed
+ * by the envelope.
+ *
+ * agx3_plan.comp's five launches spend a small build's time in per-thread
+ * chains of device loads (a node's children, its parent chain, its subtree)
+ * and in the launches themselves. Here the IR's child links, the parents
+ * and the leaf counts sit in shared memory, so every chain is one of shared
+ * loads, and workgroup barriers separate the phases.
+ *
+ * It selects the same jobs, gives each the same children in the same order
+ * and the same number of slots, and makes the same checks. Job ids and
+ * child slots are handed out in node order by workgroup scans, where the
+ * five launches hand them out by atomics in timing order. It leaves what
+ * they leave: the job records, the plan state with the encode dispatch
+ * after it, the envelope job and, for an updatable build, the plan nodes
+ * (the refit save reads them). Then it runs the envelope (agx3_envelope.h):
+ * a TLAS's encode must follow it, and a BLAS's encode writes nothing the
+ * envelope writes or reads.
+ */
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#include "hk_build_interface.h"
+
+/* Two nodes per invocation: 2i and 2i + 1. */
+layout(local_size_x = 512) in;
+/* hk_agx3_plan_small_args */
+layout(push_constant) uniform CONSTS
+{
+   hk_agx3_plan_args args;
+   uint64_t envelope_status;
+   uint32_t envelope_reserved;
+   uint32_t padding;
+};
+
+hk_agx3_envelope_args envelope_args;
+#define AGX3_ENVELOPE_ARGS envelope_args
+#include "agx3_envelope.h"
+
+#define NONE 0xffffffffu
+/* Added to a triangle leaf's count when the triangle is opaque. */
+#define LEAF_OPAQUE 16u
+
+/* The children of internal node leaf_bound + i at 2i and 2i + 1, as node
+ * indices, NONE for none. */
+shared uint s_child[HK_AGX3_PLAN_SMALL_NODES];
+shared uint s_parent[HK_AGX3_PLAN_SMALL_NODES];
+/* Leaf counts saturated at nine (agx3_plan.comp count_leaves()). */
+shared uint s_count[HK_AGX3_PLAN_SMALL_NODES];
+shared uint s_job[HK_AGX3_PLAN_SMALL_NODES];
+/* A job node's slot in its parent job's node. */
+shared uint s_root_slot[HK_AGX3_PLAN_SMALL_NODES];
+/* A scan's subgroup sums (a subgroup has at least four invocations), and
+ * their total. */
+shared uint s_scan[128];
+shared uint s_total;
+shared uint s_error;
+shared uint s_depth;
+
+/* The common builder's internal node count, final before planning. */
+uint internal_count;
+
+void
+fail(uint flag)
+{
+   atomicOr(s_error, flag);
+}
+
+uint
+leaf_size()
+{
+   return args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
+             ? SIZEOF(vk_ir_instance_node)
+             : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
+                ? SIZEOF(vk_ir_aabb_node) : SIZEOF(vk_ir_triangle_node);
+}
+
+uint
+source_index(uint ir_id)
+{
+   if (ir_id == VK_BVH_INVALID_NODE)
+      return 0xffffffffu;
+   uint offset = ir_id_to_offset(ir_id), kind = ir_id_to_type(ir_id);
+   if (kind == (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR ? vk_ir_node_instance : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR ? vk_ir_node_aabb : vk_ir_node_triangle) && offset < args.root_offset &&
+       offset % leaf_size() == 0) {
+      uint i = offset / leaf_size();
+      if (i < args.leaf_bound)
+         return i;
+   }
+   if (kind == vk_ir_node_internal && offset >= args.root_offset &&
+       (offset - args.root_offset) % SIZEOF(vk_ir_box_node) == 0) {
+      uint i = (offset - args.root_offset) / SIZEOF(vk_ir_box_node);
+      if (i < internal_count &&
+          i < args.node_bound - args.leaf_bound)
+         return args.leaf_bound + i;
+   }
+   fail(HK_AGX3_PLAN_INDEX);
+   return 0xffffffffu;
+}
+
+uint
+source_offset(uint index)
+{
+   return index < args.leaf_bound
+             ? index * leaf_size()
+             : args.root_offset +
+                  (index - args.leaf_bound) * SIZEOF(vk_ir_box_node);
+}
+
+bool
+is_internal(uint index)
+{
+   return index >= args.leaf_bound && index - args.leaf_bound < internal_count &&
+          index < args.node_bound;
+}
+
+/* agx3_plan.comp initialize()'s checks of the build. */
+uint
+build_error(uint active_leaves)
+{
+   uint error = active_leaves == 0u ? HK_AGX3_PLAN_EMPTY : 0u;
+   if (args.leaf_bound > args.node_bound || args.node_bound > 0xffffffffu / 64u ||
+       args.node_bound > HK_AGX3_PLAN_SMALL_NODES ||
+       (active_leaves != 0u &&
+        (internal_count == 0u ||
+         internal_count > args.node_bound - args.leaf_bound)) ||
+       active_leaves > args.leaf_bound ||
+       args.root_offset != args.leaf_bound * leaf_size() ||
+       args.output_bvh == 0 || (args.output_bvh & 63ul) != 0 ||
+       args.output_bvh >= (1ul << 48) ||
+       uint64_t(args.slot_bound) * 64ul + 184ul > (1ul << 48) - args.output_bvh ||
+       args.slot_bound < 5)
+      error |= HK_AGX3_PLAN_INDEX;
+   return error;
+}
+
+/* Node n's entries: its child links, and a leaf's count. */
+void
+load(uint n)
+{
+   if (n >= args.node_bound)
+      return;
+   s_parent[n] = NONE;
+   s_job[n] = NONE;
+   s_root_slot[n] = NONE;
+   if (n < args.leaf_bound) {
+      uint opaque = 0u;
+      if (args.geometry_type == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+         REF(vk_ir_triangle_node) triangle = REF(vk_ir_triangle_node)(
+            OFFSET(args.intermediate_bvh, source_offset(n)));
+         opaque = DEREF(triangle).geometry_id_and_flags & VK_GEOMETRY_OPAQUE;
+      }
+      s_count[n] = 1u | (opaque != 0u ? LEAF_OPAQUE : 0u);
+      return;
+   }
+   s_count[n] = 0u;
+   if (!is_internal(n))
+      return;
+   uint i = n - args.leaf_bound;
+   REF(vk_ir_box_node) node = REF(vk_ir_box_node)(
+      OFFSET(args.intermediate_bvh, source_offset(n)));
+   uvec2 pair = uvec2(DEREF(node).children[0], DEREF(node).children[1]);
+   for (uint c = 0; c < 2; c++)
+      s_child[2u * i + c] = source_index(pair[c]);
+}
+
+/* Each node has one parent. */
+void
+link(uint n)
+{
+   if (!is_internal(n))
+      return;
+   uint i = n - args.leaf_bound;
+   for (uint c = 0; c < 2; c++) {
+      uint child = s_child[2u * i + c];
+      if (child != NONE &&
+          atomicCompSwap(s_parent[child], NONE, n) != NONE)
+         fail(HK_AGX3_PLAN_SHAPE);
+   }
+}
+
+/* agx3_plan.comp count_leaves() over the shared child links. */
+uint
+count_leaves(uint start)
+{
+   uint stack[9], sp = 1, count = 0, steps = 0;
+   uint opacity = 0;
+   bool have_opacity = false;
+   stack[0] = start;
+   while (sp != 0) {
+      if (++steps > args.node_bound * 2u) {
+         fail(HK_AGX3_PLAN_CYCLE);
+         return 0;
+      }
+      uint index = stack[--sp];
+      if (index < args.leaf_bound) {
+         if (args.geometry_type == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+            /* One native leaf cluster shares its child triangle type. */
+            uint current_opacity = s_count[index] & LEAF_OPAQUE;
+            if (have_opacity && opacity != current_opacity)
+               return 9;
+            opacity = current_opacity;
+            have_opacity = true;
+         }
+         ++count;
+      } else {
+         uint i = index - args.leaf_bound;
+         for (uint c = 0; c < 2; c++) {
+            uint child = s_child[2u * i + c];
+            if (child != NONE) {
+               if (sp == 9)
+                  return 9;
+               stack[sp++] = child;
+            }
+         }
+      }
+      if (count + sp > 8)
+         return 9;
+   }
+   return count;
+}
+
+void
+count(uint n)
+{
+   if (is_internal(n))
+      s_count[n] = count_leaves(n);
+}
+
+/* agx3_plan.comp classify(): node n's depth, and whether it starts a job. */
+bool
+classify(uint n, uint root, out uint depth)
+{
+   depth = 0u;
+   if (n >= args.node_bound || (n != root && s_parent[n] == NONE))
+      return false; /* inactive IR leaf */
+   uint cursor = n, d = 0u;
+   while (cursor != root) {
+      if (d++ >= args.node_bound) {
+         fail(HK_AGX3_PLAN_CYCLE);
+         return false;
+      }
+      cursor = s_parent[cursor];
+      if (cursor >= args.node_bound) {
+         fail(HK_AGX3_PLAN_INDEX);
+         return false;
+      }
+   }
+   depth = d;
+   uint count = s_count[n] & 15u;
+   return n == root ||
+          (count <= 8u ? (s_count[s_parent[n]] & 15u) > 8u : d % 3u == 0u);
+}
+
+/* agx3_plan.comp emit()'s walk: the children of job node `id` in traversal
+ * order, the leaves of a leaf job and up to three binary levels of an inner
+ * one. Returns their count, 0 on failure. */
+uint
+job_children(uint id, bool leaf, out uint selected[8])
+{
+   for (uint c = 0; c < 8; c++)
+      selected[c] = 0u;
+   uint stack[9], level[9], sp = 1, count = 0, steps = 0;
+   stack[0] = id;
+   level[0] = 0;
+   while (sp != 0) {
+      if (++steps > args.node_bound * 2u) {
+         fail(HK_AGX3_PLAN_CYCLE);
+         return 0;
+      }
+      uint current = stack[--sp], d = level[sp];
+      bool end = leaf ? current < args.leaf_bound
+                      : current != id &&
+                           ((s_count[current] & 15u) <= 8u || d == 3);
+      if (end) {
+         if (count == 8) {
+            fail(HK_AGX3_PLAN_SHAPE);
+            return 0;
+         }
+         selected[count++] = current;
+      } else {
+         if (!is_internal(current)) {
+            fail(HK_AGX3_PLAN_SHAPE);
+            return 0;
+         }
+         uint i = current - args.leaf_bound;
+         /* Stack is LIFO; visit the common builder's left child first. */
+         for (int c = 1; c >= 0; c--) {
+            uint child = s_child[2u * i + uint(c)];
+            if (child != NONE) {
+               if (sp == 9) {
+                  fail(HK_AGX3_PLAN_SHAPE);
+                  return 0;
+               }
+               stack[sp] = child;
+               level[sp++] = d + 1;
+            }
+         }
+      }
+   }
+   return count;
+}
+
+uint
+job_slots(bool leaf, uint count)
+{
+   return leaf ? (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
+                     ? 2u * count
+                     : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
+                        ? count : count + (count + 3u) / 4u) : count;
+}
+
+/* An inner job gives each child job its slot. */
+void
+place_children(uint first, uint count, uint selected[8], uint job_count)
+{
+   for (uint c = 0; c < 8; c++) {
+      if (c >= count)
+         break;
+      uint child_job = s_job[selected[c]];
+      if (child_job >= job_count)
+         fail(HK_AGX3_PLAN_SHAPE);
+      else
+         s_root_slot[selected[c]] = first + c;
+   }
+}
+
+void
+write_job(uint n, uint job, bool leaf, uint first, uint count,
+          uint selected[8], uint root)
+{
+   hk_agx3_leaf_job record;
+   record.intermediate_bvh = args.intermediate_bvh;
+   record.output_bvh = args.output_bvh;
+   record.root_slot = n == root ? 0u : s_root_slot[n];
+   record.child_slot = first;
+   record.child_count = count;
+   record.node_kind =
+      leaf ? (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
+                 ? HK_AGX3_NODE_INSTANCES
+                 : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
+                    ? HK_AGX3_NODE_AABBS : HK_AGX3_NODE_LEAF)
+           : HK_AGX3_NODE_INNER;
+   for (uint c = 0; c < 8; c++)
+      record.triangle_offsets[c] = c < count ? source_offset(selected[c]) : 0u;
+   DEREF(INDEX(hk_agx3_leaf_job, args.jobs, job)) = record;
+}
+
+/* The workgroup's exclusive prefix sum of `value`, in invocation order.
+ * The first subgroup scans the subgroup sums, a subgroup's width at a time
+ * (on AGX, one: 16 subgroups of 32). */
+uint
+workgroup_exclusive_add(uint value, out uint total)
+{
+   uint inclusive = subgroupInclusiveAdd(value);
+   if (gl_SubgroupInvocationID == gl_SubgroupSize - 1u)
+      s_scan[gl_SubgroupID] = inclusive;
+   barrier();
+   if (gl_SubgroupID == 0u) {
+      uint carry = 0u;
+      for (uint base = 0u; base < gl_NumSubgroups; base += gl_SubgroupSize) {
+         uint i = base + gl_SubgroupInvocationID;
+         uint sum = i < gl_NumSubgroups ? s_scan[i] : 0u;
+         uint before = subgroupExclusiveAdd(sum);
+         if (i < gl_NumSubgroups)
+            s_scan[i] = carry + before;
+         carry += subgroupAdd(sum);
+      }
+      if (subgroupElect())
+         s_total = carry;
+   }
+   barrier();
+   total = s_total;
+   uint result = s_scan[gl_SubgroupID] + inclusive - value;
+   barrier();
+   return result;
+}
+
+void
+main()
+{
+   uint t = gl_LocalInvocationID.x;
+   uint n0 = 2u * t, n1 = 2u * t + 1u;
+   internal_count = DEREF(args.header).ir_internal_node_count;
+   uint active_leaves = DEREF(args.header).active_leaf_count;
+   uint root = args.leaf_bound + internal_count - 1u;
+   if (t == 0u) {
+      s_error = build_error(active_leaves);
+      s_depth = 0u;
+   }
+   barrier();
+   /* Every decision to skip phases is uniform: read the error between
+    * barriers. */
+   bool run = s_error == 0u;
+   barrier();
+
+   if (run) {
+      load(n0);
+      load(n1);
+      barrier();
+      link(n0);
+      link(n1);
+      barrier();
+      count(n0);
+      count(n1);
+      barrier();
+      run = s_error == 0u;
+      barrier();
+   }
+
+   uint depth0 = 0u, depth1 = 0u, job_count = 0u, slot_total = 0u;
+   if (run) {
+      bool job0 = classify(n0, root, depth0);
+      bool job1 = classify(n1, root, depth1);
+      uint id0 = workgroup_exclusive_add(uint(job0) + uint(job1), job_count);
+      uint id1 = id0 + uint(job0);
+      uint levels = 0u;
+      if (job0) {
+         s_job[n0] = id0;
+         levels = (depth0 + 2u) / 3u + 1u;
+      }
+      if (job1) {
+         s_job[n1] = id1;
+         levels = max(levels, (depth1 + 2u) / 3u + 1u);
+      }
+      levels = subgroupMax(levels);
+      if (subgroupElect())
+         atomicMax(s_depth, levels);
+      barrier();
+
+      bool leaf0 = job0 && (s_count[n0] & 15u) <= 8u;
+      bool leaf1 = job1 && (s_count[n1] & 15u) <= 8u;
+      uint selected0[8], selected1[8];
+      uint count0 = job0 ? job_children(n0, leaf0, selected0) : 0u;
+      uint count1 = job1 ? job_children(n1, leaf1, selected1) : 0u;
+      if ((job0 && (count0 == 0u || (leaf0 && count0 != (s_count[n0] & 15u)))) ||
+          (job1 && (count1 == 0u || (leaf1 && count1 != (s_count[n1] & 15u)))))
+         fail(HK_AGX3_PLAN_SHAPE);
+      uint slots0 = job0 ? job_slots(leaf0, count0) : 0u;
+      uint slots1 = job1 ? job_slots(leaf1, count1) : 0u;
+      uint first0 = 3u + workgroup_exclusive_add(slots0 + slots1, slot_total);
+      uint first1 = first0 + slots0;
+      if ((job0 && (slots0 > args.slot_bound || first0 > args.slot_bound - slots0)) ||
+          (job1 && (slots1 > args.slot_bound || first1 > args.slot_bound - slots1)))
+         fail(HK_AGX3_PLAN_ALLOCATION);
+      if (job0 && !leaf0)
+         place_children(first0, count0, selected0, job_count);
+      if (job1 && !leaf1)
+         place_children(first1, count1, selected1, job_count);
+      barrier();
+      if (job0)
+         write_job(n0, id0, leaf0, first0, count0, selected0, root);
+      if (job1)
+         write_job(n1, id1, leaf1, first1, count1, selected1, root);
+   }
+   barrier();
+
+   /* agx3_plan.comp finish(), the same in every invocation. */
+   uint error = s_error;
+   uint jobs = error != 0u ? 0u : job_count;
+   hk_agx3_envelope_job envelope;
+   envelope.bounds = REF(vk_ir_node)(OFFSET(args.intermediate_bvh,
+      source_offset(error == 0u ? root : 0u)));
+   envelope.output_bvh = args.output_bvh;
+   envelope.end_slot = 3u + slot_total;
+   envelope.primitive_count = error == 0u ? active_leaves : 0u;
+   envelope.node_count = job_count;
+   envelope.depth = s_depth;
+   envelope.opaque_build_word = error == HK_AGX3_PLAN_EMPTY
+                                   ? HK_AGX3_PLAN_EMPTY : 0u;
+   envelope.resource_id = args.resource_id;
+   envelope.geometry_type = args.geometry_type;
+   envelope.leaf_bound = args.leaf_bound;
+   if (t == 0u) {
+      hk_agx3_plan_state state;
+      state.job_count = jobs;
+      state.groups_y = 1u;
+      state.groups_z = 1u;
+      state.next_slot = envelope.end_slot;
+      state.depth = envelope.depth;
+      state.error = error;
+      state.saved_offsets = 0u;
+      state.saved_positions = 0u;
+      DEREF(args.state) = state;
+      uint64_t dispatch = uint64_t(args.state) + uint64_t(HK_AGX3_PLAN_ENCODE_DISPATCH);
+      DEREF(REF(uint32_t)(dispatch)) =
+         (jobs + HK_AGX3_NODE_JOBS_PER_GROUP - 1u) / HK_AGX3_NODE_JOBS_PER_GROUP;
+      DEREF(REF(uint32_t)(dispatch + 4ul)) = 1u;
+      DEREF(REF(uint32_t)(dispatch + 8ul)) = 1u;
+      DEREF(args.envelope) = envelope;
+   }
+   /* The refit save of an updatable build reads the plan nodes. */
+   if (error == 0u && (args.build_flags & 1u) != 0u) { /* Vulkan ALLOW_UPDATE */
+      for (uint k = 0; k < 2u; ++k) {
+         uint n = k == 0u ? n0 : n1;
+         if (n >= args.node_bound)
+            continue;
+         hk_agx3_plan_node node;
+         node.parent = s_parent[n];
+         node.leaf_count = s_count[n] & 15u;
+         node.depth = k == 0u ? depth0 : depth1;
+         node.job = s_job[n];
+         DEREF(INDEX(hk_agx3_plan_node, args.nodes, n)) = node;
+      }
+   }
+
+   /* The envelope of the one job, as agx3_envelope.comp runs it. */
+   envelope_args.jobs = args.envelope;
+   envelope_args.status = REF(uint32_t)(envelope_status);
+   envelope_args.job_count = 1u;
+   envelope_args.reserved = envelope_reserved;
+   envelope_args.metadata = args.metadata;
+   envelope_args.ir_header = args.header;
+   envelope_args.retained_offset = args.retained_offset;
+   envelope_args.build_flags = args.build_flags;
+   envelope_args.node_bound = args.node_bound;
+   envelope_args.keep_retained = args.keep_retained;
+   envelope_args.refit = 0u;
+   clear_job_instance_pointers(envelope, t, gl_WorkGroupSize.x);
+   if (t == 0u)
+      encode_envelope(0u, envelope);
+}
