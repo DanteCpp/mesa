@@ -131,6 +131,14 @@ static const uint32_t agx3_node_instances_spv[] = {
 #include "bvh/hk_agx3_gen1_leaf_instances.spv.h"
 };
 
+/* TEST-ONLY: the 32-bit store instance encoder, for A/B. */
+static const uint32_t agx3_node_instances_store32_spv[] = {
+#include "bvh/hk_agx3_gen1_leaf_instances_store32.spv.h"
+};
+DEBUG_GET_ONCE_BOOL_OPTION(hk_test_as_instance_store32, "HK_TEST_AS_INSTANCE_STORE32", false)
+DEBUG_GET_ONCE_BOOL_OPTION(hk_test_as_small_plan, "HK_TEST_AS_SMALL_PLAN", true)
+DEBUG_GET_ONCE_NUM_OPTION(hk_test_as_job_grid_leaves, "HK_TEST_AS_JOB_GRID_LEAVES", -1)
+
 static const uint32_t agx3_refit_leaf_spv[] = {
 #include "bvh/hk_agx3_refit_leaf.spv.h"
 };
@@ -799,6 +807,10 @@ get_pipeline_spv(struct hk_device *dev, const char *name, const uint32_t *spv,
 static bool
 hk_agx3_plan_job_grid(const struct hk_device *dev, uint32_t leaf_bound)
 {
+   /* TEST-ONLY: HK_TEST_AS_JOB_GRID_LEAVES=<n> moves the threshold, 0 never. */
+   const int64_t test = debug_get_option_hk_test_as_job_grid_leaves();
+   if (test >= 0)
+      return test != 0 && leaf_bound >= (uint64_t)test;
    return leaf_bound >= HK_AGX3_PLAN_JOB_GRID_MIN_LEAVES;
 }
 
@@ -809,7 +821,9 @@ static bool
 hk_agx3_plan_small(const struct hk_device *dev,
                    const struct hk_agx3_plan_args *args)
 {
-   return !args->pairs && args->node_bound <= HK_AGX3_PLAN_SMALL_NODES;
+   /* TEST-ONLY: HK_TEST_AS_SMALL_PLAN=0 keeps every build on the five phases. */
+   return debug_get_option_hk_test_as_small_plan() &&
+          !args->pairs && args->node_bound <= HK_AGX3_PLAN_SMALL_NODES;
 }
 
 VkResult
@@ -836,7 +850,13 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
    };
    /* A TLAS encodes only inner and instance nodes. */
    const bool instances = args->geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR;
-   const struct stage node_encode = instances
+   const bool store32 = debug_get_option_hk_test_as_instance_store32();
+   const struct stage node_encode = instances && store32
+      ? (struct stage){"hk-agx3-node-encode-instances-store32",
+                       agx3_node_instances_store32_spv,
+                       sizeof(agx3_node_instances_store32_spv),
+                       sizeof(struct hk_agx3_leaf_args)}
+      : instances
       ? (struct stage){"hk-agx3-node-encode-instances", agx3_node_instances_spv,
                        sizeof(agx3_node_instances_spv),
                        sizeof(struct hk_agx3_leaf_args)}

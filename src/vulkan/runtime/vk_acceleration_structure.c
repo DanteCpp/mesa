@@ -35,6 +35,7 @@
 
 #include "bvh/vk_bvh_defines.h"
 
+#include "util/u_debug.h"
 #include "util/u_string.h"
 
 static const uint32_t leaf_spv[] = {
@@ -76,6 +77,12 @@ static const uint32_t hploc_spv[] = {
 static const uint32_t hploc_shuffle_spv[] = {
 #include "bvh/hploc_internal_shuffle.spv.h"
 };
+
+/* TEST-ONLY: the rolled shuffle search, for A/B. */
+static const uint32_t hploc_shuffle_rolled_spv[] = {
+#include "bvh/hploc_internal_shuffle_rolled.spv.h"
+};
+DEBUG_GET_ONCE_BOOL_OPTION(hk_test_as_hploc_rolled, "HK_TEST_AS_HPLOC_ROLLED", false)
 
 void
 vk_bvh_build_barrier_compute_to_compute(VkCommandBuffer commandBuffer, bool indirect_dst)
@@ -1196,8 +1203,10 @@ hploc_build_internal(VkCommandBuffer commandBuffer, struct vk_device *device,
           (states[i].config.build_flags & VK_HPLOC_BUILD_FLAGS) != build_flags ||
           states[i].leaf_node_count > args->hploc_shuffle_max_leaves)
          continue;
+      const bool rolled = debug_get_option_hk_test_as_hploc_rolled();
       result = vk_get_bvh_build_pipeline_spv(device, meta, VK_META_OBJECT_KEY_HPLOC_SHUFFLE,
-                                             hploc_shuffle_spv, sizeof(hploc_shuffle_spv),
+                                             rolled ? hploc_shuffle_rolled_spv : hploc_shuffle_spv,
+                                             rolled ? sizeof(hploc_shuffle_rolled_spv) : sizeof(hploc_shuffle_spv),
                                              sizeof(struct hploc_args), args, build_flags,
                                              &shuffle_pipeline, false /* unaligned_dispatch */);
       if (result != VK_SUCCESS)

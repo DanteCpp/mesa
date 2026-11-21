@@ -201,8 +201,14 @@ main(void)
              * candidate for an invocation below node_count, the only ones
              * whose minimum is used: both its neighbours are out of range. */
             uint32_t best_candidate = 0xffffffff;
+#ifdef HPLOC_SHUFFLE_ROLLED
+            /* TEST-ONLY: the rolled search, for A/B (HK_TEST_AS_HPLOC_ROLLED). */
+            const uint32_t steps = min(uint32_t(SEARCH_RADIUS), node_count - 1);
+            for (uint32_t i = 1; i <= steps; i++) {
+#else
             [[unroll]]
             for (uint32_t i = 1; i <= SEARCH_RADIUS; i++) {
+#endif
                int32_t index = int32_t(gl_SubgroupInvocationID) - int(i);
                vk_aabb other;
                other = node_aabbs[max(index, 0)];
