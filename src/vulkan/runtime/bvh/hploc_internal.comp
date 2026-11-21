@@ -195,10 +195,14 @@ main(void)
              * below: each invocation computes the merged surface area with
              * each left neighbour and hands it to that neighbour by a
              * shuffle, so no shared atomics order the steps. Uniform control
-             * flow; past node_count - 1 steps no candidate exists. */
+             * flow. The steps are independent but for the minimum, so all
+             * of them are unrolled into one block, where their shared loads
+             * and shuffles can overlap. A step past node_count - 1 has no
+             * candidate for an invocation below node_count, the only ones
+             * whose minimum is used: both its neighbours are out of range. */
             uint32_t best_candidate = 0xffffffff;
-            const uint32_t steps = min(uint32_t(SEARCH_RADIUS), node_count - 1);
-            for (uint32_t i = 1; i <= steps; i++) {
+            [[unroll]]
+            for (uint32_t i = 1; i <= SEARCH_RADIUS; i++) {
                int32_t index = int32_t(gl_SubgroupInvocationID) - int(i);
                vk_aabb other;
                other = node_aabbs[max(index, 0)];
