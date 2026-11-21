@@ -35,6 +35,7 @@
 #include "asahi/lib/agx_usc.h"
 #include "asahi/lib/agx_vdm_barrier_core.h"
 #include "asahi/lib/agx_vdm_index_list_core.h"
+#include "asahi/lib/agx_vdm_state_core.h"
 #include "asahi/lib/agx_vdm_state_update_core.h"
 #include "asahi/lib/agx_vdm_ppp_state_core.h"
 #include "asahi/lib/agx_vdm_stream_link_core.h"
@@ -15495,13 +15496,314 @@ agx_multidraw_indirect_can_skip(struct agx_context *ctx,
                                     false);
 }
 
+struct agx_multidraw_params_reloc {
+   uint64_t dest[2];
+   uint32_t delta;
+   uint16_t offset;
+   uint8_t short_mask;
+   uint8_t low_length;
+};
+
+struct agx_multidraw_indirect_cache {
+   bool vs_patch_valid;
+   uint16_t prog_len;
+   uint8_t prog_bytes[AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE];
+   uint8_t reloc_count;
+   struct agx_multidraw_params_reloc relocs[4];
+   struct agx_vdm_state_update vdm_update;
+
+   bool draw_tpl_valid;
+   uint8_t draw_bytes[AGX_VDM_HAL200_INDIRECT_INDEXED_DRAW_LENGTH];
+   uint8_t draw_len;
+   uint8_t indirect_addr_offset;
+};
+
+static void
+agx_multidraw_init_vs_patch(struct agx_context *ctx, struct agx_batch *batch,
+                            const struct pipe_draw_info *info,
+                            uint64_t first_indirect_addr, uint32_t vs_word0,
+                            const uint32_t vs_outputs[2],
+                            struct agx_multidraw_indirect_cache *cache)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   struct agx_compiled_shader *vs = ctx->vs;
+   struct agx_linked_shader *linked = ctx->linked.vs;
+
+   if (!agx_native_graphics(dev) || agx_chip_g17_m5(dev->chip) ||
+       dev->chip == AGX_CHIP_G18G || !vs || !linked || !linked->bo ||
+       !linked->bo->va || !linked->size || vs->b.info.has_preamble ||
+       vs->b.info.preamble_scratch_size ||
+       !agx_va_in_usc_window(dev, linked->bo->va->addr + linked->entry_offset))
+      return;
+
+   struct agx_g17p_graphics_template *tmpl = linked->g17p_graphics_templates;
+   if (!tmpl || tmpl->desc.fragment || tmpl->desc.constant_program.code_size ||
+       tmpl->desc.shader_va != linked->bo->va->addr + linked->entry_offset ||
+       tmpl->program.program.length == 0 ||
+       tmpl->program.program.length > sizeof(cache->prog_bytes))
+      return;
+
+   struct agx3_ioto_uniform_range ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
+   uint32_t params_offset[AGX3_G17P_GRAPHICS_MAX_RANGES] = {0};
+   uint32_t params_mask = 0;
+   size_t count = 0;
+
+   const bool resource_pair =
+      batch->texture_count[MESA_SHADER_VERTEX] != 0 &&
+      vs->g17p_texture_resources;
+   if (resource_pair) {
+      if (!batch->stage_uniforms[MESA_SHADER_VERTEX].texture_base ||
+          !batch->samplers[MESA_SHADER_VERTEX] ||
+          (ctx->stage[MESA_SHADER_VERTEX].custom_borders &&
+           !vs->g17p_custom_border_emulation))
+         return;
+      const uint64_t pointers[2] = {
+         batch->stage_uniforms[MESA_SHADER_VERTEX].texture_base,
+         batch->samplers[MESA_SHADER_VERTEX],
+      };
+      const uint64_t pointer_va = agx_pool_upload_aligned(
+         &batch->pool, pointers, sizeof(pointers), 8);
+      if (!pointer_va)
+         return;
+      ranges[count++] = (struct agx3_ioto_uniform_range){
+         .start_halfs = 0,
+         .size_halfs = 8,
+         .address = pointer_va,
+      };
+   }
+
+   const uint64_t params_addr0 =
+      first_indirect_addr + (info->index_size ? 12 : 8);
+
+   for (unsigned i = 0; i < vs->push_range_count; ++i) {
+      const struct agx_push_range *push = &vs->push[i];
+      const bool is_params = push->table == AGX_SYSVAL_TABLE_PARAMS;
+      const uint64_t table =
+         is_params ? params_addr0 : batch->uniforms.tables[push->table];
+
+      if (resource_pair && push->uniform < AGX_ABI_G17P_TEXTURE_POINTER_HALFS)
+         return;
+
+      if (is_params && !table)
+         continue;
+
+      unsigned start = push->uniform;
+      unsigned length = push->length;
+      uint64_t source = table + push->offset;
+
+      if (resource_pair && start < 8) {
+         const unsigned end = start + length;
+         if (end <= 8)
+            continue;
+         source += (8 - start) * 2;
+         length = end - 8;
+         start = 8;
+      }
+
+      if ((length & 1) && push->table == AGX_SYSVAL_STAGE(MESA_SHADER_VERTEX)) {
+         if ((uint64_t)push->offset + ((uint64_t)length + 1) * 2 >
+             agx_stage_uniforms_size(dev->chip))
+            return;
+         ++length;
+      }
+
+      if (!table || (start & 1) || (length & 1) || count == ARRAY_SIZE(ranges))
+         return;
+
+      if (is_params) {
+         params_mask |= BITFIELD_BIT(count);
+         params_offset[count] = (uint32_t)(source - table);
+      }
+
+      ranges[count++] = (struct agx3_ioto_uniform_range){
+         .start_halfs = start,
+         .size_halfs = length,
+         .address = source,
+      };
+   }
+
+   if (vs->b.info.rodata.size_16) {
+      const struct agx_rodata *rodata = &vs->b.info.rodata;
+      const uint64_t size_B = (uint64_t)rodata->size_16 * 2;
+      if (!vs->bo || !vs->bo->va || (rodata->base_uniform & 1) ||
+          (rodata->size_16 & 1) || count == ARRAY_SIZE(ranges) ||
+          rodata->offset > vs->bo->size ||
+          size_B > vs->bo->size - rodata->offset)
+         return;
+      ranges[count++] = (struct agx3_ioto_uniform_range){
+         .start_halfs = rodata->base_uniform,
+         .size_halfs = rodata->size_16,
+         .address = vs->bo->va->addr + rodata->offset,
+      };
+   }
+
+   if (!params_mask)
+      return;
+
+   const struct agx3_g17p_graphics_program_desc target_desc = {
+      .program_va = 0,
+      .shader_va = linked->bo->va->addr + linked->entry_offset,
+      .uniform_ranges = ranges,
+      .uniform_range_count = count,
+      .shader_binary_size = linked->size,
+      .scratch_size =
+         MAX2(linked->scratch_size, linked->agx3_spectpr_scratch_size),
+      .nr_gprs = linked->nr_gprs,
+      .compiler_d_valid = linked->g17p_compiler_d_valid,
+      .compiler_d = linked->g17p_compiler_d,
+      .fragment = false,
+      .writes_sample_mask = false,
+      .colour_classes = linked->g17p_colour_classes,
+      .imageblock = {
+         .sample_size_B = batch->tilebuffer_layout.sample_size_B,
+         .nr_samples = batch->tilebuffer_layout.nr_samples,
+         .tile_size_px = batch->tilebuffer_layout.tile_size,
+      },
+   };
+
+   if (!agx3_g17p_graphics_program_template_relocate(
+          dev->chip, &tmpl->desc, &target_desc, &tmpl->program,
+          cache->prog_bytes, sizeof(cache->prog_bytes), &cache->prog_len))
+      return;
+
+   struct hk_g17p_patch_plan plan;
+   if (!hk_g17p_patch_plan_init(&plan, tmpl->desc.uniform_ranges,
+                                tmpl->desc.uniform_range_count,
+                                tmpl->program.relocations,
+                                tmpl->program.relocation_count,
+                                tmpl->program.program.length, false))
+      return;
+
+   /* Only patch PARAMS relocations directly when no invariant range shares an
+    * address-cache cluster with a PARAMS range in the template. */
+   for (unsigned r = 0; r < plan.range_count; ++r) {
+      if (!(params_mask & BITFIELD_BIT(r)))
+         continue;
+      for (unsigned j = 0; j < plan.range_count; ++j) {
+         if (!(params_mask & BITFIELD_BIT(j)) &&
+             plan.leader[j] == plan.leader[r])
+            return;
+      }
+   }
+
+   unsigned reloc_count = 0;
+   for (unsigned r = 0; r < plan.reloc_count; ++r) {
+      const struct hk_g17p_patch_reloc *rel = &plan.relocs[r];
+      if (!(params_mask & BITFIELD_BIT(rel->range)))
+         continue;
+      if (reloc_count == ARRAY_SIZE(cache->relocs))
+         return;
+      cache->relocs[reloc_count++] = (struct agx_multidraw_params_reloc){
+         .dest = {rel->dest[0], rel->dest[1]},
+         .delta = params_offset[rel->range] + rel->delta,
+         .offset = rel->offset,
+         .short_mask = rel->short_mask,
+         .low_length = (rel->short_mask & 1) ? 2 : 8,
+      };
+   }
+   if (!reloc_count)
+      return;
+
+   const struct agx_vdm_state_update_info vdm_info = {
+      .raw_vertex_shader_word0 = vs_word0,
+      .pipeline = linked->bo->va->addr,
+      .raw_pipeline_template = 0,
+      .raw_vertex_outputs = {vs_outputs[0], vs_outputs[1]},
+      .raw_vertex_unknown = 0,
+   };
+   if (!agx_vdm_state_update_pack(dev->chip, &vdm_info, &cache->vdm_update))
+      return;
+
+   cache->reloc_count = reloc_count;
+   cache->vs_patch_valid = true;
+}
+
+static void
+agx_multidraw_init_draw_template(struct agx_device *dev,
+                                 const struct pipe_draw_info *info,
+                                 uint64_t first_indirect_addr, uint64_t ib,
+                                 size_t ib_extent, uint32_t draw_state_offset,
+                                 struct agx_multidraw_indirect_cache *cache)
+{
+   struct agx_draw draw = {0};
+   if (info->index_size) {
+      draw.index_size = agx_translate_index_size(info->index_size);
+      draw.index_buffer = ib;
+      draw.index_buffer_range_B = ib_extent;
+      draw.restart = info->primitive_restart;
+      draw.indexed = true;
+   }
+   draw.b = agx_grid_indirect(first_indirect_addr);
+
+   uint8_t *next = agx_g17p_emit_indirect_draw(
+      dev->chip, cache->draw_bytes, &draw, agx_primitive_for_pipe(info->mode),
+      info->restart_index, draw_state_offset);
+   const size_t len = (size_t)(next - cache->draw_bytes);
+   const size_t addr_off =
+      (draw_state_offset ? AGX_VDM_HAL200_DRAW_STATE_POINTER_LENGTH : 0) +
+      (info->index_size ? 16 : 4);
+   if (!len || len > sizeof(cache->draw_bytes) || addr_off + 8 > len)
+      return;
+
+   const uint32_t expected[2] = {
+      util_cpu_to_le32((uint32_t)((first_indirect_addr >> 32) & 0xffffu)),
+      util_cpu_to_le32((uint32_t)first_indirect_addr & 0xfffffffcu),
+   };
+   if (memcmp(cache->draw_bytes + addr_off, expected, sizeof(expected)))
+      return;
+
+   cache->draw_len = (uint8_t)len;
+   cache->indirect_addr_offset = (uint8_t)addr_off;
+   cache->draw_tpl_valid = true;
+}
+
+static uint64_t
+agx_multidraw_patch_vs(struct agx_batch *batch, struct agx_device *dev,
+                       const struct agx_multidraw_indirect_cache *cache,
+                       uint64_t params_addr)
+{
+   for (unsigned r = 0; r < cache->reloc_count; ++r) {
+      const struct agx_multidraw_params_reloc *rel = &cache->relocs[r];
+      if (params_addr > UINT64_MAX - rel->delta)
+         return 0;
+      const uint64_t base = params_addr + rel->delta;
+      if (((rel->short_mask & 1) && (uint32_t)base >= 128) ||
+          ((rel->short_mask & 2) && (base >> 32) >= 128))
+         return 0;
+   }
+
+   struct agx_bo *program_bo = NULL;
+   struct agx_ptr t = agx_pool_alloc_aligned_with_bo(
+      &batch->pipeline_pool, cache->prog_len, AGX_IOTO_PROGRAM_ALIGNMENT,
+      &program_bo);
+   if (!t.cpu || !program_bo || !agx_va_in_usc_window(dev, t.gpu))
+      return 0;
+
+   uint8_t *dst = t.cpu;
+   memcpy(dst, cache->prog_bytes, cache->prog_len);
+   for (unsigned r = 0; r < cache->reloc_count; ++r) {
+      const struct agx_multidraw_params_reloc *rel = &cache->relocs[r];
+      const uint64_t base = params_addr + rel->delta;
+      uint8_t *out = dst + rel->offset;
+      hk_g17p_patch_ldimm(out, rel->short_mask & 1, rel->dest[0],
+                          (uint32_t)base);
+      hk_g17p_patch_ldimm(out + rel->low_length, rel->short_mask & 2,
+                          rel->dest[1], (uint32_t)(base >> 32));
+   }
+
+   agx_bo_assert_range(program_bo, t.gpu - program_bo->va->addr,
+                       cache->prog_len);
+   return t.gpu;
+}
+
 static bool
 agx_multidraw_emit_indirect(struct agx_context *ctx, struct agx_batch *batch,
                             const struct pipe_draw_info *info, unsigned drawid,
                             uint64_t indirect_addr, uint64_t ib,
                             size_t ib_extent, bool uses_base_param,
                             bool uses_draw_id, bool root_reads_params_ptr,
-                            uint32_t vs_word0, const uint32_t vs_outputs[2])
+                            uint32_t vs_word0, const uint32_t vs_outputs[2],
+                            const struct agx_multidraw_indirect_cache *cache)
 {
    struct agx_device *dev = agx_device(ctx->base.screen);
 
@@ -15520,35 +15822,51 @@ agx_multidraw_emit_indirect(struct agx_context *ctx, struct agx_batch *batch,
       if (uses_draw_id)
          batch->uniforms.draw_id = drawid;
 
+      uint64_t params_addr = 0;
       if (uses_base_param) {
-         batch->uniforms.tables[AGX_SYSVAL_TABLE_PARAMS] =
-            indirect_addr + (info->index_size ? 12 : 8);
-         batch->vs_root.tables[AGX_SYSVAL_TABLE_PARAMS] =
-            batch->uniforms.tables[AGX_SYSVAL_TABLE_PARAMS];
+         params_addr = indirect_addr + (info->index_size ? 12 : 8);
+         batch->uniforms.tables[AGX_SYSVAL_TABLE_PARAMS] = params_addr;
+         batch->vs_root.tables[AGX_SYSVAL_TABLE_PARAMS] = params_addr;
       }
 
-      if (uses_draw_id || root_reads_params_ptr)
-         agx_upload_uniforms(batch, ctx->vs);
+      bool fast_patched = false;
+      if (cache->vs_patch_valid) {
+         const uint64_t pipeline =
+            agx_multidraw_patch_vs(batch, dev, cache, params_addr);
+         struct agx_vdm_state_vertex_pipeline_pair pair;
+         if (pipeline && agx_vdm_state_vertex_pipeline_pair_pack(
+                            dev->chip, pipeline, 0, &pair)) {
+            static_assert(sizeof(pair.bytes) == 8, "pipeline pair is 8 bytes");
+            vs_update = cache->vdm_update;
+            memcpy(&vs_update.bytes[8], pair.bytes, sizeof(pair.bytes));
+            fast_patched = true;
+         }
+      }
 
-      uint64_t pipeline = 0;
-      agx_build_pipeline(batch, ctx->vs, ctx->linked.vs, MESA_SHADER_VERTEX, 0,
-                         0, &pipeline, NULL);
-      if (agx_drop_for_null_g17p_program(ctx, ctx->vs, pipeline, "vertex",
-                                         NULL))
-         return false;
+      if (!fast_patched) {
+         if (uses_draw_id || root_reads_params_ptr)
+            agx_upload_uniforms(batch, ctx->vs);
 
-      const struct agx_vdm_state_update_info vdm_info = {
-         .raw_vertex_shader_word0 = vs_word0,
-         .pipeline = pipeline,
-         .raw_pipeline_template = 0,
-         .raw_vertex_outputs = {vs_outputs[0], vs_outputs[1]},
-         .raw_vertex_unknown = 0,
-      };
-      const bool packed =
-         agx_vdm_state_update_pack(dev->chip, &vdm_info, &vs_update);
-      assert(packed);
-      if (!packed)
-         return false;
+         uint64_t pipeline = 0;
+         agx_build_pipeline(batch, ctx->vs, ctx->linked.vs, MESA_SHADER_VERTEX,
+                            0, 0, &pipeline, NULL);
+         if (agx_drop_for_null_g17p_program(ctx, ctx->vs, pipeline, "vertex",
+                                            NULL))
+            return false;
+
+         const struct agx_vdm_state_update_info vdm_info = {
+            .raw_vertex_shader_word0 = vs_word0,
+            .pipeline = pipeline,
+            .raw_pipeline_template = 0,
+            .raw_vertex_outputs = {vs_outputs[0], vs_outputs[1]},
+            .raw_vertex_unknown = 0,
+         };
+         const bool packed =
+            agx_vdm_state_update_pack(dev->chip, &vdm_info, &vs_update);
+         assert(packed);
+         if (!packed)
+            return false;
+      }
    }
 
    agx_ensure_cmdbuf_has_space(
@@ -15571,23 +15889,35 @@ agx_multidraw_emit_indirect(struct agx_context *ctx, struct agx_batch *batch,
       draw_state_offset = batch->g17p_last_draw_state_offset;
    }
 
-   struct agx_draw draw = {0};
-   if (info->index_size) {
-      draw.index_size = agx_translate_index_size(info->index_size);
-      draw.index_buffer = ib;
-      draw.index_buffer_range_B = ib_extent;
-      draw.restart = info->primitive_restart;
-      draw.indexed = true;
+   uint8_t *next;
+   if (cache->draw_tpl_valid && indirect_addr &&
+       indirect_addr < (UINT64_C(1) << 48) && !(indirect_addr & 3u)) {
+      memcpy(out, cache->draw_bytes, cache->draw_len);
+      const uint32_t addr_words[2] = {
+         util_cpu_to_le32((uint32_t)((indirect_addr >> 32) & 0xffffu)),
+         util_cpu_to_le32((uint32_t)indirect_addr),
+      };
+      memcpy(out + cache->indirect_addr_offset, addr_words, sizeof(addr_words));
+      next = out + cache->draw_len;
    } else {
-      draw.start = 0;
-   }
-   draw.b = agx_grid_indirect(indirect_addr);
+      struct agx_draw draw = {0};
+      if (info->index_size) {
+         draw.index_size = agx_translate_index_size(info->index_size);
+         draw.index_buffer = ib;
+         draw.index_buffer_range_B = ib_extent;
+         draw.restart = info->primitive_restart;
+         draw.indexed = true;
+      } else {
+         draw.start = 0;
+      }
+      draw.b = agx_grid_indirect(indirect_addr);
 
-   uint8_t *next = agx_g17p_emit_indirect_draw(
-      dev->chip, out, &draw, agx_primitive_for_pipe(info->mode),
-      info->restart_index, draw_state_offset);
-   if (next == out)
-      return false;
+      next = agx_g17p_emit_indirect_draw(
+         dev->chip, out, &draw, agx_primitive_for_pipe(info->mode),
+         info->restart_index, draw_state_offset);
+      if (next == out)
+         return false;
+   }
 
    batch->vdm.current = next;
    assert((batch->vdm.current + AGX_VDM_STREAM_LINK_LENGTH) <= batch->vdm.end &&
@@ -15623,6 +15953,10 @@ agx_multidraw_emit_indirect(struct agx_context *ctx, struct agx_batch *batch,
  *    uses_draw_id is set, only the per-draw VS parameters, VS program, and VDM
  *    vertex state update are republished, reusing the cached bind tail and
  *    draw-state selector from draw 0 without growing scissor/depth-bias arrays.
+ *  - For the common uses_base_param && !uses_draw_id && !root_reads_params_ptr
+ *    case, draw 0's relocated VS Ioto program, VDM vertex state update, and
+ *    HAL200 indirect draw record are memoized once per clean batch so each
+ *    sub-draw only patches the PARAMS LDIMM(s), pipeline pair, and indirect VA.
  */
 static void
 agx_draw_multi_indirect(struct pipe_context *pctx,
@@ -15652,6 +15986,7 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
    bool root_reads_params_ptr = false;
    uint32_t vs_word0 = 0;
    uint32_t vs_outputs[2] = {0, 0};
+   struct agx_multidraw_indirect_cache cache = {0};
 
    for (unsigned i = 0; i < indirect->draw_count; ++i) {
       if (clean != NULL) {
@@ -15659,7 +15994,7 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
          if (!agx_multidraw_emit_indirect(
                 ctx, clean, info, i, indirect_addr, ib_base, ib_size,
                 uses_base_param, uses_draw_id, root_reads_params_ptr, vs_word0,
-                vs_outputs))
+                vs_outputs, &cache))
             clean = NULL;
       } else {
          const struct pipe_draw_indirect_info subindirect = {
@@ -15673,6 +16008,8 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
          agx_draw_vbo(pctx, info, i, &subindirect, draws, 1);
 
          clean = NULL;
+         cache.vs_patch_valid = false;
+         cache.draw_tpl_valid = false;
          if (ctx->batch && !agx_batch_is_compute(ctx->batch) &&
              (ctx->batch != before || ctx->batch->draws != before_draws) &&
              agx_multidraw_state_clean(ctx)) {
@@ -15690,6 +16027,8 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
 
          if (clean) {
             indirect_base = agx_indirect_buffer_ptr(clean, indirect);
+            const uint64_t first_indirect_addr =
+               indirect_base + (uint64_t)i * stride;
             if (info->index_size)
                ib_base = agx_index_buffer_rsrc_ptr(clean, info, &ib_size);
 
@@ -15735,7 +16074,24 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
                      (ctx->rast->base.rasterizer_discard ? 0x30 + provoking
                                                          : provoking) |
                      (clean->generate_primitive_id ? UINT32_C(0x40) : 0);
+
+                  if (uses_base_param && !uses_draw_id &&
+                      !root_reads_params_ptr) {
+                     agx_multidraw_init_vs_patch(ctx, clean, info,
+                                                 first_indirect_addr, vs_word0,
+                                                 vs_outputs, &cache);
+                  }
                }
+            }
+
+            if (clean) {
+               const uint32_t draw_state_offset =
+                  (uses_base_param || uses_draw_id)
+                     ? clean->g17p_last_draw_state_offset
+                     : 0;
+               agx_multidraw_init_draw_template(dev, info, first_indirect_addr,
+                                                ib_base, ib_size,
+                                                draw_state_offset, &cache);
             }
          }
       }
