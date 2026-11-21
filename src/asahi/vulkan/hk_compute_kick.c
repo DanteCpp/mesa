@@ -48,7 +48,6 @@
 
 #include <errno.h>
 #include <strings.h>
-#include <xf86drm.h>
 
 #include "util/bitscan.h"
 #include "util/cnd_monotonic.h"
@@ -254,7 +253,7 @@ static int
 hk_compute_kick_thread(void *data)
 {
    struct hk_compute_kick *k = data;
-   const int fd = k->dev->dev.fd;
+   struct util_sync_provider *sync = k->dev->vk.sync;
 
    u_thread_setname("hk-compute-kick");
 
@@ -278,7 +277,7 @@ hk_compute_kick_thread(void *data)
             continue;
 
          uint64_t value = 0;
-         if (drmSyncobjQuery(fd, &queue->drm.syncobj, &value, 1) ||
+         if (sync->query(sync, &queue->drm.syncobj, &value, 1, 0) ||
              value >= queue->kick.pending) {
             queue->kick.pending = 0;
             queue->kick.due_ns = 0;
@@ -315,14 +314,16 @@ hk_compute_kick_thread(void *data)
 
       /* Until one of the queues completes its compute work or a kick is
        * due. Work submitted meanwhile is seen at the latest then. */
-      int ret = drmSyncobjTimelineWait(fd, k->handles, k->points, count,
-                                       deadline,
-                                       DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
-                                       NULL);
+      int ret = sync->timeline_wait(sync, k->handles, k->points, count,
+                                    deadline,
+                                    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+                                    NULL);
+      const bool timed_out = ret == -ETIME || (ret && errno == ETIME);
       mtx_lock(&k->lock);
 
-      /* Never spin on an unexpected error. */
-      if (ret && ret != -ETIME && !k->stop) {
+      /* Never spin on an unexpected error. A timeout is -ETIME from DRM,
+       * -1 with errno ETIME from the D3DKMT provider. */
+      if (ret && !timed_out && !k->stop) {
          const struct timespec until = {
             .tv_sec = deadline / NSEC_PER_SEC,
             .tv_nsec = deadline % NSEC_PER_SEC,
