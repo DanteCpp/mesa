@@ -1781,10 +1781,17 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
     * alive, and only the packets' buffer needs it: the BO cache would hand
     * it out again without waiting for the GPU. Pin before anything below
     * changes queue or synchronization state, so that a failed allocation
-    * leaves nothing to roll back. */
+    * leaves nothing to roll back. On Windows only with
+    * HK_WIN32_COMPLETION_TRACKING (hk_cmd_pool.h), default off. */
    struct hk_cmd_pending *pending = NULL;
    const bool pin_recordings = agx_chip_g17_m5(dev->dev.chip);
-   if ((pin_recordings || packed_bo) && !dev->dev.is_virtio) {
+#ifdef _WIN32
+   const bool track_completion = HK_WIN32_COMPLETION_TRACKING;
+#else
+   const bool track_completion = true;
+#endif
+   if ((pin_recordings || packed_bo) && track_completion &&
+       !dev->dev.is_virtio) {
       const struct vk_queue_submit no_recordings = {0};
       unsigned chunks = 1 + (command_count - 1) / max_commands_per_submit(dev);
       VkResult pin_result = hk_cmd_pending_begin(
@@ -2714,6 +2721,12 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
              const struct vk_queue_submit *submit, struct hk_packed_runs *out)
 {
    memset(out, 0, sizeof(*out));
+#ifdef _WIN32
+   /* The packets' buffer is kept until the submission retires only by the
+    * completion tracking (HK_WIN32_COMPLETION_TRACKING, hk_cmd_pool.h). */
+   if (!HK_WIN32_COMPLETION_TRACKING)
+      return false;
+#endif
    const unsigned n = submit->command_buffer_count;
    if (n < 2 || submit->buffer_bind_count || submit->image_bind_count ||
        submit->image_opaque_bind_count || !hk_pack_runs_enabled(dev))

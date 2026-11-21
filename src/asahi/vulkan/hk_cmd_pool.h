@@ -145,6 +145,19 @@ void hk_device_finish_vdm_slabs(struct hk_device *dev);
  * driver-owned buffer a submission reads (extra_bo, a packed compute
  * stream), which goes back to the BO cache only once the submission
  * retired. */
+
+/* This completion tracking on Windows: a build-time switch, default off
+ * (drivers/AppleAgxWddm/core/agxw_agreement.h section 5). build-windows.sh
+ * sets it from HONEYKRISP_COMPLETION_TRACKING. Off, no Windows submission is
+ * tracked: no recording is pinned, a submit ioctl carries no extra out-sync
+ * (the J813 submit is the one of the line before the public rebase), and
+ * compute packing, whose packets' buffer only the tracking keeps alive, is
+ * off. On, every submit ioctl gets one private binary syncobj as an extra
+ * out-sync, which the D3DKMT winsys signals after the job
+ * (SignalSynchronizationObjectFromGpu), outside the v6 blob. */
+#ifndef HK_WIN32_COMPLETION_TRACKING
+#define HK_WIN32_COMPLETION_TRACKING 0
+#endif
 struct agx_bo;
 struct hk_cmd_pending;
 struct hk_queue;
