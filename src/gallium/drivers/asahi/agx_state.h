@@ -17,6 +17,7 @@
 #include "asahi/lib/agx_scratch.h"
 #include "asahi/lib/agx_tilebuffer.h"
 #include "asahi/lib/agx_uvs.h"
+#include "asahi/lib/agx_vdm_hal200_bind_tail_core.h"
 #include "asahi/lib/pool.h"
 #include "compiler/shader_enums.h"
 #include "gallium/auxiliary/util/u_blitter.h"
@@ -563,6 +564,10 @@ struct agx_batch {
    uint64_t g17p_emrt_heap;
    struct agx_compiled_shader *g17p_fragment_shader;
    struct agx_linked_shader *g17p_fragment_linked;
+   /* Last HAL200 bind tail and draw-state selector emitted into this batch's
+    * pool; reused by multi-draw indirect when only per-draw VS params vary. */
+   struct agx_vdm_hal200_bind_tail g17p_last_bind_tail;
+   uint32_t g17p_last_draw_state_offset;
 
    /* G17G: primitives drawn into this render (see AGX_G17G_RENDER_PRIMS) */
    uint64_t g17g_prims;

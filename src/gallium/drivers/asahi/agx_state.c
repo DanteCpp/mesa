@@ -12025,6 +12025,9 @@ agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
           batch->depth_bias.size, viewport_count, draw_state_offset))
       return NULL;
 
+   batch->g17p_last_bind_tail = uploaded.tail;
+   batch->g17p_last_draw_state_offset = *draw_state_offset;
+
    memcpy(out, uploaded.tail.bytes, uploaded.tail.length);
    return out + uploaded.tail.length;
 }
@@ -13463,7 +13466,7 @@ agx_g17p_emit_indirect_draw(enum agx_chip chip, uint8_t *out,
                             uint32_t draw_state_offset)
 {
    const struct agx_vdm_hal200_indirect_draw_fields fields = {
-      .draw_state_context_offset = draw_state_offset,
+      .draw_state_context_offset = draw_state_offset ? draw_state_offset : 4,
       .primitive = primitive,
       .indexed = draw->indexed,
       .index_size_B = draw->indexed ? agx_index_size_to_B(draw->index_size) : 0,
@@ -13480,8 +13483,15 @@ agx_g17p_emit_indirect_draw(enum agx_chip chip, uint8_t *out,
    if (!valid)
       return out;
 
-   memcpy(out, packed.bytes, packed.length);
-   return out + packed.length;
+   size_t emitted = 0;
+   const bool ok = agx_vdm_hal200_draw_emit(
+      chip, packed.bytes, packed.length, draw_state_offset != 0, out,
+      packed.length, &emitted);
+   assert(ok);
+   if (!ok)
+      return out;
+
+   return out + emitted;
 }
 
 static uint64_t
@@ -15452,6 +15462,289 @@ agx_draw_multi(struct pipe_context *pctx, const struct pipe_draw_info *info,
    }
 }
 
+static bool
+agx_multidraw_indirect_can_skip(struct agx_context *ctx,
+                                const struct pipe_draw_info *info,
+                                const struct pipe_draw_indirect_info *indirect)
+{
+#ifndef NDEBUG
+   if (unlikely(agx_device(ctx->base.screen)->debug & AGX_DBG_DIRTY))
+      return false;
+#endif
+
+   if (!ctx->vs || !ctx->linked.vs || !ctx->fs || !ctx->linked.fs ||
+       ctx->gs || ctx->stage[MESA_SHADER_GEOMETRY].shader ||
+       ctx->stage[MESA_SHADER_TESS_EVAL].shader || ctx->in_tess ||
+       ctx->swtnl_inner || ctx->active_draw_without_restart ||
+       ctx->streamout.num_targets || info->mode == MESA_PRIM_PATCHES ||
+       info->has_user_indices)
+      return false;
+
+   if (ctx->active_queries) {
+      if (ctx->prims_generated[0])
+         return false;
+
+      for (unsigned i = 0; i < ARRAY_SIZE(ctx->pipeline_statistics); ++i) {
+         if (ctx->pipeline_statistics[i])
+            return false;
+      }
+   }
+
+   bool xfb_passthrough = false;
+   return !agx_needs_passthrough_gs(ctx, info, indirect, &xfb_passthrough,
+                                    false);
+}
+
+static bool
+agx_multidraw_emit_indirect(struct agx_context *ctx, struct agx_batch *batch,
+                            const struct pipe_draw_info *info, unsigned drawid,
+                            uint64_t indirect_addr, uint64_t ib,
+                            size_t ib_extent, bool uses_base_param,
+                            bool uses_draw_id, bool root_reads_params_ptr,
+                            uint32_t vs_word0, const uint32_t vs_outputs[2])
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+
+   if (ctx->time_elapsed)
+      agx_batch_add_timestamp_query(batch, ctx->time_elapsed);
+
+   uint32_t draw_state_offset = 0;
+   struct agx_vdm_state_update vs_update;
+   const bool republish_vs = uses_base_param || uses_draw_id;
+
+   if (republish_vs) {
+      if (batch->g17p_last_bind_tail.length != AGX_VDM_HAL200_BIND_TAIL_LENGTH ||
+          !batch->g17p_last_draw_state_offset)
+         return false;
+
+      if (uses_draw_id)
+         batch->uniforms.draw_id = drawid;
+
+      if (uses_base_param) {
+         batch->uniforms.tables[AGX_SYSVAL_TABLE_PARAMS] =
+            indirect_addr + (info->index_size ? 12 : 8);
+         batch->vs_root.tables[AGX_SYSVAL_TABLE_PARAMS] =
+            batch->uniforms.tables[AGX_SYSVAL_TABLE_PARAMS];
+      }
+
+      if (uses_draw_id || root_reads_params_ptr)
+         agx_upload_uniforms(batch, ctx->vs);
+
+      uint64_t pipeline = 0;
+      agx_build_pipeline(batch, ctx->vs, ctx->linked.vs, MESA_SHADER_VERTEX, 0,
+                         0, &pipeline, NULL);
+      if (agx_drop_for_null_g17p_program(ctx, ctx->vs, pipeline, "vertex",
+                                         NULL))
+         return false;
+
+      const struct agx_vdm_state_update_info vdm_info = {
+         .raw_vertex_shader_word0 = vs_word0,
+         .pipeline = pipeline,
+         .raw_pipeline_template = 0,
+         .raw_vertex_outputs = {vs_outputs[0], vs_outputs[1]},
+         .raw_vertex_unknown = 0,
+      };
+      const bool packed =
+         agx_vdm_state_update_pack(dev->chip, &vdm_info, &vs_update);
+      assert(packed);
+      if (!packed)
+         return false;
+   }
+
+   agx_ensure_cmdbuf_has_space(
+      batch, &batch->vdm,
+      (republish_vs
+          ? AGX_VDM_STATE_UPDATE_LENGTH + AGX_VDM_HAL200_BIND_TAIL_LENGTH
+          : 0) +
+         AGX_VDM_HAL200_INDIRECT_INDEXED_DRAW_LENGTH + AGX_VDM_BARRIER_LENGTH);
+
+   uint8_t *out = batch->vdm.current;
+   if (republish_vs) {
+      memcpy(out, vs_update.bytes, vs_update.length);
+      out += vs_update.length;
+      if (unlikely(dev->debug & AGX_DBG_PERF))
+         ctx->perf.vs_emits++;
+
+      memcpy(out, batch->g17p_last_bind_tail.bytes,
+             batch->g17p_last_bind_tail.length);
+      out += batch->g17p_last_bind_tail.length;
+      draw_state_offset = batch->g17p_last_draw_state_offset;
+   }
+
+   struct agx_draw draw = {0};
+   if (info->index_size) {
+      draw.index_size = agx_translate_index_size(info->index_size);
+      draw.index_buffer = ib;
+      draw.index_buffer_range_B = ib_extent;
+      draw.restart = info->primitive_restart;
+      draw.indexed = true;
+   } else {
+      draw.start = 0;
+   }
+   draw.b = agx_grid_indirect(indirect_addr);
+
+   uint8_t *next = agx_g17p_emit_indirect_draw(
+      dev->chip, out, &draw, agx_primitive_for_pipe(info->mode),
+      info->restart_index, draw_state_offset);
+   if (next == out)
+      return false;
+
+   batch->vdm.current = next;
+   assert((batch->vdm.current + AGX_VDM_STREAM_LINK_LENGTH) <= batch->vdm.end &&
+          "Failed to reserve sufficient space in encoder");
+   ctx->dirty = 0;
+
+   batch->draws++;
+   if (unlikely(dev->debug & AGX_DBG_PERF))
+      ctx->perf.draws++;
+
+   /* Same limits as the end of agx_draw_vbo() */
+   if (unlikely(
+          (((batch->scissor.size / AGX_SCISSOR_LENGTH) + AGX_MAX_VIEWPORTS) >
+           UINT16_MAX) ||
+          (batch->depth_bias.size / AGX_DEPTH_BIAS_LENGTH) >= UINT16_MAX)) {
+      agx_flush_batch_for_reason(ctx, batch, "Scissor/depth bias overflow");
+   } else if (unlikely(batch->draws > 100000)) {
+      agx_flush_batch_for_reason(ctx, batch, "Absurd number of draws");
+   }
+
+   return true;
+}
+
+/*
+ * Fast path for glMultiDraw{Elements,Arrays}Indirect on native HAL200 chips.
+ * Draw 0 (and the first draw after any mid-loop batch flush) runs through full
+ * agx_draw_vbo() to validate shaders, descriptors, feedback loops, BO reads,
+ * and the HAL200 bind tail. Subsequent sub-draws on the clean batch skip all
+ * per-draw validation:
+ *  - When neither uses_base_param nor uses_draw_id is set, only the indirect
+ *    draw body is emitted (no bind tail or draw-state selector).
+ *  - When uses_base_param (including instanced vertex attributes) or
+ *    uses_draw_id is set, only the per-draw VS parameters, VS program, and VDM
+ *    vertex state update are republished, reusing the cached bind tail and
+ *    draw-state selector from draw 0 without growing scissor/depth-bias arrays.
+ */
+static void
+agx_draw_multi_indirect(struct pipe_context *pctx,
+                        const struct pipe_draw_info *info,
+                        const struct pipe_draw_indirect_info *indirect,
+                        const struct pipe_draw_start_count_bias *draws)
+{
+   struct agx_context *ctx = agx_context(pctx);
+   struct agx_device *dev = agx_device(pctx->screen);
+
+   if (!agx_native_graphics(dev) || indirect->count_from_stream_output ||
+       !indirect->buffer || info->has_user_indices) {
+      util_draw_multi_unroll_indirect(pctx, info, indirect, draws);
+      return;
+   }
+
+   const unsigned stride =
+      indirect->stride ? indirect->stride
+                       : (info->index_size ? 5 : 4) * sizeof(uint32_t);
+   struct agx_batch *clean = NULL;
+   int can_skip = -1;
+   uint64_t indirect_base = 0;
+   uint64_t ib_base = 0;
+   size_t ib_size = 0;
+   bool uses_base_param = false;
+   bool uses_draw_id = false;
+   bool root_reads_params_ptr = false;
+   uint32_t vs_word0 = 0;
+   uint32_t vs_outputs[2] = {0, 0};
+
+   for (unsigned i = 0; i < indirect->draw_count; ++i) {
+      if (clean != NULL) {
+         const uint64_t indirect_addr = indirect_base + (uint64_t)i * stride;
+         if (!agx_multidraw_emit_indirect(
+                ctx, clean, info, i, indirect_addr, ib_base, ib_size,
+                uses_base_param, uses_draw_id, root_reads_params_ptr, vs_word0,
+                vs_outputs))
+            clean = NULL;
+      } else {
+         const struct pipe_draw_indirect_info subindirect = {
+            .buffer = indirect->buffer,
+            .offset = indirect->offset + i * stride,
+            .draw_count = 1,
+         };
+         struct agx_batch *before = ctx->batch;
+         const unsigned before_draws = before ? before->draws : 0;
+
+         agx_draw_vbo(pctx, info, i, &subindirect, draws, 1);
+
+         clean = NULL;
+         if (ctx->batch && !agx_batch_is_compute(ctx->batch) &&
+             (ctx->batch != before || ctx->batch->draws != before_draws) &&
+             agx_multidraw_state_clean(ctx)) {
+            if (can_skip < 0)
+               can_skip = agx_multidraw_indirect_can_skip(ctx, info, indirect);
+            if (can_skip)
+               clean = ctx->batch;
+         }
+
+         if (clean) {
+            agx_legalize_feedback_loops(ctx);
+            if (ctx->batch != clean || !agx_multidraw_state_clean(ctx))
+               clean = NULL;
+         }
+
+         if (clean) {
+            indirect_base = agx_indirect_buffer_ptr(clean, indirect);
+            if (info->index_size)
+               ib_base = agx_index_buffer_rsrc_ptr(clean, info, &ib_size);
+
+            uses_base_param = ctx->linked.vs->uses_base_param;
+            uses_draw_id = ctx->vs->b.info.uses_draw_id;
+            root_reads_params_ptr = false;
+
+            if (uses_base_param || uses_draw_id) {
+               if (clean->g17p_last_bind_tail.length !=
+                      AGX_VDM_HAL200_BIND_TAIL_LENGTH ||
+                   !clean->g17p_last_draw_state_offset) {
+                  clean = NULL;
+               } else {
+                  struct agx_compiled_shader *vs = ctx->vs;
+                  if (uses_base_param) {
+                     for (unsigned p = 0; p < vs->push_range_count; ++p) {
+                        const struct agx_push_range *push = &vs->push[p];
+                        if (push->table == AGX_SYSVAL_TABLE_ROOT &&
+                            push->offset < sizeof(clean->uniforms.tables)) {
+                           root_reads_params_ptr = true;
+                           break;
+                        }
+                     }
+                  }
+
+                  struct agx_vdm_state_vertex_shader_word_0_packed counts;
+                  agx_pack(&counts, VDM_STATE_VERTEX_SHADER_WORD_0, cfg) {
+                     cfg.uniform_register_count = vs->b.info.push_count;
+                     cfg.preshader_register_count = vs->b.info.nr_preamble_gprs;
+                     cfg.texture_state_register_count =
+                        agx_nr_tex_descriptors(clean, vs);
+                     cfg.sampler_state_register_count =
+                        translate_sampler_state_count(ctx, vs->stage);
+                  }
+                  vs_word0 = counts.opaque[0];
+
+                  const uint32_t provoking =
+                     ctx->rast->base.flatshade_first ? 0 : 2;
+                  vs_outputs[0] =
+                     vs->uvs.vdm.opaque[0] +
+                     (clean->generate_primitive_id ? UINT32_C(0x100) : 0);
+                  vs_outputs[1] =
+                     (ctx->rast->base.rasterizer_discard ? 0x30 + provoking
+                                                         : provoking) |
+                     (clean->generate_primitive_id ? UINT32_C(0x40) : 0);
+               }
+            }
+         }
+      }
+
+      if (clean && ctx->batch != clean)
+         clean = NULL;
+   }
+}
+
 static void
 agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
              unsigned drawid_offset,
@@ -15472,7 +15765,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       assert(drawid_offset == 0);
       assert(num_draws == 1);
 
-      util_draw_multi_unroll_indirect(pctx, info, indirect, draws);
+      agx_draw_multi_indirect(pctx, info, indirect, draws);
       return;
    }
 
