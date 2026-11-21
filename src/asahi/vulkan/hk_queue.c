@@ -1422,9 +1422,10 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
     */
    const bool had_queue = queue->drm.id != UINT32_MAX;
    if (had_queue) {
-      if (drmSyncobjTimelineWait(dev->dev.fd, &queue->drm.syncobj,
-                                 &queue->drm.timeline_value, 1, INT64_MAX,
-                                 DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL))
+      if (dev->vk.sync->timeline_wait(dev->vk.sync, &queue->drm.syncobj,
+                                      &queue->drm.timeline_value, 1, INT64_MAX,
+                                      DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
+                                      NULL))
          return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
                           "Waiting for the replaced kernel queue failed: %s",
                           strerror(errno));
@@ -1688,7 +1689,7 @@ hk_sibling_deep(struct hk_device *dev, struct hk_queue *queue,
 {
    uint64_t done = 0;
 
-   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1))
+   if (dev->vk.sync->query(dev->vk.sync, &queue->drm.syncobj, &done, 1, 0))
       return false;
    return submitted_point >= done + HK_G17P_SIBLING_MIN_IN_FLIGHT;
 }
