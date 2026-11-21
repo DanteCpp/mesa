@@ -60,6 +60,7 @@
 #include "hk_device.h"
 #include "hk_image.h"
 #include "hk_native_descriptor.h"
+#include "brl_nir_lower_aligned_ubo.h"
 #include "hk_physical_device.h"
 #include "hk_sampler.h"
 #include "hk_shader.h"
@@ -3341,6 +3342,19 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
                                      rs->null_storage_buffer_descriptor,
                                      agx_chip_g17_m5(dev->dev.chip)));
    }
+   /* robustBufferAccess2 UBO sizes are aligned to the 64-byte record
+    * (robustUniformBufferAccessSizeAlignment) on every generation, and the
+    * zero page holds a whole record. The pass leaves other address forms
+    * alone. Not on AGX3B: there the compiler gives device loads an unscaled
+    * 32-bit byte index register (agx_optimize_nir()'s byte_indices), so the
+    * per-load check needs no 64-bit add, while a shared record address adds
+    * one (low add, carry, high add) for every record. */
+   STATIC_ASSERT(HK_MIN_UBO_ALIGNMENT <= AGX_ZERO_PAGE_SIZE);
+   if (rs->uniform_buffers ==
+          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT &&
+       agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX3B)
+      NIR_PASS(lowered_buf_io, nir, brl_nir_lower_aligned_ubo,
+               HK_MIN_UBO_ALIGNMENT, BRL_MAX_UBO_RANGE);
    NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             hk_ubo_addr_format(rs->uniform_buffers));
 

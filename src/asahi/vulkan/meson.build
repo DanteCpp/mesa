@@ -68,6 +68,8 @@ hk_files = files(
   'hk_instance.h',
   'hk_nir_forward_image_stores.c',
   'hk_nir_forward_image_stores.h',
+  'brl_nir_lower_aligned_ubo.c',
+  'brl_nir_lower_aligned_ubo.h',
   'hk_nir_lower_descriptors.c',
   'hk_nir_lower_gs.c',
   'hk_nir_lower_tes_rq.c',
@@ -206,6 +208,10 @@ if with_tests
 
   test('hk_root_size', executable('hk_root_size_test',
     files('tests/test-hk-root-size.c', 'hk_nir_root_size.c'),
+    include_directories : [include_directories('.'), inc_include, inc_src],
+    dependencies : [idep_nir, idep_mesautil]), suite : ['asahi'])
+  test('brl_aligned_ubo', executable('brl_aligned_ubo_test',
+    files('tests/test-brl-aligned-ubo.c', 'brl_nir_lower_aligned_ubo.c'),
     include_directories : [include_directories('.'), inc_include, inc_src],
     dependencies : [idep_nir, idep_mesautil]), suite : ['asahi'])
   # Unused recording functions require section garbage collection so the
