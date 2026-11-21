@@ -2,6 +2,21 @@
 #include <gtest/gtest.h>
 #include "agx_test.h"
 
+/* The remat-only pass runs where the register file is split statically:
+ * AGX2 and AGX3D (agx_has_static_register_split()). The spiller itself takes
+ * any encoding, so the tests also keep the AGX3 keys they were written with.
+ */
+struct remat_key {
+   enum agx_isa_encoding encoding;
+   enum agx_chip chip;
+   bool emit_agx3d;
+};
+
+static const remat_key remat_keys[] = {
+   {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G14G, false},
+   {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G18G, true},
+};
+
 /* The remat-only pass is an occupancy optimization of a program that already
  * fits the register file. Sixteen phis of constants are not themselves
  * rematerializable, so rematerialization cannot meet a 24-half budget. The
@@ -9,15 +24,17 @@
  * uses the full file) instead of moving them to scratch, which used to make
  * fragment preambles recompile without rematerialization.
  */
-TEST(SpillFallback, RematOnlyKeepsPhiWebsInRegisters)
+static void
+remat_only_keeps_phi_webs_in_registers(const remat_key &k)
 {
    for (unsigned mode = 0; mode < 4; ++mode) {
       SCOPED_TRACE(mode);
       void *mem = ralloc_context(NULL);
       agx_builder *b = agx_test_builder(mem);
       agx_shader_key key = {};
-      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-      key.dev.chip = AGX_CHIP_G17P;
+      key.dev.encoding = k.encoding;
+      key.dev.chip = k.chip;
+      key.dev.emit_agx3d = k.emit_agx3d;
       key.has_scratch = true;
       b->shader->key = &key;
       b->shader->stage = MESA_SHADER_COMPUTE;
@@ -71,18 +88,30 @@ TEST(SpillFallback, RematOnlyKeepsPhiWebsInRegisters)
    }
 }
 
-/* Straight-line form of the above on a G17G fragment preamble, the shape the
- * removed recompile was limited to: constants are rematerialized at their
+TEST(SpillFallback, RematOnlyKeepsPhiWebsInRegisters)
+{
+   remat_only_keeps_phi_webs_in_registers(
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false});
+   for (const remat_key &k : remat_keys) {
+      SCOPED_TRACE(k.chip);
+      remat_only_keeps_phi_webs_in_registers(k);
+   }
+}
+
+/* Straight-line form of the above on a fragment preamble (on G17G, the shape
+ * the removed recompile was limited to): constants are rematerialized at their
  * uses, and the values that cannot be stay in registers although they alone
  * exceed the budget. Nothing goes to scratch.
  */
-TEST(SpillFallback, RematOnlyRematerializesConstantsWithoutScratch)
+static void
+remat_only_rematerializes_constants_without_scratch(const remat_key &k)
 {
    void *mem = ralloc_context(NULL);
    agx_builder *b = agx_test_builder(mem);
    agx_shader_key key = {};
-   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
-   key.dev.chip = AGX_CHIP_G17G;
+   key.dev.encoding = k.encoding;
+   key.dev.chip = k.chip;
+   key.dev.emit_agx3d = k.emit_agx3d;
    key.has_scratch = true;
    b->shader->key = &key;
    b->shader->stage = MESA_SHADER_FRAGMENT;
@@ -126,6 +155,16 @@ TEST(SpillFallback, RematOnlyRematerializesConstantsWithoutScratch)
    EXPECT_EQ(memory, 0u);
    EXPECT_EQ(fadds, ARRAY_SIZE(values));
    ralloc_free(mem);
+}
+
+TEST(SpillFallback, RematOnlyRematerializesConstantsWithoutScratch)
+{
+   remat_only_rematerializes_constants_without_scratch(
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, false});
+   for (const remat_key &k : remat_keys) {
+      SCOPED_TRACE(k.chip);
+      remat_only_rematerializes_constants_without_scratch(k);
+   }
 }
 
 /* A value live through a G17P loop that the loop never reads stays spilled
