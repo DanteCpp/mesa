@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include "agx_test.h"
 extern "C" {
-#include "asahi/vulkan/hk_nir_border_index.h"
+#include "borealis/vulkan/hk_nir_border_index.h"
 }
 
 TEST(BorderIndex, MatchesOnlyRelatedImmutableDescriptorFields)

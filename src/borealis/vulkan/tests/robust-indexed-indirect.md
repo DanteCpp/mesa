@@ -46,7 +46,7 @@ retains the exact prior silent-empty failure and failure-publication, point-coun
 and query-status negative controls:
 
 ```
-python3 src/asahi/vulkan/tests/robust-index-exhaustion.py --output /path/to/evidence
+python3 src/borealis/vulkan/tests/robust-index-exhaustion.py --output /path/to/evidence
 ```
 
 This requires Clang with address/undefined sanitizers and pthreads. Its emitter

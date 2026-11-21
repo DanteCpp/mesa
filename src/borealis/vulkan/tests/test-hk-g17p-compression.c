@@ -4,17 +4,9 @@
  * (hk_g17p_compression.h). The generic hk_can_compress() checks are applied
  * separately by the driver.
  */
-#include "asahi/vulkan/hk_g17p_compression.h"
+#include "borealis/vulkan/hk_g17p_compression.h"
 #include <stdio.h>
 #include <stdlib.h>
-
-/* The physical T6040 selector in hk_image.c supplies this capability.
- * The pre-existing test-hk-g17p-compression separately pins false/Neo. */
-static bool
-g16s_eligible(enum agx_chip chip, unsigned plane, const VkImageCreateInfo *info)
-{
-   return hk_hal200_compression_eligible(chip, 0x6040, plane, info, true);
-}
 
 static unsigned checks;
 #define CHECK(x)                                                              \
@@ -26,12 +18,7 @@ static unsigned checks;
       }                                                                       \
    } while (0)
 
-/* Exercise mutable extension chains through a runtime call, as the driver
- * does, rather than letting the compiler fold the whole stack fixture. */
-static bool (*volatile runtime_eligible)(enum agx_chip, unsigned,
-                                         const VkImageCreateInfo *) =
-   g16s_eligible;
-#define ELIGIBLE(i) runtime_eligible(AGX_CHIP_G17P, 0, &(i))
+#define ELIGIBLE(i) hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &(i))
 
 static VkImageCreateInfo
 image(VkFormat format, uint32_t w, uint32_t h, uint32_t mips,
@@ -63,37 +50,30 @@ check_formats(void)
    unsigned color = 0, depth = 0;
    for (unsigned f = 1; f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; ++f) {
       const bool c = hk_g17p_compression_color_format((VkFormat)f);
-      const bool d = hk_g17p_compression_depth_format((VkFormat)f) ||
-                     f == VK_FORMAT_S8_UINT;
+      const bool d = hk_g17p_compression_depth_format((VkFormat)f);
       CHECK(!(c && d));
       color += c;
       depth += d;
 
       VkImageCreateInfo i = image((VkFormat)f, 64, 64, 1, color_usage);
-      CHECK(ELIGIBLE(i) == (c || hk_g17p_compression_depth_format((VkFormat)f)));
+      CHECK(ELIGIBLE(i) == (c || d));
    }
    CHECK(color == 46);
-   CHECK(depth == 4);
+   CHECK(depth == 3);
 
-   /* No 16-byte texels (tilebuffer spill), no packed/padded RGB, no packed
-    * depth/stencil, no block-compressed or YCbCr formats. */
+   /* No 16-byte texels (tilebuffer spill), no packed/padded RGB, no stencil
+    * or combined depth/stencil, no block-compressed or YCbCr formats. */
    static const VkFormat rejected[] = {
-      VK_FORMAT_R32G32B32A32_SFLOAT,
-      VK_FORMAT_R32G32B32A32_UINT,
-      VK_FORMAT_R32G32B32A32_SINT,
-      VK_FORMAT_R32G32B32_SFLOAT,
-      VK_FORMAT_R8G8B8_UNORM,
-      VK_FORMAT_R16G16B16_SFLOAT,
-      VK_FORMAT_E5B9G9R9_UFLOAT_PACK32,
-      VK_FORMAT_R4G4B4A4_UNORM_PACK16,
-      VK_FORMAT_A1R5G5B5_UNORM_PACK16,
-      VK_FORMAT_D24_UNORM_S8_UINT,
-      VK_FORMAT_D16_UNORM_S8_UINT,
+      VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT,
+      VK_FORMAT_R32G32B32A32_SINT,   VK_FORMAT_R32G32B32_SFLOAT,
+      VK_FORMAT_R8G8B8_UNORM,        VK_FORMAT_R16G16B16_SFLOAT,
+      VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+      VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, VK_FORMAT_R4G4B4A4_UNORM_PACK16,
+      VK_FORMAT_A1R5G5B5_UNORM_PACK16, VK_FORMAT_S8_UINT,
+      VK_FORMAT_D24_UNORM_S8_UINT,   VK_FORMAT_D16_UNORM_S8_UINT,
       VK_FORMAT_X8_D24_UNORM_PACK32,
-      VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
-      VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK,
-      VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
-      VK_FORMAT_G8B8G8R8_422_UNORM,
+      VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK,
+      VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, VK_FORMAT_G8B8G8R8_422_UNORM,
       VK_FORMAT_R64_UINT,
    };
    for (unsigned r = 0; r < sizeof(rejected) / sizeof(rejected[0]); ++r) {
@@ -103,27 +83,26 @@ check_formats(void)
 }
 
 static void
-check_shape(VkFormat format, bool is_zs)
+check_shape(VkFormat format, bool is_depth)
 {
-   const bool is_depth = hk_g17p_compression_depth_format(format);
    const VkImageUsageFlags usage =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
       VK_IMAGE_USAGE_SAMPLED_BIT |
-      (is_zs ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
-             : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+      (is_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
    const VkImageCreateInfo base = image(format, 2408, 1508, 1, usage);
    CHECK(ELIGIBLE(base));
 
    /* Chip and plane. */
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
-      CHECK(g16s_eligible((enum agx_chip)chip, 0, &base) ==
+      CHECK(hk_g17p_compression_eligible((enum agx_chip)chip, 0, &base) ==
             (chip == AGX_CHIP_G17P));
    /* Plane 1 is the stencil plane of D32_SFLOAT_S8_UINT alone. */
-   CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &base) ==
+   CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, &base) ==
          (format == VK_FORMAT_D32_SFLOAT_S8_UINT));
-   CHECK(!g16s_eligible(AGX_CHIP_G17P, 2, &base));
-   CHECK(!g16s_eligible(AGX_CHIP_G17P, 0, NULL));
-   CHECK(!g16s_eligible(AGX_CHIP_G17P, 1, NULL));
+   CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 2, &base));
+   CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, NULL));
+   CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, NULL));
 
    /* Usage: only texture/PBE/ZLS usages are admitted. */
    VkImageUsageFlags allowed =
@@ -175,18 +154,15 @@ check_shape(VkFormat format, bool is_zs)
    i.imageType = VK_IMAGE_TYPE_1D;
    CHECK(!ELIGIBLE(i));
    i = base; i.imageType = VK_IMAGE_TYPE_3D;
-   CHECK(ELIGIBLE(i) == !is_zs);
+   CHECK(!ELIGIBLE(i));
    i = base; i.extent.depth = 2;
    CHECK(!ELIGIBLE(i));
    i = base; i.arrayLayers = 2;
-   CHECK(ELIGIBLE(i));
+   CHECK(!ELIGIBLE(i));
    i = base; i.arrayLayers = 6;
-   CHECK(ELIGIBLE(i));
-   /* Of the multisample colour attachments, only 2x (one layer) on M4 Pro. */
+   CHECK(!ELIGIBLE(i));
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
-      CHECK(ELIGIBLE(i) == (s == 2));
-      i.arrayLayers = 2;
       CHECK(!ELIGIBLE(i));
    }
    i = base; i.tiling = VK_IMAGE_TILING_LINEAR;
@@ -196,7 +172,7 @@ check_shape(VkFormat format, bool is_zs)
    i = base; i.mipLevels = 0;
    CHECK(!ELIGIBLE(i));
    i = base; i.mipLevels = 12;
-   CHECK(ELIGIBLE(i));
+   CHECK(ELIGIBLE(i) == !is_depth);
    i = base; i.extent.width = 15;
    CHECK(!ELIGIBLE(i));
    i = base; i.extent.height = 15;
@@ -230,190 +206,6 @@ check_shape(VkFormat format, bool is_zs)
    VkBaseInStructure wsi = {.sType = HK_G17P_WSI_IMAGE_CREATE_INFO_MESA};
    i = base; i.pNext = &wsi;
    CHECK(!ELIGIBLE(i));
-}
-
-/* Compression is chosen for the image's whole lifetime. Its first render
- * pass, attachment slot and neighbouring formats are unknown at allocation.
- * Cover every admitted colour format, including the smallest ones that can
- * spill next to wide targets, and input/transient attachment combinations.
- * A 2x single-layer attachment is admitted: allocated first, every target
- * of at most eight bytes fits the 64-byte 2x sample (hk_resident_attachments).
- */
-static void
-check_colour_msaa_spill_policy(void)
-{
-   for (unsigned f = 1; f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; ++f) {
-      if (!hk_g17p_compression_color_format((VkFormat)f))
-         continue;
-
-      for (unsigned samples = 1; samples <= 4; samples *= 2) {
-         for (unsigned layers = 1; layers <= 4; layers *= 4) {
-            /* 512x512: above the size below which a never-attachment image
-             * stays plain (HK_G17P_MIP_PBE_MIN_TEXELS). */
-            VkImageCreateInfo i = image((VkFormat)f, 512, 512, 1,
-               VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-               VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-            i.samples = (VkSampleCountFlagBits)samples;
-            i.arrayLayers = layers;
-            CHECK(ELIGIBLE(i));
-            for (unsigned mask = 0; mask < 4; ++mask) {
-               VkImageCreateInfo attachment = i;
-               attachment.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-               if (mask & 1)
-                  attachment.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
-               if (mask & 2)
-                  attachment.usage |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
-               const bool expected =
-                  samples == 1 || (samples == 2 && layers == 1 && !(mask & 1));
-               CHECK(ELIGIBLE(attachment) == expected);
-               attachment.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
-                                  VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-               CHECK(ELIGIBLE(attachment) == expected);
-            }
-         }
-      }
-   }
-}
-
-static void
-check_layered_and_msaa(void)
-{
-   /* Large enough that the small never-attachment rule does not apply. */
-   VkImageCreateInfo i =
-      image(VK_FORMAT_R8G8B8A8_SRGB, 512, 512, 1,
-            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-               VK_IMAGE_USAGE_SAMPLED_BIT);
-   i.arrayLayers = 12;
-   i.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-   CHECK(ELIGIBLE(i));
-   VkImageCreateInfo small = i;
-   small.extent.width = small.extent.height = 256;
-   CHECK(!ELIGIBLE(small));
-   i.mipLevels = 5;
-   CHECK(!ELIGIBLE(i));
-   i.mipLevels = 1;
-   i.flags = 0;
-   for (unsigned samples = 1; samples <= 64; samples <<= 1) {
-      i.samples = (VkSampleCountFlagBits)samples;
-      CHECK(ELIGIBLE(i) == (samples <= 4));
-      i.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-      CHECK(ELIGIBLE(i) == (samples == 1));
-      i.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-      i.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-      CHECK(!ELIGIBLE(i));
-      i.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
-   }
-   i.samples = VK_SAMPLE_COUNT_1_BIT;
-   i.arrayLayers = 1;
-   i.imageType = VK_IMAGE_TYPE_3D;
-   i.extent.depth = 9;
-   i.flags = VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
-             VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
-   CHECK(ELIGIBLE(i));
-   i.mipLevels = 5;
-   CHECK(!ELIGIBLE(i));
-   i.mipLevels = 1;
-   i.samples = VK_SAMPLE_COUNT_2_BIT;
-   CHECK(!ELIGIBLE(i));
-   i.samples = VK_SAMPLE_COUNT_1_BIT;
-   i.arrayLayers = 2;
-   CHECK(!ELIGIBLE(i));
-   i.arrayLayers = 1;
-   i.format = VK_FORMAT_D32_SFLOAT;
-   CHECK(!ELIGIBLE(i));
-
-
-}
-
-/* Preserve the pre-port depth/stencil policy across the shapes observed in
- * depth sampling, feedback loops, host copies and transfer clears. Allocation
- * tests alone did not catch the unsupported colour-alias command paths.
- * The exceptions are the depth plane at 2x (one layer), without
- * feedback-loop use, and single-level single-sample arrays. */
-static void
-check_legacy_depth_policy(void)
-{
-   const VkFormat formats[] = { VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT,
-      VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_S8_UINT };
-   const VkImageUsageFlags usages[] = {
-      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-         VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT,
-      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT,
-   };
-   for (unsigned f = 0; f < 4; ++f) {
-      for (unsigned u = 0; u < 4; ++u) {
-         for (unsigned levels = 1; levels <= 8; levels *= 2) {
-            for (unsigned layers = 1; layers <= 6; ++layers) {
-               for (unsigned samples = 1; samples <= 4; samples *= 2) {
-                  VkImageCreateInfo i = image(formats[f], 128, 128, levels,
-                                               usages[u]);
-                  i.arrayLayers = layers;
-                  i.samples = (VkSampleCountFlagBits)samples;
-                  const bool expected =
-                     f < 3 && u < 3 && levels == 1 &&
-                     (samples == 1 ||
-                      (samples == 2 && layers == 1 && u != 1));
-                  CHECK(ELIGIBLE(i) == expected);
-                  CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &i) ==
-                        (expected && f == 2 && samples == 1));
-               }
-            }
-         }
-      }
-   }
-}
-
-/* Kyty's guest depth targets: shadow-map cascades rendered one layer per
- * pass, with transfer, sampled and (when enabled) feedback-loop usage. */
-static void
-check_depth_arrays(void)
-{
-   const VkImageUsageFlags kyty = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-   const VkFormat formats[] = {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D16_UNORM,
-                               VK_FORMAT_D32_SFLOAT_S8_UINT};
-   for (unsigned f = 0; f < 3; ++f) {
-      VkImageCreateInfo i = image(formats[f], 1536, 1536, 1, kyty);
-      i.arrayLayers = 4;
-      CHECK(ELIGIBLE(i));
-      CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &i) == (f == 2));
-      /* The Neo policy keeps one layer. */
-      CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &i));
-      i.usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
-      CHECK(ELIGIBLE(i));
-      i.flags = VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
-      CHECK(ELIGIBLE(i));
-      i.arrayLayers = 2048;
-      CHECK(ELIGIBLE(i));
-
-      /* Not cube maps, mip chains, multisampled arrays or volumes. */
-      VkImageCreateInfo c = i;
-      c.arrayLayers = 6;
-      c.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-      CHECK(!ELIGIBLE(c));
-      c = i; c.mipLevels = 2;
-      CHECK(!ELIGIBLE(c));
-      c = i; c.samples = VK_SAMPLE_COUNT_2_BIT;
-      c.usage &= ~VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
-      c.flags = 0;
-      CHECK(!ELIGIBLE(c));
-      c.arrayLayers = 1;
-      CHECK(ELIGIBLE(c)); /* the 2x depth plane, one layer */
-      c = i; c.arrayLayers = 0;
-      CHECK(!ELIGIBLE(c));
-      c = i; c.extent.depth = 2;
-      CHECK(!ELIGIBLE(c));
-      c = i; c.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-      CHECK(!ELIGIBLE(c));
-   }
-
-   /* Standalone stencil stays plain. */
-   VkImageCreateInfo s = image(VK_FORMAT_S8_UINT, 1536, 1536, 1, kyty);
-   s.arrayLayers = 4;
-   CHECK(!ELIGIBLE(s));
 }
 
 static void
@@ -459,6 +251,16 @@ check_minecraft(void)
       big = image(compute_blit[f], 4096, 4096, 13, texture_usage);
       CHECK(ELIGIBLE(big));
    }
+
+   /* The same holds for every compressed colour format and mip count: a
+    * small glyph-cache style R8 texture taking tile uploads stays plain
+    * unless it is also rendered to. */
+   VkImageCreateInfo r8 = image(VK_FORMAT_R8_UNORM, 130, 130, 1, texture_usage);
+   CHECK(!ELIGIBLE(r8));
+   r8.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   CHECK(ELIGIBLE(r8));
+   r8 = image(VK_FORMAT_R8_UNORM, 512, 512, 1, texture_usage);
+   CHECK(ELIGIBLE(r8));
    VkImageCreateInfo srgb = image(VK_FORMAT_R8G8B8A8_SRGB, 256, 256, 9,
                                   texture_usage);
    CHECK(!ELIGIBLE(srgb));
@@ -478,51 +280,6 @@ check_minecraft(void)
    VkImageCreateInfo i = image(VK_FORMAT_B8G8R8A8_UNORM, 2408, 1508, 1, 0x13);
    CHECK(ELIGIBLE(i));
    i.pNext = &external;
-   CHECK(!ELIGIBLE(i));
-}
-
-static void
-check_transport_fever_3(void)
-{
-   /* Transport Fever 3 at 2x anti-aliasing: its 3456x2234 G-buffer is
-    * R11G11B10F, A2R10G10B10 and RGBA8 (usage 0x13) and D32S8 (0x23),
-    * reloaded and stored about six times a frame. All but R11G11B10F (which
-    * would lose NaN) and the stencil plane compress on M4 Pro; nothing
-    * multisampled does on the other G17P chips. */
-   static const struct { VkFormat format; VkImageUsageFlags usage; bool m4_pro; }
-      gbuffer[] = {
-         {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 0x13, false},
-         {VK_FORMAT_A2R10G10B10_UNORM_PACK32, 0x13, true},
-         {VK_FORMAT_R8G8B8A8_UNORM, 0x13, true},
-         {VK_FORMAT_D32_SFLOAT_S8_UINT, 0x23, true},
-      };
-   for (unsigned g = 0; g < sizeof(gbuffer) / sizeof(gbuffer[0]); ++g) {
-      VkImageCreateInfo i =
-         image(gbuffer[g].format, 3456, 2234, 1, gbuffer[g].usage);
-      i.samples = VK_SAMPLE_COUNT_2_BIT;
-      CHECK(ELIGIBLE(i) == gbuffer[g].m4_pro);
-      CHECK(!g16s_eligible(AGX_CHIP_G17P, 1, &i));
-      CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &i));
-      i.samples = VK_SAMPLE_COUNT_4_BIT;
-      CHECK(!ELIGIBLE(i));
-   }
-}
-
-static void
-check_r11g11b10f(void)
-{
-   const VkImageUsageFlags attachment = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-
-   /* A compressed tile of the R11G11B10F class reads NaN back as zero, and
-    * a render or copy into the attachment must keep it: never compressed. */
-   VkImageCreateInfo i =
-      image(VK_FORMAT_B10G11R11_UFLOAT_PACK32, 3456, 2234, 12, attachment);
-   CHECK(!ELIGIBLE(i));
-   i.mipLevels = 1;
-   CHECK(!ELIGIBLE(i));
-   i.samples = VK_SAMPLE_COUNT_2_BIT;
    CHECK(!ELIGIBLE(i));
 }
 
@@ -555,7 +312,7 @@ check_zink(void)
       image(VK_FORMAT_D32_SFLOAT_S8_UINT, 2408, 1506, 1, ds);
    depth.flags = VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
    CHECK(ELIGIBLE(depth));
-   CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &depth));
+   CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, &depth));
    /* This is Portal's actual shape. A device-copy performance query must
     * find its compressed layout when host transfer is removed; otherwise
     * zink retains HOST_TRANSFER and never uses depth compression. */
@@ -564,16 +321,6 @@ check_zink(void)
    depth.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
    CHECK(ELIGIBLE(depth));
    depth.samples = VK_SAMPLE_COUNT_4_BIT;
-   CHECK(!ELIGIBLE(depth));
-   /* At 2x neither its feedback-loop usage nor its sample-location flag. */
-   depth.samples = VK_SAMPLE_COUNT_2_BIT;
-   CHECK(!ELIGIBLE(depth));
-   depth.usage &= ~VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
-   CHECK(!ELIGIBLE(depth));
-   depth.flags = 0;
-   CHECK(ELIGIBLE(depth));
-   CHECK(!g16s_eligible(AGX_CHIP_G17P, 1, &depth));
-   depth.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
    CHECK(!ELIGIBLE(depth));
    const VkImageCreateInfo d32 = image(VK_FORMAT_D32_SFLOAT, 2408, 1506, 1, ds);
    CHECK(ELIGIBLE(d32));
@@ -649,11 +396,12 @@ check_shared(void)
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
    CHECK(SHARED(base));
 
-   /* G17P only, plane 0 only. */
+   /* G17P and M5 only, plane 0 only. */
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
       CHECK(hk_g17p_shared_compression_eligible((enum agx_chip)chip, 0,
                                                 &base) ==
-            (chip == AGX_CHIP_G17P || agx_chip_g17_m5((enum agx_chip)chip)));
+            (chip == AGX_CHIP_G17P || chip == AGX_CHIP_G17G ||
+             chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C));
    CHECK(!hk_g17p_shared_compression_eligible(AGX_CHIP_G17P, 1, &base));
    CHECK(!hk_g17p_shared_compression_eligible(AGX_CHIP_G17P, 0, NULL));
 
@@ -731,100 +479,284 @@ check_shared(void)
    CHECK(SHARED(kopper));
 }
 
-/* The M4 Max (T6041) keeps a reloaded 2x sample whole
- * (agx_chip_uncovered_tile_ms_reload_defect()), so it takes the 2x colour
- * attachments and 2x depth, nothing more of the M4 Pro's shapes. The A18 Pro
- * (T8140, "Neo") does not, and keeps its 2x images plain. */
-static bool
-m4_max_eligible(enum agx_chip chip, unsigned plane,
-                const VkImageCreateInfo *info)
+static void
+check_m5_depth(void)
 {
-   return hk_hal200_compression_eligible(chip, 0x6041, plane, info, false);
-}
+   /* Minecraft under zink: a D32 depth buffer with zink's usages and the
+    * sample-location flag zink sets on depth attachments. */
+   const VkImageUsageFlags ds = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+   static const VkFormat formats[] = {
+      VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT,
+   };
+   for (unsigned f = 0; f < sizeof(formats) / sizeof(formats[0]); ++f) {
+      VkImageCreateInfo i = image(formats[f], 2976, 1872, 1, ds);
+      i.flags = VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+      for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
+         CHECK(hk_m5_depth_compression_eligible((enum agx_chip)chip, 0, &i) ==
+               agx_chip_g17_m5((enum agx_chip)chip));
+      /* Of the second planes, only the single-sample stencil plane of
+       * D32_SFLOAT_S8_UINT is admitted. */
+      CHECK(hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 1, &i) ==
+            (formats[f] == VK_FORMAT_D32_SFLOAT_S8_UINT));
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, NULL));
+      /* Neither policy admits a depth image as colour, nor colour as depth. */
+      CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &i));
 
-static bool
-neo_eligible(enum agx_chip chip, unsigned plane, const VkImageCreateInfo *info)
-{
-   return hk_hal200_compression_eligible(chip, 0x8140, plane, info, false);
-}
+      VkImageCreateInfo c = i;
+      c.usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.usage &= ~VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.samples = VK_SAMPLE_COUNT_4_BIT;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.mipLevels = 2;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.arrayLayers = 2;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.extent.width = 15;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      VkExternalMemoryImageCreateInfo external = {
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+      };
+      c.pNext = &external;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
 
-static bool (*volatile runtime_m4_max)(enum agx_chip, unsigned,
-                                       const VkImageCreateInfo *) =
-   m4_max_eligible;
-static bool (*volatile runtime_neo)(enum agx_chip, unsigned,
-                                    const VkImageCreateInfo *) = neo_eligible;
-#define M4_MAX(i) runtime_m4_max(AGX_CHIP_G17P, 0, &(i))
-#define NEO(i)    runtime_neo(AGX_CHIP_G17P, 0, &(i))
+      /* Later links are read too: external memory or the WSI marker behind
+       * another structure still refuses compression. */
+      VkImageFormatListCreateInfo list = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+      };
+      VkBaseInStructure wsi = {.sType = HK_G17P_WSI_IMAGE_CREATE_INFO_MESA};
+      c = i;
+      c.pNext = &list;
+      CHECK(hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      list.pNext = &external;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      list.pNext = &wsi;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   }
+
+   /* No stencil-only or other depth/stencil formats. */
+   static const VkFormat rejected[] = {
+      VK_FORMAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT,
+      VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_X8_D24_UNORM_PACK32,
+      VK_FORMAT_R32_SFLOAT,
+   };
+   for (unsigned r = 0; r < sizeof(rejected) / sizeof(rejected[0]); ++r) {
+      VkImageCreateInfo i = image(rejected[r], 64, 64, 1, ds);
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &i));
+   }
+}
 
 static void
-check_m4_max(void)
+check_m5_color(void)
 {
-   const VkImageUsageFlags rt =
-      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+   const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-   const VkImageUsageFlags ds = VK_IMAGE_USAGE_SAMPLED_BIT |
-                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+   /* Minecraft's blocks atlas: RGBA8, 2048x2048, five mips; zink gives its
+    * sampled textures colour-attachment usage. */
+   VkImageCreateInfo i = image(VK_FORMAT_R8G8B8A8_UNORM, 2048, 2048, 5, usage);
+   for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
+      CHECK(hk_m5_color_compression_eligible((enum agx_chip)chip, 0, &i) ==
+            agx_chip_g17_m5((enum agx_chip)chip));
+   i.mipLevels = 1;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &i));
+   i.mipLevels = 12;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &i));
+   VkImageCreateInfo c = i;
+   c.arrayLayers = 2;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   /* A transfer destination is made renderable like an attachment; an
+    * image that is neither is not compressed. */
+   c = i;
+   c.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.usage &= ~VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i;
+   c.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i;
+   c.samples = VK_SAMPLE_COUNT_4_BIT;
+   c.mipLevels = 1;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   /* One-byte texels compress only as a single level. */
+   static const VkFormat one_byte[] = {
+      VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT,
+   };
+   for (unsigned f = 0; f < sizeof(one_byte) / sizeof(one_byte[0]); ++f) {
+      c = i;
+      c.format = one_byte[f];
+      CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c.mipLevels = 1;
+      CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   }
+   c = i;
+   c.format = VK_FORMAT_R8G8_UNORM;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+}
 
-   VkImageCreateInfo c = image(VK_FORMAT_R8G8B8A8_UNORM, 1920, 1080, 1, rt);
-   CHECK(M4_MAX(c) && NEO(c));
+static void
+check_m5_depth_msaa(void)
+{
+   _Static_assert(DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION ==
+                     (UINT64_C(1) << 23), "depth capability allocation");
+   const uint64_t capability = DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION;
+   const uint64_t feature_sets[] = {0, UINT64_C(1) << 15,
+                                  UINT64_C(1) << 16, capability, UINT64_MAX};
+   const VkFormat formats[] = {VK_FORMAT_D32_SFLOAT,
+                               VK_FORMAT_D32_SFLOAT_S8_UINT};
+   const VkImageUsageFlags uses[] = {
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+   };
+   for (unsigned f = 0; f < 2; ++f) {
+      for (unsigned n = 2; n <= 4; n *= 2) {
+         for (unsigned u = 0; u < 3; ++u) {
+            VkImageCreateInfo i = image(formats[f], 3024, 1964, 1, uses[u]);
+            i.samples = n;
+            for (unsigned c = 0; c < 5; ++c) {
+               const bool capable = (feature_sets[c] & capability) != 0;
+               CHECK(hk_m5_depth_msaa_compression_eligible(
+                        AGX_CHIP_G17S, 0, &i, feature_sets[c]) ==
+                     (capable && u < 2));
+               CHECK(hk_m5_depth_msaa_transfer_eligible(
+                        AGX_CHIP_G17S, 0, &i, feature_sets[c]) ==
+                     (capable && u == 2));
+            }
+         }
+      }
+   }
 
-   c.samples = VK_SAMPLE_COUNT_2_BIT;
-   CHECK(M4_MAX(c) && !NEO(c));
-   VkImageCreateInfo x = c;
-   x.samples = VK_SAMPLE_COUNT_4_BIT;
-   CHECK(!M4_MAX(x));
-   x = c;
-   x.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
-   CHECK(!M4_MAX(x));
-   x = c;
-   x.arrayLayers = 2;
-   CHECK(!M4_MAX(x));
-   x = c;
-   x.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-   CHECK(!M4_MAX(x));
-   x = c;
-   x.format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-   CHECK(!M4_MAX(x));
+   VkImageCreateInfo base = image(VK_FORMAT_D32_SFLOAT_S8_UINT, 17, 19, 1,
+                                 uses[2]);
+   base.samples = VK_SAMPLE_COUNT_4_BIT;
+   for (unsigned bad = 0; bad < 15; ++bad) {
+      VkImageCreateInfo i = base;
+      unsigned plane = 0;
+      switch (bad) {
+      case 0: i.samples = VK_SAMPLE_COUNT_1_BIT; break;
+      case 1: i.samples = VK_SAMPLE_COUNT_8_BIT; break;
+      case 2: i.format = VK_FORMAT_D16_UNORM; break;
+      case 3: i.extent.width = 15; break;
+      case 4: i.extent.height = 15; break;
+      case 5: i.extent.depth = 2; break;
+      case 6: i.arrayLayers = 2; break;
+      case 7: i.mipLevels = 2; break;
+      case 8: i.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; break;
+      case 9: i.flags = VK_IMAGE_CREATE_EXTENDED_USAGE_BIT; break;
+      case 10: i.usage |= VK_IMAGE_USAGE_STORAGE_BIT; break;
+      case 11: i.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT; break;
+      case 12: i.tiling = VK_IMAGE_TILING_LINEAR; break;
+      case 13: i.imageType = VK_IMAGE_TYPE_3D; break;
+      case 14: plane = 1; break;
+      }
+      CHECK(!hk_m5_depth_msaa_compression_eligible(AGX_CHIP_G17S, plane,
+                                                 &i, capability));
+      CHECK(!hk_m5_depth_msaa_transfer_eligible(AGX_CHIP_G17S, plane, &i,
+                                              capability));
+   }
+   VkImageStencilUsageCreateInfo stencil = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO,
+      .stencilUsage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+   };
+   base.pNext = &stencil;
+   CHECK(hk_m5_depth_msaa_transfer_eligible(AGX_CHIP_G17S, 0, &base,
+                                           capability));
+   stencil.stencilUsage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+   CHECK(!hk_m5_depth_msaa_transfer_eligible(AGX_CHIP_G17S, 0, &base,
+                                            capability));
+   CHECK(!hk_m5_depth_msaa_transfer_eligible(AGX_CHIP_G17S, 0, NULL,
+                                            capability));
+}
 
-   /* Layered colour stays on the M4 Pro. */
-   x = image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, rt);
-   x.arrayLayers = 6;
-   CHECK(!M4_MAX(x) && g16s_eligible(AGX_CHIP_G17P, 0, &x));
-
-   VkImageCreateInfo d = image(VK_FORMAT_D32_SFLOAT, 1920, 1080, 1, ds);
-   CHECK(M4_MAX(d));
-   d.samples = VK_SAMPLE_COUNT_2_BIT;
-   CHECK(M4_MAX(d) && !NEO(d));
-   d.samples = VK_SAMPLE_COUNT_4_BIT;
-   CHECK(!M4_MAX(d));
-
-   /* Depth arrays: M4 Pro only. */
-   d = image(VK_FORMAT_D32_SFLOAT, 1024, 1024, 1, ds);
-   d.arrayLayers = 4;
-   CHECK(!M4_MAX(d) && g16s_eligible(AGX_CHIP_G17P, 0, &d));
-
-   /* Other chips never. */
-   CHECK(!runtime_m4_max(AGX_CHIP_G14G, 0, &c));
+static void
+check_m5_msaa_color(void)
+{
+   const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   VkImageCreateInfo i = image(VK_FORMAT_R16G16B16A16_SFLOAT, 3024, 1964, 1,
+                               usage);
+   for (unsigned samples = 1; samples <= 8; samples *= 2) {
+      i.samples = (VkSampleCountFlagBits)samples;
+      CHECK(hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &i) ==
+            (samples == 2 || samples == 4));
+   }
+   i.samples = VK_SAMPLE_COUNT_4_BIT;
+   for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; chip++)
+      CHECK(hk_m5_msaa_color_compression_eligible(
+               (enum agx_chip)chip, 0, &i) == (chip == AGX_CHIP_G17S));
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 1, &i));
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, NULL));
+   VkImageCreateInfo c = i;
+   c.pNext = &i;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   /* A mutable format is admitted here; hk_can_compress() then requires a
+    * format list of compatible views. Aliasing is not. */
+   c = i; c.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+   CHECK(hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i; c.flags = VK_IMAGE_CREATE_ALIAS_BIT;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i; c.arrayLayers = 2;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i; c.mipLevels = 2;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i; c.format = VK_FORMAT_R8G8B8A8_UNORM;
+   CHECK(hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i; c.format = VK_FORMAT_B8G8R8A8_SRGB;
+   CHECK(hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i; c.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i; c.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i; c.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i; c.extent.width = 15;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i; c.imageType = VK_IMAGE_TYPE_3D;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
 }
 
 int
 main(void)
 {
    check_formats();
-   check_transport_fever_3();
-   check_r11g11b10f();
    check_shape(VK_FORMAT_R8G8B8A8_UNORM, false);
    check_shape(VK_FORMAT_B8G8R8A8_SRGB, false);
    check_shape(VK_FORMAT_R16G16B16A16_SFLOAT, false);
    check_shape(VK_FORMAT_R8_UNORM, false);
-   check_legacy_depth_policy();
-   check_depth_arrays();
-   check_layered_and_msaa();
-   check_colour_msaa_spill_policy();
+   check_shape(VK_FORMAT_D32_SFLOAT, true);
+   check_shape(VK_FORMAT_D16_UNORM, true);
+   check_shape(VK_FORMAT_D32_SFLOAT_S8_UINT, true);
    check_minecraft();
    check_zink();
    check_shared();
-   check_m4_max();
+   check_m5_depth();
+   check_m5_color();
+   check_m5_msaa_color();
+   check_m5_depth_msaa();
    printf("G17P compression policy: %u checks passed\n", checks);
    return 0;
 }

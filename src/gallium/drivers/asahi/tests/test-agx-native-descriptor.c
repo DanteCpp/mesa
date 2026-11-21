@@ -8,7 +8,7 @@
 #include "asahi/lib/agx_abi.h"
 #include "asahi/compiler/agx_nir.h"
 #include "asahi/lib/agx_pbe_agx3_core.h"
-#include "asahi/vulkan/hk_native_descriptor.h"
+#include "borealis/vulkan/hk_native_descriptor.h"
 #include "util/macros.h"
 
 #include <stdio.h>

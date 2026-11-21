@@ -7,7 +7,7 @@ code. No Vulkan or DRM device is created and nothing is submitted.
 
 ```
 meson test -C build --suite asahi --print-errorlogs
-ASAHI_MESA_DEBUG=perf build/src/asahi/vulkan/hk-cpu-upload-bench 1000
+ASAHI_MESA_DEBUG=perf build/src/borealis/vulkan/hk-cpu-upload-bench 1000
 ```
 
 The numeric argument is the number of simulated command buffers, each with

@@ -33,7 +33,7 @@ TYPE(hk_bvh_header, 4);
 #define VOID_REF  uint64_t
 #endif
 
-#include "../../libagx/gen1_as_metadata.h"
+#include "../../../asahi/libagx/gen1_as_metadata.h"
 #ifdef VULKAN
 TYPE(libagx_gen1_as_metadata, 8);
 #endif
