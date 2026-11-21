@@ -12,11 +12,11 @@ if with_tools.contains('drm-shim')
     dual_source_glslang = find_program('glslangValidator', required : false)
     if dual_source_glslang.found()
       test(
-        'hk_dual_source_gpl',
+        'bk_dual_source_gpl',
         prog_python,
         args : [
           files('vulkan/tests/run-dual-source-gpl.py'),
-          hk_dual_source_gpl_test, libvulkan_borealis, libasahi_noop_drm_shim,
+          bk_dual_source_gpl_test, libvulkan_borealis, libasahi_noop_drm_shim,
           dual_source_glslang.full_path(),
         ],
         suite : ['asahi'],
@@ -29,7 +29,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
   # Graphics-path copies from one layer of a block-compressed image into a
   # compressed G17P image; encoded and stream-validated, not executed.
   test(
-    'hk-g17p-compressed-layer-copy',
+    'bk-g17p-compressed-layer-copy',
     prog_python,
     args : [
       files('../gallium/drivers/asahi/tests/run-shim.py'),
@@ -51,7 +51,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
   # Compressed M4 Pro depth arrays through every transfer, clear and
   # attachment path; recorded and submitted, not executed.
   test(
-    'hk-g16s-layered-depth',
+    'bk-g16s-layered-depth',
     prog_python,
     args : [
       files('../gallium/drivers/asahi/tests/run-shim.py'),
@@ -71,7 +71,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
 
   # Mip chains on compressed images take compute dispatches, no render pass.
   test(
-    'hk-g17p-compressed-mip-blit',
+    'bk-g17p-compressed-mip-blit',
     prog_python,
     args : [
       files('../gallium/drivers/asahi/tests/run-shim.py'),
@@ -90,11 +90,11 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
-  # Batched software tessellation (hk_tess_batch.h): its compute streams put
+  # Batched software tessellation (bk_tess_batch.h): its compute streams put
   # the direct launches of a stage back to back, which the validator admits;
   # encoded and stream-validated, not executed.
   test(
-    'hk-g17p-tess-batch-stream',
+    'bk-g17p-tess-batch-stream',
     prog_python,
     args : [
       files('../gallium/drivers/asahi/tests/run-shim.py'),
@@ -118,12 +118,12 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
   foreach chip : ['g13g', 'g17p']
     foreach policy : ['allow', 'deny', 'unsupported']
       test(
-        'hk-' + chip + '-global-priority-' + policy,
+        'bk-' + chip + '-global-priority-' + policy,
         prog_python,
         args : [
           files('../gallium/drivers/asahi/tests/run-shim.py'),
           libasahi_noop_drm_shim,
-          hk_vulkan_global_priority,
+          bk_vulkan_global_priority,
         ],
         env : [
           'ASAHI_SHIM_CHIP=' + chip,
@@ -137,12 +137,12 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
 
   # A sparse image bind as a queue's first submission, with no command buffer.
   test(
-    'hk-g17p-sparse-bind-first-submit',
+    'bk-g17p-sparse-bind-first-submit',
     prog_python,
     args : [
       files('../gallium/drivers/asahi/tests/run-shim.py'),
       libasahi_noop_drm_shim,
-      hk_vulkan_sparse_bind_first_submit,
+      bk_vulkan_sparse_bind_first_submit,
     ],
     env : [
       'ASAHI_SHIM_CHIP=g17p',
@@ -154,12 +154,12 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
 
   # Descriptor buffer sizes and strides as vkd3d-proton lays out its heaps.
   test(
-    'hk-g17p-descriptor-buffer-sizes',
+    'bk-g17p-descriptor-buffer-sizes',
     prog_python,
     args : [
       files('../gallium/drivers/asahi/tests/run-shim.py'),
       libasahi_noop_drm_shim,
-      hk_vulkan_descriptor_buffer_sizes,
+      bk_vulkan_descriptor_buffer_sizes,
     ],
     env : [
       'ASAHI_SHIM_CHIP=g17p',
@@ -171,12 +171,12 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
 
   # Texel buffer descriptors from vkGetDescriptorEXT: their software metadata.
   test(
-    'hk-g17p-descriptor-buffer-texel',
+    'bk-g17p-descriptor-buffer-texel',
     prog_python,
     args : [
       files('../gallium/drivers/asahi/tests/run-shim.py'),
       libasahi_noop_drm_shim,
-      hk_vulkan_descriptor_buffer_texel,
+      bk_vulkan_descriptor_buffer_texel,
     ],
     env : [
       'ASAHI_SHIM_CHIP=g17p',
@@ -189,12 +189,12 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
   # Background/end-of-tile shader cache shared by command buffers recording
   # on several threads.
   test(
-    'hk-g17p-bg-eot-threads',
+    'bk-g17p-bg-eot-threads',
     prog_python,
     args : [
       files('../gallium/drivers/asahi/tests/run-shim.py'),
       libasahi_noop_drm_shim,
-      hk_vulkan_bg_eot_threads,
+      bk_vulkan_bg_eot_threads,
       '16', '20',
     ],
     env : [
@@ -210,12 +210,12 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
   # and validation, without executing on the GPU.
   foreach chip : ['g13g', 'g17p']
     test(
-      'hk-' + chip + '-explicit-plane-layout',
+      'bk-' + chip + '-explicit-plane-layout',
       prog_python,
       args : [
         files('../gallium/drivers/asahi/tests/run-shim.py'),
         libasahi_noop_drm_shim,
-        hk_vulkan_explicit_plane_layout,
+        bk_vulkan_explicit_plane_layout,
       ],
       env : [
         'ASAHI_SHIM_CHIP=' + chip,

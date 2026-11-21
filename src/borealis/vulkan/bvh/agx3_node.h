@@ -4,8 +4,8 @@
  * Native G17P node encoding helpers shared by node encoding (agx3_leaf.comp)
  * and refit propagation (agx3_refit.comp).
  */
-#ifndef HK_AGX3_NODE_H
-#define HK_AGX3_NODE_H
+#ifndef BK_AGX3_NODE_H
+#define BK_AGX3_NODE_H
 
 bool
 finite(float x)
@@ -79,7 +79,7 @@ store_aabb(uint64_t address, vec3 lo, vec3 hi)
 }
 
 /* Bounds a refit leaves for a job that failed: its ancestors fail too. */
-#define HK_AGX3_FAILED_BOUNDS vec3(uintBitsToFloat(0x7fc00000u))
+#define BK_AGX3_FAILED_BOUNDS vec3(uintBitsToFloat(0x7fc00000u))
 
 /* Root word t of a node with `count` children: its header bits, then the
  * bounds of child t (lo, hi) quantized against the node's base and
@@ -88,8 +88,8 @@ uint64_t
 root_word(uint t, uint count, uint kind, uint triangle_type0, uint child_slot,
           uint slot_bias, vec3 base, uvec3 exponent, vec3 lo, vec3 hi, inout bool ok)
 {
-   bool leaf = kind == HK_AGX3_NODE_LEAF, instances = kind == HK_AGX3_NODE_INSTANCES;
-   bool aabbs = kind == HK_AGX3_NODE_AABBS;
+   bool leaf = kind == BK_AGX3_NODE_LEAF, instances = kind == BK_AGX3_NODE_INSTANCES;
+   bool aabbs = kind == BK_AGX3_NODE_AABBS;
    uint capacity = max(min(count, 4u), 1u);
    uint64_t word = uint64_t(0);
    if (t == 0)
@@ -136,4 +136,4 @@ root_word(uint t, uint count, uint kind, uint triangle_type0, uint child_slot,
    return word;
 }
 
-#endif /* HK_AGX3_NODE_H */
+#endif /* BK_AGX3_NODE_H */

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 /* aurora-packtest: correctness of multi-command-buffer submissions with
- * submit packing (hk_queue.c, hk_pack.c) on and off.
+ * submit packing (bk_queue.c, bk_pack.c) on and off.
  *
  * Each case is a list of command buffers holding compute dispatches over a
  * storage buffer of slots, barriers, transfers and work that keeps a command
@@ -826,8 +826,8 @@ trace_line(const char *line, size_t n)
       /* The pass-through is best effort. */
    }
    unsigned runs, members;
-   if (n > 13 && !memcmp(line, "HK_PACK runs=", 13) &&
-       sscanf(line, "HK_PACK runs=%u members=%u", &runs, &members) == 2) {
+   if (n > 13 && !memcmp(line, "BK_PACK runs=", 13) &&
+       sscanf(line, "BK_PACK runs=%u members=%u", &runs, &members) == 2) {
       pthread_mutex_lock(&tr.lock);
       tr.packed += members;
       pthread_mutex_unlock(&tr.lock);
