@@ -862,10 +862,35 @@ agx_get_params(struct agx_device *dev, void *buf, size_t size)
 
    memset(buf, 0, size);
 
+   /* DRM_IOCTL_ASAHI_GET_PARAMS is _IOW, so the kernel does not write back
+    * get_param.size; older kernels simply leave optional tail fields
+    * untouched. Stamp the capacity tail before the ioctl so a 600-byte legacy
+    * reply is distinguishable from an explicit (0, 0) "no driver limit",
+    * while still returning zeroed fields on legacy kernels.
+    */
+   const size_t limits_end =
+      offsetof(struct drm_asahi_params_global, client_memory_limit) +
+      sizeof(((struct drm_asahi_params_global *)0)->client_memory_limit);
+   if (size >= limits_end) {
+      struct drm_asahi_params_global *p = buf;
+      p->memory_limit = UINT64_MAX;
+      p->client_memory_limit = UINT64_MAX;
+   }
+
    int ret = drmIoctl(dev->fd, DRM_IOCTL_ASAHI_GET_PARAMS, &get_param);
    if (ret) {
       fprintf(stderr, "DRM_IOCTL_ASAHI_GET_PARAMS failed: %m\n");
       return -EINVAL;
+   }
+
+   if (size >= limits_end) {
+      struct drm_asahi_params_global *p = buf;
+      if (p->memory_limit == UINT64_MAX &&
+          p->client_memory_limit == UINT64_MAX) {
+         p->memory_limit = 0;
+         p->client_memory_limit = 0;
+         return offsetof(struct drm_asahi_params_global, memory_limit);
+      }
    }
 
    return get_param.size;
@@ -977,6 +1002,7 @@ agx_cleanup_partial_device(struct agx_device *dev, unsigned initialized)
       util_sparse_array_finish(&dev->bo_map);
       simple_mtx_destroy(&dev->bo_cache.lock);
       simple_mtx_destroy(&dev->bo_map_lock);
+      simple_mtx_destroy(&dev->bo_mmap_lock);
       agxdecode_destroy_context(dev->agxdecode);
    }
    if (initialized & AGX_INIT_VIRTIO) {
@@ -1049,6 +1075,11 @@ agx_open_device(void *memctx, struct agx_device *dev)
               params_size, required_params_size);
       goto fail;
    }
+   const size_t limits_params_size =
+      offsetof(struct drm_asahi_params_global, client_memory_limit) +
+      sizeof(dev->params.client_memory_limit);
+   dev->has_memory_limits =
+      !dev->is_virtio && (size_t)params_size >= limits_params_size;
 
    dev->chip = agx_chip_from_params(&dev->params);
 
@@ -1346,6 +1377,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
    util_sparse_array_init(&dev->bo_map, sizeof(struct agx_bo), 512);
    simple_mtx_init(&dev->bo_map_lock, mtx_plain);
+   simple_mtx_init(&dev->bo_mmap_lock, mtx_plain);
 
    simple_mtx_init(&dev->bo_cache.lock, mtx_plain);
    list_inithead(&dev->bo_cache.lru);

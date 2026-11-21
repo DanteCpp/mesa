@@ -25,7 +25,11 @@ jobs:
         run: |
           dnf -y install dnf-plugins-core git
           dnf -y builddep mesa
-          dnf -y install ccache clang
+          # The GLVND EGL dispatcher (libEGL.so.1). builddep installs
+          # libglvnd-core-devel but not libglvnd-egl, and Mesa built against
+          # GLVND provides just the vendor library, so the asahi-egl-priority
+          # tests' dlopen of libEGL.so.1 would find nothing.
+          dnf -y install ccache clang libglvnd-egl
 
       - name: Check out
         uses: actions/checkout@v4
@@ -41,13 +45,13 @@ jobs:
         run: |
           CC="ccache clang" CXX="ccache clang++" meson setup build \
             -Dgallium-drivers=asahi -Dvulkan-drivers=asahi \
-            -Dplatforms=wayland,x11 -Dbuild-tests=true
+            -Dplatforms=wayland,x11 -Dbuild-tests=true -Dtools=drm-shim
 
       - name: Build
         run: meson compile -C build
 
       - name: Test
-        run: meson test -C build --suite asahi --num-processes "$(nproc)" --print-errorlogs
+        run: meson test -C build --suite asahi --suite poly --num-processes "$(nproc)" --print-errorlogs
 
       - name: Upload test logs
         if: failure()

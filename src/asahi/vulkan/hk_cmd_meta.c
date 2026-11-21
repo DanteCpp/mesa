@@ -163,8 +163,21 @@ hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
    save->buffer_active0 = !!(desc->buffer_active & BITFIELD_BIT(0));
    save->buffer_set0 = desc->root.sets[0];
    save->buffer_set_size0 = desc->set_sizes[0];
-   if (save->has_push_desc0)
-      hk_copy_push_descriptor_set(&save->push_desc0, desc->push[0]);
+   if (save->has_push_desc0) {
+      /* Saved off the stack, and only the bytes the layout uses: a push set
+       * can be HK_PUSH_DESCRIPTOR_SET_SIZE, and meta operations nest. */
+      const struct hk_push_descriptor_set *src = desc->push[0];
+      const size_t bytes = ALIGN_POT(
+         offsetof(struct hk_push_descriptor_set, data) + src->size, 8);
+      save->push_desc0_offset = cmd->meta_push_saves.size;
+      void *dst = util_dynarray_grow_bytes(&cmd->meta_push_saves, 1, bytes);
+      if (dst != NULL) {
+         hk_copy_push_descriptor_set(dst, src);
+      } else {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         save->has_push_desc0 = false;
+      }
+   }
 
    static_assert(sizeof(save->push) == sizeof(desc->root.push));
    memcpy(save->push, desc->root.push, sizeof(save->push));
@@ -193,6 +206,15 @@ hk_meta_init_render(struct hk_cmd_buffer *cmd,
    }
 }
 
+/* The push set 0 that hk_meta_begin() saved */
+static const struct hk_push_descriptor_set *
+hk_meta_saved_push_desc0(const struct hk_cmd_buffer *cmd,
+                         const struct hk_meta_save *save)
+{
+   return (const void *)((const uint8_t *)cmd->meta_push_saves.data +
+                         save->push_desc0_offset);
+}
+
 void
 hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
             VkPipelineBindPoint bind_point)
@@ -205,7 +227,8 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       /* Set 0 came from a descriptor buffer: rebind its address. A push
        * descriptor set the application pushed earlier stays inactive. */
       if (save->has_push_desc0)
-         hk_copy_push_descriptor_set(desc->push[0], &save->push_desc0);
+         hk_copy_push_descriptor_set(desc->push[0],
+                                     hk_meta_saved_push_desc0(cmd, save));
       desc->sets[0] = NULL;
       desc->root.sets[0] = save->buffer_set0;
       desc->set_sizes[0] = save->buffer_set_size0;
@@ -220,7 +243,8 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       desc->push_dirty &= ~BITFIELD_BIT(0);
       desc->push_active &= ~BITFIELD_BIT(0);
    } else if (save->has_push_desc0) {
-      hk_copy_push_descriptor_set(desc->push[0], &save->push_desc0);
+      hk_copy_push_descriptor_set(desc->push[0],
+                                  hk_meta_saved_push_desc0(cmd, save));
       desc->push_dirty |= BITFIELD_BIT(0);
       if (save->push_active0)
          desc->push_active |= BITFIELD_BIT(0);
@@ -228,6 +252,13 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
          desc->push_active &= ~BITFIELD_BIT(0);
    } else {
       desc->push_active &= ~BITFIELD_BIT(0);
+   }
+
+   /* Nested meta operations end in the reverse order they begin, so this
+    * save is the last one stacked. */
+   if (save->has_push_desc0) {
+      assert(save->push_desc0_offset < cmd->meta_push_saves.size);
+      cmd->meta_push_saves.size = save->push_desc0_offset;
    }
 
    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
@@ -3013,10 +3044,10 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
    }
 }
 
-/* Several regions of one vkCmdCopyBuffer in one dispatch (G17P only, the
- * chip it was measured on). vk_meta_copy_buffer_addresses() issues one
- * dispatch per region; each costs ~1.2-1.6 us of GPU time beyond its bytes
- * (80 regions of 4 KiB take ~100 us, the same bytes as one region ~6 us).
+/* Several regions of one vkCmdCopyBuffer in one dispatch.
+ * vk_meta_copy_buffer_addresses() issues one dispatch per region; on G17P
+ * each costs ~1.2-1.6 us of GPU time beyond its bytes (80 regions of 4 KiB
+ * take ~100 us, the same bytes as one region ~6 us).
  * Workgroup row y copies region y; rows shorter than the widest region end
  * early. No source region of a copy command may overlap a destination region
  * (VUID-VkCopyBufferInfo2-pRegions-00117) and overlapping destinations go to
@@ -3201,10 +3232,10 @@ hk_copy_batch_add(struct hk_cmd_buffer *cmd, struct hk_copy_batch *batch,
    if (!size)
       return;
 
-   if (dev->dev.chip != AGX_CHIP_G17P || size > (1ull << 30)) {
-      /* Other chips are unmeasured. Large regions gain nothing from batching
-       * and keep the shader's 32-bit offsets far from wrapping: vk_meta
-       * copies them (in several dispatches if needed). */
+   if (size > (1ull << 30)) {
+      /* Large regions gain nothing from batching and keep the shader's
+       * 32-bit offsets far from wrapping: vk_meta copies them (in several
+       * dispatches if needed). */
       hk_copy_batch_flush(cmd, batch);
       vk_meta_copy_buffer_addresses(&cmd->vk, &dev->meta, src, dst, size);
       return;

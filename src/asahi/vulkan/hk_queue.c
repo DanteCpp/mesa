@@ -116,6 +116,15 @@ queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
                           "DRM_IOCTL_SYNCOBJ_TRANSFER failed: %m");
    }
 
+   /* The waits are only in the queue timeline: no kernel job carries them,
+    * and the kernel orders this queue's later work after its earlier jobs
+    * alone. A wait's second scope includes every later submission of the
+    * queue (vkd3d-proton implements ID3D12CommandQueue::Wait as such an
+    * empty batch), so later submissions wait for this point themselves
+    * (queue_submit_recordings()). */
+   if (submit->wait_count)
+      queue->drm.empty_wait_point = queue->drm.timeline_value;
+
    return queue_signal_timeline(dev, queue, submit);
 }
 
@@ -141,6 +150,7 @@ hk_gen1_render_ray_query_stages(struct hk_device *dev, const struct hk_cs *cs,
 
 static void
 asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
+                       bool no_query_access,
                        struct drm_asahi_cmd_compute *cmd)
 {
    /* A linked stream leaves its root through a link record, so the root
@@ -150,7 +160,7 @@ asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
 
    *cmd = (struct drm_asahi_cmd_compute){
       .flags = (cs->m5_matrix_ops ? DRM_ASAHI_COMPUTE_USES_MATRIX : 0) |
-               (!cs->query_access &&
+               (no_query_access &&
                       (dev->dev.params.features &
                        DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
                    ? DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS
@@ -175,6 +185,21 @@ asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
       cmd->helper.cfg = cs->scratch.cs.preamble ? (1 << 16) : 0;
       cmd->helper.binary = agx_helper_program(&dev->bg_eot);
    }
+}
+
+/* Fill a compute command of the submission at queue->drm.timeline_value and
+ * record the timestamps the kernel will publish for it. NO_QUERY_ACCESS is
+ * decided by the query words the stream touches, against the stamps still
+ * pending on the device (renders and compute commands earlier in this
+ * submission included), not by query_access. */
+static void
+hk_queue_fill_cdm_command(struct hk_device *dev, struct hk_queue *queue,
+                          struct hk_cs *cs, struct drm_asahi_cmd_compute *cmd)
+{
+   const uint64_t point = queue->drm.timeline_value;
+   asahi_fill_cdm_command(dev, cs,
+                          !hk_query_stamps_conflict(dev, queue, point, cs), cmd);
+   hk_query_stamps_note_cs(dev, queue, point, cs);
 }
 
 /* Neither attachment storage nor empty-tile operations may observe the
@@ -1697,12 +1722,38 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       alloca((submit->wait_count + kernel_signal_count + 3) *
              sizeof(struct drm_asahi_sync));
 
+   /* At most one wait on the queue's own timeline: the kernel refuses two
+    * points of one timeline in a submission. own_wait is its index. */
+   int own_wait = -1;
    if (replaced) {
+      own_wait = wait_count;
       syncs[wait_count++] = (struct drm_asahi_sync){
          .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
          .handle = queue->drm.syncobj,
          .timeline_value = replaced_point,
       };
+   }
+
+   /* Waits an earlier empty submission transferred into the queue timeline
+    * (queue_submit_empty()) order this submission too, until they are known
+    * complete: work sent to a sibling kernel queue or in a later chunk is not
+    * ordered after the kernel job that first carried them. */
+   if (queue->drm.empty_wait_point) {
+      uint64_t done = 0;
+      if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1) == 0 &&
+          done >= queue->drm.empty_wait_point) {
+         queue->drm.empty_wait_point = 0;
+      } else if (own_wait >= 0) {
+         syncs[own_wait].timeline_value =
+            MAX2(syncs[own_wait].timeline_value, queue->drm.empty_wait_point);
+      } else {
+         own_wait = wait_count;
+         syncs[wait_count++] = (struct drm_asahi_sync){
+            .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
+            .handle = queue->drm.syncobj,
+            .timeline_value = queue->drm.empty_wait_point,
+         };
+      }
    }
 
    for (unsigned i = 0; i < submit->wait_count; ++i) {
@@ -2001,7 +2052,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                                          cs->compute_resources.size);
             }
             struct drm_asahi_cmd_compute_with_prior cmd = {0};
-            asahi_fill_cdm_command(dev, cs, &cmd.legacy);
+            hk_queue_fill_cdm_command(dev, queue, cs, &cmd.legacy);
             cmd.legacy.flags |= hk_as_build_flags(dev->dev.chip,
                                                   dev->dev.params.features,
                                                   cs->as_build);
@@ -2102,6 +2153,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             }
             struct drm_asahi_cmd_render_with_prior cmd = {0};
             asahi_fill_vdm_command(dev, cs, &cmd.legacy);
+            hk_query_stamps_note_cs(dev, queue, queue->drm.timeline_value, cs);
 
             /* M5: the vertex half's own render and compute prefixes, when
              * they are narrower than the whole render's, so its tiling can
@@ -2284,13 +2336,18 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
     * first submission already waits for every earlier point. */
    if (sib_remap && sib_earlier && !replaced) {
       assert(sib_target == 0);
-      memmove(&syncs[wait_count + 1], &syncs[wait_count],
-              (kernel_signal_count + 1) * sizeof(*syncs));
-      syncs[wait_count++] = (struct drm_asahi_sync){
-         .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
-         .handle = queue->drm.syncobj,
-         .timeline_value = queue->sib.last_point,
-      };
+      if (own_wait >= 0) {
+         syncs[own_wait].timeline_value =
+            MAX2(syncs[own_wait].timeline_value, queue->sib.last_point);
+      } else {
+         memmove(&syncs[wait_count + 1], &syncs[wait_count],
+                 (kernel_signal_count + 1) * sizeof(*syncs));
+         syncs[wait_count++] = (struct drm_asahi_sync){
+            .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
+            .handle = queue->drm.syncobj,
+            .timeline_value = queue->sib.last_point,
+         };
+      }
    }
 
    struct drm_asahi_submit submit_ioctl = {
@@ -2350,8 +2407,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
  * Every firmware compute command costs a fixed setup and completion on top
  * of its dispatches. On the M5 Pro (G17S) a chain of 242 one-dispatch
  * command buffers took 3.0 ms as separate commands and 0.31 ms as one; the
- * M4 (G16G) kernel runs one command of the whole device at a time, with
- * about 0.3 ms of turnaround each. Applications that record a dispatch or a
+ * M4 (G16G) kernel took about 0.3 ms of turnaround per command before it
+ * kept several of a VM in flight. Applications that record a dispatch or a
  * few per command buffer and submit many at once (ML graphs, image filters)
  * pay that cost per command buffer. A run of consecutive command buffers
  * that each record one plain compute stream is therefore submitted as one
@@ -2364,10 +2421,13 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
  *
  * - Where the kernel takes a stream's own completion flush
  *   (DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION, M5), every such stream
- *   ends with the strong, memory-scoped flush. A boundary keeps the strong
- *   flush and drops its memory scope, which only memory reached through a
- *   second address needs (hk_cdm_alias_scope()); while such memory may
- *   exist, it keeps the scope too. The packet's end keeps the whole flush.
+ *   ends with a strong flush: the memory-scoped one, or, where memory has
+ *   no second address, the application's barrier or the deferred clears'
+ *   flush without memory scope (hk_pack_run_member()). A boundary keeps the
+ *   strong flush and drops its memory scope, which only memory reached
+ *   through a second address needs (hk_cdm_alias_scope()); while such
+ *   memory may exist, it keeps or gets the scope. The packet's end gets the
+ *   whole flush, upgraded in place where the last member's lacked the scope.
  * - HAL200 streams whose strong flush has no memory-scoped form (G16) end
  *   with their last launch's ordering barrier or a strong flush, and the end
  *   of the command publishes their writes. At a boundary the record becomes
@@ -2378,18 +2438,18 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
  * Work in a packet waits for whatever any member waited for, and work after
  * it waits for the whole packet. On the compute subqueue that adds no
  * ordering (M5 runs one queue's compute commands in order, the G16 kernel
- * one command of the device at a time); a member that would add a render
- * wait or synchronization kinds starts a new packet instead
- * (hk_pack_plan()). Streams whose bytes depend on where they were recorded
- * (links, calls, immediate writes) or that carry queries, timestamps, events,
- * indirect or internal launches stay separate, and so do streams with global
- * atomics where another kernel queue could run beside the packet
- * (hk_pack_atomics_allowed()). A packet stays within the launch, thread and
- * static work bounds of hk_pack.h and holds at most one stream with a looping
- * program, so at ALU rate it runs about as long as its longest member could
- * alone (hk_pack.h says how far that holds for memory-bound programs); it
- * carries no more compute attachments than the kernel takes for one
- * command. A run past a bound starts a new packet.
+ * every compute command of a VM in order on one firmware queue); a member
+ * that would add a render wait or synchronization kinds starts a new packet
+ * instead (hk_pack_plan()). Streams whose bytes depend on where they were
+ * recorded (links, calls, immediate writes) or that carry queries,
+ * timestamps, events, indirect or internal launches stay separate, and so do
+ * streams with global atomics where another kernel queue could run beside the
+ * packet (hk_pack_atomics_allowed()). A packet stays within the launch,
+ * thread and static work bounds of hk_pack.h and holds at most one stream
+ * with a looping program, so at ALU rate it runs about as long as its longest
+ * member could alone (hk_pack.h says how far that holds for memory-bound
+ * programs); it carries no more compute attachments than the kernel takes for
+ * one command. A run past a bound starts a new packet.
  *
  * It is on wherever a boundary is defined (hk_pack_boundary()), which the
  * stream format and the kernel decide. HK_PACK_CDM_SUBMIT=0/1 (or the older
@@ -2440,11 +2500,13 @@ hk_pack_attachment_limit(const struct hk_device *dev)
  * ASAHI_M5_PACK_ATOMICS=1 (or HK_PACK_ATOMICS=1) and the device has a
  * single kernel queue, which runs its commands in order. A second kernel
  * queue created while a packet runs is not covered; unpacked atomic work
- * has the same exposure. The G16 kernel runs one command of the whole
- * device at a time, so nothing ever runs beside a packet there: G16G packs
- * them unless HK_PACK_ATOMICS=0. That is a property of the G16 kernel, the
- * only one for G16G, which no uAPI feature reports yet; the chip stands for
- * it until one does. */
+ * has the same exposure. The G16 kernel puts every compute command of a VM
+ * on its one firmware compute queue and never runs one beside another VM's:
+ * several commands of one VM may be in flight there, but the firmware runs
+ * them one after another, never beside a packet. G16G packs them unless
+ * HK_PACK_ATOMICS=0. That is a property of the G16 kernel, the only one for
+ * G16G, which no uAPI feature reports yet; the chip stands for it until one
+ * does (hk_pack_atomics_choice()). */
 DEBUG_GET_ONCE_OPTION(hk_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
 DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
 
@@ -2456,9 +2518,8 @@ hk_pack_atomics_allowed(struct hk_device *dev, const struct hk_queue *queue)
       opt = debug_get_option_m5_pack_atomics_opt();
 
    if (dev->dev.chip == AGX_CHIP_G16G)
-      return opt ? debug_parse_bool_option(opt, false) : true;
-
-   if (!opt || !debug_parse_bool_option(opt, false) || queue->sib.count > 1)
+      return hk_pack_atomics_choice(true, opt, queue->sib.count);
+   if (!hk_pack_atomics_choice(false, opt, queue->sib.count))
       return false;
 
    vk_foreach_queue(iter, &dev->vk) {
@@ -2565,7 +2626,9 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
 
    if (!run_count) {
       if (hk_pack_trace())
-         fprintf(stderr, "HK_PACK runs=0 eligible=%u of %u\n", eligible, n);
+         fprintf(stderr, "HK_PACK runs=0 eligible=%u of %u strong_tails=%d\n",
+                 eligible, n,
+                 hk_pack_admits_strong_tail(hk_pack_boundary(dev)));
       free(runs);
       return false;
    }
@@ -2641,12 +2704,15 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
          hk_pack_dedup_resources(&cs->compute_resources, unique);
 
          if (visible_completion) {
-            /* Each source ends with the strong memory-scoped flush. The
-             * packet's end keeps it for the host and other queues, which
-             * observe nothing of a packet before its completion. Between
-             * members, the next one reads through the same addresses, so
-             * the scope is needed only where memory can also be reached
-             * through a second address (hk_cdm_alias_scope()). */
+            /* Each source ends with a strong flush (hk_pack_run_member()).
+             * The packet's end gets the memory scope, upgrading the record
+             * in place if the source's lacked it, for the host and other
+             * queues, which observe nothing of a packet before its
+             * completion. Between members, the next one reads through the
+             * same addresses, so the scope is needed only where memory can
+             * also be reached through a second address
+             * (hk_cdm_alias_scope()); a source without it keeps its plain
+             * strong flush there. */
             if (!last && !hk_cdm_alias_scope(dev) &&
                 cs->current == cs->memory_flush_end &&
                 cs->current == cs->strong_flush_end) {
@@ -2683,8 +2749,9 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
 
    if (hk_pack_trace())
       fprintf(stderr, "HK_PACK runs=%u members=%u eligible=%u of %u commands=%u "
-              "bytes=%zu\n", run_count, packed_members, eligible, n,
-              out->command_count, total);
+              "bytes=%zu strong_tails=%d\n", run_count, packed_members,
+              eligible, n, out->command_count, total,
+              hk_pack_admits_strong_tail(hk_pack_boundary(dev)));
    free(runs);
    return true;
 }
@@ -2693,8 +2760,18 @@ static VkResult
 queue_submit(struct hk_device *dev, struct hk_queue *queue,
              struct vk_queue_submit *submit, bool *untouched)
 {
+   /* Packing copies the command buffers' streams: no patch site may be
+    * written meanwhile (host_alias.patch_lock). The copies are the only CPU
+    * reads of stream words at submission; the GPU reads each word whole. */
+   const bool alias_dynamic = dev->host_alias.dynamic;
+   if (unlikely(alias_dynamic))
+      u_rwlock_rdlock(&dev->host_alias.patch_lock);
    struct hk_packed_runs runs;
-   if (!hk_pack_runs(dev, queue, submit, &runs))
+   const bool have_runs = hk_pack_runs(dev, queue, submit, &runs);
+   if (unlikely(alias_dynamic))
+      u_rwlock_rdunlock(&dev->host_alias.patch_lock);
+
+   if (!have_runs)
       return queue_submit_recordings(dev, queue, submit, submit, NULL,
                                      untouched);
 
@@ -2731,6 +2808,15 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
    if (vk_device_is_lost_no_report(&dev->vk))
       return VK_ERROR_DEVICE_LOST;
+
+   /* While a resource may alias, the command buffers recorded before it get
+    * memory scope at their patch sites (hk_cdm_alias_scope()), before
+    * anything reads their streams: submit packing copies them, holding
+    * host_alias.patch_lock shared (queue_submit()). */
+   if (unlikely(dev->host_alias.dynamic) &&
+       p_atomic_read(&dev->alias_live))
+      hk_submit_patch_alias_sites(dev, submit->command_buffers,
+                                  submit->command_buffer_count);
 
    /* Look at the command buffers before they are submitted: once the work is
     * with the kernel it can complete, and the application may then free or
@@ -3050,6 +3136,7 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
 {
    /* Stop/join the submit worker before releasing anything it can use. */
    vk_queue_finish(&queue->vk);
+   hk_query_stamps_clear_queue(dev, queue);
    hk_cmd_pending_finish_queue(dev, queue);
    drmSyncobjDestroy(dev->dev.fd, queue->drm.syncobj);
    if (queue->drm.id != UINT32_MAX)

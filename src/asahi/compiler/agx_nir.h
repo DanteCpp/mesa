@@ -38,9 +38,10 @@ struct nir_def;
 #define AGX_NIR_SCS_TOUCH_FLAGS                                                \
    (AGX_NIR_SCS_TOUCH | AGX_NIR_SCS_TOUCH_FENCE_BEFORE |                       \
     AGX_NIR_SCS_TOUCH_FENCE_AFTER)
-/* byte_offsets: fold constant index addends into that byte offset. */
+/* byte_offsets: fold constant index addends into that byte offset.
+ * checked_offsets: see agx_shader_key::checked_offsets. */
 bool agx_nir_lower_address(struct nir_shader *shader, bool byte_indices,
-                           bool byte_offsets);
+                           bool byte_offsets, bool checked_offsets);
 bool agx_nir_preserve_position_order(struct nir_shader *shader);
 bool agx_nir_scalarize_int64(struct nir_shader *shader);
 bool agx_nir_lower_divmod64(struct nir_shader *shader, bool native_add64);
@@ -72,7 +73,8 @@ bool agx_nir_lower_layer(struct nir_shader *s);
 bool agx_nir_lower_clip_distance(struct nir_shader *s);
 bool agx_nir_lower_subgroups(struct nir_shader *s);
 bool agx_nir_lower_subgroups_g17p(struct nir_shader *s);
-bool agx_nir_lower_subgroups_m5(struct nir_shader *s, bool native_shuffle_xor);
+bool agx_nir_lower_subgroups_m5(struct nir_shader *s, bool native_shuffle_xor,
+                                bool native_float_minmax);
 bool agx_nir_flush_subgroup_minmax(struct nir_shader *s);
 bool agx_nir_lower_dynamic_shuffle_xor(struct nir_shader *s);
 bool agx_nir_lower_quad_derivative_ids(struct nir_shader *s);
