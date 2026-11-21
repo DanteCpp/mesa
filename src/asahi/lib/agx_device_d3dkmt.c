@@ -1916,9 +1916,9 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
       static_assert(AGX_PRIMARY_WRITE_RANGES == AGXW_MAX_PRIMARY_WRITE_RANGES,
                     "primary write capacity");
       struct agxw_submit_private_v6 *v6 = (void *)priv;
-      v6->base.version = AGXW_SUBMIT_PRIVATE_VERSION_V6;
-      v6->base.flags = AGXW_SUBMIT_READ_SET_COMPLETE |
-                       AGXW_SUBMIT_PRIMARY_WRITE_SET_COMPLETE;
+      /* drivers/AppleAgxWddm/core/agxw_agreement.h, section 2. */
+      v6->base.version = AGXW_AGREE_SUBMIT_VERSION;
+      v6->base.flags = AGXW_AGREE_V6_FLAGS;
       v6->primary_write_range_count = primary->count;
       struct agxw_submit_read_range *writes = read_ranges + v6->read_range_count;
       for (unsigned i = 0; i < primary->count; i++)
@@ -3156,10 +3156,18 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
    dev->is_virtio = false;
    dev->ops = agx_device_d3dkmt_ops;
    dev->write_set_contract = true;
-   dev->primary_write_contract = identity.chip_id == 0x8142 &&
-      identity.gpu_generation == 17 && identity.gpu_variant == 'G' &&
-      identity.submit_private_max_version == AGXW_SUBMIT_PRIVATE_VERSION_V6;
+   /* agxw_agreement.h, section 2 (WHEN v6) and section 3: the shader window
+    * this driver lays out is the one the kernel and our D3D11 DLL use. */
+   static_assert(AGX_M5_SHADER_BASE == AGXW_J813_USC_EXEC_BASE,
+                 "agreement: J813 shader window base");
+   static_assert(AGX_G17P_USC_WINDOW_BASE == AGXW_J813_USC_EXEC_BASE,
+                 "agreement: G17 USC window base");
+   dev->primary_write_contract = identity.chip_id == AGXW_AGREE_J813_CHIP_ID &&
+      identity.gpu_generation == AGXW_AGREE_J813_GPU_GENERATION &&
+      identity.gpu_variant == AGXW_AGREE_J813_GPU_VARIANT &&
+      identity.submit_private_max_version == AGXW_AGREE_SUBMIT_VERSION;
    ws->v6_log = dev->primary_write_contract;
+   d3dkmt_log_flushed("agxw-v6: package %s\n", AGXW_PACKAGE_VERSION_STRING);
    d3dkmt_log_flushed("agxw-v6: device contract=%s chip=0x%x gen=%u variant=%c max_version=%u\n",
                       dev->primary_write_contract ? "v6" : "off",
                       (unsigned)identity.chip_id, (unsigned)identity.gpu_generation,
