@@ -342,10 +342,16 @@ DEBUG_GET_ONCE_BOOL_OPTION(m5_host_alias_trace, "ASAHI_M5_HOST_ALIAS_TRACE",
 
 /* The class of the mappings over [pointer, pointer + size) in
  * /proc/self/maps (hk_host_maps_classify_fd()); HK_HOST_MAP_OTHER when the
- * file cannot be read. */
+ * file cannot be read. Linux only: Windows has no maps file, so the range is
+ * reported as not supported (HK_HOST_MAP_OTHER, which aliases). Host imports
+ * are not reached there anyway: the D3DKMT winsys has no USERPTR. */
 static enum hk_host_map_class
 hk_host_maps_classify_self(const void *pointer, uint64_t size)
 {
+#ifdef _WIN32
+   (void)pointer, (void)size;
+   return HK_HOST_MAP_OTHER;
+#else
    const uintptr_t start = (uintptr_t)pointer;
    if (size == 0 || size > UINTPTR_MAX - start)
       return HK_HOST_MAP_OTHER;
@@ -357,6 +363,7 @@ hk_host_maps_classify_self(const void *pointer, uint64_t size)
       hk_host_maps_classify_fd(fd, start, start + (uintptr_t)size);
    close(fd);
    return cls;
+#endif
 }
 
 /* M5 with host_alias.dynamic: enter a host import into the device's set, so
