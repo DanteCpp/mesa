@@ -2424,9 +2424,10 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
                             "Kernel reports no usable command queues");
          goto fail_disk_cache;
       }
-      /* limits.max_queues is the machine-wide pool of application GART
-       * contexts (g17_queue_limits.rs: contexts 5..62), shared with every
-       * other client on the device. VkQueueFamilyProperties::queueCount is a
+      /* limits.max_queues is a machine-wide pool shared with every other
+       * client on the device: application GART contexts on G17
+       * (g17_queue_limits.rs: contexts 5..62), logical-queue credits on the
+       * G15 and G16 kernels. VkQueueFamilyProperties::queueCount is a
        * per-device guarantee: an application may create a device with that
        * many queues and expect it to succeed. Handing the shared pool out as
        * the guarantee makes any application that asks for queueCount queues
@@ -2448,8 +2449,9 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * clears and blits the same way on any family. These families only
     * narrow what the application may record, so they reuse the universal
     * queue implementation, and like it they create their kernel queue on
-    * first submission, in the device's one VM. The G17P and M3 kernels
-    * report independent queues too, but the families are qualified on M5. */
+    * first submission, in the device's one VM. The G17P, M3 (G15) and M4
+    * (G16) kernels report independent queues too, but the families are
+    * qualified on M5. */
    if (agx_chip_g17_m5(pdev->dev.chip) &&
        (pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES)) {
       pdev->queue_families[pdev->queue_family_count++] = (struct hk_queue_family){

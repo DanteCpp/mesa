@@ -166,6 +166,29 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     endforeach
   endforeach
 
+  # Queue families and queues: every queue of the universal family submits on
+  # a kernel queue of its own. The G16 kernel reports INDEPENDENT_QUEUES, so
+  # G16G has eight queues; without it (G13G) there is one.
+  foreach row : [['g16g', '1', '8'], ['g13g', '1', '1']]
+    test(
+      'borealis-' + row[0] + '-queues',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        brl_vulkan_queues,
+        row[1],
+        row[2],
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + row[0],
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
+
   # A sparse image bind as a queue's first submission, with no command buffer.
   test(
     'hk-g17p-sparse-bind-first-submit',

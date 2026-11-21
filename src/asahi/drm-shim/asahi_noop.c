@@ -244,8 +244,12 @@ static const struct drm_asahi_queue_limits queue_limits_g17 = {
    .max_in_flight_per_queue = 1,
 };
 
+/* T8132 / M4, as the G16 kernel (drivers/gpu/drm/asahi/g16) reports it: its
+ * logical queues are independent scheduling entities, so it reports
+ * INDEPENDENT_QUEUES with the QUEUE_LIMITS of queue_limits_g16g. */
 static const struct drm_asahi_params_global params_g16g = {
    .features = DRM_ASAHI_FEATURE_VM_STATUS |
+               DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES |
                DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS |
                DRM_ASAHI_FEATURE_VM_STATUS_MIRROR |
                DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS,
@@ -358,6 +362,13 @@ static const struct drm_asahi_params_global params_g15g = {
    .command_timestamp_frequency_hz = 1000000000,
    .usc_generation = 3,
    .gpu_hal_generation = DRM_ASAHI_GPU_HAL_LEGACY,
+};
+
+/* QUEUE_LIMITS (group 2) of the G16 kernel: its logical-queue bound and the
+ * jobs each queue's scheduler admits to the engine. */
+static const struct drm_asahi_queue_limits queue_limits_g16g = {
+   .max_queues = 58,
+   .max_in_flight_per_queue = 16,
 };
 
 /* QUEUE_LIMITS (group 2) of the M3 kernel. */
@@ -581,6 +592,39 @@ shim_g15_kernel(void)
 {
    const struct drm_asahi_params_global *params = shim_params();
    return params == &params_g15s || params == &params_g15c;
+}
+
+/* Kernel queues as the driver uses them: the live ones (QUEUE_CREATE less
+ * QUEUE_DESTROY) and the distinct queue ids that submitted work, for tests
+ * that check each API queue submits on a kernel queue of its own. */
+#define SHIM_TRACKED_QUEUES 64
+static simple_mtx_t shim_queue_lock = SIMPLE_MTX_INITIALIZER;
+static uint32_t shim_live_queues;
+static uint32_t shim_submitted_queue_ids[SHIM_TRACKED_QUEUES];
+static uint32_t shim_submitted_queue_count;
+
+static void
+shim_note_submitting_queue(uint32_t queue_id)
+{
+   simple_mtx_lock(&shim_queue_lock);
+   bool seen = false;
+   for (uint32_t i = 0; i < shim_submitted_queue_count; ++i)
+      seen |= shim_submitted_queue_ids[i] == queue_id;
+   if (!seen && shim_submitted_queue_count < SHIM_TRACKED_QUEUES)
+      shim_submitted_queue_ids[shim_submitted_queue_count++] = queue_id;
+   simple_mtx_unlock(&shim_queue_lock);
+}
+
+void asahi_noop_queue_counts(uint32_t *live, uint32_t *submitted)
+   __attribute__((visibility("default")));
+
+void
+asahi_noop_queue_counts(uint32_t *live, uint32_t *submitted)
+{
+   simple_mtx_lock(&shim_queue_lock);
+   *live = shim_live_queues;
+   *submitted = shim_submitted_queue_count;
+   simple_mtx_unlock(&shim_queue_lock);
 }
 
 /* The queue's USC window, as QUEUE_CREATE set it. One queue base per run is
@@ -1307,12 +1351,19 @@ asahi_ioctl_queue_create(int fd, unsigned long request, void *arg)
    }
    shim_usc_exec_base = create->usc_exec_base;
    create->queue_id = next_queue_id++;
+   simple_mtx_lock(&shim_queue_lock);
+   shim_live_queues++;
+   simple_mtx_unlock(&shim_queue_lock);
    return 0;
 }
 
 static int
 asahi_ioctl_queue_destroy(int fd, unsigned long request, void *arg)
 {
+   simple_mtx_lock(&shim_queue_lock);
+   if (shim_live_queues)
+      shim_live_queues--;
+   simple_mtx_unlock(&shim_queue_lock);
    return 0;
 }
 
@@ -1562,6 +1613,16 @@ asahi_ioctl_get_param(int fd, unsigned long request, void *arg)
       return asahi_ioctl_vm_status_mirror(fd, gp);
 
    case DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS:
+      if (shim_params() == &params_g16g) {
+         if (gp->size < sizeof(queue_limits_g16g)) {
+            errno = EINVAL;
+            return -1;
+         }
+         memcpy((void *)(uintptr_t)gp->pointer, &queue_limits_g16g,
+                sizeof(queue_limits_g16g));
+         gp->size = sizeof(queue_limits_g16g);
+         return 0;
+      }
       if (shim_params() == &params_g16s_rt ||
           shim_params() == &params_g16s_as) {
          const struct drm_asahi_queue_limits limits = {
@@ -2254,6 +2315,8 @@ asahi_ioctl_submit(int fd, unsigned long request, void *arg)
    simple_mtx_lock(&shim_mapping_lock);
    int ret = asahi_ioctl_submit_unlocked(fd, request, arg);
    simple_mtx_unlock(&shim_mapping_lock);
+   if (ret == 0)
+      shim_note_submitting_queue(((struct drm_asahi_submit *)arg)->queue_id);
    return ret;
 }
 

@@ -1060,6 +1060,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  brl_vulkan_queues = executable(
+    'brl-vulkan-queues',
+    files('tests/brl_vulkan_queues.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan'), dep_dl],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   hk_vulkan_sparse_bind_first_submit = executable(
     'hk-vulkan-sparse-bind-first-submit',
     files('tests/hk_vulkan_sparse_bind_first_submit.c'),
