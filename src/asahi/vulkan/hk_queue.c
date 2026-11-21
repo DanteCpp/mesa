@@ -1700,15 +1700,14 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       dev->dev.chip == AGX_CHIP_G17P ||
       (agx_chip_g17_m5(dev->dev.chip) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES));
+   const bool chunk_timelines = cumulative_signals &&
+      (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS) &&
+      command_count > max_commands_per_submit(dev);
    const bool kernel_cumulative = dev->dev.chip == AGX_CHIP_G17P &&
-      submit->signal_count > 0 &&
+      !chunk_timelines && submit->signal_count > 0 &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS);
    const unsigned kernel_signal_count =
       cumulative_signals && !kernel_cumulative ? 0 : submit->signal_count;
-   const bool chunk_timelines = cumulative_signals &&
-      (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS) &&
-      agx_chip_g17_m5(dev->dev.chip) &&
-      command_count > max_commands_per_submit(dev);
    const uint64_t point_count = chunk_timelines
       ? 1 + (command_count - 1) / max_commands_per_submit(dev) : 1;
    if (queue->drm.timeline_value > UINT64_MAX - point_count) {
@@ -2175,7 +2174,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
              * alone, so its vertex work overlaps compute work that only its
              * fragment half waits for. Every other render keeps the forms
              * below, which the kernel can publish directly. */
-            const bool g17p_staged =
+            bool g17p_staged =
                dev->dev.chip == AGX_CHIP_G17P && !queue->sync.serialize &&
                queue->sync.exact_prior &&
                (dev->dev.params.features &
@@ -2184,10 +2183,6 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                (cs->sync.barrier_ta[HK_SYNC_CDM] !=
                    cs->sync.barrier[HK_SYNC_CDM] ||
                 cs->sync.prior_ta[HK_SYNC_CDM] != cs->sync.prior[HK_SYNC_CDM]);
-            if (g17p_staged) {
-               cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
-               perf_debug_dev(&dev->dev, "G17P staged render");
-            }
 
             /* The render's vertex half depends on no earlier render while its
              * fragment half does (hk_sync: every render dependency targets
@@ -2221,9 +2216,11 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
 
             /* G17P: a vertex half that still names earlier renders can use
              * the fragment-only barriers too when the order of tiling kicks
-             * already covers what it names. A staged render takes neither
-             * the flag nor part in ta_cover: its tiling waits only for its
-             * narrower tiling prefix. */
+             * already covers what it names. Otherwise, when the vertex half
+             * still depends on an earlier render than the fragment half, send
+             * the narrower tiling prefix via a staged render instead of
+             * stalling tiling on the whole prefix. A staged render takes
+             * neither FRAGMENT_BARRIERS nor part in ta_cover. */
             if (dev->dev.chip == AGX_CHIP_G17P && !g17p_staged &&
                 !queue->sync.serialize && queue->sync.exact_prior &&
                 (dev->dev.params.features &
@@ -2235,11 +2232,24 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                const uint64_t vertex = hk_drm_render_prefix(
                   base, cs->sync.barrier_ta[HK_SYNC_VDM],
                   cs->sync.prior_ta[HK_SYNC_VDM]);
+               uint64_t next_cover = queue->sync.ta_cover;
                if (hk_drm_g17p_tiling_ordered(
                       base, nr_vdm, whole, vertex,
                       cmd.legacy.flags & DRM_ASAHI_RENDER_FRAGMENT_BARRIERS,
-                      &queue->sync.ta_cover))
+                      &next_cover)) {
                   cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+                  queue->sync.ta_cover = next_cover;
+               } else if ((dev->dev.params.features &
+                           DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2) &&
+                          cs->sync.ta_split && vertex < whole) {
+                  g17p_staged = true;
+               } else {
+                  queue->sync.ta_cover = next_cover;
+               }
+            }
+            if (g17p_staged) {
+               cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
+               perf_debug_dev(&dev->dev, "G17P staged render");
             }
 
             /* Likewise for compute: when the vertex half depends on less
