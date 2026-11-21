@@ -3979,10 +3979,10 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
        *    compute grid-Z input there made every layered eMRT store address
        *    layer zero.
        *
-       * Both are driver-internal, and hk sets g17p_emrt only for the eMRT
-       * epilog (hk_cmd_draw.c). An API gl_Layer read never reaches here from
-       * hk -- nir_lower_sysvals_to_varyings rewrites it as a flat coefficient
-       * first (hk_shader.c) -- but it does from gallium, which lowers
+       * Both are driver-internal, and Borealis sets g17p_emrt only for the eMRT
+       * epilog (brl_cmd_draw.c). An API gl_Layer read never reaches here from
+       * Borealis -- nir_lower_sysvals_to_varyings rewrites it as a flat coefficient
+       * first (brl_shader.c) -- but it does from gallium, which lowers
        * VARYING_SLOT_LAYER back to this intrinsic with layer_as_varying
        * false and sets neither key bit. Leave that path alone. */
       if (b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
@@ -6255,7 +6255,7 @@ agx_lower_agx3_half_iadd_constants(agx_context *ctx)
 }
 
 /* A 32-bit add or multiply-add of halves -- 16-bit integer arithmetic the
- * optimizer widened, as hk's int16 shaders and dynamically indexed uniform
+ * optimizer widened, as Borealis's int16 shaders and dynamically indexed uniform
  * arrays produce -- has no mixed-width AGX3 form. Extend each half register
  * explicitly: AGX IR plain half sources are signed and abs selects zero
  * extension; negation and the add's shift stay on the widened operation. */
@@ -10460,7 +10460,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       }
    }
 
-   /* Force preamble generation for internal shaders since hk's meta copies
+   /* Force preamble generation for internal shaders since Borealis's meta copies
     * depend on it for correctness with imgwblk intrinsics.
     */
    if (preamble_size &&
@@ -13939,7 +13939,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 
    /* A frontend that reaches this helper with `g17p` set owns the element-index
     * conversion for the whole shader, including shared accesses that do not
-    * exist yet: hk_shader.c lowers `shared` variables to load_shared and
+    * exist yet: brl_shader.c lowers `shared` variables to load_shared and
     * store_shared at :1810, which is *between* its two calls here (:252 and
     * :1892), so the first call legitimately finds nothing and the second does
     * the work.  Record the ownership rather than the work -- a flag set by the
