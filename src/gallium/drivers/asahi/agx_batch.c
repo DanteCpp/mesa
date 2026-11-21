@@ -367,6 +367,7 @@ agx_batch_init(struct agx_context *ctx,
    batch->g17p_fragment_linked = NULL;
    batch->g17p_last_bind_tail.length = 0;
    batch->g17p_last_draw_state_offset = 0;
+   memset(batch->g17p_resource_pair, 0, sizeof(batch->g17p_resource_pair));
 
    agx_bo_reference(screen->rodata);
    agx_pool_init(&batch->pool, dev, "Batch pool", 0, true);

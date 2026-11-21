@@ -568,6 +568,14 @@ struct agx_batch {
     * pool; reused by multi-draw indirect when only per-draw VS params vary. */
    struct agx_vdm_hal200_bind_tail g17p_last_bind_tail;
    uint32_t g17p_last_draw_state_offset;
+   /* Cached 16-byte {texture_base, samplers} pointer pair uploaded into this
+    * batch's pool per stage, so consecutive draws with unchanged descriptors
+    * keep a stable uniform-range VA and hit the graphics program cache. */
+   struct {
+      uint64_t texture_base;
+      uint64_t samplers;
+      uint64_t va;
+   } g17p_resource_pair[MESA_SHADER_STAGES];
 
    /* G17G: primitives drawn into this render (see AGX_G17G_RENDER_PRIMS) */
    uint64_t g17g_prims;

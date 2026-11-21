@@ -6634,6 +6634,31 @@ agx_graphics_tps_frame(const struct agx_device *dev,
    return dev->chip == AGX_CHIP_G18G ? ALIGN_POT(frame, 16) : frame;
 }
 
+static uint64_t
+agx_g17p_resource_pair_va(struct agx_batch *batch, mesa_shader_stage stage)
+{
+   const uint64_t texture_base = batch->stage_uniforms[stage].texture_base;
+   const uint64_t samplers = batch->samplers[stage];
+   if (!texture_base || !samplers)
+      return 0;
+
+   if (batch->g17p_resource_pair[stage].va &&
+       batch->g17p_resource_pair[stage].texture_base == texture_base &&
+       batch->g17p_resource_pair[stage].samplers == samplers)
+      return batch->g17p_resource_pair[stage].va;
+
+   const uint64_t pointers[2] = {texture_base, samplers};
+   const uint64_t va =
+      agx_pool_upload_aligned(&batch->pool, pointers, sizeof(pointers), 8);
+   if (!va)
+      return 0;
+
+   batch->g17p_resource_pair[stage].texture_base = texture_base;
+   batch->g17p_resource_pair[stage].samplers = samplers;
+   batch->g17p_resource_pair[stage].va = va;
+   return va;
+}
+
 static uint32_t
 agx_build_g17p_graphics_program(struct agx_batch *batch,
                                 struct agx_compiled_shader *cs,
@@ -6692,17 +6717,10 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
        stage == MESA_SHADER_FRAGMENT)
       return 0;
    if (resource_pair) {
-      if (!batch->stage_uniforms[stage].texture_base ||
-          !batch->samplers[stage] ||
-          (batch->ctx->stage[stage].custom_borders &&
+      if ((batch->ctx->stage[stage].custom_borders &&
            !cs->g17p_custom_border_emulation))
          return 0;
-      const uint64_t pointers[2] = {
-         batch->stage_uniforms[stage].texture_base,
-         batch->samplers[stage],
-      };
-      const uint64_t pointer_va = agx_pool_upload_aligned(
-         &batch->pool, pointers, sizeof(pointers), 8);
+      const uint64_t pointer_va = agx_g17p_resource_pair_va(batch, stage);
       if (!pointer_va)
          return 0;
       ranges[count++] = (struct agx3_ioto_uniform_range){
@@ -15536,13 +15554,6 @@ agx_multidraw_init_vs_patch(struct agx_context *ctx, struct agx_batch *batch,
        !agx_va_in_usc_window(dev, linked->bo->va->addr + linked->entry_offset))
       return;
 
-   struct agx_g17p_graphics_template *tmpl = linked->g17p_graphics_templates;
-   if (!tmpl || tmpl->desc.fragment || tmpl->desc.constant_program.code_size ||
-       tmpl->desc.shader_va != linked->bo->va->addr + linked->entry_offset ||
-       tmpl->program.program.length == 0 ||
-       tmpl->program.program.length > sizeof(cache->prog_bytes))
-      return;
-
    struct agx3_ioto_uniform_range ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
    uint32_t params_offset[AGX3_G17P_GRAPHICS_MAX_RANGES] = {0};
    uint32_t params_mask = 0;
@@ -15552,17 +15563,11 @@ agx_multidraw_init_vs_patch(struct agx_context *ctx, struct agx_batch *batch,
       batch->texture_count[MESA_SHADER_VERTEX] != 0 &&
       vs->g17p_texture_resources;
    if (resource_pair) {
-      if (!batch->stage_uniforms[MESA_SHADER_VERTEX].texture_base ||
-          !batch->samplers[MESA_SHADER_VERTEX] ||
-          (ctx->stage[MESA_SHADER_VERTEX].custom_borders &&
-           !vs->g17p_custom_border_emulation))
+      if (ctx->stage[MESA_SHADER_VERTEX].custom_borders &&
+          !vs->g17p_custom_border_emulation)
          return;
-      const uint64_t pointers[2] = {
-         batch->stage_uniforms[MESA_SHADER_VERTEX].texture_base,
-         batch->samplers[MESA_SHADER_VERTEX],
-      };
-      const uint64_t pointer_va = agx_pool_upload_aligned(
-         &batch->pool, pointers, sizeof(pointers), 8);
+      const uint64_t pointer_va =
+         agx_g17p_resource_pair_va(batch, MESA_SHADER_VERTEX);
       if (!pointer_va)
          return;
       ranges[count++] = (struct agx3_ioto_uniform_range){
@@ -15640,7 +15645,7 @@ agx_multidraw_init_vs_patch(struct agx_context *ctx, struct agx_batch *batch,
    if (!params_mask)
       return;
 
-   const struct agx3_g17p_graphics_program_desc target_desc = {
+   struct agx3_g17p_graphics_program_desc target_desc = {
       .program_va = 0,
       .shader_va = linked->bo->va->addr + linked->entry_offset,
       .uniform_ranges = ranges,
@@ -15661,29 +15666,58 @@ agx_multidraw_init_vs_patch(struct agx_context *ctx, struct agx_batch *batch,
       },
    };
 
-   if (!agx3_g17p_graphics_program_template_relocate(
-          dev->chip, &tmpl->desc, &target_desc, &tmpl->program,
-          cache->prog_bytes, sizeof(cache->prog_bytes), &cache->prog_len))
-      return;
-
+   struct agx_g17p_graphics_template *tmpl = linked->g17p_graphics_templates;
    struct hk_g17p_patch_plan plan;
-   if (!hk_g17p_patch_plan_init(&plan, tmpl->desc.uniform_ranges,
-                                tmpl->desc.uniform_range_count,
-                                tmpl->program.relocations,
-                                tmpl->program.relocation_count,
-                                tmpl->program.program.length, false))
-      return;
+   bool plan_ok = false;
 
-   /* Only patch PARAMS relocations directly when no invariant range shares an
-    * address-cache cluster with a PARAMS range in the template. */
-   for (unsigned r = 0; r < plan.range_count; ++r) {
-      if (!(params_mask & BITFIELD_BIT(r)))
-         continue;
-      for (unsigned j = 0; j < plan.range_count; ++j) {
-         if (!(params_mask & BITFIELD_BIT(j)) &&
-             plan.leader[j] == plan.leader[r])
-            return;
+   if (tmpl && !tmpl->desc.fragment && !tmpl->desc.constant_program.code_size &&
+       tmpl->desc.shader_va == linked->bo->va->addr + linked->entry_offset &&
+       tmpl->program.program.length > 0 &&
+       tmpl->program.program.length <= sizeof(cache->prog_bytes) &&
+       agx3_g17p_graphics_program_template_relocate(
+          dev->chip, &tmpl->desc, &target_desc, &tmpl->program,
+          cache->prog_bytes, sizeof(cache->prog_bytes), &cache->prog_len) &&
+       hk_g17p_patch_plan_init(&plan, tmpl->desc.uniform_ranges,
+                               tmpl->desc.uniform_range_count,
+                               tmpl->program.relocations,
+                               tmpl->program.relocation_count,
+                               tmpl->program.program.length, false)) {
+      /* Reuse the MRU template when no invariant range shares an address-cache
+       * cluster with a PARAMS range. */
+      plan_ok = true;
+      for (unsigned r = 0; plan_ok && r < plan.range_count; ++r) {
+         if (!(params_mask & BITFIELD_BIT(r)))
+            continue;
+         for (unsigned j = 0; j < plan.range_count; ++j) {
+            if (!(params_mask & BITFIELD_BIT(j)) &&
+                plan.leader[j] == plan.leader[r]) {
+               plan_ok = false;
+               break;
+            }
+         }
       }
+   }
+
+   if (!plan_ok) {
+      /* Generate one address-independent patchable template for the multi-draw
+       * when the MRU template cannot be patched directly (for example when
+       * PARAMS shares a cluster with an invariant range in the template). */
+      struct agx3_g17p_graphics_program_template local_tmpl;
+      target_desc.patchable = true;
+      if (!agx3_g17p_graphics_program_template_generate(
+             dev->chip, &target_desc, &local_tmpl) ||
+          local_tmpl.program.length == 0 ||
+          local_tmpl.program.length > sizeof(cache->prog_bytes) ||
+          !hk_g17p_patch_plan_init(&plan, target_desc.uniform_ranges,
+                                   target_desc.uniform_range_count,
+                                   local_tmpl.relocations,
+                                   local_tmpl.relocation_count,
+                                   local_tmpl.program.length, true))
+         return;
+
+      memcpy(cache->prog_bytes, local_tmpl.program.bytes,
+             local_tmpl.program.length);
+      cache->prog_len = local_tmpl.program.length;
    }
 
    unsigned reloc_count = 0;
@@ -16044,10 +16078,14 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
                } else {
                   struct agx_compiled_shader *vs = ctx->vs;
                   if (uses_base_param) {
+                     const unsigned params_off = offsetof(
+                        struct agx_draw_uniforms, tables[AGX_SYSVAL_TABLE_PARAMS]);
                      for (unsigned p = 0; p < vs->push_range_count; ++p) {
                         const struct agx_push_range *push = &vs->push[p];
                         if (push->table == AGX_SYSVAL_TABLE_ROOT &&
-                            push->offset < sizeof(clean->uniforms.tables)) {
+                            push->offset < params_off + sizeof(uint64_t) &&
+                            push->offset + (unsigned)push->length * 2u >
+                               params_off) {
                            root_reads_params_ptr = true;
                            break;
                         }
