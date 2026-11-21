@@ -616,7 +616,7 @@ check_main_side_effects_fence_strip(void)
    nir_push_loop(&b);
    {
       nir_def *i = nir_load_var(&b, iter);
-      nir_break_if(&b, nir_uge_imm(&b, i, 64));
+      nir_break_if(&b, nir_uge_imm(&b, i, 128));
       nir_global_atomic(&b, 32, nir_imm_int64(&b, atomic_addr),
                         nir_imm_int(&b, 1), .atomic_op = nir_atomic_op_iadd);
       nir_fence_mem_to_tex_agx(&b);

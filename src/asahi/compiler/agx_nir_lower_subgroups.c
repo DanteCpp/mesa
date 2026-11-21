@@ -370,7 +370,18 @@ agx_nir_lower_subgroups(nir_shader *s)
 bool
 agx_nir_lower_subgroups_g17p(nir_shader *s)
 {
-   return agx_nir_lower_subgroups_internal(s, true, false, false, false);
+   const bool compute = s->info.stage == MESA_SHADER_COMPUTE;
+
+   /* The native float reduce treats denormals as zeros of their sign and does
+    * not flush or reliably preserve them, so keep the shuffle tree whenever
+    * the shader requests 32-bit denormal flush-to-zero or denormal preserve.
+    */
+   const bool denorm32_exact =
+      nir_is_denorm_flush_to_zero(s->info.float_controls_execution_mode, 32) ||
+      nir_is_denorm_preserve(s->info.float_controls_execution_mode, 32);
+
+   return agx_nir_lower_subgroups_internal(s, true, false, compute,
+                                           compute && !denorm32_exact);
 }
 
 bool
@@ -379,17 +390,18 @@ agx_nir_lower_subgroups_m5(nir_shader *s, bool native_shuffle_xor,
 {
    const bool compute = s->info.stage == MESA_SHADER_COMPUTE;
 
-   /* The native float reduce does not flush denormal results, so it is not
-    * used when the shader asks for 32-bit denormals to be flushed: those
-    * reductions keep the tree, of values agx_nir_flush_subgroup_minmax()
-    * has flushed.
+   /* The native float reduce treats denormals as zeros of their sign and does
+    * not flush or reliably preserve them, so keep the shuffle tree whenever
+    * the shader requests 32-bit denormal flush-to-zero or denormal preserve.
     */
-   const bool ftz32 =
-      nir_is_denorm_flush_to_zero(s->info.float_controls_execution_mode, 32);
+   const bool denorm32_exact =
+      nir_is_denorm_flush_to_zero(s->info.float_controls_execution_mode, 32) ||
+      nir_is_denorm_preserve(s->info.float_controls_execution_mode, 32);
 
    return agx_nir_lower_subgroups_internal(
       s, false, s->info.stage != MESA_SHADER_FRAGMENT,
-      native_shuffle_xor && compute, native_float_minmax && compute && !ftz32);
+      native_shuffle_xor && compute,
+      native_float_minmax && compute && !denorm32_exact);
 }
 
 static bool
