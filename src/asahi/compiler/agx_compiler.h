@@ -748,7 +748,7 @@ typedef struct {
    /* Halves taken off the spill budget after a failed allocation, so the
     * live-range shuffle gets free room (agx_compile_function_nir retries). */
    unsigned ra_budget_cut;
-   /* Set by agx_ra_impl() while it assigns registers: a failed allocation
+   /* Set by agx_ra() while it assigns registers: a failed allocation
     * that has no legal region left at all leaves RA through it (a
     * jmp_buf *), see find_best_region_to_evict(). */
    void *ra_abort;
@@ -1276,6 +1276,7 @@ void agx_opt_promote_m5_float_constants(agx_context *ctx);
 void agx_dce(agx_context *ctx, bool partial);
 void agx_pressure_schedule(agx_context *ctx);
 void agx_ilp_schedule(agx_context *ctx);
+int agx_ilp_m5_device_load_cap(int program_peak);
 bool agx3_lower_uniform_program(agx_context *ctx);
 /* Success/refusal, not a progress flag. Call only for AGX3B preambles. */
 bool agx3_lower_cprog_inputs(agx_context *ctx);

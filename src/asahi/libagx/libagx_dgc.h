@@ -657,7 +657,8 @@ agx_vdm_draw_size(enum agx_chip chip, struct agx_draw draw)
 }
 
 static inline GLOBAL uint32_t *
-agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
+agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip,
+                bool kernel_admits_inval)
 {
    /* The AGX3 encoding uses this exact type-1 memory-barrier word on every
     * byte-witnessed G15--G17 identity.  Do not feed those chips through the
@@ -678,8 +679,9 @@ agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
    case AGX_CHIP_G18G:
-      /* Includes the USC cache invalidate (agx_vdm_barrier_core.h). */
-      *out++ = AGX_VDM_BARRIER_CORE_WORD;
+      /* With the USC cache invalidate where the kernel admits it
+       * (agx_vdm_barrier_core.h). */
+      *out++ = agx_vdm_barrier_core_word(chip, kernel_admits_inval);
       return out;
 
    case AGX_CHIP_G16P:

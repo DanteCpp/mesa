@@ -71,8 +71,9 @@ enum hk_pack_boundary {
    HK_PACK_BOUNDARY_NONE,
    /* The kernel takes each stream's own completion flush, the strong
     * memory-scoped flush (DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION, M5
-    * streams): a member ends with it, and a boundary keeps the scope the
-    * next member needs. */
+    * streams): a member ends with a strong flush, a boundary keeps the
+    * memory scope only where memory may have a second address
+    * (hk_cdm_alias_scope()), and the packet's end gets it. */
    HK_PACK_BOUNDARY_VISIBLE_COMPLETION,
    /* HAL200 streams whose strong flush has no memory-scoped form (G16): the
     * kernel publishes a command's writes when it completes, and a boundary
@@ -82,6 +83,26 @@ enum hk_pack_boundary {
 };
 
 enum hk_pack_boundary hk_pack_boundary(const struct hk_device *dev);
+
+/* Whether a member may end with a strong flush without memory scope, as an
+ * application barrier at the end of a command buffer leaves it: at every
+ * boundary. The HAL200 boundary upgrades it in place; at the
+ * visible-completion boundary the packet's end carries the memory-scoped
+ * flush the kernel takes as its completion (hk_pack_runs()).
+ * hk_pack_run_member() takes the answer from here, and the packing trace
+ * reports it (strong_tails=), so tests know which barrier-ended command
+ * buffers must pack. */
+bool hk_pack_admits_strong_tail(enum hk_pack_boundary boundary);
+
+/* Whether streams with global atomics may be packed, before the check of the
+ * device's other kernel queues: with `serial_kernel` (G16G, whose kernel
+ * runs a VM's compute commands one after another on one firmware queue) by
+ * default and unless HK_PACK_ATOMICS (`opt`) says no; otherwise only when
+ * `opt` says yes and the queue has a single kernel queue (`queues`). `opt`
+ * takes debug_parse_bool_option()'s values plus "on" and "off"; any other
+ * value keeps the default. */
+bool hk_pack_atomics_choice(bool serial_kernel, const char *opt,
+                            unsigned queues);
 
 /* The single compute stream of `cmd` that a packet may copy, or NULL. */
 const struct hk_cs *hk_pack_run_member(const struct hk_device *dev,

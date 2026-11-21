@@ -223,6 +223,43 @@ test_rejections(void)
      member(own_cut, false) != NULL);
 }
 
+/* M5: a member's stream ends with a strong flush, with memory scope (the
+ * visible-completion tail vkEndCommandBuffer gives a last launch) or without
+ * (an application barrier, or the deferred clears' flush, at the end on a
+ * device whose memory has no second address). A weak barrier publishes
+ * nothing and ends no member; nor does a strong flush before the end. */
+static void
+test_m5_tails(void)
+{
+   struct hk_cmd_buffer *c = plain(2);
+   struct hk_cs *s = list_first_entry(&c->control_streams, struct hk_cs, node);
+   struct hk_device *m5 =
+      dev_with(AGX_CHIP_G17S, DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION);
+   uint32_t *end = s->weak_barrier_end;
+
+   T("M5: weak barrier tail is no member",
+     !hk_pack_run_member(m5, c, terminate, false));
+
+   s->weak_barrier_end = NULL;
+   s->strong_flush_end = s->memory_flush_end = end;
+   s->visible_completion = true;
+   T("M5: memory-scoped visible-completion tail is a member",
+     hk_pack_run_member(m5, c, terminate, false) == s);
+   T("M5: no member without the visible-completion feature",
+     !hk_pack_run_member(dev_with(AGX_CHIP_G17S, 0), c, terminate, false));
+
+   s->memory_flush_end = NULL;
+   s->visible_completion = false;
+   T("M5: strong flush without memory scope is a member",
+     hk_pack_run_member(m5, c, terminate, false) == s);
+   T("M5: nor a plain strong flush without the feature",
+     !hk_pack_run_member(dev_with(AGX_CHIP_G17S, 0), c, terminate, false));
+
+   s->strong_flush_end = end - 1;
+   T("M5: strong flush before the end is no member",
+     !hk_pack_run_member(m5, c, terminate, false));
+}
+
 /* Plans a submission to queue `q` as hk_pack_runs() does. */
 static void
 plan_queue(const struct hk_queue *q, struct hk_cmd_buffer **cmds, unsigned n,
@@ -480,7 +517,10 @@ test_boundary(void)
    T("G17P: memory-scoped flush form, no boundary",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
    dev->dev.chip = AGX_CHIP_G15S;
-   T("G15S: wide visibility, no boundary",
+   T("G15S: not qualified, no boundary",
+     hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
+   dev->dev.chip = AGX_CHIP_G17A;
+   T("G17A: HAL200, caches pending, no boundary",
      hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
    dev->dev.chip = AGX_CHIP_G14G;
    T("G14G: no boundary", hk_pack_boundary(dev) == HK_PACK_BOUNDARY_NONE);
@@ -493,7 +533,54 @@ test_boundary(void)
      hk_pack_run_member(
         dev_with(AGX_CHIP_G17S, DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION),
         c, terminate, false));
+
+   /* A stream an application barrier ends: a strong flush without memory
+    * scope, so no visible completion. The member check takes it exactly
+    * where hk_pack_admits_strong_tail() says, which the trace reports. */
+   struct hk_cs *s = list_first_entry(&c->control_streams, struct hk_cs, node);
+   s->memory_flush_end = NULL;
+   s->visible_completion = false;
+   T("M5: a strong-flush tail, and the trace says so",
+     hk_pack_run_member(
+        dev_with(AGX_CHIP_G17S, DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION),
+        c, terminate, false) &&
+        hk_pack_admits_strong_tail(HK_PACK_BOUNDARY_VISIBLE_COMPLETION));
+   T("no strong-flush tail without a boundary",
+     !hk_pack_admits_strong_tail(HK_PACK_BOUNDARY_NONE));
    chip = AGX_CHIP_G16G;
+   struct hk_cmd_buffer *g = plain(1);
+   s = list_first_entry(&g->control_streams, struct hk_cs, node);
+   s->strong_flush_end = s->weak_barrier_end;
+   s->weak_barrier_end = NULL;
+   T("G16G: a strong-flush tail, and the trace says so",
+     hk_pack_run_member(dev_with(AGX_CHIP_G16G, 0), g, terminate, false) &&
+        hk_pack_admits_strong_tail(HK_PACK_BOUNDARY_STRONG_FLUSH));
+}
+
+/* HK_PACK_ATOMICS: on by default where the kernel runs a VM's compute
+ * commands one after another (G16G), opt-in elsewhere with one kernel queue;
+ * an unparsable value keeps the default. */
+static void
+test_atomics_choice(void)
+{
+   T("G16G: atomics packed by default", hk_pack_atomics_choice(true, NULL, 1));
+   T("G16G: HK_PACK_ATOMICS=0 keeps them apart",
+     !hk_pack_atomics_choice(true, "0", 1));
+   T("G16G: HK_PACK_ATOMICS=1", hk_pack_atomics_choice(true, "1", 1));
+   T("G16G: an unparsable value keeps the default",
+     hk_pack_atomics_choice(true, "maybe", 1));
+   T("G16G: HK_PACK_ATOMICS=off keeps them apart",
+     !hk_pack_atomics_choice(true, "off", 1) &&
+        !hk_pack_atomics_choice(true, "OFF", 1));
+   T("M5: atomics apart by default", !hk_pack_atomics_choice(false, NULL, 1));
+   T("M5: HK_PACK_ATOMICS=1 with one kernel queue",
+     hk_pack_atomics_choice(false, "1", 1));
+   T("M5: HK_PACK_ATOMICS=1 with two kernel queues",
+     !hk_pack_atomics_choice(false, "1", 2));
+   T("M5: an unparsable value keeps the default",
+     !hk_pack_atomics_choice(false, "maybe", 1));
+   T("M5: HK_PACK_ATOMICS=on with one kernel queue",
+     hk_pack_atomics_choice(false, "on", 1));
 }
 
 /* hk_sync_forget_stream() leaves a command buffer's latest render of a kind
@@ -530,6 +617,32 @@ test_forget(bool exact)
 #undef N
 }
 
+/* A render forgotten in an earlier submission on an exact-prior queue: the
+ * queue's latest positions (last_absolute), not the kinds it ran (ever), say
+ * which priors wait (from the fourth review of #488). */
+static void
+test_forget_history(void)
+{
+   struct hk_cmd_buffer *r = new_cmd();
+   r->sync.kind_override = HK_SYNC_XFER;
+   add(r, false);
+   r->sync.kind_override = 0;
+   struct hk_cs *gone = add(r, false);
+   hk_sync_forget_stream(r, gone);
+   list_del(&gone->node);
+   struct hk_queue *q = new_queue(true);
+   T("exact: earlier forget: history resolves", resolve(q, &r, 1));
+   struct hk_cmd_buffer *c[2] = {plain(1), after_render()};
+   struct hk_pack_run runs[4];
+   unsigned count;
+   plan_queue(q, c, 2, false, runs, &count);
+   T("exact: a render forgotten in an earlier submission splits", count == 0);
+   T("exact: earlier forget: resolves", resolve(q, c, 2));
+   T("exact: earlier forget: the resolver agrees",
+     wait_of(first_cs(c[0]), HK_SYNC_VDM, 0, true) == 0 &&
+        wait_of(first_cs(c[1]), HK_SYNC_VDM, 0, true) != 0);
+}
+
 /* A tail of a graphics destination class the packet's stream belongs to
  * holds the members after it: a stream of every kind waits for the
  * fragment-class requirements too (hk_sync_full_kinds()). */
@@ -555,6 +668,47 @@ test_full_classes(void)
    pack(all, 2, &cs);
    T("the fold applies a fragment-class tail to the members after it",
      cs->sync.dep[HK_SYNC_VDM].prior & HK_SYNC_GFX);
+}
+
+/* M5: where memory has no second address, a command buffer recorded as
+ * {dispatch, COMPUTE -> COMPUTE barrier} ends with the application's strong
+ * flush without memory scope. Those streams are members too (the packet's
+ * end gets the memory scope), so the chain forms one packet, also when its
+ * members' tails mix both flushes. */
+static void
+test_m5_barrier_chain(void)
+{
+   struct hk_pack_run runs[16];
+   unsigned count;
+
+   chip = AGX_CHIP_G17S;
+   struct hk_cmd_buffer *chain[8];
+   for (unsigned i = 0; i < 8; ++i) {
+      chain[i] = plain(1);
+      hk_sync_barrier(chain[i], HK_SYNC_COMPUTE, HK_SYNC_COMPUTE);
+      struct hk_cs *s =
+         list_first_entry(&chain[i]->control_streams, struct hk_cs, node);
+      s->visible_completion = false;
+      s->memory_flush_end = NULL;
+   }
+   plan(chain, 8, runs, &count);
+   T("G17S: a chain ending in barriers without memory scope forms one packet",
+     runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){8}));
+   plan(chain, 3, runs, &count);
+   T("G17S: three of them form one packet",
+     runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){3}));
+   plan_on(chain, 8, HK_SYNC_GFX, false, runs, &count);
+   T("G17S: the chain forms one packet on a queue that ran renders",
+     runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){8}));
+
+   struct hk_cs *scoped =
+      list_first_entry(&chain[3]->control_streams, struct hk_cs, node);
+   scoped->visible_completion = true;
+   scoped->memory_flush_end = scoped->strong_flush_end;
+   plan(chain, 8, runs, &count);
+   T("G17S: plain and memory-scoped tails mixed form one packet",
+     runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){8}));
+   chip = AGX_CHIP_G16G;
 }
 
 static void
@@ -1099,13 +1253,17 @@ main(void)
    if (!test_context)
       return EXIT_FAILURE;
    test_boundary();
+   test_atomics_choice();
    test_rejections();
+   test_m5_tails();
    test_plan();
+   test_m5_barrier_chain();
    test_dependencies(false);
    test_dependencies(true);
    test_folds();
    test_forget(false);
    test_forget(true);
+   test_forget_history();
    test_full_classes();
    test_random();
    test_history();

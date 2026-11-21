@@ -1305,7 +1305,7 @@ m5_merge_buffer_words(nir_shader *nir)
                continue;
             nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
             if (in->num_components != 1 || in->def.bit_size != 32 ||
-                !nir_intrinsic_can_reorder(in) || nir_intrinsic_align(in) < 4)
+                !nir_intrinsic_can_reorder(in))
                continue;
             struct m5_word_read r = {.load = in};
             switch (in->intrinsic) {
@@ -1325,7 +1325,7 @@ m5_merge_buffer_words(nir_shader *nir)
             default:
                continue;
             }
-            if (r.offset_def->bit_size != 32)
+            if (nir_intrinsic_align(in) < 4 || r.offset_def->bit_size != 32)
                continue;
             r.offset = m5_bounded_offset(nir_scalar_resolved(r.offset_def, 0), 12);
             if (r.offset.valid)
@@ -3240,32 +3240,50 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             dev->dev.chip == AGX_CHIP_G17G || dev->dev.chip == AGX_CHIP_G17S);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
-   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
-            hk_buffer_addr_format(rs->storage_buffers,
-                                  rs->null_storage_buffer_descriptor,
-                                  agx_chip_g17_m5(dev->dev.chip)));
-   /* While UBO offsets are still 32-bit deref offsets, merge the loads of a
-    * block that read the same record: once lowered, their 64-bit addresses
-    * hide how they relate. Components of a vector become loads of the whole
-    * vector, so that reads of one record's .xy and .z are the same load. A
-    * uniform buffer does not change during a draw or dispatch, so its loads
-    * may be reordered, as load_ubo always may: repeated ones are then merged
-    * and loop invariant ones may leave the loop. */
-   NIR_PASS(_, nir, nir_lower_array_deref_of_vec, nir_var_mem_ubo, NULL,
+   /* While UBO (and G17P/M5 SSBO) offsets are still 32-bit deref offsets,
+    * merge adjacent scalar and component loads: once lowered to 64-bit
+    * base + u2u64(offset32), potential 32-bit wrap hides adjacency from later
+    * nir_opt_load_store_vectorize. Gate pre-lowering SSBO vectorization on
+    * G17P and M5 (matching storage_result_select below) so AGX2 and other
+    * generations keep their exact existing lowering sequence. A uniform buffer
+    * does not change during a draw or dispatch, so its loads may also be
+    * marked reorderable before CSE and vectorization. */
+   const bool agx3_ssbo_vec =
+      dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip);
+   if (!agx3_ssbo_vec) {
+      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
+               hk_buffer_addr_format(rs->storage_buffers,
+                                     rs->null_storage_buffer_descriptor,
+                                     agx_chip_g17_m5(dev->dev.chip)));
+   }
+   const nir_variable_mode pre_lower_vec_modes =
+      nir_var_mem_ubo | (agx3_ssbo_vec ? nir_var_mem_ssbo : 0);
+   NIR_PASS(_, nir, nir_lower_array_deref_of_vec, pre_lower_vec_modes, NULL,
             nir_lower_direct_array_deref_of_vec_load);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_ubo_loads_reorderable,
             nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_opt_cse);
    NIR_PASS(_, nir, nir_opt_load_store_vectorize,
             &(const nir_load_store_vectorize_options){
-               .modes = nir_var_mem_ubo,
+               .modes = pre_lower_vec_modes,
                .robust_modes =
-                  rs->uniform_buffers ==
-                        VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
-                     ? 0
-                     : nir_var_mem_ubo,
+                  (rs->uniform_buffers ==
+                         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
+                      ? 0
+                      : nir_var_mem_ubo) |
+                  (!agx3_ssbo_vec ||
+                         rs->storage_buffers ==
+                            VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
+                      ? 0
+                      : nir_var_mem_ssbo),
                .callback = agx_mem_vectorize_cb,
             });
+   if (agx3_ssbo_vec) {
+      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
+               hk_buffer_addr_format(rs->storage_buffers,
+                                     rs->null_storage_buffer_descriptor,
+                                     agx_chip_g17_m5(dev->dev.chip)));
+   }
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             hk_ubo_addr_format(rs->uniform_buffers));
 
@@ -3343,10 +3361,9 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
 
    struct global_load_lowering global_loads = {
       .soft_fault = agx_has_soft_fault(&dev->dev),
-      .storage_result_select = dev->dev.chip == AGX_CHIP_G17P ||
-                               agx_chip_g17_m5(dev->dev.chip),
+      .storage_result_select = agx3_ssbo_vec,
    };
-   if (agx_chip_g17_m5(dev->dev.chip) && global_loads.soft_fault) {
+   if (global_loads.storage_result_select && global_loads.soft_fault) {
       /* Reads of one descriptor share its base and size only after CSE. */
       NIR_PASS(_, nir, nir_opt_cse);
       NIR_PASS(_, nir, m5_merge_buffer_words);
@@ -3460,7 +3477,11 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       /* hk_nir_lower_robust_image_access() leaves formatless loads to this
        * pass. */
       NIR_PASS(_, nir, agx_nir_lower_texture_with_buffer_metadata,
-               agx_chip_descriptor_generation(dev->dev.chip),
+               agx_chip_descriptor_generation(dev->dev.chip) |
+                  (agx_chip_texture_descriptor_spare_word(dev->dev.chip) &&
+                         !nir->info.internal
+                      ? AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT
+                      : 0),
                lower_agx3_robust_fetches, dev->dev.sparse_ro_offset,
                dev->vk.enabled_features.sparseResidencyBuffer);
    } else {
@@ -4077,8 +4098,8 @@ hk_lower_hw_vs(struct hk_device *dev, nir_shader *nir, struct hk_shader *shader,
 
    /* On G17P a vertex shader that stores a varying at a UVS index it loaded
     * at run time can have the varying land in the wrong place while another
-    * context renders, so give a shader compiled without its fragment shader
-    * the canonical layout, whose indices are constants.
+    * context renders, so a shader compiled without its fragment shader writes
+    * each varying at a constant index that linking relocates.
     */
    NIR_PASS(_, nir, agx_nir_lower_uvs, &shader->info.uvs,
             layer_as_varying, dev->dev.chip == AGX_CHIP_G17P,
@@ -5425,6 +5446,15 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       .has_scratch = !nir->info.internal,
       .promote_constants = true,
       .promote_textures = true,
+      /* hk_buffer_addr_format() and hk_ubo_addr_format() bound robust
+       * buffers, and nir_lower_explicit_io then checks each access's 32-bit
+       * offset. Null-descriptor bounds need no exact offset: their size is
+       * zero, so every access fails the check. */
+      .checked_offsets =
+         rs && (rs->storage_buffers !=
+                   VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT ||
+                rs->uniform_buffers !=
+                   VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT),
       .g17p_sparse_vertex_outputs =
          agx_native_graphics(&dev->dev) && hw &&
          hk_g17p_sparse_vertex_outputs(&nir->info, sw_stage,
@@ -6691,7 +6721,7 @@ hk_shared_base_to_offset(nir_builder *b, nir_intrinsic_instr *intr,
  * workgroup writes its child grid and payload to its entry of the task
  * record. Payload accesses go to the entry; payload atomics and sub-dword
  * payload accesses use shared memory, copied out before the launch. */
-static void
+void
 hk_g17p_lower_task_kernel(nir_shader *nir)
 {
    NIR_PASS(_, nir, nir_lower_task_shader,
@@ -6753,6 +6783,11 @@ hk_g17p_lower_task_kernel(nir_shader *nir)
 
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_task_kernel_rewrite,
             nir_metadata_none, &k);
+
+   /* The payload now lives in the entry and shared memory. Drop its
+    * variables: a compute shader cannot declare task payload. */
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_mem_task_payload,
+            NULL);
 
    nir->info.stage = MESA_SHADER_COMPUTE;
    memset(&nir->info.cs, 0, sizeof(nir->info.cs));
@@ -7617,12 +7652,28 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       /* The raster replay is always a hardware vertex shader. */
       rq_layout.graphics_stage = dev->gen1_native_graphics_rq;
       /* On M5 the main kernel performs the invocation's API stores and
-       * atomics; the count and raster variants drop them. */
-      const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+       * atomics. On generations whose pre-raster CDM path can launch a
+       * MESA_SHADER_GEOMETRY main kernel (AGX2 via hk_dispatch_with_usc() and
+       * native AGX3 via hk_dispatch_g17p_native()), move side effects to main
+       * whenever replay is independent of them, keeping side-effect-only loops
+       * off the tiler. G18G's hk_dispatch_g17g_native() rejects non-compute
+       * stages and indirect grids, and hk_dispatch_with_usc_launch() rejects
+       * non-AGX2 command-stream generations, so those keep replay until they
+       * have a graphics-stage CDM launcher. */
+      const bool supports_gs_main_cdm =
+         agx_native_graphics(&dev->dev) ||
+         agx_chip_command_stream_generation(dev->dev.chip) ==
+            AGX_CS_GENERATION_AGX2;
+      const enum poly_gs_side_effects side_effects =
+         agx_chip_g17_m5(dev->dev.chip)
+            ? POLY_GS_SIDE_EFFECTS_MAIN
+            : (supports_gs_main_cdm
+                  ? POLY_GS_SIDE_EFFECTS_MAIN_IF_INDEPENDENT
+                  : POLY_GS_SIDE_EFFECTS_REPLAY);
       if (!hk_nir_lower_gs(nir, &count, &rast, &pre_gs,
                            &count_variant->info.gs,
-                           hk_native_rq_profile(dev) ? &rq_layout : NULL, m5,
-                           NULL)) {
+                           hk_native_rq_profile(dev) ? &rq_layout : NULL,
+                           side_effects, NULL)) {
          ralloc_free(nir);
          ralloc_free(count);
          ralloc_free(rast);

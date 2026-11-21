@@ -61,6 +61,7 @@ libasahi_agx_files = files(
   'agx3_compose/agx3c_tables.c',
   'agx3_compose/agx3d_tables.c',
   'agx3_transcode.c',
+  'agx3_reencode_cache.c',
   'agx3_binder.c',
   'agx3_atomic_core.c',
   'agx3_cf_core.c',
@@ -686,6 +687,7 @@ if with_tests
          'test/test-scalarize-int64.cpp',
          'test/test-lower-divmod64.cpp',
          'test/test-spill-fallback.cpp',
+         'test/test-agx-register-cache.cpp',
          'test/test-rt-register-pressure.cpp',
          'test/test-uniform-remat.cpp',
          'test/test-lower-pseudo.cpp',
@@ -731,10 +733,12 @@ if with_tests
          'test/test-fuse-lea-constants.cpp',
          'test/test-divergence-load-agx.cpp',
          'test/test-lower-address-exact-scale.cpp',
+         'test/test-lower-address-checked-offsets.cpp',
          'test/test-ftz-subgroup-minmax.cpp',
          'test/test-m5-half-widen-once.cpp',
          'test/test-m5-byte-to-float.cpp',
          'test/test-fold-narrowed-half.cpp',
+         'test/test-m5-float-minmax-reduce.cpp',
          'test/test-m5-copy-schedule.cpp',
          'test/test-preamble-flag-branches.cpp',
          'test/test-flatten-loads.cpp',
@@ -917,6 +921,19 @@ if with_tests
     executable(
       'agx3_ray_query_prerequisites_test',
       files('test/test-agx3-ray-query-prerequisites.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx3_g17p_task_kernel_shared',
+    executable(
+      'agx3_g17p_task_kernel_shared_test',
+      files('test/test-agx3-g17p-task-kernel-shared.c'),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       dependencies : [idep_nir, idep_mesautil],
