@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_image.h"
+#include "hk_sparse.h"
 #include "hk_frame_anatomy.h"
 #include "hk_instance.h"
 #include "hk_g17p_compression.h"
@@ -838,7 +839,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       if (!pdev->vk.supported_features.sparseBinding)
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-      if (pdev->dev.chip == AGX_CHIP_G17P &&
+      if (hk_sparse_uses_2d_array_slice_layout(pdev->dev.chip) &&
           (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)) {
          const struct vk_features *supported = &pdev->vk.supported_features;
          if (pImageFormatInfo->tiling != VK_IMAGE_TILING_OPTIMAL ||
@@ -1030,7 +1031,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
     * particular, exposing ordinary 2x/4x attachments does not enable sparse
     * multisampling. The sparse format query delegates to this query too.
     */
-   if (pdev->dev.chip == AGX_CHIP_G17P &&
+   if (hk_sparse_uses_2d_array_slice_layout(pdev->dev.chip) &&
        (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT))
       sampleCounts &= VK_SAMPLE_COUNT_1_BIT;
 
@@ -1310,7 +1311,7 @@ hk_GetPhysicalDeviceSparseImageFormatProperties2(
    {
       props->properties = hk_fill_sparse_image_fmt_props(
          vk_format_to_pipe_format(pFormatInfo->format), pFormatInfo->samples,
-         aspects, pdev->dev.chip == AGX_CHIP_G17P &&
+         aspects, pdev->vk.supported_features.sparseResidencyImage3D &&
                      pFormatInfo->type == VK_IMAGE_TYPE_3D);
    }
 }
@@ -2121,7 +2122,7 @@ hk_get_image_sparse_memory_requirements(
       reqs->memoryRequirements =
          hk_fill_sparse_image_memory_reqs(
             &image->planes[0].layout, aspects,
-            dev->dev.chip == AGX_CHIP_G17P &&
+            hk_sparse_uses_2d_array_slice_layout(dev->dev.chip) &&
                image->vk.image_type == VK_IMAGE_TYPE_3D);
    };
 }

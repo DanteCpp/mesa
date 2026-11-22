@@ -416,8 +416,9 @@ hk_get_device_features(
       .sparseResidencyImage2D = true,
       .sparseResidencyBuffer = true,
 
-      /* This needs investigation. */
-      .sparseResidencyImage3D = false,
+      /* M5 uses the same 2D-array slice layout for 3D sparse images as G17P
+       * (with sparseResidencyStandard3DBlockShape = false). */
+      .sparseResidencyImage3D = agx_chip_g17_m5(dev->chip),
       .variableMultisampleRate = false,
       .inheritedQueries = true,
 

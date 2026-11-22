@@ -8,12 +8,20 @@
  * Do not divide block-compressed coordinates by the block extent again.
  * Other chips keep the twiddled-block path.
  */
+/* Whether this chip uses the 2D-array slice layout for sparse images
+ * (tiled-element addressing and single-slice 3D granularity). */
+static inline bool
+hk_sparse_uses_2d_array_slice_layout(enum agx_chip chip)
+{
+   return agx_chip_g17p_or_m5(chip);
+}
+
 static inline uint64_t
 hk_sparse_image_tile_offset_B(enum agx_chip chip, const struct ail_layout *layout,
                               unsigned level, unsigned x_el, unsigned y_el,
                               unsigned z)
 {
-   if (chip == AGX_CHIP_G17P) {
+   if (hk_sparse_uses_2d_array_slice_layout(chip)) {
       assert(x_el % layout->tilesize_el[level].width_el == 0);
       assert(y_el % layout->tilesize_el[level].height_el == 0);
       return z * layout->layer_stride_B +
