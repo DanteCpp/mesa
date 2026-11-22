@@ -16,6 +16,7 @@ libasahi_agx_files = files(
   'agx_nir_lower_atomics.c',
   'agx_nir_opt_flatten_loads.c',
   'agx_nir_opt_select_load.c',
+  'agx_nir_opt_u8x4_hsum.c',
   'agx_nir_opt_licm.c',
   'agx_nir_opt_sink_loop_sample_uses.c',
   'agx_nir_lower_clip_m1_1.c',
@@ -769,6 +770,7 @@ if with_tests
          'test/test-preamble-flag-branches.cpp',
          'test/test-flatten-loads.cpp',
          'test/test-shared-phase-cse.cpp',
+         'test/test-u8x4-hsum.cpp',
          # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives
          # in libasahi_lib, which this test does not link.
          '../lib/agx_chip.c',
