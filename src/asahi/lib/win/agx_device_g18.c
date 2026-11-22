@@ -405,18 +405,28 @@ agx_g18_get_params(struct agx_device *dev, void *buf, size_t size)
 static int agx_g18_sync_wait_submit(const struct drm_asahi_sync *syncs,
                                     uint32_t count);
 static void agx_g18_sync_signal_submit(const struct drm_asahi_sync *syncs,
-                                       uint32_t count);
+                                       uint32_t count, bool retired);
 
 /* The asynchronous render the kernel may still be running (one per
- * process: the render node has one job slot). The lock is held across the
- * SUBMIT that starts it and the SUBMIT that retires it, so an observer that
- * finds nothing pending knows the GPU is done. */
+ * process: the render node has one job slot). Its out-syncs are marked
+ * submitted in the sync table right away (so the next SUBMIT's in-syncs
+ * pass and let the kernel retire the frame in the same ioctl), while their
+ * retired values advance only once the frame has actually retired in the
+ * kernel. Non-blocking queries (vkGetSemaphoreCounterValue) and timeout=0
+ * polls therefore never stall on a sync-only SUBMIT during active frames,
+ * and no observer can ever see a sync as retired before the GPU finished. */
+#define AGX_G18_MAX_PENDING_OUTS 16
+#define AGX_G18_IDLE_RETIRE_NS   25000000ll /* 25 ms: retire idle frame for spin-pollers */
+
 static struct {
    once_flag once;
    mtx_t lock;
    bool pending;
    int fd;
    uint32_t queue_id;
+   int64_t submit_ns;
+   struct drm_asahi_sync pending_outs[AGX_G18_MAX_PENDING_OUTS];
+   uint32_t pending_out_count;
    int enabled; /* -1 unknown, 0 off, 1 on */
 } agx_g18_async = {.once = ONCE_FLAG_INIT, .enabled = -1};
 
@@ -430,31 +440,59 @@ agx_g18_async_init(void)
                               : 1;
 }
 
-/* Lock held: a synchronization-only SUBMIT, which the kernel answers once
- * the pending frame is retired. Its errors (a closed file, a lost device)
- * belong to the next real call, which reports them. */
-static void
-agx_g18_async_retire_locked(void)
+static bool
+agx_g18_async_stale(void)
 {
+   call_once(&agx_g18_async.once, agx_g18_async_init);
+   if (!agx_g18_async.enabled)
+      return false;
+   mtx_lock(&agx_g18_async.lock);
+   bool stale = agx_g18_async.pending &&
+                os_time_get_nano() - agx_g18_async.submit_ns >=
+                   AGX_G18_IDLE_RETIRE_NS;
+   mtx_unlock(&agx_g18_async.lock);
+   return stale;
+}
+
+/* Lock held: a synchronization-only SUBMIT, which the kernel answers once
+ * the pending frame is retired. Transfers any deferred out-syncs to the
+ * caller so they can be signalled as retired after releasing the lock. */
+static bool
+agx_g18_async_retire_locked(struct drm_asahi_sync *retired_outs,
+                            uint32_t *retired_count)
+{
+   *retired_count = 0;
    if (!agx_g18_async.pending)
-      return;
+      return false;
    struct drm_asahi_submit k = {.queue_id = agx_g18_async.queue_id};
    if (agx_win_kmd_call(agx_g18_async.fd, G18_RN_SUBMIT, &k, sizeof(k)))
       fprintf(stderr, "agx-g18: retiring an asynchronous render: %s\n",
               strerror(errno));
    agx_g18_async.pending = false;
+   *retired_count = agx_g18_async.pending_out_count;
+   if (*retired_count)
+      memcpy(retired_outs, agx_g18_async.pending_outs,
+             *retired_count * sizeof(*retired_outs));
+   agx_g18_async.pending_out_count = 0;
+   return true;
 }
 
-/* Every observation of the sync table starts here. */
-static void
+/* Retire any in-flight asynchronous render and signal its deferred out-syncs.
+ * Returns true if a pending render was retired. */
+static bool
 agx_g18_async_retire(void)
 {
    call_once(&agx_g18_async.once, agx_g18_async_init);
    if (!agx_g18_async.enabled)
-      return;
+      return false;
+   struct drm_asahi_sync retired_outs[AGX_G18_MAX_PENDING_OUTS];
+   uint32_t retired_count = 0;
    mtx_lock(&agx_g18_async.lock);
-   agx_g18_async_retire_locked();
+   bool did = agx_g18_async_retire_locked(retired_outs, &retired_count);
    mtx_unlock(&agx_g18_async.lock);
+   if (retired_count)
+      agx_g18_sync_signal_submit(retired_outs, retired_count, true);
+   return did;
 }
 
 /* The hardware commands of a SUBMIT: whether any is a render (only
@@ -485,8 +523,9 @@ agx_g18_cmdbuf_renders(const struct drm_asahi_submit *submit, bool *any,
    }
 }
 
-/* G4-PLAN 3.1: wait for the in-syncs, submit without syncs (the kernel runs
- * the job to completion), then signal the out-syncs. */
+/* G4-PLAN 3.1: wait for the in-syncs, submit without syncs, then signal
+ * the out-syncs (deferred until retirement when G18_SUBMIT_ASYNC leaves a
+ * render in flight). */
 static int
 agx_g18_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
                struct agx_submit_virt *virt)
@@ -494,6 +533,8 @@ agx_g18_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    (void)virt;
    const struct drm_asahi_sync *syncs =
       (const struct drm_asahi_sync *)(uintptr_t)submit->syncs;
+   const struct drm_asahi_sync *out_syncs = syncs + submit->in_sync_count;
+   const uint32_t out_count = submit->out_sync_count;
 
    if (submit->in_sync_count) {
       int ret = agx_g18_sync_wait_submit(syncs, submit->in_sync_count);
@@ -508,12 +549,18 @@ agx_g18_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    k.in_sync_count = 0;
    k.out_sync_count = 0;
 
+   struct drm_asahi_sync retired_outs[AGX_G18_MAX_PENDING_OUTS];
+   uint32_t retired_count = 0;
+   bool deferred = false;
    int ret = 0;
+
    if (k.cmdbuf_size) {
       bool any_render, last_render;
       agx_g18_cmdbuf_renders(&k, &any_render, &last_render);
       call_once(&agx_g18_async.once, agx_g18_async_init);
-      if (agx_g18_async.enabled && any_render) {
+      bool can_async = agx_g18_async.enabled && any_render &&
+                       (!last_render || out_count <= AGX_G18_MAX_PENDING_OUTS);
+      if (can_async) {
          mtx_lock(&agx_g18_async.lock);
          /* The kernel retires the previous frame before this SUBMIT runs
           * anything (G6 track Q: no sync-only SUBMIT first). */
@@ -525,31 +572,66 @@ agx_g18_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
             agx_g18_async.enabled = 0;
             k.flags &= ~G18_SUBMIT_ASYNC;
             ret = agx_g18_asahi_call(dev, DRM_IOCTL_ASAHI_SUBMIT, &k);
-            if (!ret)
+            if (!ret) {
+               if (agx_g18_async.pending) {
+                  retired_count = agx_g18_async.pending_out_count;
+                  if (retired_count)
+                     memcpy(retired_outs, agx_g18_async.pending_outs,
+                            retired_count * sizeof(*retired_outs));
+                  agx_g18_async.pending = false;
+                  agx_g18_async.pending_out_count = 0;
+               }
                fprintf(stderr, "agx-g18: the render node refuses "
                                "G18_SUBMIT_ASYNC: synchronous SUBMITs\n");
+            }
          } else if (!ret) {
+            if (agx_g18_async.pending) {
+               retired_count = agx_g18_async.pending_out_count;
+               if (retired_count)
+                  memcpy(retired_outs, agx_g18_async.pending_outs,
+                         retired_count * sizeof(*retired_outs));
+            }
             agx_g18_async.pending = last_render;
             agx_g18_async.fd = dev->fd;
             agx_g18_async.queue_id = k.queue_id;
+            if (last_render) {
+               agx_g18_async.submit_ns = os_time_get_nano();
+               agx_g18_async.pending_out_count = out_count;
+               if (out_count)
+                  memcpy(agx_g18_async.pending_outs, out_syncs,
+                         out_count * sizeof(*out_syncs));
+               deferred = true;
+            } else {
+               agx_g18_async.pending_out_count = 0;
+            }
          }
          mtx_unlock(&agx_g18_async.lock);
       } else {
-         /* Compute only: serialize with async renders on the render node's
-          * one job slot so pending state stays exact across threads. */
+         /* Compute only (or too many out-syncs for async deferral):
+          * serialize with async renders on the render node's one job slot. */
          mtx_lock(&agx_g18_async.lock);
          ret = agx_g18_asahi_call(dev, DRM_IOCTL_ASAHI_SUBMIT, &k);
-         if (!ret)
+         if (!ret && agx_g18_async.pending) {
+            retired_count = agx_g18_async.pending_out_count;
+            if (retired_count)
+               memcpy(retired_outs, agx_g18_async.pending_outs,
+                      retired_count * sizeof(*retired_outs));
             agx_g18_async.pending = false;
+            agx_g18_async.pending_out_count = 0;
+         }
          mtx_unlock(&agx_g18_async.lock);
       }
+   } else if (out_count) {
+      /* Sync-only submit: retire any in-flight render before signalling. */
+      agx_g18_async_retire();
    }
    if (ret)
       return ret;
 
-   if (submit->out_sync_count)
-      agx_g18_sync_signal_submit(syncs + submit->in_sync_count,
-                                 submit->out_sync_count);
+   if (retired_count)
+      agx_g18_sync_signal_submit(retired_outs, retired_count, true);
+   if (out_count)
+      agx_g18_sync_signal_submit(out_syncs, out_count, !deferred);
    return 0;
 }
 
@@ -644,10 +726,14 @@ void
 agx_g18_close_fd(int fd)
 {
    call_once(&agx_g18_async.once, agx_g18_async_init);
+   struct drm_asahi_sync retired_outs[AGX_G18_MAX_PENDING_OUTS];
+   uint32_t retired_count = 0;
    mtx_lock(&agx_g18_async.lock);
    if (agx_g18_async.pending && agx_g18_async.fd == fd)
-      agx_g18_async_retire_locked();
+      agx_g18_async_retire_locked(retired_outs, &retired_count);
    mtx_unlock(&agx_g18_async.lock);
+   if (retired_count)
+      agx_g18_sync_signal_submit(retired_outs, retired_count, true);
    agx_win_kmd_close(fd);
 }
 
@@ -668,7 +754,8 @@ agx_g18_close_fd(int fd)
 #define AGX_WIN_MAX_FORWARDS 256
 
 struct agx_g18_syncobj {
-   uint64_t value;
+   uint64_t value;     /* retired on the GPU */
+   uint64_t submitted; /* >= value; includes in-flight async render */
    bool live;
 };
 
@@ -717,10 +804,16 @@ agx_g18_point_done(const struct agx_g18_syncobj *o, uint64_t point)
 }
 
 static bool
+agx_g18_point_submitted(const struct agx_g18_syncobj *o, uint64_t point)
+{
+   return o->submitted >= (point ? point : 1);
+}
+
+static bool
 agx_g18_point_available(uint32_t handle, const struct agx_g18_syncobj *o,
                         uint64_t point)
 {
-   if (agx_g18_point_done(o, point))
+   if (agx_g18_point_submitted(o, point))
       return true;
    for (uint32_t i = 0; i < agx_g18_syncs.nfwd; i++) {
       const struct agx_g18_forward *f = &agx_g18_syncs.fwd[i];
@@ -730,43 +823,75 @@ agx_g18_point_available(uint32_t handle, const struct agx_g18_syncobj *o,
    return false;
 }
 
-/* Signal (handle, point) and fire every forward that became ready. Lock
- * held. */
 static void
-agx_g18_signal_locked(uint32_t handle, uint64_t point)
+agx_g18_advance_field(uint64_t *field, uint64_t point)
 {
-   struct agx_g18_syncobj *o = agx_g18_sync_get(handle);
-   if (o) {
-      if (point == 0)
-         o->value = o->value ? o->value : 1;
-      else if (point > o->value)
-         o->value = point;
-   }
+   if (point == 0)
+      *field = *field ? *field : 1;
+   else if (point > *field)
+      *field = point;
+}
 
-   bool fired;
+/* Advance `submitted` across pending forwards without removing them (the
+ * forward remains until its source actually retires). Lock held. */
+static void
+agx_g18_propagate_submitted_locked(void)
+{
+   bool changed;
    do {
-      fired = false;
+      changed = false;
       for (uint32_t i = 0; i < agx_g18_syncs.nfwd; i++) {
          struct agx_g18_forward f = agx_g18_syncs.fwd[i];
          struct agx_g18_syncobj *s = agx_g18_sync_get(f.src);
-         if (s && !agx_g18_point_done(s, f.src_point))
+         struct agx_g18_syncobj *d = agx_g18_sync_get(f.dst);
+         if (!s || !d || !agx_g18_point_submitted(s, f.src_point))
             continue;
-         /* Ready (or its source is gone: a destroyed source never signals,
-          * drop the forward). */
-         agx_g18_syncs.fwd[i] = agx_g18_syncs.fwd[--agx_g18_syncs.nfwd];
-         if (s) {
-            struct agx_g18_syncobj *d = agx_g18_sync_get(f.dst);
-            if (d) {
-               if (f.dst_point == 0)
-                  d->value = d->value ? d->value : 1;
-               else if (f.dst_point > d->value)
-                  d->value = f.dst_point;
-            }
-         }
-         fired = true;
-         break;
+         uint64_t before = d->submitted;
+         agx_g18_advance_field(&d->submitted, f.dst_point);
+         if (d->submitted != before)
+            changed = true;
       }
-   } while (fired);
+   } while (changed);
+}
+
+/* Signal (handle, point): always advances `submitted`; when `retired` is
+ * true, also advances `value` and fires retired forwards. Lock held. */
+static void
+agx_g18_signal_locked(uint32_t handle, uint64_t point, bool retired)
+{
+   struct agx_g18_syncobj *o = agx_g18_sync_get(handle);
+   if (o) {
+      agx_g18_advance_field(&o->submitted, point);
+      if (retired)
+         agx_g18_advance_field(&o->value, point);
+   }
+
+   if (retired) {
+      bool fired;
+      do {
+         fired = false;
+         for (uint32_t i = 0; i < agx_g18_syncs.nfwd; i++) {
+            struct agx_g18_forward f = agx_g18_syncs.fwd[i];
+            struct agx_g18_syncobj *s = agx_g18_sync_get(f.src);
+            if (s && !agx_g18_point_done(s, f.src_point))
+               continue;
+            /* Ready (or its source is gone: a destroyed source never signals,
+             * drop the forward). */
+            agx_g18_syncs.fwd[i] = agx_g18_syncs.fwd[--agx_g18_syncs.nfwd];
+            if (s) {
+               struct agx_g18_syncobj *d = agx_g18_sync_get(f.dst);
+               if (d) {
+                  agx_g18_advance_field(&d->submitted, f.dst_point);
+                  agx_g18_advance_field(&d->value, f.dst_point);
+               }
+            }
+            fired = true;
+            break;
+         }
+      } while (fired);
+   } else {
+      agx_g18_propagate_submitted_locked();
+   }
 
    u_cnd_monotonic_broadcast(&agx_g18_syncs.cond);
 }
@@ -800,8 +925,10 @@ agx_g18_sync_create(struct util_sync_provider *p, uint32_t flags,
       }
       h = agx_g18_syncs.count++;
    }
+   uint64_t init = (flags & DRM_SYNCOBJ_CREATE_SIGNALED) ? 1 : 0;
    agx_g18_syncs.obj[h] = (struct agx_g18_syncobj){
-      .value = (flags & DRM_SYNCOBJ_CREATE_SIGNALED) ? 1 : 0,
+      .value = init,
+      .submitted = init,
       .live = true,
    };
    mtx_unlock(&agx_g18_syncs.lock);
@@ -815,6 +942,14 @@ agx_g18_sync_destroy(struct util_sync_provider *p, uint32_t handle)
    (void)p;
    mtx_lock(&agx_g18_syncs.lock);
    struct agx_g18_syncobj *o = agx_g18_sync_get(handle);
+   if (o && o->submitted > o->value) {
+      /* Retire before releasing the handle index so a deferred async
+       * out-sync cannot later signal a reused handle. */
+      mtx_unlock(&agx_g18_syncs.lock);
+      agx_g18_async_retire();
+      mtx_lock(&agx_g18_syncs.lock);
+      o = agx_g18_sync_get(handle);
+   }
    if (o) {
       o->live = false;
       /* Forwards into it are dead; forwards out of it never fire. */
@@ -855,10 +990,10 @@ agx_g18_sync_no_sync_file_import(struct util_sync_provider *p,
 }
 
 /* `retire`: an observation by the application (the GPU must be done with
- * what the table says is signalled). A SUBMIT's own in-syncs pass false:
- * the render node runs and retires every job in order (one job slot), so
- * the next SUBMIT starts after the GPU finished the pending frame anyway
- * (G6 track Q: one sync-only SUBMIT round trip less per SUBMIT). */
+ * what the wait accepts). A SUBMIT's own in-syncs pass false: the render
+ * node runs and retires every job in order (one job slot), so `submitted`
+ * suffices and the next SUBMIT retires the pending frame inside the same
+ * kernel call. */
 static int
 agx_g18_sync_wait_impl(uint32_t *handles, uint64_t *points,
                        unsigned num_handles, int64_t timeout_nsec,
@@ -875,9 +1010,10 @@ agx_g18_sync_wait_impl(uint32_t *handles, uint64_t *points,
       .tv_nsec = timeout_nsec % 1000000000ll,
    };
 
+   bool poll_retired = false, tried_retire = false;
    mtx_lock(&agx_g18_syncs.lock);
    for (;;) {
-      unsigned done = 0, first = UINT32_MAX;
+      unsigned done = 0, submitted = 0, first = UINT32_MAX;
       for (unsigned i = 0; i < num_handles; i++) {
          struct agx_g18_syncobj *o = agx_g18_sync_get(handles[i]);
          if (!o) {
@@ -885,33 +1021,49 @@ agx_g18_sync_wait_impl(uint32_t *handles, uint64_t *points,
             return agx_g18_sync_err(EINVAL);
          }
          uint64_t point = points ? points[i] : 0;
-         bool ok = avail ? agx_g18_point_available(handles[i], o, point)
-                         : agx_g18_point_done(o, point);
+         bool ok = avail   ? agx_g18_point_available(handles[i], o, point)
+                 : !retire ? agx_g18_point_submitted(o, point)
+                           : agx_g18_point_done(o, point);
          if (ok) {
             done++;
             if (first == UINT32_MAX)
                first = i;
          }
+         if (agx_g18_point_submitted(o, point))
+            submitted++;
       }
 
       if (all ? done == num_handles : done > 0) {
          mtx_unlock(&agx_g18_syncs.lock);
-         /* Retire AFTER observing the signal: any G18_SUBMIT_ASYNC that
-          * produced this signal already set agx_g18_async.pending before
-          * acquiring agx_g18_syncs.lock, so retiring here guarantees the
-          * GPU has finished before the waiter touches its buffers. */
-         if (retire && !avail)
-            agx_g18_async_retire();
          if (first_signaled)
             *first_signaled = first;
          return 0;
       }
 
-      if (os_time_get_nano() >= timeout_nsec) {
+      bool can_satisfy_by_retire =
+         retire && !avail && (all ? submitted == num_handles : submitted > 0);
+      int64_t now = os_time_get_nano();
+
+      if (can_satisfy_by_retire && now < timeout_nsec && !tried_retire) {
+         mtx_unlock(&agx_g18_syncs.lock);
+         bool did = agx_g18_async_retire();
+         mtx_lock(&agx_g18_syncs.lock);
+         if (!did)
+            tried_retire = true;
+         continue;
+      } else if (now >= timeout_nsec) {
+         if (can_satisfy_by_retire && !poll_retired && agx_g18_async_stale()) {
+            poll_retired = true;
+            mtx_unlock(&agx_g18_syncs.lock);
+            agx_g18_async_retire();
+            mtx_lock(&agx_g18_syncs.lock);
+            continue;
+         }
          mtx_unlock(&agx_g18_syncs.lock);
          return agx_g18_sync_err(ETIME);
       }
 
+      tried_retire = false;
       u_cnd_monotonic_timedwait(&agx_g18_syncs.cond, &agx_g18_syncs.lock,
                                 &deadline);
    }
@@ -944,6 +1096,19 @@ agx_g18_sync_reset(struct util_sync_provider *p, const uint32_t *handles,
    (void)p;
    int ret = 0;
    mtx_lock(&agx_g18_syncs.lock);
+   bool need_retire = false;
+   for (uint32_t i = 0; i < count; i++) {
+      struct agx_g18_syncobj *o = agx_g18_sync_get(handles[i]);
+      if (o && o->submitted > o->value) {
+         need_retire = true;
+         break;
+      }
+   }
+   if (need_retire) {
+      mtx_unlock(&agx_g18_syncs.lock);
+      agx_g18_async_retire();
+      mtx_lock(&agx_g18_syncs.lock);
+   }
    for (uint32_t i = 0; i < count; i++) {
       struct agx_g18_syncobj *o = agx_g18_sync_get(handles[i]);
       if (!o) {
@@ -951,6 +1116,7 @@ agx_g18_sync_reset(struct util_sync_provider *p, const uint32_t *handles,
          continue;
       }
       o->value = 0;
+      o->submitted = 0;
       for (uint32_t j = 0; j < agx_g18_syncs.nfwd;) {
          if (agx_g18_syncs.fwd[j].dst == handles[i])
             agx_g18_syncs.fwd[j] = agx_g18_syncs.fwd[--agx_g18_syncs.nfwd];
@@ -975,7 +1141,7 @@ agx_g18_sync_timeline_signal(struct util_sync_provider *p,
          ret = agx_g18_sync_err(EINVAL);
          continue;
       }
-      agx_g18_signal_locked(handles[i], points ? points[i] : 0);
+      agx_g18_signal_locked(handles[i], points ? points[i] : 0, true);
    }
    mtx_unlock(&agx_g18_syncs.lock);
    return ret;
@@ -993,6 +1159,8 @@ agx_g18_sync_query(struct util_sync_provider *p, uint32_t *handles,
                    uint64_t *points, uint32_t count, uint32_t flags)
 {
    (void)p, (void)flags;
+   if (agx_g18_async_stale())
+      agx_g18_async_retire();
    int ret = 0;
    mtx_lock(&agx_g18_syncs.lock);
    for (uint32_t i = 0; i < count; i++) {
@@ -1004,9 +1172,6 @@ agx_g18_sync_query(struct util_sync_provider *p, uint32_t *handles,
       points[i] = o->value;
    }
    mtx_unlock(&agx_g18_syncs.lock);
-   /* Retire AFTER reading the table so every signal reflected in points[]
-    * has completed on the GPU before the caller observes it. */
-   agx_g18_async_retire();
    return ret;
 }
 
@@ -1025,21 +1190,25 @@ agx_g18_sync_transfer(struct util_sync_provider *p, uint32_t dst_handle,
    }
 
    if (agx_g18_point_done(s, src_point)) {
-      agx_g18_signal_locked(dst_handle, dst_point);
+      agx_g18_signal_locked(dst_handle, dst_point, true);
    } else {
       if (agx_g18_syncs.nfwd == AGX_WIN_MAX_FORWARDS) {
          mtx_unlock(&agx_g18_syncs.lock);
          return agx_g18_sync_err(ENOMEM);
       }
       /* A binary destination gets a new, unsignalled fence. */
-      if (dst_point == 0)
+      if (dst_point == 0) {
          d->value = 0;
+         d->submitted = 0;
+      }
       agx_g18_syncs.fwd[agx_g18_syncs.nfwd++] = (struct agx_g18_forward){
          .src = src_handle,
          .dst = dst_handle,
          .src_point = src_point,
          .dst_point = dst_point,
       };
+      if (agx_g18_point_submitted(s, src_point))
+         agx_g18_propagate_submitted_locked();
       u_cnd_monotonic_broadcast(&agx_g18_syncs.cond);
    }
    mtx_unlock(&agx_g18_syncs.lock);
@@ -1072,14 +1241,16 @@ agx_g18_sync_wait_submit(const struct drm_asahi_sync *syncs, uint32_t count)
 }
 
 static void
-agx_g18_sync_signal_submit(const struct drm_asahi_sync *syncs, uint32_t count)
+agx_g18_sync_signal_submit(const struct drm_asahi_sync *syncs, uint32_t count,
+                           bool retired)
 {
    mtx_lock(&agx_g18_syncs.lock);
    for (uint32_t i = 0; i < count; i++) {
       agx_g18_signal_locked(syncs[i].handle,
                             syncs[i].sync_type == DRM_ASAHI_SYNC_SYNCOBJ
                                ? 0
-                               : syncs[i].timeline_value);
+                               : syncs[i].timeline_value,
+                            retired);
    }
    mtx_unlock(&agx_g18_syncs.lock);
 }
