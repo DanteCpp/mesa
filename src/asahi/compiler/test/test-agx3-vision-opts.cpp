@@ -2527,3 +2527,51 @@ TEST(AGX3VisionOpts, PackNarrowMuxTreePreNegateAndMaskPeel)
    }
 }
 
+
+TEST(AGX3VisionOpts, Agx3bDirectByteFromWordU2f32)
+{
+   auto compile_unpack = [](enum agx_isa_encoding enc, enum agx_chip chip,
+                            bool emit_agx3d) {
+      nir_builder b = make_compute_shader("u2f32-rgba8-unpack");
+      nir_def *in = make_desc_base(&b, 4);
+      nir_def *out = make_desc_base(&b, 8);
+      nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *w = nir_load_agx(
+         &b, 1, 32, in, gid,
+         .access = (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE |
+                                              ACCESS_CAN_REORDER),
+         .base = 0, .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+      nir_def *b0 = nir_u2f32(&b, nir_iand_imm(&b, w, 0xff));
+      nir_def *b1 = nir_u2f32(&b, nir_ubitfield_extract_imm(&b, w, 8, 8));
+      nir_def *b2 = nir_u2f32(&b, nir_ubitfield_extract_imm(&b, w, 16, 8));
+      nir_def *b3 = nir_u2f32(&b, nir_ushr_imm(&b, w, 24));
+      nir_def *sum = nir_fadd(&b, nir_fadd(&b, b0, b1), nir_fadd(&b, b2, b3));
+      nir_store_agx(&b, sum, out, gid,
+                    .access = ACCESS_NON_READABLE, .base = 0,
+                    .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+
+      agx_preprocess_nir(b.shader);
+      struct agx_shader_key key = {};
+      key.dev.encoding = enc;
+      key.dev.chip = chip;
+      key.dev.emit_agx3d = emit_agx3d;
+      struct agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_EQ(part.info.stats.spills, 0u);
+      unsigned instrs = part.info.stats.instrs;
+      free(part.binary);
+      ralloc_free(b.shader);
+      return instrs;
+   };
+
+   /* AGX3B (G15/G16/G17P) matches AGX3C (G17S) direct byte-from-word unpack,
+    * avoiding extra shift/mask ALU instructions needed on AGX2 and G18G. */
+   unsigned agx3b_instrs =
+      compile_unpack(AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false);
+   unsigned agx3c_instrs =
+      compile_unpack(AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false);
+   unsigned agx2_instrs =
+      compile_unpack(AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, false);
+   EXPECT_EQ(agx3b_instrs, agx3c_instrs);
+   EXPECT_LT(agx3b_instrs, agx2_instrs);
+}
