@@ -2835,7 +2835,8 @@ exec_loop_nir(nir_shader *shader, uint32_t start_val, uint32_t bound_val,
                         res.hit_step_limit = true;
                         return true;
                      }
-                     vals[&intr->def] = (idx * 2654435761u) ^ 0x5a5a5a5au;
+                     uint32_t v = (idx * 2654435761u) ^ 0x5a5a5a5au;
+                     vals[&intr->def] = intr->def.bit_size == 8 ? (v & 0xffu) : v;
                      break;
                   }
                   case nir_intrinsic_store_agx: {
@@ -3647,7 +3648,8 @@ exec_stencil_nir(nir_shader *shader, const std::vector<uint32_t> &pc,
                         res.hit_step_limit = true;
                         return true;
                      }
-                     vals[&intr->def] = (idx * 2654435761u) ^ 0x5a5a5a5au;
+                     uint32_t v = (idx * 2654435761u) ^ 0x5a5a5a5au;
+                     vals[&intr->def] = intr->def.bit_size == 8 ? (v & 0xffu) : v;
                      break;
                   }
                   case nir_intrinsic_store_agx:
@@ -4412,6 +4414,251 @@ TEST(AGX3VisionOpts, InteriorBounds2DEarlyOuterBreakTripZero)
    EXPECT_EQ(r_opt_v.out_sum, r_ref_v.out_sum);
    EXPECT_EQ(r_opt_v.iters, 9u);
 
+   ralloc_free(ref);
+   ralloc_free(opt);
+}
+
+TEST(AGX3VisionOpts, RotatedSmallWindow3x3And4xPeelExecution)
+{
+   /* Run interior bounds unswitch + runtime loop unrolling on a rotated 2D
+    * stencil (32-bit loads), verifying exact execution across 3x3 (fully
+    * straight-line), 4x4 (exact 4-peel skipping tail), 5x5 (4-peel + 1 tail),
+    * 6..7, 8..11 (8x main), 1..2 (scalar), rectangular, border, and wrap cases. */
+   for (unsigned factor : {8u, 4u}) {
+   nir_shader *ref = make_2d_interior_bounds_shader(factor == 4u);
+   nir_shader *opt = nir_shader_clone(NULL, ref);
+   ASSERT_TRUE(agx_nir_opt_unswitch_interior_bounds(opt));
+   unsigned widest = 0;
+   ASSERT_TRUE(agx_nir_unroll_runtime_loops(opt, factor, 320, &widest));
+   nir_opt_dead_cf(opt);
+   nir_opt_copy_prop(opt);
+   nir_opt_constant_folding(opt);
+   nir_opt_dce(opt);
+   nir_validate_shader(opt, "after rotated small-window peel");
+   EXPECT_EQ(widest, factor);
+
+   /* Verify a loop-free 3x3 straight-line branch exists (a then_list containing
+    * >= 9 load_agx instructions and 0 nested loops). */
+   bool found_3x3_straight = false;
+   nir_function_impl *impl = nir_shader_get_entrypoint(opt);
+   std::function<unsigned(struct exec_list *, bool *)> scan =
+      [&](struct exec_list *list, bool *has_loop) -> unsigned {
+      unsigned loads = 0;
+      foreach_list_typed(nir_cf_node, n, node, list) {
+         if (n->type == nir_cf_node_block) {
+            nir_foreach_instr(instr, nir_cf_node_as_block(n)) {
+               if (instr->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_agx)
+                  loads++;
+            }
+         } else if (n->type == nir_cf_node_loop) {
+            *has_loop = true;
+         } else if (n->type == nir_cf_node_if) {
+            nir_if *nif = nir_cf_node_as_if(n);
+            bool tl = false, el = false;
+            unsigned tloads = scan(&nif->then_list, &tl);
+            unsigned eloads = scan(&nif->else_list, &el);
+            if (!tl && tloads >= 9)
+               found_3x3_straight = true;
+            if (tl || el)
+               *has_loop = true;
+            loads += tloads + eloads;
+         }
+      }
+      return loads;
+   };
+   bool top_loop = false;
+   scan(&impl->body, &top_loop);
+   EXPECT_TRUE(found_3x3_straight);
+
+   struct Case2D {
+      int32_t kh, kw, oy, sy, py, dy, ih, bx, dx, iw;
+   };
+   const Case2D cases[] = {
+      {1, 1, 2, 1, 0, 1, 16, 2, 1, 16},
+      {2, 2, 2, 1, 0, 1, 16, 2, 1, 16},
+      {3, 3, 2, 1, -1, 1, 16, 2, 1, 16},        /* 3x3 straight-line */
+      {3, 4, 2, 1, -1, 1, 16, 2, 1, 16},        /* 3x4 exact 4-peel */
+      {4, 3, 2, 1, -1, 1, 16, 2, 1, 16},        /* 4x3 inner 3-peel */
+      {4, 4, 2, 1, -1, 1, 16, 2, 1, 16},        /* 4x4 exact 4-peel */
+      {5, 5, 3, 1, -2, 1, 16, 2, 1, 16},        /* 5x5 4-peel + 1 tail */
+      {3, 5, 2, 1, -1, 1, 16, 2, 1, 16},        /* 3x5 */
+      {5, 3, 3, 1, -2, 1, 16, 2, 1, 16},        /* 5x3 */
+      {6, 6, 3, 1, -2, 1, 20, 2, 1, 20},        /* 6x6 */
+      {7, 7, 3, 1, -2, 1, 20, 2, 1, 20},        /* 7x7 */
+      {8, 8, 3, 1, -2, 1, 20, 2, 1, 20},        /* 8x8 */
+      {9, 9, 3, 1, -2, 1, 20, 2, 1, 20},        /* 9x9 */
+      {3, 11, 2, 1, -1, 1, 24, 2, 1, 24},       /* 3x11 */
+      {3, 3, 0, 1, -1, 1, 16, 2, 1, 16},        /* border y */
+      {5, 5, 3, 1, -2, 1, 16, -1, 1, 16},       /* border x */
+      {0, 3, 2, 1, -1, 1, 16, 2, 1, 16},        /* kh = 0 */
+      {3, 0, 2, 1, -1, 1, 16, 2, 1, 16},        /* kw = 0 */
+      {5, 5, 1, 2, -1, 2, 24, 1, 2, 24},        /* strided + dilated 5x5 */
+   };
+   for (const auto &c : cases) {
+      std::vector<uint32_t> pc = {
+         (uint32_t)c.kh, (uint32_t)c.kw, (uint32_t)c.oy, (uint32_t)c.sy,
+         (uint32_t)c.py, (uint32_t)c.dy, (uint32_t)c.ih, (uint32_t)c.bx,
+         (uint32_t)c.dx, (uint32_t)c.iw,
+      };
+      NirExecResult r_ref = exec_stencil_nir(ref, pc, 2048);
+      NirExecResult r_opt = exec_stencil_nir(opt, pc, 2048);
+      EXPECT_FALSE(r_ref.hit_step_limit);
+      EXPECT_FALSE(r_opt.hit_step_limit);
+      EXPECT_EQ(r_opt.out_sum, r_ref.out_sum)
+         << "kh=" << c.kh << " kw=" << c.kw << " oy=" << c.oy << " bx=" << c.bx;
+      EXPECT_EQ(r_opt.iters, r_ref.iters)
+         << "kh=" << c.kh << " kw=" << c.kw << " oy=" << c.oy << " bx=" << c.bx;
+   }
+   ralloc_free(ref);
+   ralloc_free(opt);
+   }
+}
+
+
+TEST(AGX3VisionOpts, Rotated8BitInnerNonZeroStart)
+{
+   /* Exercise the f >= 8 && loop_has_8bit_load(inner) small-window split on a
+    * rotated 8-bit inner loop with a runtime non-zero start iv0 (both positive
+    * and negative starts, iv0 >= bound single-iteration rotated edge cases, and
+    * near-INT32_MIN/MAX boundaries) across trip counts 1..10. */
+   auto build_rot8_nonzero = [&]() {
+      nir_builder b = make_compute_shader("rot8_nonzero_start");
+      nir_def *kh = push_u32(&b, 0);
+      nir_def *kx0 = push_u32(&b, 4);
+      nir_def *kx_end = push_u32(&b, 8);
+      nir_def *src = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *dst = nir_load_preamble(&b, 1, 64, .base = 4);
+
+      nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+
+      nir_if *pos = nir_push_if(&b, nir_igt_imm(&b, kh, 0));
+      {
+         nir_variable *ky = nir_local_variable_create(b.impl, glsl_uint_type(), "ky");
+         nir_store_var(&b, ky, nir_imm_int(&b, 0), 1);
+         nir_loop *yloop = nir_push_loop(&b);
+         {
+            nir_def *yv = nir_load_var(&b, ky);
+            nir_variable *kx = nir_local_variable_create(b.impl, glsl_uint_type(), "kx");
+            nir_store_var(&b, kx, kx0, 1);
+            nir_loop *xloop = nir_push_loop(&b);
+            {
+               nir_def *xv = nir_load_var(&b, kx);
+               nir_def *idx = nir_iadd(&b, nir_imul_imm(&b, yv, 32), xv);
+               nir_def *b8 = nir_load_agx(
+                  &b, 1, 8, src, idx,
+                  .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE |
+                                                  ACCESS_CAN_REORDER),
+                  .format = PIPE_FORMAT_R8_UINT);
+               nir_def *v = nir_u2u32(&b, b8);
+               nir_def *mix = nir_ixor(&b, nir_imul_imm(&b, v, 7), nir_iadd(&b, yv, xv));
+               nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), mix), 1);
+
+               nir_def *xnext = nir_iadd_imm(&b, xv, 1);
+               nir_store_var(&b, kx, xnext, 1);
+               nir_if *xex = nir_push_if(&b, nir_ige(&b, xnext, kx_end));
+               nir_jump(&b, nir_jump_break);
+               nir_pop_if(&b, xex);
+            }
+            nir_pop_loop(&b, xloop);
+
+            nir_def *ynext = nir_iadd_imm(&b, yv, 1);
+            nir_store_var(&b, ky, ynext, 1);
+            nir_if *yex = nir_push_if(&b, nir_ige(&b, ynext, kh));
+            nir_jump(&b, nir_jump_break);
+            nir_pop_if(&b, yex);
+         }
+         nir_pop_loop(&b, yloop);
+      }
+      nir_pop_if(&b, pos);
+
+      nir_store_agx(&b, nir_load_var(&b, acc), dst, nir_imm_int(&b, 0),
+                    .access = ACCESS_NON_READABLE, .format = PIPE_FORMAT_R32_UINT);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "build_rot8_nonzero");
+      return b.shader;
+   };
+
+   nir_shader *ref = build_rot8_nonzero();
+   nir_shader *opt = nir_shader_clone(NULL, ref);
+   unsigned widest = 0;
+   ASSERT_TRUE(agx_nir_unroll_runtime_loops(opt, 8, 320, &widest));
+   nir_opt_dead_cf(opt);
+   nir_opt_copy_prop(opt);
+   nir_opt_constant_folding(opt);
+   nir_opt_dce(opt);
+   nir_validate_shader(opt, "after rotated 8-bit non-zero start peel");
+   EXPECT_EQ(widest, 8u);
+
+   /* Verify a straight-line 3x3 8-bit branch was emitted (9+ 8-bit loads, no loop). */
+   bool found_3x3 = false;
+   nir_function_impl *impl = nir_shader_get_entrypoint(opt);
+   std::function<unsigned(struct exec_list *, bool *)> scan =
+      [&](struct exec_list *list, bool *has_loop) -> unsigned {
+      unsigned loads = 0;
+      foreach_list_typed(nir_cf_node, n, node, list) {
+         if (n->type == nir_cf_node_block) {
+            nir_foreach_instr(instr, nir_cf_node_as_block(n)) {
+               if (instr->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_agx &&
+                   nir_instr_as_intrinsic(instr)->def.bit_size == 8)
+                  loads++;
+            }
+         } else if (n->type == nir_cf_node_loop) {
+            *has_loop = true;
+         } else if (n->type == nir_cf_node_if) {
+            nir_if *nif = nir_cf_node_as_if(n);
+            bool tl = false, el = false;
+            unsigned tloads = scan(&nif->then_list, &tl);
+            unsigned eloads = scan(&nif->else_list, &el);
+            if (!tl && tloads >= 9)
+               found_3x3 = true;
+            if (tl || el)
+               *has_loop = true;
+            loads += tloads + eloads;
+         }
+      }
+      return loads;
+   };
+   bool top_loop = false;
+   scan(&impl->body, &top_loop);
+   EXPECT_TRUE(found_3x3);
+
+   struct Case {
+      int32_t kh, kx0, kx_end;
+   };
+   std::vector<Case> cases;
+   for (int32_t kh : {1, 3, 4}) {
+      for (int32_t trip = 1; trip <= 10; ++trip) {
+         cases.push_back({kh, 2, 2 + trip});
+         cases.push_back({kh, -3, -3 + trip});
+      }
+   }
+   cases.push_back({3, 5, 5});
+   cases.push_back({3, 5, 2});
+   cases.push_back({3, -1, -4});
+   cases.push_back({3, INT32_MIN, INT32_MIN + 3});
+   cases.push_back({3, INT32_MIN, INT32_MIN + 5});
+   cases.push_back({3, INT32_MAX - 3, INT32_MAX});
+   cases.push_back({3, INT32_MAX - 5, INT32_MAX});
+   cases.push_back({3, INT32_MAX - 1, INT32_MAX});
+
+   for (const auto &c : cases) {
+      std::vector<uint32_t> pc = {
+         (uint32_t)c.kh, (uint32_t)c.kx0, (uint32_t)c.kx_end,
+      };
+      auto r_ref = exec_stencil_nir(ref, pc, 2048);
+      auto r_opt = exec_stencil_nir(opt, pc, 2048);
+      EXPECT_FALSE(r_ref.hit_step_limit);
+      EXPECT_FALSE(r_opt.hit_step_limit);
+      EXPECT_EQ(r_opt.out_sum, r_ref.out_sum)
+         << "kh=" << c.kh << " kx0=" << c.kx0 << " kx_end=" << c.kx_end;
+      EXPECT_EQ(r_opt.iters, r_ref.iters)
+         << "kh=" << c.kh << " kx0=" << c.kx0 << " kx_end=" << c.kx_end;
+   }
    ralloc_free(ref);
    ralloc_free(opt);
 }
