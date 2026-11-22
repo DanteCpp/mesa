@@ -43,9 +43,8 @@
  *    field back as zero, however it was written. Rendering NaN into an
  *    R11G11B10F attachment has to keep it, so they stay plain.
  *  - Depth: D16_UNORM, D32_SFLOAT and both planes of D32_SFLOAT_S8_UINT,
- *    one level, one layer, one sample; under the same 2x property also the
- *    depth plane at 2x (one layer); on M4 Pro also arrays of one level and
- *    one sample. The 2x depth
+ *    one level, one sample (single-layer and 2D arrays); under the same 2x
+ *    property also the depth plane at 2x (one layer). The 2x depth
  *    plane alone excludes input-attachment, feedback-loop and
  *    sample-location use (its S8 plane stays plain). The ZLS unit compresses the S8
  *    stencil plane with the same metadata layout as depth (stencil
@@ -175,19 +174,18 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
     * are admitted below. Colour's layered/MSAA packet support is independent
     * of this restriction.
     */
-   /* g16s (agx_is_m4_pro()) admits shapes that only the M4 Pro has been
-    * measured with: layered, cube and 3D colour, multisampled colour images
-    * that are not attachments (2x or 4x), and depth arrays. What is missing
-    * on the other G17P SoCs is a measurement, not a known hardware
-    * difference: they share the PBE, ZLS and texture encodings these use,
-    * but these shapes have not been run there. 4x colour attachments are plain on every G17P SoC, the
-    * M4 Pro included (see the colour checks below): a 4x reload loses the
-    * upper bytes of a wide sample on the M4 Pro and the M4 Max alike
-    * (agx_chip_uncovered_tile_ms_reload_defect(chip, chip_id, 4)), so a
-    * pass that reloads them spills them, and G17P has no decompression for
-    * a spilled compressed target. Widening 4x needs that defect measured
-    * away on a SoC or a G17P decompression program. */
-   const bool m4_pro = g16s;
+   /* g16s (agx_is_m4_pro()) admits colour shapes that only the M4 Pro has been
+    * measured with: layered, cube and 3D colour, and multisampled colour images
+    * that are not attachments (2x or 4x). What is missing on the other G17P
+    * SoCs is a measurement, not a known hardware difference: they share the
+    * PBE, ZLS and texture encodings these use, but these shapes have not been
+    * run there. 4x colour attachments are plain on every G17P SoC, the M4 Pro
+    * included (see the colour checks below): a 4x reload loses the upper bytes
+    * of a wide sample on the M4 Pro and the M4 Max alike
+    * (agx_chip_uncovered_tile_ms_reload_defect(chip, chip_id, 4)), so a pass
+    * that reloads them spills them, and G17P has no decompression for a
+    * spilled compressed target. Widening 4x needs that defect measured away on
+    * a SoC or a G17P decompression program. */
    /* Shapes whose reason is that a reloaded 2x sample stays whole in the
     * tilebuffer: the 2x colour attachments below never spill. 2x depth goes
     * through ZLS, not the background program; it sits under the same
@@ -270,15 +268,14 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
       info->mipLevels == 1 &&
       (info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
       !(info->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
-   /* Single-sample, single-level depth arrays on M4 Pro. Every access to
-    * one layer addresses its metadata at compression_layer_stride_B: ZLS
-    * (with the metadata layer stride for layered rendering), the metadata
-    * fast clear, the texture and PBE descriptors. The graphics copies, uploads
-    * and blits split into single-layer passes (hk_cmd_meta.c). Missing on
-    * the M4 Max and the A18 Pro: a run of these layered paths there. */
+   /* Single-sample, single-level depth arrays on G17P. Every access to one
+    * layer addresses its metadata at compression_layer_stride_B: ZLS (with
+    * the metadata layer stride for layered rendering), the metadata fast
+    * clear, the texture and PBE descriptors. The graphics copies, uploads and
+    * blits split into single-layer passes (hk_cmd_meta.c). */
    const bool depth_array =
-      m4_pro && info->samples == VK_SAMPLE_COUNT_1_BIT &&
-      info->mipLevels == 1 && hk_g17p_compression_depth_format(info->format);
+      info->samples == VK_SAMPLE_COUNT_1_BIT && info->mipLevels == 1 &&
+      hk_g17p_compression_depth_format(info->format);
    if (!g16s) {
       if (info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
           !info->arrayLayers || (info->arrayLayers != 1 && !depth_array) ||
@@ -356,10 +353,9 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
           info->mipLevels == 1;
 }
 
-/* Preserve the qualified Neo policy for every pre-existing caller. T6040's
- * extended shapes are selected by physical identity at image allocation, and
- * the 2x shapes by the SoC's chip id; chip id 0 is no SoC's, so they stay
- * off here. */
+/* Base G17P policy with chip-specific extensions disabled. T6040's extended
+ * shapes are selected by physical identity at image allocation, and the 2x
+ * shapes by the SoC's chip id; chip id 0 is no SoC's, so they stay off here. */
 static inline bool
 hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
                              const VkImageCreateInfo *info)

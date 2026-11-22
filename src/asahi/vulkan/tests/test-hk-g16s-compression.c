@@ -389,8 +389,9 @@ check_depth_arrays(void)
       i.arrayLayers = 4;
       CHECK(ELIGIBLE(i));
       CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &i) == (f == 2));
-      /* The Neo policy keeps one layer. */
-      CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &i));
+      /* Single-level depth arrays are enabled across G17P. */
+      CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &i));
+      CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, &i) == (f == 2));
       i.usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
       CHECK(ELIGIBLE(i));
       i.flags = VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
@@ -807,10 +808,10 @@ check_m4_max(void)
    d.samples = VK_SAMPLE_COUNT_4_BIT;
    CHECK(!M4_MAX(d));
 
-   /* Depth arrays: M4 Pro only. */
+   /* Single-level depth arrays are enabled across G17P. */
    d = image(VK_FORMAT_D32_SFLOAT, 1024, 1024, 1, ds);
    d.arrayLayers = 4;
-   CHECK(!M4_MAX(d) && g16s_eligible(AGX_CHIP_G17P, 0, &d));
+   CHECK(M4_MAX(d) && NEO(d) && g16s_eligible(AGX_CHIP_G17P, 0, &d));
 
    /* Other chips never. */
    CHECK(!runtime_m4_max(AGX_CHIP_G14G, 0, &c));

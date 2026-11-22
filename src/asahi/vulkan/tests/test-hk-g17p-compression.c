@@ -167,9 +167,18 @@ check_shape(VkFormat format, bool is_depth)
    i = base; i.extent.depth = 2;
    CHECK(!ELIGIBLE(i));
    i = base; i.arrayLayers = 2;
-   CHECK(!ELIGIBLE(i));
+   CHECK(ELIGIBLE(i) == is_depth);
    i = base; i.arrayLayers = 6;
-   CHECK(!ELIGIBLE(i));
+   CHECK(ELIGIBLE(i) == is_depth);
+   if (is_depth) {
+      i = base; i.arrayLayers = 4; i.mipLevels = 2;
+      CHECK(!ELIGIBLE(i));
+      i = base; i.arrayLayers = 4; i.samples = VK_SAMPLE_COUNT_2_BIT;
+      CHECK(!ELIGIBLE(i));
+      i = base; i.arrayLayers = 6;
+      i.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+      CHECK(!ELIGIBLE(i));
+   }
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
       CHECK(!ELIGIBLE(i));
