@@ -208,12 +208,23 @@ vulkan_lite_runtime_header_gen_deps = declare_dependency(
 
 vulkan_lite_runtime_deps += vulkan_lite_runtime_header_gen_deps
 
+# The runtime's _WIN32 paths (Win32 semaphore/fence/memory handles,
+# vk_icdEnumerateAdapterPhysicalDevices) use the VK_KHR_*_win32 types, which
+# vulkan.h only declares with VK_USE_PLATFORM_WIN32_KHR. That comes from the
+# windows WSI platform; define it here too so a Windows build without WSI
+# (-Dplatforms=, no DirectX-Headers) still compiles. The generated dispatch
+# tables pad guarded entries, so their layout does not depend on it.
+vk_runtime_win32_args = []
+if host_machine.system() == 'windows'
+  vk_runtime_win32_args += '-DVK_USE_PLATFORM_WIN32_KHR'
+endif
+
 libvulkan_lite_runtime = static_library(
   'vulkan_lite_runtime',
   vulkan_lite_runtime_files,
   include_directories : [inc_include, inc_src],
   dependencies : vulkan_lite_runtime_deps,
-  c_args : [c_msvc_compat_args, soong_compat_c_args, '-DMESA_VK_LOG=@0@'.format(get_option('debug').to_int())],
+  c_args : [c_msvc_compat_args, soong_compat_c_args, vk_runtime_win32_args, '-DMESA_VK_LOG=@0@'.format(get_option('debug').to_int())],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false,
 )
@@ -223,7 +234,7 @@ libvulkan_lite_instance = static_library(
   ['vk_instance.c'],
   include_directories : [inc_include, inc_src],
   dependencies : vulkan_lite_runtime_deps,
-  c_args : ['-DVK_LITE_RUNTIME_INSTANCE=1', c_msvc_compat_args, soong_compat_c_args],
+  c_args : ['-DVK_LITE_RUNTIME_INSTANCE=1', c_msvc_compat_args, soong_compat_c_args, vk_runtime_win32_args],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false,
 )
@@ -310,7 +321,7 @@ libvulkan_runtime = static_library(
   [vulkan_runtime_files],
   include_directories : [inc_include, inc_src],
   dependencies : vulkan_runtime_deps,
-  c_args : [c_msvc_compat_args, soong_compat_c_args],
+  c_args : [c_msvc_compat_args, soong_compat_c_args, vk_runtime_win32_args],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false,
 )
@@ -320,7 +331,7 @@ libvulkan_instance = static_library(
   ['vk_instance.c'],
   include_directories : [inc_include, inc_src],
   dependencies : vulkan_runtime_deps,
-  c_args : ['-DVK_LITE_RUNTIME_INSTANCE=0', c_msvc_compat_args, soong_compat_c_args],
+  c_args : ['-DVK_LITE_RUNTIME_INSTANCE=0', c_msvc_compat_args, soong_compat_c_args, vk_runtime_win32_args],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false,
 )

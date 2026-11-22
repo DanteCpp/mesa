@@ -24,6 +24,7 @@
 /** VK_EXT_headless_surface */
 
 #include "util/macros.h"
+#include "util/os_time.h"
 #include "util/timespec.h"
 #include "vk_util.h"
 #include "vk_instance.h"
@@ -400,7 +401,8 @@ wsi_headless_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
 
    timespec_from_nsec(&rel_timeout, info->timeout);
 
-   clock_gettime(CLOCK_MONOTONIC, &start_time);
+   /* os_time, not clock_gettime: on mingw that is winpthreads. */
+   timespec_from_nsec(&start_time, os_time_get_nano());
    timespec_add(&end_time, &rel_timeout, &start_time);
 
    while (1) {
@@ -423,7 +425,7 @@ wsi_headless_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
 
       /* Check for timeout. */
       struct timespec current_time;
-      clock_gettime(CLOCK_MONOTONIC, &current_time);
+      timespec_from_nsec(&current_time, os_time_get_nano());
       if (timespec_after(&current_time, &end_time))
          return VK_NOT_READY;
    }

@@ -61,7 +61,7 @@ copy_vars(nir_builder *b, nir_deref_instr *dst, nir_deref_instr *src)
          copy_vars(b, nir_build_deref_struct(b, dst, i), nir_build_deref_struct(b, src, i));
       }
    } else if (glsl_type_is_array_or_matrix(dst->type)) {
-      unsigned count = glsl_type_is_array(dst->type) ? glsl_array_size(dst->type) : glsl_get_matrix_columns(dst->type);
+      unsigned count = glsl_type_is_array(dst->type) ? glsl_array_size(dst->type): glsl_get_matrix_columns(dst->type);
       for (unsigned i = 0; i < count; i++) {
          copy_vars(b, nir_build_deref_array_imm(b, dst, i), nir_build_deref_array_imm(b, src, i));
       }
@@ -1247,8 +1247,8 @@ amd_varying_expression_max_cost(nir_shader *producer, nir_shader *consumer)
       return UINT_MAX;
 
    case MESA_SHADER_GEOMETRY: /* VS->GS, TES->GS */
-      return consumer->info.gs.vertices_in == 1 ? UINT_MAX :
-             consumer->info.gs.vertices_in == 2 ? 20 : 14;
+      return consumer->info.gs.vertices_in == 1 ? UINT_MAX:
+             consumer->info.gs.vertices_in == 2 ? 20: 14;
 
    case MESA_SHADER_TESS_EVAL: /* VS->TES, TCS->TES */
    case MESA_SHADER_FRAGMENT:
@@ -1669,11 +1669,11 @@ lower_fbfetch_instr(nir_builder *b, nir_instr *instr, void *data)
    fbfetch->data.binding = ZINK_FBFETCH_BINDING;
    fbfetch->data.binding = ZINK_FBFETCH_BINDING;
    fbfetch->data.sample = ms;
-   enum glsl_sampler_dim dim = ms ? GLSL_SAMPLER_DIM_SUBPASS_MS : GLSL_SAMPLER_DIM_SUBPASS;
+   enum glsl_sampler_dim dim = ms ? GLSL_SAMPLER_DIM_SUBPASS_MS: GLSL_SAMPLER_DIM_SUBPASS;
    fbfetch->type = glsl_image_type(dim, false, GLSL_TYPE_FLOAT);
    nir_shader_add_variable(b->shader, fbfetch);
    nir_def *deref = &nir_build_deref_var(b, fbfetch)->def;
-   nir_def *sample = ms ? nir_load_sample_id(b) : nir_undef(b, 1, 32);
+   nir_def *sample = ms ? nir_load_sample_id(b): nir_undef(b, 1, 32);
    nir_def *load = nir_image_deref_load(b, 4, 32, deref, nir_imm_vec4(b, 0, 0, 0, 1), sample, nir_imm_int(b, 0));
    nir_def_rewrite_uses(&intr->def, load);
    return true;
@@ -1749,7 +1749,7 @@ lower_txf_lod_robustness_instr(nir_builder *b, nir_tex_instr *txf, void *data)
    nir_const_value oob_values[4] = {0};
    unsigned bit_size = nir_alu_type_get_type_size(txf->dest_type);
    oob_values[3] = (txf->dest_type & nir_type_float) ?
-                   nir_const_value_for_float(1.0, bit_size) : nir_const_value_for_uint(1, bit_size);
+                   nir_const_value_for_float(1.0, bit_size): nir_const_value_for_uint(1, bit_size);
    nir_def *oob_val = nir_build_imm(b, nir_tex_instr_dest_size(txf), bit_size, oob_values);
 
    nir_pop_if(b, lod_oob_else);
@@ -1949,7 +1949,7 @@ update_so_info(struct zink_shader *zs, nir_shader *nir, uint64_t outputs_written
          while (!var && slot < VARYING_SLOT_TESS_MAX)
             var = find_var_with_location_frac(nir, slot--, output->component_offset + c, have_psiz, nir_var_shader_out);
          slot = output->location;
-         unsigned slot_count = var ? get_var_slot_count(nir, var) : 0;
+         unsigned slot_count = var ? get_var_slot_count(nir, var): 0;
          if (!var || var->data.location > slot || var->data.location + slot_count <= slot) {
             /* if no variable is found for the xfb output, no output exists */
             inlined[slot][c + output->component_offset] = true;
@@ -1964,7 +1964,7 @@ update_so_info(struct zink_shader *zs, nir_shader *nir, uint64_t outputs_written
             continue;
          assert(!glsl_type_is_array(var->type) || is_clipcull_dist(var->data.location));
          assert(!glsl_type_is_struct_or_ifc(var->type));
-         unsigned num_components = glsl_type_is_array(var->type) ? glsl_get_aoa_size(var->type) : glsl_get_vector_elements(var->type);
+         unsigned num_components = glsl_type_is_array(var->type) ? glsl_get_aoa_size(var->type): glsl_get_vector_elements(var->type);
          if (glsl_type_is_64bit(glsl_without_array(var->type)))
             num_components *= 2;
          /* if this is the entire variable, try to blast it out during the initial declaration
@@ -2005,7 +2005,7 @@ update_so_info(struct zink_shader *zs, nir_shader *nir, uint64_t outputs_written
       while (!var)
          var = find_var_with_location_frac(nir, slot--, output->component_offset, have_psiz, nir_var_shader_out);
       slot = output->location;
-      unsigned slot_count = var ? get_var_slot_count(nir, var) : 0;
+      unsigned slot_count = var ? get_var_slot_count(nir, var): 0;
       if (!var || var->data.location > slot || var->data.location + slot_count <= slot)
          continue;
       /* this is a lowered 64bit variable that can't be exported due to packing */
@@ -2013,7 +2013,7 @@ update_so_info(struct zink_shader *zs, nir_shader *nir, uint64_t outputs_written
          goto out;
 
       unsigned num_slots = is_clipcull_dist(var->data.location) ?
-                           glsl_array_size(var->type) / 4 :
+                           glsl_array_size(var->type) / 4:
                            glsl_count_vec4_slots(var->type, false, false);
       /* for each variable, iterate over all the variable's slots and inline the outputs */
       for (unsigned j = 0; j < num_slots; j++) {
@@ -2083,7 +2083,7 @@ lower_attrib(nir_builder *b, nir_instr *instr, void *data)
    unsigned num_components = glsl_get_vector_elements(split[0]->type);
    b->cursor = nir_after_instr(instr);
    nir_def *loads[4];
-   for (unsigned i = 0; i < (state->needs_w ? num_components - 1 : num_components); i++)
+   for (unsigned i = 0; i < (state->needs_w ? num_components - 1: num_components); i++)
       loads[i] = nir_load_deref(b, nir_build_deref_var(b, split[i+1]));
    if (state->needs_w) {
       /* oob load w comopnent to get correct value for int/float */
@@ -2111,14 +2111,14 @@ decompose_attribs(nir_shader *nir, uint32_t decomposed_attrs, uint32_t decompose
       assert(var);
       split[0] = var;
       bits |= BITFIELD_BIT(var->data.driver_location);
-      const struct glsl_type *new_type = glsl_type_is_scalar(var->type) ? var->type : glsl_get_array_element(var->type);
+      const struct glsl_type *new_type = glsl_type_is_scalar(var->type) ? var->type: glsl_get_array_element(var->type);
       unsigned num_components = glsl_get_vector_elements(var->type);
       state.needs_w = (decomposed_attrs_without_w & BITFIELD_BIT(location)) != 0 && num_components == 4;
-      for (unsigned i = 0; i < (state.needs_w ? num_components - 1 : num_components); i++) {
+      for (unsigned i = 0; i < (state.needs_w ? num_components - 1: num_components); i++) {
          split[i+1] = nir_variable_clone(var, nir);
          nir_variable_set_namef(nir, split[i+1], "%s_split%u", var->name, i);
          if (decomposed_attrs_without_w & BITFIELD_BIT(location))
-            split[i+1]->type = !i && num_components == 4 ? var->type : new_type;
+            split[i+1]->type = !i && num_components == 4 ? var->type: new_type;
          else
             split[i+1]->type = new_type;
          split[i+1]->data.driver_location = ffs(bits) - 1;
@@ -2160,7 +2160,7 @@ rewrite_bo_access_instr(nir_builder *b, nir_instr *instr, void *data)
                         intr->def.bit_size == 64 &&
                         nir_intrinsic_align_offset(intr) % 8 != 0;
       force_2x32 |= intr->def.bit_size == 64 && !has_int64;
-      nir_def *offset = nir_udiv_imm(b, intr->src[1].ssa, (force_2x32 ? 32 : intr->def.bit_size) / 8);
+      nir_def *offset = nir_udiv_imm(b, intr->src[1].ssa, (force_2x32 ? 32: intr->def.bit_size) / 8);
       nir_src_rewrite(&intr->src[1], offset);
       /* if 64bit isn't supported, 64bit loads definitely aren't supported, so rewrite as 2x32 with cast and pray */
       if (force_2x32) {
@@ -2187,7 +2187,7 @@ rewrite_bo_access_instr(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_load_shared: {
       b->cursor = nir_before_instr(instr);
       bool force_2x32 = intr->def.bit_size == 64 && !has_int64;
-      nir_def *offset = nir_udiv_imm(b, intr->src[0].ssa, (force_2x32 ? 32 : intr->def.bit_size) / 8);
+      nir_def *offset = nir_udiv_imm(b, intr->src[0].ssa, (force_2x32 ? 32: intr->def.bit_size) / 8);
       nir_src_rewrite(&intr->src[0], offset);
       /* if 64bit isn't supported, 64bit loads definitely aren't supported, so rewrite as 2x32 with cast and pray */
       if (force_2x32) {
@@ -2208,7 +2208,7 @@ rewrite_bo_access_instr(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_store_ssbo: {
       b->cursor = nir_before_instr(instr);
       bool force_2x32 = nir_src_bit_size(intr->src[0]) == 64 && !has_int64;
-      nir_def *offset = nir_udiv_imm(b, intr->src[2].ssa, (force_2x32 ? 32 : nir_src_bit_size(intr->src[0])) / 8);
+      nir_def *offset = nir_udiv_imm(b, intr->src[2].ssa, (force_2x32 ? 32: nir_src_bit_size(intr->src[0])) / 8);
       nir_src_rewrite(&intr->src[2], offset);
       /* if 64bit isn't supported, 64bit loads definitely aren't supported, so rewrite as 2x32 with cast and pray */
       if (force_2x32) {
@@ -2226,7 +2226,7 @@ rewrite_bo_access_instr(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_store_shared: {
       b->cursor = nir_before_instr(instr);
       bool force_2x32 = nir_src_bit_size(intr->src[0]) == 64 && !has_int64;
-      nir_def *offset = nir_udiv_imm(b, intr->src[1].ssa, (force_2x32 ? 32 : nir_src_bit_size(intr->src[0])) / 8);
+      nir_def *offset = nir_udiv_imm(b, intr->src[1].ssa, (force_2x32 ? 32: nir_src_bit_size(intr->src[0])) / 8);
       nir_src_rewrite(&intr->src[1], offset);
       /* if 64bit isn't supported, 64bit loads definitely aren't supported, so rewrite as 2x32 with cast and pray */
       if (nir_src_bit_size(intr->src[0]) == 64 && !has_int64) {
@@ -2255,7 +2255,7 @@ static nir_variable *
 get_bo_var(nir_shader *shader, struct bo_vars *bo, bool ssbo, nir_src *src, unsigned bit_size)
 {
    nir_variable *var, **ptr;
-   unsigned idx = ssbo || (nir_src_is_const(*src) && !nir_src_as_uint(*src)) ? 0 : 1;
+   unsigned idx = ssbo || (nir_src_is_const(*src) && !nir_src_as_uint(*src)) ? 0: 1;
 
    if (ssbo)
       ptr = &bo->ssbo[bit_size >> 4];
@@ -2279,7 +2279,7 @@ get_bo_var(nir_shader *shader, struct bo_vars *bo, bool ssbo, nir_src *src, unsi
       if (ssbo)
          nir_variable_set_namef(shader, var, "%s@%u", "ssbos", bit_size);
       else
-         nir_variable_set_namef(shader, var, "%s@%u", idx ? "ubos" : "uniform_0", bit_size);
+         nir_variable_set_namef(shader, var, "%s@%u", idx ? "ubos": "uniform_0", bit_size);
       *ptr = var;
       nir_shader_add_variable(shader, var);
 
@@ -2395,7 +2395,7 @@ remove_bo_access_instr(nir_builder *b, nir_instr *instr, void *data)
    assert(var);
    assert(offset);
    nir_deref_instr *deref_var = nir_build_deref_var(b, var);
-   nir_def *idx = !ssbo && var->data.driver_location ? nir_iadd_imm(b, src->ssa, -1) : src->ssa;
+   nir_def *idx = !ssbo && var->data.driver_location ? nir_iadd_imm(b, src->ssa, -1): src->ssa;
    if (!ssbo && bo->first_ubo && var->data.driver_location)
       idx = nir_iadd_imm(b, idx, -bo->first_ubo);
    else if (ssbo && bo->first_ssbo)
@@ -2605,7 +2605,7 @@ struct io_slot_map {
 static void
 assign_track_slot_mask(struct io_slot_map *io, nir_variable *var, unsigned slot, unsigned num_slots)
 {
-   uint64_t *track = var->data.patch ? io->patch_slot_track : io->slot_track;
+   uint64_t *track = var->data.patch ? io->patch_slot_track: io->slot_track;
    uint32_t mask = BITFIELD_MASK(glsl_get_vector_elements(glsl_without_array(var->type))) << var->data.location_frac;
    uint64_t slot_mask = BITFIELD64_RANGE(slot, num_slots);
    u_foreach_bit(c, mask) {
@@ -2685,11 +2685,11 @@ static void
 assign_slot_io(mesa_shader_stage stage, struct io_slot_map *io, nir_variable *var, unsigned slot)
 {
    unsigned num_slots = get_io_slot_count(stage, var);
-   uint8_t *slot_map = var->data.patch ? io->patch_slot_map : io->slot_map;
+   uint8_t *slot_map = var->data.patch ? io->patch_slot_map: io->slot_map;
    /* callers must only allocate slots for unassigned locations */
    assert(slot_map[slot] == 0xff);
    assign_track_slot_mask(io, var, slot, num_slots);
-   unsigned *reserved = var->data.patch ? &io->patch_reserved : &io->reserved;
+   unsigned *reserved = var->data.patch ? &io->patch_reserved: &io->reserved;
    assert(*reserved + num_slots <= MAX_VARYING);
    assert(*reserved < MAX_VARYING);
    for (unsigned i = 0; i < num_slots; i++)
@@ -2714,7 +2714,7 @@ assign_producer_var_io(mesa_shader_stage stage, nir_variable *var, struct io_slo
    }
    assign_track_slot_mask(io, var, slot, get_io_slot_count(stage, var));
    /* prefill_slot_map() has assigned slots for all producer locations */
-   slot = var->data.patch ? io->patch_slot_map[slot] : io->slot_map[slot];
+   slot = var->data.patch ? io->patch_slot_map[slot]: io->slot_map[slot];
    assert(slot < MAX_VARYING);
    var->data.driver_location = slot;
 }
@@ -2724,7 +2724,7 @@ is_texcoord(mesa_shader_stage stage, const nir_variable *var)
 {
    if (stage != MESA_SHADER_FRAGMENT)
       return false;
-   return var->data.location >= VARYING_SLOT_TEX0 && 
+   return var->data.location >= VARYING_SLOT_TEX0 &&
           var->data.location <= VARYING_SLOT_TEX7;
 }
 
@@ -2741,7 +2741,7 @@ assign_consumer_var_io(mesa_shader_stage stage, nir_variable *var, struct io_slo
       assert(slot >= VARYING_SLOT_PATCH0);
       slot -= VARYING_SLOT_PATCH0;
    }
-   uint8_t *slot_map = var->data.patch ? io->patch_slot_map : io->slot_map;
+   uint8_t *slot_map = var->data.patch ? io->patch_slot_map: io->slot_map;
    if (slot_map[slot] == (unsigned char)-1) {
       switch (slot) {
       case VARYING_SLOT_COL0:
@@ -2836,7 +2836,7 @@ static bool
 delete_psiz_store(nir_shader *nir, bool one)
 {
    bool progress = nir_shader_intrinsics_pass(nir, delete_psiz_store_instr,
-                                              nir_metadata_control_flow, one ? nir : NULL);
+                                              nir_metadata_control_flow, one ? nir: NULL);
    if (progress)
       nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    return progress;
@@ -2995,9 +2995,9 @@ align_array_slot_io(nir_shader *producer, nir_shader *consumer)
       if (!input_var)
          continue;
       const glsl_type* output_type = nir_is_arrayed_io(output_var, producer->info.stage) ?
-         glsl_get_array_element(output_var->type) : output_var->type;
+         glsl_get_array_element(output_var->type): output_var->type;
       const glsl_type* input_type = nir_is_arrayed_io(input_var, consumer->info.stage) ?
-         glsl_get_array_element(input_var->type) : input_var->type;
+         glsl_get_array_element(input_var->type): input_var->type;
       /* XFB + FS indirect indexing, remove it. */
       if (glsl_type_is_array(input_type) && !glsl_type_is_array(output_type)) {
          split_fs_indirect_arrays(consumer);
@@ -3023,7 +3023,7 @@ fix_var_int_floatness(nir_shader *producer, nir_shader *consumer)
                glsl_vector_type(output_base, vec_type->vector_elements);
             input_var->type = nir_is_arrayed_io(input_var, consumer->info.stage)
                ? glsl_array_type(element, glsl_array_size(input_var->type), input_var->type->explicit_stride)
-               : element;
+: element;
          }
       }
    }
@@ -3056,10 +3056,10 @@ lower_clip_fs(nir_shader *producer, nir_shader *fs)
    NIR_PASS(_, fs, nir_lower_clip_fs, BITFIELD_RANGE(0, fs->info.clip_distance_array_size), false, true);
    NIR_PASS(_, fs, nir_lower_discard_if, nir_lower_demote_if_to_cf | nir_lower_terminate_if_to_cf);
    NIR_PASS(_, fs, nir_shader_intrinsics_pass, move_clip_intrins, nir_metadata_control_flow, NULL);
-   nir_get_variable_with_location(fs, nir_var_shader_in, clip0_relocate_target, 
+   nir_get_variable_with_location(fs, nir_var_shader_in, clip0_relocate_target,
       glsl_vec_type(MIN2(fs->info.clip_distance_array_size, 4)));
    if (fs->info.clip_distance_array_size > 4)
-      nir_get_variable_with_location(fs, nir_var_shader_in, clip0_relocate_target + 1, 
+      nir_get_variable_with_location(fs, nir_var_shader_in, clip0_relocate_target + 1,
          glsl_vec_type(fs->info.clip_distance_array_size - 4));
 }
 
@@ -3088,7 +3088,7 @@ zink_compiler_assign_io(struct zink_screen *screen, nir_shader *producer, nir_sh
       do_fixup = true;
    }
    fix_var_int_floatness(producer, consumer);
-   nir_shader *nir = producer->info.stage == MESA_SHADER_TESS_CTRL ? producer : consumer;
+   nir_shader *nir = producer->info.stage == MESA_SHADER_TESS_CTRL ? producer: consumer;
    nir_variable *var = nir_find_variable_with_location(producer, nir_var_shader_out, VARYING_SLOT_PSIZ);
    if (var) {
       bool can_remove = false;
@@ -3293,7 +3293,7 @@ lower_64bit_vars_function(nir_shader *shader, nir_function_impl *impl, nir_varia
             nir_def *comp[NIR_MAX_VEC_COMPONENTS];
             /* this is the stored matrix type from the deref */
             struct hash_entry *he = _mesa_hash_table_search(derefs, deref);
-            const struct glsl_type *matrix = he ? he->data : NULL;
+            const struct glsl_type *matrix = he ? he->data: NULL;
             if (doubles_only && !matrix)
                break;
             func_progress = true;
@@ -3562,7 +3562,7 @@ zink_shader_spirv_compile(struct zink_screen *screen, struct zink_shader *zs, st
       sci.setLayoutCount = pg->num_dsl;
       sci.pSetLayouts = pg->dsl;
    } else {
-      sci.setLayoutCount = zs->info.stage == MESA_SHADER_COMPUTE ? 1 : ZINK_GFX_SHADER_COUNT;
+      sci.setLayoutCount = zs->info.stage == MESA_SHADER_COMPUTE ? 1: ZINK_GFX_SHADER_COUNT;
       dsl[zink_descriptor_stage_idx(zs->info.stage)] = zs->precompile.dsl;;
       sci.pSetLayouts = dsl;
    }
@@ -3787,7 +3787,7 @@ lower_zs_swizzle_tex_instr(nir_builder *b, nir_instr *instr, void *data)
                vec[i] = nir_imm_floatN_t(b, 1, tex->def.bit_size);
             break;
          default:
-            vec[i] = dest->num_components == 1 ? dest : nir_channel(b, dest, i);
+            vec[i] = dest->num_components == 1 ? dest: nir_channel(b, dest, i);
             break;
          }
       }
@@ -3817,7 +3817,7 @@ static bool
 lower_zs_swizzle_tex(nir_shader *nir, const void *swizzle, bool shadow_only)
 {
    /* We don't use nir_lower_tex to do our swizzling, because of this base_sampler_id. */
-   unsigned base_sampler_id = mesa_shader_stage_is_compute(nir->info.stage) ? 0 : PIPE_MAX_SAMPLERS * nir->info.stage;
+   unsigned base_sampler_id = mesa_shader_stage_is_compute(nir->info.stage) ? 0: PIPE_MAX_SAMPLERS * nir->info.stage;
    struct lower_zs_swizzle_state state = {shadow_only, base_sampler_id, swizzle};
    return nir_shader_instructions_pass(nir, lower_zs_swizzle_tex_instr,
                                        nir_metadata_control_flow,
@@ -3915,16 +3915,16 @@ add_derefs_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
                         (b->shader->info.stage == MESA_SHADER_FRAGMENT && !is_input);
    unsigned loc = nir_intrinsic_io_semantics(intr).location;
    nir_src *src_offset = nir_get_io_offset_src(intr);
-   const unsigned slot_offset = src_offset && nir_src_is_const(*src_offset) ? nir_src_as_uint(*src_offset) : 0;
+   const unsigned slot_offset = src_offset && nir_src_is_const(*src_offset) ? nir_src_as_uint(*src_offset): 0;
    unsigned location = loc + slot_offset;
    unsigned frac = nir_intrinsic_component(intr);
-   unsigned bit_size = is_load ? intr->def.bit_size : nir_src_bit_size(intr->src[0]);
+   unsigned bit_size = is_load ? intr->def.bit_size: nir_src_bit_size(intr->src[0]);
    /* set c aligned/rounded down to dword */
    unsigned c = frac;
    if (frac && bit_size < 32)
       c = frac * bit_size / 32;
    /* loop over all the variables and rewrite corresponding access */
-   nir_foreach_variable_with_modes(var, b->shader, is_input ? nir_var_shader_in : nir_var_shader_out) {
+   nir_foreach_variable_with_modes(var, b->shader, is_input ? nir_var_shader_in: nir_var_shader_out) {
       const struct glsl_type *type = var->type;
       if (nir_is_arrayed_io(var, b->shader->info.stage))
          type = glsl_get_array_element(type);
@@ -3965,7 +3965,7 @@ add_derefs_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       }
       if (glsl_type_is_array(type)) {
          /* unroll array derefs */
-         unsigned idx = var->data.compact ? (frac - var->data.location_frac) : 0;
+         unsigned idx = var->data.compact ? (frac - var->data.location_frac): 0;
          assert(src_offset);
          if (var->data.location < VARYING_SLOT_VAR0) {
             if (src_offset) {
@@ -3989,7 +3989,7 @@ add_derefs_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
                   nir_def *offset = src_offset->ssa;
                   if (is_builtin_array)
                      nir_imul_imm(b, offset, 4);
-                  deref = nir_build_deref_array(b, deref, idx ? nir_iadd_imm(b, offset, idx) : src_offset->ssa);
+                  deref = nir_build_deref_array(b, deref, idx ? nir_iadd_imm(b, offset, idx): src_offset->ssa);
                }
             } else {
                deref = nir_build_deref_array_imm(b, deref, idx);
@@ -3998,11 +3998,11 @@ add_derefs_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          } else {
             idx += location - var->data.location;
             /* need to convert possible N*M to [N][M] */
-            nir_def *nm = idx ? nir_iadd_imm(b, src_offset->ssa, idx) : src_offset->ssa;
+            nir_def *nm = idx ? nir_iadd_imm(b, src_offset->ssa, idx): src_offset->ssa;
             while (glsl_type_is_array(type)) {
                const struct glsl_type *elem = glsl_get_array_element(type);
                unsigned type_size = glsl_count_vec4_slots(elem, false, false);
-               nir_def *n = glsl_type_is_array(elem) ? nir_udiv_imm(b, nm, type_size) : nm;
+               nir_def *n = glsl_type_is_array(elem) ? nir_udiv_imm(b, nm, type_size): nm;
                if (glsl_type_is_vector_or_scalar(elem) && glsl_type_is_64bit(elem) && glsl_get_vector_elements(elem) > 2)
                   n = nir_udiv_imm(b, n, 2);
                deref = nir_build_deref_array(b, deref, n);
@@ -4140,7 +4140,7 @@ zink_shader_compile(struct zink_screen *screen, bool can_shobj, struct zink_shad
    }
 
    NIR_PASS(_, nir, add_derefs);
-   NIR_PASS(_, nir, nir_lower_fragcolor, nir->info.fs.color_is_dual_source ? 1 : 8);
+   NIR_PASS(_, nir, nir_lower_fragcolor, nir->info.fs.color_is_dual_source ? 1: 8);
    if (key) {
       if (key->inline_uniforms) {
          NIR_PASS(_, nir, nir_inline_uniforms,
@@ -4265,7 +4265,7 @@ zink_shader_compile(struct zink_screen *screen, bool can_shobj, struct zink_shad
          if (zink_fs_key_base(key)->point_coord_yinvert)
             NIR_PASS(_, nir, invert_point_coord);
          if (zs->fs.legacy_shadow_mask && !key->base.needs_zs_shader_swizzle)
-            NIR_PASS(need_optimize, nir, lower_zs_swizzle_tex, zink_fs_key_base(key)->shadow_needs_shader_swizzle ? extra_data : NULL, true);
+            NIR_PASS(need_optimize, nir, lower_zs_swizzle_tex, zink_fs_key_base(key)->shadow_needs_shader_swizzle ? extra_data: NULL, true);
          if (nir->info.fs.uses_fbfetch_output) {
             nir_variable *fbfetch = NULL;
             NIR_PASS(_, nir, lower_fbfetch, &fbfetch, zink_fs_key_base(key)->fbfetch_ms);
@@ -4314,7 +4314,7 @@ zink_shader_compile(struct zink_screen *screen, bool can_shobj, struct zink_shad
    NIR_PASS(has_sparse, nir, lower_sparse);
    if (has_sparse)
       optimize_nir(nir, zs, false);
-   
+
    struct zink_shader_object obj = compile_module(screen, zs, nir, can_shobj, pg);
    ralloc_free(nir);
    return obj;
@@ -4352,7 +4352,7 @@ zink_shader_compile_separate(struct zink_screen *screen, struct zink_shader *zs)
       }
    }
    NIR_PASS(_, nir, add_derefs);
-   NIR_PASS(_, nir, nir_lower_fragcolor, nir->info.fs.color_is_dual_source ? 1 : 8);
+   NIR_PASS(_, nir, nir_lower_fragcolor, nir->info.fs.color_is_dual_source ? 1: 8);
    if (screen->driconf.inline_uniforms) {
       NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_mem_global | nir_var_mem_ubo | nir_var_mem_ssbo | nir_var_mem_shared, NULL, NULL);
       NIR_PASS(_, nir, rewrite_bo_access, screen);
@@ -4421,8 +4421,8 @@ unbreak_bos(nir_shader *shader, struct zink_shader *zs, bool needs_size)
       if (type_is_counter(type))
          continue;
       /* be conservative: use the bigger of the interface and variable types to ensure in-bounds access */
-      unsigned size = glsl_count_attribute_slots(glsl_type_is_array(var->type) ? var->type : type, false);
-      const struct glsl_type *interface_type = var->interface_type ? glsl_without_array(var->interface_type) : NULL;
+      unsigned size = glsl_count_attribute_slots(glsl_type_is_array(var->type) ? var->type: type, false);
+      const struct glsl_type *interface_type = var->interface_type ? glsl_without_array(var->interface_type): NULL;
       if (interface_type) {
          unsigned block_size = glsl_get_explicit_size(interface_type, true);
          if (glsl_get_length(interface_type) == 1) {
@@ -4490,7 +4490,7 @@ unbreak_bos(nir_shader *shader, struct zink_shader *zs, bool needs_size)
       assert(first_ssbo < PIPE_MAX_SHADER_BUFFERS);
       unsigned num_ssbos = shader->info.num_ssbos - first_ssbo;
       assert(num_ssbos);
-      const struct glsl_type *ssbo_type = glsl_array_type(glsl_uint_type(), needs_size ? 0 : max_ssbo_size * 4, 4);
+      const struct glsl_type *ssbo_type = glsl_array_type(glsl_uint_type(), needs_size ? 0: max_ssbo_size * 4, 4);
       field.type = ssbo_type;
       nir_variable *var = nir_variable_create(shader, nir_var_mem_ssbo,
                                               glsl_array_type(glsl_struct_type(&field, 1, "struct", false), num_ssbos, 0),
@@ -4531,7 +4531,7 @@ analyze_io(struct zink_shader *zs, nir_shader *shader)
             int deref_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
             if (deref_idx >= 0) {
                nir_variable *img = nir_deref_instr_get_variable(nir_def_as_deref(tex->src[deref_idx].src.ssa));
-               unsigned size = glsl_type_is_array(img->type) ? glsl_get_aoa_size(img->type) : 1;
+               unsigned size = glsl_type_is_array(img->type) ? glsl_get_aoa_size(img->type): 1;
                BITSET_SET_COUNT(shader->info.textures_used,
                                img->data.driver_location, size);
             }
@@ -4539,13 +4539,13 @@ analyze_io(struct zink_shader *zs, nir_shader *shader)
          }
          if (instr->type != nir_instr_type_intrinsic)
             continue;
- 
+
          nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
          switch (intrin->intrinsic) {
          case nir_intrinsic_store_ssbo:
             zs->ssbos_used |= get_src_mask_ssbo(shader->info.num_ssbos, intrin->src[1]);
             break;
- 
+
          case nir_intrinsic_get_ssbo_size: {
             zs->ssbos_used |= get_src_mask_ssbo(shader->info.num_ssbos, intrin->src[0]);
             ret = true;
@@ -4577,7 +4577,7 @@ struct zink_bindless_info {
 static nir_variable *
 create_bindless_texture(nir_shader *nir, nir_tex_instr *tex, unsigned descriptor_set)
 {
-   unsigned binding = tex->sampler_dim == GLSL_SAMPLER_DIM_BUF ? 1 : 0;
+   unsigned binding = tex->sampler_dim == GLSL_SAMPLER_DIM_BUF ? 1: 0;
    nir_variable *var;
 
    const struct glsl_type *sampler_type = glsl_sampler_type(tex->sampler_dim, tex->is_shadow, tex->is_array, GLSL_TYPE_FLOAT);
@@ -4591,7 +4591,7 @@ create_bindless_texture(nir_shader *nir, nir_tex_instr *tex, unsigned descriptor
 static nir_variable *
 create_bindless_image(nir_shader *nir, enum glsl_sampler_dim dim, unsigned descriptor_set)
 {
-   unsigned binding = dim == GLSL_SAMPLER_DIM_BUF ? 3 : 2;
+   unsigned binding = dim == GLSL_SAMPLER_DIM_BUF ? 3: 2;
    nir_variable *var;
 
    const struct glsl_type *image_type = glsl_image_type(dim, false, GLSL_TYPE_FLOAT);
@@ -4614,7 +4614,7 @@ lower_bindless_instr(nir_builder *b, nir_instr *in, void *data)
       if (idx == -1)
          return false;
 
-      nir_variable *var = tex->sampler_dim == GLSL_SAMPLER_DIM_BUF ? bindless->bindless[1] : bindless->bindless[0];
+      nir_variable *var = tex->sampler_dim == GLSL_SAMPLER_DIM_BUF ? bindless->bindless[1]: bindless->bindless[0];
       if (!var) {
          var = create_bindless_texture(b->shader, tex, bindless->bindless_set);
          if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF)
@@ -4672,7 +4672,7 @@ lower_bindless_instr(nir_builder *b, nir_instr *in, void *data)
    }
 
    enum glsl_sampler_dim dim = nir_intrinsic_image_dim(instr);
-   nir_variable *var = dim == GLSL_SAMPLER_DIM_BUF ? bindless->bindless[3] : bindless->bindless[2];
+   nir_variable *var = dim == GLSL_SAMPLER_DIM_BUF ? bindless->bindless[3]: bindless->bindless[2];
    if (!var)
       var = create_bindless_image(b->shader, dim, bindless->bindless_set);
    instr->intrinsic = op;
@@ -4706,7 +4706,7 @@ lower_bindless_io_instr(nir_builder *b, nir_intrinsic_instr *instr,
    if (!filter_io_instr(instr, &is_load, &is_input, &is_interp))
       return false;
 
-   nir_variable *var = find_var_with_location_frac(b->shader, nir_intrinsic_io_semantics(instr).location, nir_intrinsic_component(instr), false, is_input ? nir_var_shader_in : nir_var_shader_out);
+   nir_variable *var = find_var_with_location_frac(b->shader, nir_intrinsic_io_semantics(instr).location, nir_intrinsic_component(instr), false, is_input ? nir_var_shader_in: nir_var_shader_out);
    if (var->data.bindless)
       return false;
    if (var->data.mode != nir_var_shader_in && var->data.mode != nir_var_shader_out)
@@ -4764,7 +4764,7 @@ zink_binding(mesa_shader_stage stage, VkDescriptorType type, int index, bool com
       case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
          assert(index < ZINK_MAX_SHADER_IMAGES);
          if (stage == MESA_SHADER_KERNEL)
-            return index + (compact_descriptors ? (PIPE_MAX_SAMPLERS + PIPE_MAX_SHADER_SAMPLER_VIEWS) : 0);
+            return index + (compact_descriptors ? (PIPE_MAX_SAMPLERS + PIPE_MAX_SHADER_SAMPLER_VIEWS): 0);
          return (base * ZINK_MAX_SHADER_IMAGES) + index + (compact_descriptors * (ZINK_GFX_SHADER_COUNT * PIPE_MAX_SAMPLERS));
 
       default:
@@ -4786,7 +4786,7 @@ handle_bindless_var(nir_shader *nir, nir_variable *var, const struct glsl_type *
    if (!glsl_type_is_image(type) && !glsl_type_is_sampler(type))
       return;
 
-   VkDescriptorType vktype = glsl_type_is_image(type) ? zink_image_type(type) : zink_sampler_type(type);
+   VkDescriptorType vktype = glsl_type_is_image(type) ? zink_image_type(type): zink_sampler_type(type);
    unsigned binding;
    switch (vktype) {
       case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
@@ -4863,7 +4863,7 @@ convert_1d_shadow_tex(nir_builder *b, nir_instr *instr, void *data)
       tex->def.num_components = needed_components;
       assert(num_components < 3);
       /* take either xz or just x since this is promoted to 2D from 1D */
-      uint32_t mask = num_components == 2 ? (1|4) : 1;
+      uint32_t mask = num_components == 2 ? (1|4): 1;
       nir_def *dst = nir_channels(b, &tex->def, mask);
       nir_def_rewrite_uses_after(&tex->def, dst);
    }
@@ -4880,7 +4880,7 @@ lower_1d_shadow(nir_shader *shader, struct zink_screen *screen)
       if (!glsl_type_is_sampler(type) || !glsl_sampler_type_is_shadow(type) || glsl_get_sampler_dim(type) != GLSL_SAMPLER_DIM_1D)
          continue;
       const struct glsl_type *sampler = glsl_sampler_type(GLSL_SAMPLER_DIM_2D, true, glsl_sampler_type_is_array(type), glsl_get_sampler_result_type(type));
-      var->type = type != var->type ? glsl_array_type(sampler, length, glsl_get_explicit_stride(var->type)) : sampler;
+      var->type = type != var->type ? glsl_array_type(sampler, length, glsl_get_explicit_stride(var->type)): sampler;
 
       found = true;
    }
@@ -4914,7 +4914,7 @@ scan_nir(struct zink_screen *screen, nir_shader *shader, struct zink_shader *zs)
 
                 /* Structs have been lowered already, so get_aoa_size is sufficient. */
                 const unsigned size =
-                   glsl_type_is_array(var->type) ? glsl_get_aoa_size(var->type) : 1;
+                   glsl_type_is_array(var->type) ? glsl_get_aoa_size(var->type): 1;
                 BITSET_SET_COUNT(shader->info.images_used, var->data.binding,
                                 MAX2(size, 1));
             }
@@ -4988,7 +4988,7 @@ match_tex_dests_instr_post(nir_builder *b, nir_tex_instr *in, void *data)
 static bool
 match_tex_dests(nir_shader *shader, struct zink_shader *zs, bool pre_mangle)
 {
-   return nir_shader_tex_pass(shader, pre_mangle ? match_tex_dests_instr_pre : match_tex_dests_instr_post, nir_metadata_control_flow, zs);
+   return nir_shader_tex_pass(shader, pre_mangle ? match_tex_dests_instr_pre: match_tex_dests_instr_post, nir_metadata_control_flow, zs);
 }
 
 static bool
@@ -5213,7 +5213,7 @@ type_sampler_vars(nir_shader *nir)
                 nir_tex_instr_is_query(tex))
                continue;
             const struct glsl_type *img_type = glsl_sampler_type(glsl_get_sampler_dim(glsl_without_array(var->type)), tex->is_shadow, tex->is_array, nir_get_glsl_base_type_for_nir_type(tex->dest_type));
-            unsigned size = glsl_type_is_array(var->type) ? glsl_array_size(var->type) : 1;
+            unsigned size = glsl_type_is_array(var->type) ? glsl_array_size(var->type): 1;
             if (size > 1)
                img_type = glsl_array_type(img_type, size, 0);
             var->type = img_type;
@@ -5248,7 +5248,7 @@ fixup_io_locations(nir_shader *nir)
    if (nir->info.stage != MESA_SHADER_FRAGMENT && nir->info.stage != MESA_SHADER_VERTEX)
       modes = nir_var_shader_in | nir_var_shader_out;
    else
-      modes = nir->info.stage == MESA_SHADER_FRAGMENT ? nir_var_shader_in : nir_var_shader_out;
+      modes = nir->info.stage == MESA_SHADER_FRAGMENT ? nir_var_shader_in: nir_var_shader_out;
    u_foreach_bit(mode, modes) {
       nir_variable_mode m = BITFIELD_BIT(mode);
       if ((m == nir_var_shader_in && ((nir->info.inputs_read & BITFIELD64_MASK(VARYING_SLOT_VAR1)) == nir->info.inputs_read)) ||
@@ -5436,11 +5436,11 @@ zink_lower_bit_size_cb(const nir_instr *instr, void *data)
       case nir_op_find_lsb:
       case nir_op_ifind_msb:
       case nir_op_ufind_msb:
-         return alu->src[0].src.ssa->bit_size == 32 ? 0 : 32;
+         return alu->src[0].src.ssa->bit_size == 32 ? 0: 32;
       case nir_op_bitfield_insert:
       case nir_op_bitfield_reverse:
          if (!screen->info.have_KHR_maintenance9)
-            return alu->src[0].src.ssa->bit_size == 32 ? 0 : 32;
+            return alu->src[0].src.ssa->bit_size == 32 ? 0: 32;
          return 0;
       default:
          return 0;
@@ -5568,23 +5568,23 @@ separate_clipcull_array(nir_shader *nir, nir_variable *var)
       return;
    }
 
-   const glsl_type *cull_array_type = 
+   const glsl_type *cull_array_type =
       glsl_array_type(glsl_float_type(), nir->info.cull_distance_array_size, 4);
    nir_variable* culldist_var = nir_variable_clone(var, nir);
    culldist_var->type = nir_is_arrayed_io(var, nir->info.stage)
                         ? glsl_array_type(cull_array_type, glsl_array_size(var->type), 0)
-                        : cull_array_type;
+: cull_array_type;
    culldist_var->data.location = VARYING_SLOT_CULL_DIST0;
    culldist_var->data.location_frac = 0;
    culldist_var->name = "gl_CullDistance";
    nir_shader_add_variable(nir, culldist_var);
 
    /* shrink the original clip distance array as well */
-   const glsl_type *clip_array_type = 
+   const glsl_type *clip_array_type =
       glsl_array_type(glsl_float_type(), nir->info.clip_distance_array_size, 4);
    var->type = nir_is_arrayed_io(var, nir->info.stage)
                ? glsl_array_type(clip_array_type, glsl_array_size(var->type), 0)
-               : clip_array_type;
+: clip_array_type;
 }
 
 static void
@@ -5807,14 +5807,14 @@ zink_shader_init(struct zink_screen *screen, struct zink_shader *zs)
             ztype = ZINK_DESCRIPTOR_TYPE_UBO;
             /* buffer 0 is a push descriptor */
             var->data.descriptor_set = !!var->data.driver_location;
-            unsigned clamped_stage = mesa_shader_stage_is_compute(nir->info.stage) ? MESA_SHADER_COMPUTE : mesa_shader_stage_is_mesh(nir->info.stage) ? nir->info.stage - MESA_SHADER_TASK : nir->info.stage;
-            var->data.binding = !var->data.driver_location ? clamped_stage :
+            unsigned clamped_stage = mesa_shader_stage_is_compute(nir->info.stage) ? MESA_SHADER_COMPUTE: mesa_shader_stage_is_mesh(nir->info.stage) ? nir->info.stage - MESA_SHADER_TASK: nir->info.stage;
+            var->data.binding = !var->data.driver_location ? clamped_stage:
                                 zink_binding(nir->info.stage,
                                              VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                                              var->data.driver_location,
                                              screen->compact_descriptors);
             assert(var->data.driver_location || var->data.binding < 10);
-            VkDescriptorType vktype = !var->data.driver_location ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            VkDescriptorType vktype = !var->data.driver_location ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             int binding = var->data.binding;
 
             if (!var->data.driver_location) {
@@ -5851,7 +5851,7 @@ zink_shader_init(struct zink_screen *screen, struct zink_shader *zs)
                zs->bindless = true;
                handle_bindless_var(nir, var, type, &bindless);
             } else if (glsl_type_is_sampler(type) || glsl_type_is_image(type)) {
-               VkDescriptorType vktype = glsl_type_is_image(type) ? zink_image_type(type) : glsl_type_is_bare_sampler(type) ? VK_DESCRIPTOR_TYPE_SAMPLER : zink_sampler_type(type);
+               VkDescriptorType vktype = glsl_type_is_image(type) ? zink_image_type(type): glsl_type_is_bare_sampler(type) ? VK_DESCRIPTOR_TYPE_SAMPLER: zink_sampler_type(type);
                if (nir->info.stage == MESA_SHADER_KERNEL && vktype == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                   vktype = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
                ztype = zink_desc_type_from_vktype(vktype);
@@ -5948,7 +5948,7 @@ gfx_shader_prune(struct zink_screen *screen, struct zink_shader *shader)
    /* this shader may still be precompiling, so access here must be locked and singular */
    simple_mtx_lock(&shader->lock);
    struct set_entry *entry = _mesa_set_next_entry(shader->programs, NULL);
-   struct zink_gfx_program *prog = (void*)(entry ? entry->key : NULL);
+   struct zink_gfx_program *prog = (void*)(entry ? entry->key: NULL);
    if (entry)
       _mesa_set_remove(shader->programs, entry);
    simple_mtx_unlock(&shader->lock);
@@ -5964,11 +5964,11 @@ gfx_shader_prune(struct zink_screen *screen, struct zink_shader *shader)
       stages_present &= ~BITFIELD_BIT(MESA_SHADER_TESS_CTRL);
       stages_remaining &= ~BITFIELD_BIT(MESA_SHADER_TESS_CTRL);
    }
-   unsigned idx = is_mesh ? zink_mesh_cache_stages(stages_present) : zink_program_cache_stages(stages_present);
+   unsigned idx = is_mesh ? zink_mesh_cache_stages(stages_present): zink_program_cache_stages(stages_present);
    if (!prog->base.removed && stages_present == stages_remaining &&
          (stage == MESA_SHADER_FRAGMENT || !shader->non_fs.is_generated)) {
-      struct hash_table *ht = is_mesh ? &prog->base.ctx->mesh_cache[idx] : &prog->base.ctx->program_cache[idx];
-      simple_mtx_t *lock = is_mesh ? &prog->base.ctx->mesh_lock[idx] : &prog->base.ctx->program_lock[idx];
+      struct hash_table *ht = is_mesh ? &prog->base.ctx->mesh_cache[idx]: &prog->base.ctx->program_cache[idx];
+      simple_mtx_t *lock = is_mesh ? &prog->base.ctx->mesh_lock[idx]: &prog->base.ctx->program_lock[idx];
       simple_mtx_lock(lock);
       struct hash_entry *he = _mesa_hash_table_search(ht, prog->shaders);
       assert(he && he->data == prog);
@@ -6060,7 +6060,7 @@ zink_shader_tcs_compile(struct zink_screen *screen, struct zink_shader *zs, unsi
 /* creating a passthrough tcs shader that's roughly:
 
 #version 150
-#extension GL_ARB_tessellation_shader : require
+#extension GL_ARB_tessellation_shader: require
 
 in vec4 some_var[gl_MaxPatchVertices];
 out vec4 some_var_out;

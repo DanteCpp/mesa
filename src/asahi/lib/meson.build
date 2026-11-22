@@ -105,12 +105,65 @@ libasahi_lib_files = files(
 # add the ntagx sync provider (SS3.1) on Windows. decode.c (POSIX-only,
 # <sys/mman.h>) is swapped for decode_stub.c inside libasahi_decode below:
 # the runtime still links that library's PPP/VDM/CDM encoder cores.
+# The Windows backends. Three winsys backends implement agx_device_ops_t on
+# Windows:
+#
+#  - the G18 render node (win/agx_device_g18.c, \\.\G18Win0): asahi DRM
+#    ioctls framed in DeviceIoControl calls on the g18win driver, user-mode
+#    sync objects. Self-contained, always built on Windows.
+#  - the D3DKMT winsys (agx_device_d3dkmt.c and friends) and
+#  - the private AGXKMD node (agx_device_win.c, \\.\AGXKMD).
+#
+# The last two compile sources and headers from a separate drivers tree
+# (kmd-uapi-core, AppleAgxWddm/core) that the build names through the
+# cross-file properties ntagx_kmd_uapi_core and ntagx_wddm_contract_core.
+# They are built only when those properties are set, so a cross build
+# without that tree still configures and links the G18 backend.
+# hk_win_c_args (below) tells hk which of them exist.
+asahi_win_agxkmd = false
+asahi_win_d3dkmt = false
+libasahi_lib_inc_win = []
 if host_machine.system() == 'windows'
+  kmd_uapi_core_dir = meson.get_external_property('ntagx_kmd_uapi_core', '')
+  wddm_contract_dir = meson.get_external_property('ntagx_wddm_contract_core',
+                                                  '')
+  asahi_win_agxkmd = kmd_uapi_core_dir != ''
+  asahi_win_d3dkmt = asahi_win_agxkmd or wddm_contract_dir != ''
+  # Without them, these give the entry points hk and agx_device.c name
+  # (enumeration finds nothing; the bridge helpers take the no-bridge path).
+  if not asahi_win_agxkmd
+    libasahi_lib_files += files('win/agx_win_no_agxkmd.c')
+  endif
+  if not asahi_win_d3dkmt
+    libasahi_lib_files += files('win/agx_win_no_d3dkmt.c')
+  endif
+endif
+
+if asahi_win_agxkmd
   libasahi_lib_files += files(
     'agx_device_win.c',
     'agx_device_win.h',
     'agx_sync_win.c',
   )
+  # BUILD-STATUS.md stage-2: agx_device_win.c calls ntasi_kmd_uapi_cmd_to_ctl
+  # (kmd-uapi-core/kmd_uapi.c); until now that tree was only ever put on the
+  # include path (-Dc_args' -I, for kmd_uapi.h), never actually compiled in
+  # -- link failed with "undefined symbol: ntasi_kmd_uapi_cmd_to_ctl".
+  # kmd-uapi-core/kmd-syncobj-core live outside this Mesa tree entirely (in
+  # the windows-on-apple-silicon repo, passed in via -Dc_args at `meson
+  # setup`, same as the honeykrisp-port/overlay directory) with no fixed
+  # relative path from here, so this can't be a plain files('../../relative')
+  # reference; meson's `files()` does accept an absolute path string (it
+  # only special-cases and resolves *relative* strings against
+  # current_source_dir(), an absolute string passes through unchanged) --
+  # VERIFIED by this successfully compiling. kmd_syncobj.c (kmd-syncobj-core)
+  # is NOT added here: nothing under src/asahi currently calls a
+  # kmd_syncobj_* symbol (grep, stage-2), only kmd_uapi.h types/macros are
+  # used so far by agx_sync_win.c.
+  libasahi_lib_files += files(kmd_uapi_core_dir / 'kmd_uapi.c')
+endif
+
+if asahi_win_d3dkmt
   # The D3DKMT winsys: the same agx_device_ops_t surface, but through
   # dxgkrnl and a WDDM miniport instead of a private ioctl node, so that
   # Vulkan and D3D share one allocator, one GPU VA regime and one handle
@@ -138,24 +191,6 @@ if host_machine.system() == 'windows'
     'agx_device_d3dkmt.h',
     'agx_sync_d3dkmt.c',
   )
-  # BUILD-STATUS.md stage-2: agx_device_win.c calls ntasi_kmd_uapi_cmd_to_ctl
-  # (kmd-uapi-core/kmd_uapi.c); until now that tree was only ever put on the
-  # include path (-Dc_args' -I, for kmd_uapi.h), never actually compiled in
-  # -- link failed with "undefined symbol: ntasi_kmd_uapi_cmd_to_ctl".
-  # kmd-uapi-core/kmd-syncobj-core live outside this Mesa tree entirely (in
-  # the windows-on-apple-silicon repo, passed in via -Dc_args at `meson
-  # setup`, same as the honeykrisp-port/overlay directory) with no fixed
-  # relative path from here, so this can't be a plain files('../../relative')
-  # reference; meson's `files()` does accept an absolute path string (it
-  # only special-cases and resolves *relative* strings against
-  # current_source_dir(), an absolute string passes through unchanged) --
-  # VERIFIED by this successfully compiling. kmd_syncobj.c (kmd-syncobj-core)
-  # is NOT added here: nothing under src/asahi currently calls a
-  # kmd_syncobj_* symbol (grep, stage-2), only kmd_uapi.h types/macros are
-  # used so far by agx_sync_win.c.
-  kmd_uapi_core_dir = meson.get_external_property('ntagx_kmd_uapi_core')
-  libasahi_lib_files += files(kmd_uapi_core_dir / 'kmd_uapi.c')
-
   # The WDDM miniport's kernel<->userspace contract
   # (drivers/AppleAgxWddm/core). agxw_contract.h is INCLUDED by the D3DKMT
   # winsys rather than transcribed, and agxw_contract.c is COMPILED IN so the
@@ -168,13 +203,10 @@ if host_machine.system() == 'windows'
   # same repository. Deriving keeps this patch applicable without editing
   # honeykrisp-port/cross-*.txt; setting the property explicitly is the
   # tidier long-term form.
-  agxw_contract_dir = meson.get_external_property(
-    'ntagx_wddm_contract_core',
-    kmd_uapi_core_dir / '..' / '..' / '..' / 'AppleAgxWddm' / 'core')
+  agxw_contract_dir = wddm_contract_dir != '' ? wddm_contract_dir : \
+    kmd_uapi_core_dir / '..' / '..' / '..' / 'AppleAgxWddm' / 'core'
   libasahi_lib_files += files(agxw_contract_dir / 'agxw_contract.c')
   libasahi_lib_inc_win = include_directories(agxw_contract_dir)
-else
-  libasahi_lib_inc_win = []
 endif
 
 # The virtio backend needs libdrm/libvdrm, which Windows does not have, even
@@ -197,7 +229,15 @@ endif
 # here (root meson.build), so appending to the global pre_args list from a
 # subdir meson.build would silently do nothing -- pass it as per-target
 # c_args instead.
-hk_win_c_args = host_machine.system() == 'windows' ? [] : ['-DHAVE_VDRM']
+asahi_win_c_args = []
+if asahi_win_agxkmd
+  asahi_win_c_args += '-DAGX_WIN_AGXKMD=1'
+endif
+if asahi_win_d3dkmt
+  asahi_win_c_args += '-DAGX_WIN_D3DKMT=1'
+endif
+hk_win_c_args = host_machine.system() == 'windows' ? asahi_win_c_args \
+                                                   : ['-DHAVE_VDRM']
 
 libasahi_decode_files = files(
   'agx3_cdm_decode_core.c',
@@ -283,6 +323,7 @@ libasahi_lib = static_library(
   c_args : [
     no_override_init_args,
     '-Wno-c2x-extensions',
+    asahi_win_c_args,
   ],
   gnu_symbol_visibility : 'hidden',
   link_with: libasahi_lib_links,

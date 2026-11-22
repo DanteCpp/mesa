@@ -193,7 +193,7 @@ zink_set_driver_strings(struct zink_screen *screen)
       VK_VERSION_MAJOR(screen->info.device_version),
       VK_VERSION_MINOR(screen->info.device_version),
       screen->info.props.deviceName,
-      strstr(vk_DriverId_to_str(zink_driverid(screen)), "VK_DRIVER_ID_") ? driver_name : "Driver Unknown"
+      strstr(vk_DriverId_to_str(zink_driverid(screen)), "VK_DRIVER_ID_") ? driver_name: "Driver Unknown"
    );
    if (written < 0)
       return written;
@@ -328,7 +328,7 @@ disk_cache_init(struct zink_screen *screen)
    *  cached pipelines).
    *
    * "Although they have identical descriptions, VkPhysicalDeviceIDProperties
-   *  ::deviceUUID may differ from
+   *::deviceUUID may differ from
    *  VkPhysicalDeviceProperties2::pipelineCacheUUID. The former is intended to
    *  identify and correlate devices across API and driver boundaries, while the
    *  latter is used to identify a compatible device and driver combination to
@@ -433,7 +433,7 @@ cache_get_job(void *data, void *gdata, int thread_index)
    VkPipelineCacheCreateInfo pcci;
    pcci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
    pcci.pNext = NULL;
-   pcci.flags = screen->info.have_EXT_pipeline_creation_cache_control ? VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT : 0;
+   pcci.flags = screen->info.have_EXT_pipeline_creation_cache_control ? VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT: 0;
    pcci.initialDataSize = 0;
    pcci.pInitialData = NULL;
 
@@ -739,7 +739,7 @@ zink_init_screen_caps(struct zink_screen *screen)
 {
    struct pipe_caps *caps = (struct pipe_caps *)&screen->base.caps;
 
-   u_init_pipe_screen_caps(&screen->base, screen->is_cpu ? 0 : 1);
+   u_init_pipe_screen_caps(&screen->base, screen->is_cpu ? 0: 1);
 
    /* Vulkan spec says the builtins count, so make GL count them towards
     * link-failing.
@@ -908,7 +908,7 @@ zink_init_screen_caps(struct zink_screen *screen)
 
    caps->max_dual_source_render_targets =
       screen->info.feats.features.dualSrcBlend ?
-      screen->info.props.limits.maxFragmentDualSrcAttachments : 0;
+      screen->info.props.limits.maxFragmentDualSrcAttachments: 0;
 
    caps->max_render_targets = screen->info.props.limits.maxColorAttachments;
 
@@ -944,7 +944,7 @@ zink_init_screen_caps(struct zink_screen *screen)
 
    caps->vertex_input_alignment =
       screen->info.have_EXT_legacy_vertex_attributes ?
-      PIPE_VERTEX_INPUT_ALIGNMENT_NONE : PIPE_VERTEX_INPUT_ALIGNMENT_ELEMENT;
+      PIPE_VERTEX_INPUT_ALIGNMENT_NONE: PIPE_VERTEX_INPUT_ALIGNMENT_ELEMENT;
 
    caps->gl_clamp = false;
 
@@ -985,7 +985,7 @@ zink_init_screen_caps(struct zink_screen *screen)
 
    caps->max_stream_output_buffers =
       screen->info.have_EXT_transform_feedback ?
-      screen->info.tf_props.maxTransformFeedbackBuffers : 0;
+      screen->info.tf_props.maxTransformFeedbackBuffers: 0;
    caps->stream_output_pause_resume =
    caps->stream_output_interleave_buffers = screen->info.have_EXT_transform_feedback;
 
@@ -1121,18 +1121,18 @@ zink_init_screen_caps(struct zink_screen *screen)
    caps->cull_distance = screen->info.feats.features.shaderCullDistance;
 
    caps->sparse_buffer_page_size =
-      screen->info.feats.features.sparseResidencyBuffer ? ZINK_SPARSE_BUFFER_PAGE_SIZE : 0;
+      screen->info.feats.features.sparseResidencyBuffer ? ZINK_SPARSE_BUFFER_PAGE_SIZE: 0;
 
    /* Sparse texture */
    caps->max_sparse_texture_size =
       screen->info.feats.features.sparseResidencyImage2D ?
-      caps->max_texture_2d_size : 0;
+      caps->max_texture_2d_size: 0;
    caps->max_sparse_3d_texture_size =
       screen->info.feats.features.sparseResidencyImage3D ?
-      (1 << (caps->max_texture_3d_levels - 1)) : 0;
+      (1 << (caps->max_texture_3d_levels - 1)): 0;
    caps->max_sparse_array_texture_layers =
       screen->info.feats.features.sparseResidencyImage2D ?
-      caps->max_texture_array_layers : 0;
+      caps->max_texture_array_layers: 0;
    caps->sparse_texture_full_array_cube_mipmaps =
       screen->info.feats.features.sparseResidencyImage2D;
    caps->query_sparse_texture_residency =
@@ -1208,7 +1208,7 @@ zink_init_screen_caps(struct zink_screen *screen)
       screen->info.have_KHR_external_memory_fd &&
       screen->info.have_EXT_external_memory_dma_buf &&
       screen->info.have_EXT_queue_family_foreign
-      ? DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT : 0;
+      ? DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT: 0;
 #else
       0;
 #endif
@@ -1236,34 +1236,34 @@ zink_init_screen_caps(struct zink_screen *screen)
    caps->min_line_width =
    caps->min_line_width_aa =
       screen->info.feats.features.wideLines ?
-      MAX2(screen->info.props.limits.lineWidthRange[0], 0.01) : 1.0f;
+      MAX2(screen->info.props.limits.lineWidthRange[0], 0.01): 1.0f;
 
    caps->min_point_size =
    caps->min_point_size_aa =
       screen->info.feats.features.largePoints ?
-      MAX2(screen->info.props.limits.pointSizeRange[0], 0.01) : 1.0f;
+      MAX2(screen->info.props.limits.pointSizeRange[0], 0.01): 1.0f;
 
    caps->line_width_granularity =
       screen->info.feats.features.wideLines ?
-      screen->info.props.limits.lineWidthGranularity : 0.1f;
+      screen->info.props.limits.lineWidthGranularity: 0.1f;
 
    caps->point_size_granularity =
       screen->info.feats.features.largePoints ?
-      screen->info.props.limits.pointSizeGranularity : 0.1f;
+      screen->info.props.limits.pointSizeGranularity: 0.1f;
 
    caps->max_line_width =
    caps->max_line_width_aa =
       screen->info.feats.features.wideLines ?
-      screen->info.props.limits.lineWidthRange[1] : 1.0f;
+      screen->info.props.limits.lineWidthRange[1]: 1.0f;
 
    caps->max_point_size =
    caps->max_point_size_aa =
       screen->info.feats.features.largePoints ?
-      screen->info.props.limits.pointSizeRange[1] : 1.0f;
+      screen->info.props.limits.pointSizeRange[1]: 1.0f;
 
    caps->max_texture_anisotropy =
       screen->info.feats.features.samplerAnisotropy ?
-      screen->info.props.limits.maxSamplerAnisotropy : 1.0f;
+      screen->info.props.limits.maxSamplerAnisotropy: 1.0f;
 
    caps->max_texture_lod_bias = screen->info.props.limits.maxSamplerLodBias;
 
@@ -1399,7 +1399,7 @@ zink_is_format_supported(struct pipe_screen *pscreen,
    }
 
    /* always use superset to determine feature support */
-   VkFormat vkformat = zink_get_format(screen, format == PIPE_FORMAT_A8_UNORM ? zink_format_get_emulated_alpha(format) : format);
+   VkFormat vkformat = zink_get_format(screen, format == PIPE_FORMAT_A8_UNORM ? zink_format_get_emulated_alpha(format): format);
    if (vkformat == VK_FORMAT_UNDEFINED)
       return false;
 
@@ -1462,7 +1462,7 @@ zink_is_format_supported(struct pipe_screen *pscreen,
          bool need_2D = false;
          if (util_format_is_depth_or_stencil(format))
             need_2D |= screen->need_2D_zs;
-         info.type = need_2D ? VK_IMAGE_TYPE_2D : VK_IMAGE_TYPE_1D;
+         info.type = need_2D ? VK_IMAGE_TYPE_2D: VK_IMAGE_TYPE_1D;
          break;
       }
 
@@ -2524,7 +2524,7 @@ zink_create_exportable_semaphore(struct zink_screen *screen)
    if (sem)
       return sem;
    VkResult ret = VKSCR(CreateSemaphore)(screen->dev, &sci, NULL, &sem);
-   return ret == VK_SUCCESS ? sem : VK_NULL_HANDLE;
+   return ret == VK_SUCCESS ? sem: VK_NULL_HANDLE;
 }
 
 #if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD)
@@ -2795,7 +2795,7 @@ zink_get_sparse_texture_virtual_page_size(struct pipe_screen *pscreen,
    switch (target) {
    case PIPE_TEXTURE_1D:
    case PIPE_TEXTURE_1D_ARRAY:
-      type = (screen->need_2D_sparse || (screen->need_2D_zs && is_zs)) ? VK_IMAGE_TYPE_2D : VK_IMAGE_TYPE_1D;
+      type = (screen->need_2D_sparse || (screen->need_2D_zs && is_zs)) ? VK_IMAGE_TYPE_2D: VK_IMAGE_TYPE_1D;
       break;
 
    case PIPE_TEXTURE_2D:
@@ -2819,7 +2819,7 @@ zink_get_sparse_texture_virtual_page_size(struct pipe_screen *pscreen,
 
    VkImageUsageFlags use_flags = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                  VK_IMAGE_USAGE_STORAGE_BIT;
-   use_flags |= is_zs ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   use_flags |= is_zs ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
    VkImageUsageFlags flags = zink_get_format_props(screen, pformat)->optimalTilingFeatures & use_flags;
    if (zink_borealis_g17p(screen)) {
       /* Admit sparse textures per target/format. A missing page size is
@@ -2842,13 +2842,13 @@ zink_get_sparse_texture_virtual_page_size(struct pipe_screen *pscreen,
          &image_props);
       if (result != VK_SUCCESS ||
           !(image_props.sampleCounts &
-            (multi_sample ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_1_BIT)))
+            (multi_sample ? VK_SAMPLE_COUNT_2_BIT: VK_SAMPLE_COUNT_1_BIT)))
          return 0;
    }
    VkSparseImageFormatProperties props[4]; //planar?
    unsigned prop_count = ARRAY_SIZE(props);
    VKSCR(GetPhysicalDeviceSparseImageFormatProperties)(screen->pdev, format, type,
-                                                       multi_sample ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_1_BIT,
+                                                       multi_sample ? VK_SAMPLE_COUNT_2_BIT: VK_SAMPLE_COUNT_1_BIT,
                                                        flags,
                                                        VK_IMAGE_TILING_OPTIMAL,
                                                        &prop_count, props);
@@ -2857,7 +2857,7 @@ zink_get_sparse_texture_virtual_page_size(struct pipe_screen *pscreen,
       flags &= ~VK_IMAGE_USAGE_STORAGE_BIT;
       prop_count = ARRAY_SIZE(props);
       VKSCR(GetPhysicalDeviceSparseImageFormatProperties)(screen->pdev, format, type,
-                                                         multi_sample ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_1_BIT,
+                                                         multi_sample ? VK_SAMPLE_COUNT_2_BIT: VK_SAMPLE_COUNT_1_BIT,
                                                          flags,
                                                          VK_IMAGE_TILING_OPTIMAL,
                                                          &prop_count, props);
@@ -2877,7 +2877,7 @@ zink_get_sparse_texture_virtual_page_size(struct pipe_screen *pscreen,
    return 1;
 hack_it_up:
    {
-      const int (*page_sizes)[3] = target == PIPE_TEXTURE_3D ? page_size_3d : page_size_2d;
+      const int (*page_sizes)[3] = target == PIPE_TEXTURE_3D ? page_size_3d: page_size_2d;
       int blk_size = util_format_get_blocksize(pformat);
 
       if (size) {
@@ -3433,7 +3433,7 @@ zink_create_semaphore(struct zink_screen *screen)
    if (sem)
       return sem;
    VkResult ret = VKSCR(CreateSemaphore)(screen->dev, &sci, NULL, &sem);
-   return ret == VK_SUCCESS ? sem : VK_NULL_HANDLE;
+   return ret == VK_SUCCESS ? sem: VK_NULL_HANDLE;
 }
 
 void
@@ -3912,7 +3912,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
          zink_descriptor_mode = ZINK_DESCRIPTOR_MODE_LAZY;
 	 break;
       default:
-         zink_descriptor_mode = can_db ? ZINK_DESCRIPTOR_MODE_DB : ZINK_DESCRIPTOR_MODE_LAZY;
+         zink_descriptor_mode = can_db ? ZINK_DESCRIPTOR_MODE_DB: ZINK_DESCRIPTOR_MODE_LAZY;
       }
    }
    if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB) {
@@ -4078,7 +4078,7 @@ struct pipe_screen *
 zink_win32_create_screen(uint64_t adapter_luid)
 {
    struct zink_screen *ret = zink_internal_create_screen(NULL, -1, -1, adapter_luid);
-   return ret ? &ret->base : NULL;
+   return ret ? &ret->base: NULL;
 }
 
 void VKAPI_PTR zink_stub_function_not_loaded()

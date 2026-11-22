@@ -10,6 +10,13 @@ if with_android_stub
   inc_include += [include_directories('android_stub')]
 endif
 
+# drm-uapi/drm.h and sync_file.h include <sys/ioccom.h> off Linux; Windows
+# has none, so carry a stand-in (only the _IO* encoders) on every target's
+# include path.
+if host_machine.system() == 'windows'
+  inc_include += [include_directories('win32_stub')]
+endif
+
 if not with_glvnd and host_machine.system() != 'windows'
   if with_gles1 or with_gles2 or with_opengl or with_egl
     install_headers('KHR/khrplatform.h', subdir : 'KHR')

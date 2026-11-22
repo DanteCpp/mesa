@@ -356,7 +356,7 @@ ttn_emit_declaration(struct ttn_compile *c)
              * the shader.
              */
             nir_def *reg = nir_decl_reg(b, 4, 32,
-                                            is_array ? array_size : 0);
+                                            is_array ? array_size: 0);
 
             var->data.mode = nir_var_shader_out;
             nir_variable_set_namef(b->shader, var, "out_%d", idx);
@@ -684,7 +684,7 @@ ttn_src_for_file_and_index(struct ttn_compile *c, unsigned file, unsigned index,
 
       load = nir_intrinsic_instr_create(b->shader, op);
       if (op == nir_intrinsic_load_uniform) {
-         nir_intrinsic_set_dest_type(load, src_is_float ? nir_type_float :
+         nir_intrinsic_set_dest_type(load, src_is_float ? nir_type_float:
                                                           nir_type_int);
       }
 
@@ -1196,7 +1196,7 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
    sview = tgsi_inst->Src[samp].Register.Index;
 
    nir_alu_type sampler_type =
-      sview < c->num_samp_types ? c->samp_types[sview] : nir_type_float32;
+      sview < c->num_samp_types ? c->samp_types[sview]: nir_type_float32;
 
    if (op == nir_texop_lod) {
       instr->dest_type = nir_type_float32;
@@ -1366,7 +1366,7 @@ ttn_txq(struct ttn_compile *c, nir_def **src)
    int sview = tgsi_inst->Src[1].Register.Index;
 
    nir_alu_type sampler_type =
-      sview < c->num_samp_types ? c->samp_types[sview] : nir_type_float32;
+      sview < c->num_samp_types ? c->samp_types[sview]: nir_type_float32;
 
    nir_variable *var =
       get_sampler_var(c, sview, txs->sampler_dim,
@@ -1746,7 +1746,7 @@ ttn_emit_instruction(struct ttn_compile *c)
     * 32 bits). This needs to be passed into ttn_alu() because it can't be
     * inferred for comparison opcodes.
     */
-   unsigned dst_bitsize = tgsi_type_is_64bit(tgsi_dst_type) ? 64 : 32;
+   unsigned dst_bitsize = tgsi_type_is_64bit(tgsi_dst_type) ? 64: 32;
 
    /* If this is non-NULL after the switch, it will be written to the
     * corresponding register/variable/etc after.
@@ -1958,7 +1958,7 @@ ttn_emit_instruction(struct ttn_compile *c)
       unsigned index = tgsi_dst->Register.Index;
       unsigned offset = c->temp_regs[index].offset;
       struct tgsi_ind_register *indirect = tgsi_dst->Register.Indirect ?
-                                           &tgsi_dst->Indirect : NULL;
+                                           &tgsi_dst->Indirect: NULL;
       nir_store_deref(b, ttn_array_deref(c, var, offset, indirect), dst,
                       tgsi_dst->Register.WriteMask);
    } else {
@@ -2050,9 +2050,9 @@ ttn_add_output_stores(struct ttn_compile *c)
 
          nir_deref_instr *deref = nir_build_deref_var(b, c->clipdist);
          nir_def *zero = nir_imm_zero(b, 1, 32);
-         unsigned offset = var->data.location == VARYING_SLOT_CLIP_DIST1 ? 4 : 0;
+         unsigned offset = var->data.location == VARYING_SLOT_CLIP_DIST1 ? 4: 0;
          unsigned size = var->data.location == VARYING_SLOT_CLIP_DIST1 ?
-                          b->shader->info.clip_distance_array_size :
+                          b->shader->info.clip_distance_array_size:
                           MIN2(4, b->shader->info.clip_distance_array_size);
          for (unsigned i = offset; i < size; i++) {
             /* deref the array member and store each component */
@@ -2328,9 +2328,9 @@ ttn_optimize_nir(nir_shader *nir)
 
       if (!nir->info.flrp_lowered) {
          unsigned lower_flrp =
-            (nir->options->lower_flrp16 ? 16 : 0) |
-            (nir->options->lower_flrp32 ? 32 : 0) |
-            (nir->options->lower_flrp64 ? 64 : 0);
+            (nir->options->lower_flrp16 ? 16: 0) |
+            (nir->options->lower_flrp32 ? 32: 0) |
+            (nir->options->lower_flrp64 ? 64: 0);
 
          if (lower_flrp) {
             NIR_PASS(progress, nir, nir_lower_flrp,
@@ -2385,7 +2385,7 @@ lower_clipdistance_to_array(nir_shader *nir)
                continue;
             b.cursor = nir_before_instr(instr);
             uint32_t wrmask = nir_intrinsic_write_mask(intr);
-            unsigned offset = var == dist1 ? 4 : 0;
+            unsigned offset = var == dist1 ? 4: 0;
             /* iterate over the store's writemask for components */
             for (unsigned i = 0; i < nir->info.clip_distance_array_size; i++) {
                /* deref the array member and store each component */

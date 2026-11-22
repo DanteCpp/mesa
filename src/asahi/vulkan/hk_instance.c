@@ -60,12 +60,12 @@ static const struct vk_instance_extension_table instance_extensions = {
    .EXT_display_surface_counter = true,
    .EXT_acquire_drm_display = true,
 #endif
-#ifdef VK_USE_PLATFORM_WIN32_KHR
+#ifdef HK_WSI_WIN32
    /* honeykrisp-h1-execution.md SS4 item 2: the GDI/CPU present path
     * (wsi_common_win32.cpp, upstream-shipped already, SS4 header). */
    .KHR_win32_surface = true,
 #endif
-#ifndef VK_USE_PLATFORM_WIN32_KHR
+#ifndef HK_WSI_WIN32
    .EXT_headless_surface = true,
 #endif
    .KHR_device_group_creation = true,

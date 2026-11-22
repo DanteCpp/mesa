@@ -46,7 +46,36 @@
 #include <stdint.h>
 
 #include "agx_d3dkmt.h"
+#ifdef AGX_WIN_D3DKMT
 #include "agx_d3dkmt_core.h"
+#else
+/*
+ * A Windows build without the D3DKMT winsys (no ntagx_* cross-file property,
+ * src/asahi/lib/meson.build): agx_d3dkmt_core.h needs the miniport contract
+ * from the separate drivers tree, so carry the few names hk uses here. The
+ * functions below are defined by win/agx_win_no_d3dkmt.c and find no
+ * adapter, open nothing and import nothing.
+ */
+enum agx_d3dkmt_external_memory_type {
+   AGX_D3DKMT_EXTERNAL_MEMORY_NONE = 0,
+   AGX_D3DKMT_EXTERNAL_MEMORY_OPAQUE_WIN32 = 1,
+   AGX_D3DKMT_EXTERNAL_MEMORY_OPAQUE_WIN32_KMT = 2,
+};
+
+static inline bool
+agx_d3dkmt_is_local_allocation_handle(uintptr_t handle)
+{
+   (void)handle;
+   return false;
+}
+
+static inline agx_kmt_handle
+agx_d3dkmt_local_allocation_handle(uintptr_t handle)
+{
+   (void)handle;
+   return 0;
+}
+#endif
 #include "agx_device.h"
 
 struct util_sync_provider;

@@ -669,6 +669,18 @@ endif
 # (SS3.2 -- "drm-uapi/drm.h" for DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT) and
 # hk_physical_device_win.c/hk_device.c need are supplied via -Dc_args at
 # `meson setup`, same as src/asahi/lib/meson.build's libasahi_lib.
+# hk's Windows code uses the VK_KHR_*_win32 types, declared only with
+# VK_USE_PLATFORM_WIN32_KHR; HK_WSI_WIN32 says whether the Win32 WSI
+# (-Dplatforms=windows, which needs DirectX-Headers) is built, so a headless
+# build advertises no Win32 surface or swapchain.
+hk_win32_args = []
+if host_machine.system() == 'windows'
+  hk_win32_args += '-DVK_USE_PLATFORM_WIN32_KHR'
+  if with_platform_windows
+    hk_win32_args += '-DHK_WSI_WIN32'
+  endif
+endif
+
 libhk = static_library(
   'hk',
   [
@@ -698,7 +710,7 @@ libhk = static_library(
         include_directories('.'),
       ],
   link_with : [libasahi_lib, libasahi_layout, libasahi_compiler],
-  c_args : ['-Wno-c2x-extensions', hk_win_c_args],
+  c_args : ['-Wno-c2x-extensions', hk_win_c_args, hk_win32_args],
   dependencies : [hk_deps],
   gnu_symbol_visibility : 'hidden',
 )

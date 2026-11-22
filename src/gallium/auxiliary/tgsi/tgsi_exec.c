@@ -1,9 +1,9 @@
 /**************************************************************************
- * 
+ *
  * Copyright 2007-2008 VMware, Inc.
  * All Rights Reserved.
  * Copyright 2009-2010 VMware, Inc.  All rights Reserved.
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the
  * "Software"), to deal in the Software without restriction, including
@@ -11,11 +11,11 @@
  * distribute, sub license, and/or sell copies of the Software, and to
  * permit persons to whom the Software is furnished to do so, subject to
  * the following conditions:
- * 
+ *
  * The above copyright notice and this permission notice (including the
  * next paragraph) shall be included in all copies or substantial portions
  * of the Software.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
  * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
  * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
@@ -23,7 +23,7 @@
  * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
  * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- * 
+ *
  **************************************************************************/
 
 /**
@@ -140,10 +140,10 @@ micro_cmp(union tgsi_exec_channel *dst,
           const union tgsi_exec_channel *src1,
           const union tgsi_exec_channel *src2)
 {
-   dst->f[0] = src0->f[0] < 0.0f ? src1->f[0] : src2->f[0];
-   dst->f[1] = src0->f[1] < 0.0f ? src1->f[1] : src2->f[1];
-   dst->f[2] = src0->f[2] < 0.0f ? src1->f[2] : src2->f[2];
-   dst->f[3] = src0->f[3] < 0.0f ? src1->f[3] : src2->f[3];
+   dst->f[0] = src0->f[0] < 0.0f ? src1->f[0]: src2->f[0];
+   dst->f[1] = src0->f[1] < 0.0f ? src1->f[1]: src2->f[1];
+   dst->f[2] = src0->f[2] < 0.0f ? src1->f[2]: src2->f[2];
+   dst->f[3] = src0->f[3] < 0.0f ? src1->f[3]: src2->f[3];
 }
 
 static void
@@ -189,10 +189,10 @@ static void
 micro_dabs(union tgsi_double_channel *dst,
            const union tgsi_double_channel *src)
 {
-   dst->d[0] = src->d[0] >= 0.0 ? src->d[0] : -src->d[0];
-   dst->d[1] = src->d[1] >= 0.0 ? src->d[1] : -src->d[1];
-   dst->d[2] = src->d[2] >= 0.0 ? src->d[2] : -src->d[2];
-   dst->d[3] = src->d[3] >= 0.0 ? src->d[3] : -src->d[3];
+   dst->d[0] = src->d[0] >= 0.0 ? src->d[0]: -src->d[0];
+   dst->d[1] = src->d[1] >= 0.0 ? src->d[1]: -src->d[1];
+   dst->d[2] = src->d[2] >= 0.0 ? src->d[2]: -src->d[2];
+   dst->d[3] = src->d[3] >= 0.0 ? src->d[3]: -src->d[3];
 }
 
 static void
@@ -300,40 +300,40 @@ static void
 micro_dslt(union tgsi_double_channel *dst,
            const union tgsi_double_channel *src)
 {
-   dst->u[0][0] = src[0].d[0] < src[1].d[0] ? ~0U : 0U;
-   dst->u[1][0] = src[0].d[1] < src[1].d[1] ? ~0U : 0U;
-   dst->u[2][0] = src[0].d[2] < src[1].d[2] ? ~0U : 0U;
-   dst->u[3][0] = src[0].d[3] < src[1].d[3] ? ~0U : 0U;
+   dst->u[0][0] = src[0].d[0] < src[1].d[0] ? ~0U: 0U;
+   dst->u[1][0] = src[0].d[1] < src[1].d[1] ? ~0U: 0U;
+   dst->u[2][0] = src[0].d[2] < src[1].d[2] ? ~0U: 0U;
+   dst->u[3][0] = src[0].d[3] < src[1].d[3] ? ~0U: 0U;
 }
 
 static void
 micro_dsne(union tgsi_double_channel *dst,
            const union tgsi_double_channel *src)
 {
-   dst->u[0][0] = src[0].d[0] != src[1].d[0] ? ~0U : 0U;
-   dst->u[1][0] = src[0].d[1] != src[1].d[1] ? ~0U : 0U;
-   dst->u[2][0] = src[0].d[2] != src[1].d[2] ? ~0U : 0U;
-   dst->u[3][0] = src[0].d[3] != src[1].d[3] ? ~0U : 0U;
+   dst->u[0][0] = src[0].d[0] != src[1].d[0] ? ~0U: 0U;
+   dst->u[1][0] = src[0].d[1] != src[1].d[1] ? ~0U: 0U;
+   dst->u[2][0] = src[0].d[2] != src[1].d[2] ? ~0U: 0U;
+   dst->u[3][0] = src[0].d[3] != src[1].d[3] ? ~0U: 0U;
 }
 
 static void
 micro_dsge(union tgsi_double_channel *dst,
            const union tgsi_double_channel *src)
 {
-   dst->u[0][0] = src[0].d[0] >= src[1].d[0] ? ~0U : 0U;
-   dst->u[1][0] = src[0].d[1] >= src[1].d[1] ? ~0U : 0U;
-   dst->u[2][0] = src[0].d[2] >= src[1].d[2] ? ~0U : 0U;
-   dst->u[3][0] = src[0].d[3] >= src[1].d[3] ? ~0U : 0U;
+   dst->u[0][0] = src[0].d[0] >= src[1].d[0] ? ~0U: 0U;
+   dst->u[1][0] = src[0].d[1] >= src[1].d[1] ? ~0U: 0U;
+   dst->u[2][0] = src[0].d[2] >= src[1].d[2] ? ~0U: 0U;
+   dst->u[3][0] = src[0].d[3] >= src[1].d[3] ? ~0U: 0U;
 }
 
 static void
 micro_dseq(union tgsi_double_channel *dst,
            const union tgsi_double_channel *src)
 {
-   dst->u[0][0] = src[0].d[0] == src[1].d[0] ? ~0U : 0U;
-   dst->u[1][0] = src[0].d[1] == src[1].d[1] ? ~0U : 0U;
-   dst->u[2][0] = src[0].d[2] == src[1].d[2] ? ~0U : 0U;
-   dst->u[3][0] = src[0].d[3] == src[1].d[3] ? ~0U : 0U;
+   dst->u[0][0] = src[0].d[0] == src[1].d[0] ? ~0U: 0U;
+   dst->u[1][0] = src[0].d[1] == src[1].d[1] ? ~0U: 0U;
+   dst->u[2][0] = src[0].d[2] == src[1].d[2] ? ~0U: 0U;
+   dst->u[3][0] = src[0].d[3] == src[1].d[3] ? ~0U: 0U;
 }
 
 static void
@@ -478,10 +478,10 @@ static void
 micro_iabs(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src)
 {
-   dst->i[0] = src->i[0] >= 0 ? src->i[0] : -src->i[0];
-   dst->i[1] = src->i[1] >= 0 ? src->i[1] : -src->i[1];
-   dst->i[2] = src->i[2] >= 0 ? src->i[2] : -src->i[2];
-   dst->i[3] = src->i[3] >= 0 ? src->i[3] : -src->i[3];
+   dst->i[0] = src->i[0] >= 0 ? src->i[0]: -src->i[0];
+   dst->i[1] = src->i[1] >= 0 ? src->i[1]: -src->i[1];
+   dst->i[2] = src->i[2] >= 0 ? src->i[2]: -src->i[2];
+   dst->i[3] = src->i[3] >= 0 ? src->i[3]: -src->i[3];
 }
 
 static void
@@ -595,10 +595,10 @@ micro_seq(union tgsi_exec_channel *dst,
           const union tgsi_exec_channel *src0,
           const union tgsi_exec_channel *src1)
 {
-   dst->f[0] = src0->f[0] == src1->f[0] ? 1.0f : 0.0f;
-   dst->f[1] = src0->f[1] == src1->f[1] ? 1.0f : 0.0f;
-   dst->f[2] = src0->f[2] == src1->f[2] ? 1.0f : 0.0f;
-   dst->f[3] = src0->f[3] == src1->f[3] ? 1.0f : 0.0f;
+   dst->f[0] = src0->f[0] == src1->f[0] ? 1.0f: 0.0f;
+   dst->f[1] = src0->f[1] == src1->f[1] ? 1.0f: 0.0f;
+   dst->f[2] = src0->f[2] == src1->f[2] ? 1.0f: 0.0f;
+   dst->f[3] = src0->f[3] == src1->f[3] ? 1.0f: 0.0f;
 }
 
 static void
@@ -606,30 +606,30 @@ micro_sge(union tgsi_exec_channel *dst,
           const union tgsi_exec_channel *src0,
           const union tgsi_exec_channel *src1)
 {
-   dst->f[0] = src0->f[0] >= src1->f[0] ? 1.0f : 0.0f;
-   dst->f[1] = src0->f[1] >= src1->f[1] ? 1.0f : 0.0f;
-   dst->f[2] = src0->f[2] >= src1->f[2] ? 1.0f : 0.0f;
-   dst->f[3] = src0->f[3] >= src1->f[3] ? 1.0f : 0.0f;
+   dst->f[0] = src0->f[0] >= src1->f[0] ? 1.0f: 0.0f;
+   dst->f[1] = src0->f[1] >= src1->f[1] ? 1.0f: 0.0f;
+   dst->f[2] = src0->f[2] >= src1->f[2] ? 1.0f: 0.0f;
+   dst->f[3] = src0->f[3] >= src1->f[3] ? 1.0f: 0.0f;
 }
 
 static void
 micro_sgn(union tgsi_exec_channel *dst,
           const union tgsi_exec_channel *src)
 {
-   dst->f[0] = src->f[0] < 0.0f ? -1.0f : src->f[0] > 0.0f ? 1.0f : 0.0f;
-   dst->f[1] = src->f[1] < 0.0f ? -1.0f : src->f[1] > 0.0f ? 1.0f : 0.0f;
-   dst->f[2] = src->f[2] < 0.0f ? -1.0f : src->f[2] > 0.0f ? 1.0f : 0.0f;
-   dst->f[3] = src->f[3] < 0.0f ? -1.0f : src->f[3] > 0.0f ? 1.0f : 0.0f;
+   dst->f[0] = src->f[0] < 0.0f ? -1.0f: src->f[0] > 0.0f ? 1.0f: 0.0f;
+   dst->f[1] = src->f[1] < 0.0f ? -1.0f: src->f[1] > 0.0f ? 1.0f: 0.0f;
+   dst->f[2] = src->f[2] < 0.0f ? -1.0f: src->f[2] > 0.0f ? 1.0f: 0.0f;
+   dst->f[3] = src->f[3] < 0.0f ? -1.0f: src->f[3] > 0.0f ? 1.0f: 0.0f;
 }
 
 static void
 micro_isgn(union tgsi_exec_channel *dst,
           const union tgsi_exec_channel *src)
 {
-   dst->i[0] = src->i[0] < 0 ? -1 : src->i[0] > 0 ? 1 : 0;
-   dst->i[1] = src->i[1] < 0 ? -1 : src->i[1] > 0 ? 1 : 0;
-   dst->i[2] = src->i[2] < 0 ? -1 : src->i[2] > 0 ? 1 : 0;
-   dst->i[3] = src->i[3] < 0 ? -1 : src->i[3] > 0 ? 1 : 0;
+   dst->i[0] = src->i[0] < 0 ? -1: src->i[0] > 0 ? 1: 0;
+   dst->i[1] = src->i[1] < 0 ? -1: src->i[1] > 0 ? 1: 0;
+   dst->i[2] = src->i[2] < 0 ? -1: src->i[2] > 0 ? 1: 0;
+   dst->i[3] = src->i[3] < 0 ? -1: src->i[3] > 0 ? 1: 0;
 }
 
 static void
@@ -637,10 +637,10 @@ micro_sgt(union tgsi_exec_channel *dst,
           const union tgsi_exec_channel *src0,
           const union tgsi_exec_channel *src1)
 {
-   dst->f[0] = src0->f[0] > src1->f[0] ? 1.0f : 0.0f;
-   dst->f[1] = src0->f[1] > src1->f[1] ? 1.0f : 0.0f;
-   dst->f[2] = src0->f[2] > src1->f[2] ? 1.0f : 0.0f;
-   dst->f[3] = src0->f[3] > src1->f[3] ? 1.0f : 0.0f;
+   dst->f[0] = src0->f[0] > src1->f[0] ? 1.0f: 0.0f;
+   dst->f[1] = src0->f[1] > src1->f[1] ? 1.0f: 0.0f;
+   dst->f[2] = src0->f[2] > src1->f[2] ? 1.0f: 0.0f;
+   dst->f[3] = src0->f[3] > src1->f[3] ? 1.0f: 0.0f;
 }
 
 static void
@@ -658,10 +658,10 @@ micro_sle(union tgsi_exec_channel *dst,
           const union tgsi_exec_channel *src0,
           const union tgsi_exec_channel *src1)
 {
-   dst->f[0] = src0->f[0] <= src1->f[0] ? 1.0f : 0.0f;
-   dst->f[1] = src0->f[1] <= src1->f[1] ? 1.0f : 0.0f;
-   dst->f[2] = src0->f[2] <= src1->f[2] ? 1.0f : 0.0f;
-   dst->f[3] = src0->f[3] <= src1->f[3] ? 1.0f : 0.0f;
+   dst->f[0] = src0->f[0] <= src1->f[0] ? 1.0f: 0.0f;
+   dst->f[1] = src0->f[1] <= src1->f[1] ? 1.0f: 0.0f;
+   dst->f[2] = src0->f[2] <= src1->f[2] ? 1.0f: 0.0f;
+   dst->f[3] = src0->f[3] <= src1->f[3] ? 1.0f: 0.0f;
 }
 
 static void
@@ -669,10 +669,10 @@ micro_slt(union tgsi_exec_channel *dst,
           const union tgsi_exec_channel *src0,
           const union tgsi_exec_channel *src1)
 {
-   dst->f[0] = src0->f[0] < src1->f[0] ? 1.0f : 0.0f;
-   dst->f[1] = src0->f[1] < src1->f[1] ? 1.0f : 0.0f;
-   dst->f[2] = src0->f[2] < src1->f[2] ? 1.0f : 0.0f;
-   dst->f[3] = src0->f[3] < src1->f[3] ? 1.0f : 0.0f;
+   dst->f[0] = src0->f[0] < src1->f[0] ? 1.0f: 0.0f;
+   dst->f[1] = src0->f[1] < src1->f[1] ? 1.0f: 0.0f;
+   dst->f[2] = src0->f[2] < src1->f[2] ? 1.0f: 0.0f;
+   dst->f[3] = src0->f[3] < src1->f[3] ? 1.0f: 0.0f;
 }
 
 static void
@@ -680,10 +680,10 @@ micro_sne(union tgsi_exec_channel *dst,
           const union tgsi_exec_channel *src0,
           const union tgsi_exec_channel *src1)
 {
-   dst->f[0] = src0->f[0] != src1->f[0] ? 1.0f : 0.0f;
-   dst->f[1] = src0->f[1] != src1->f[1] ? 1.0f : 0.0f;
-   dst->f[2] = src0->f[2] != src1->f[2] ? 1.0f : 0.0f;
-   dst->f[3] = src0->f[3] != src1->f[3] ? 1.0f : 0.0f;
+   dst->f[0] = src0->f[0] != src1->f[0] ? 1.0f: 0.0f;
+   dst->f[1] = src0->f[1] != src1->f[1] ? 1.0f: 0.0f;
+   dst->f[2] = src0->f[2] != src1->f[2] ? 1.0f: 0.0f;
+   dst->f[3] = src0->f[3] != src1->f[3] ? 1.0f: 0.0f;
 }
 
 static void
@@ -710,20 +710,20 @@ static void
 micro_i64abs(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->i64[0] = src->i64[0] >= 0.0 ? src->i64[0] : -src->i64[0];
-   dst->i64[1] = src->i64[1] >= 0.0 ? src->i64[1] : -src->i64[1];
-   dst->i64[2] = src->i64[2] >= 0.0 ? src->i64[2] : -src->i64[2];
-   dst->i64[3] = src->i64[3] >= 0.0 ? src->i64[3] : -src->i64[3];
+   dst->i64[0] = src->i64[0] >= 0.0 ? src->i64[0]: -src->i64[0];
+   dst->i64[1] = src->i64[1] >= 0.0 ? src->i64[1]: -src->i64[1];
+   dst->i64[2] = src->i64[2] >= 0.0 ? src->i64[2]: -src->i64[2];
+   dst->i64[3] = src->i64[3] >= 0.0 ? src->i64[3]: -src->i64[3];
 }
 
 static void
 micro_i64sgn(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->i64[0] = src->i64[0] < 0 ? -1 : src->i64[0] > 0 ? 1 : 0;
-   dst->i64[1] = src->i64[1] < 0 ? -1 : src->i64[1] > 0 ? 1 : 0;
-   dst->i64[2] = src->i64[2] < 0 ? -1 : src->i64[2] > 0 ? 1 : 0;
-   dst->i64[3] = src->i64[3] < 0 ? -1 : src->i64[3] > 0 ? 1 : 0;
+   dst->i64[0] = src->i64[0] < 0 ? -1: src->i64[0] > 0 ? 1: 0;
+   dst->i64[1] = src->i64[1] < 0 ? -1: src->i64[1] > 0 ? 1: 0;
+   dst->i64[2] = src->i64[2] < 0 ? -1: src->i64[2] > 0 ? 1: 0;
+   dst->i64[3] = src->i64[3] < 0 ? -1: src->i64[3] > 0 ? 1: 0;
 }
 
 static void
@@ -740,100 +740,100 @@ static void
 micro_u64seq(union tgsi_double_channel *dst,
            const union tgsi_double_channel *src)
 {
-   dst->u[0][0] = src[0].u64[0] == src[1].u64[0] ? ~0U : 0U;
-   dst->u[1][0] = src[0].u64[1] == src[1].u64[1] ? ~0U : 0U;
-   dst->u[2][0] = src[0].u64[2] == src[1].u64[2] ? ~0U : 0U;
-   dst->u[3][0] = src[0].u64[3] == src[1].u64[3] ? ~0U : 0U;
+   dst->u[0][0] = src[0].u64[0] == src[1].u64[0] ? ~0U: 0U;
+   dst->u[1][0] = src[0].u64[1] == src[1].u64[1] ? ~0U: 0U;
+   dst->u[2][0] = src[0].u64[2] == src[1].u64[2] ? ~0U: 0U;
+   dst->u[3][0] = src[0].u64[3] == src[1].u64[3] ? ~0U: 0U;
 }
 
 static void
 micro_u64sne(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->u[0][0] = src[0].u64[0] != src[1].u64[0] ? ~0U : 0U;
-   dst->u[1][0] = src[0].u64[1] != src[1].u64[1] ? ~0U : 0U;
-   dst->u[2][0] = src[0].u64[2] != src[1].u64[2] ? ~0U : 0U;
-   dst->u[3][0] = src[0].u64[3] != src[1].u64[3] ? ~0U : 0U;
+   dst->u[0][0] = src[0].u64[0] != src[1].u64[0] ? ~0U: 0U;
+   dst->u[1][0] = src[0].u64[1] != src[1].u64[1] ? ~0U: 0U;
+   dst->u[2][0] = src[0].u64[2] != src[1].u64[2] ? ~0U: 0U;
+   dst->u[3][0] = src[0].u64[3] != src[1].u64[3] ? ~0U: 0U;
 }
 
 static void
 micro_i64slt(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->u[0][0] = src[0].i64[0] < src[1].i64[0] ? ~0U : 0U;
-   dst->u[1][0] = src[0].i64[1] < src[1].i64[1] ? ~0U : 0U;
-   dst->u[2][0] = src[0].i64[2] < src[1].i64[2] ? ~0U : 0U;
-   dst->u[3][0] = src[0].i64[3] < src[1].i64[3] ? ~0U : 0U;
+   dst->u[0][0] = src[0].i64[0] < src[1].i64[0] ? ~0U: 0U;
+   dst->u[1][0] = src[0].i64[1] < src[1].i64[1] ? ~0U: 0U;
+   dst->u[2][0] = src[0].i64[2] < src[1].i64[2] ? ~0U: 0U;
+   dst->u[3][0] = src[0].i64[3] < src[1].i64[3] ? ~0U: 0U;
 }
 
 static void
 micro_u64slt(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->u[0][0] = src[0].u64[0] < src[1].u64[0] ? ~0U : 0U;
-   dst->u[1][0] = src[0].u64[1] < src[1].u64[1] ? ~0U : 0U;
-   dst->u[2][0] = src[0].u64[2] < src[1].u64[2] ? ~0U : 0U;
-   dst->u[3][0] = src[0].u64[3] < src[1].u64[3] ? ~0U : 0U;
+   dst->u[0][0] = src[0].u64[0] < src[1].u64[0] ? ~0U: 0U;
+   dst->u[1][0] = src[0].u64[1] < src[1].u64[1] ? ~0U: 0U;
+   dst->u[2][0] = src[0].u64[2] < src[1].u64[2] ? ~0U: 0U;
+   dst->u[3][0] = src[0].u64[3] < src[1].u64[3] ? ~0U: 0U;
 }
 
 static void
 micro_i64sge(union tgsi_double_channel *dst,
            const union tgsi_double_channel *src)
 {
-   dst->u[0][0] = src[0].i64[0] >= src[1].i64[0] ? ~0U : 0U;
-   dst->u[1][0] = src[0].i64[1] >= src[1].i64[1] ? ~0U : 0U;
-   dst->u[2][0] = src[0].i64[2] >= src[1].i64[2] ? ~0U : 0U;
-   dst->u[3][0] = src[0].i64[3] >= src[1].i64[3] ? ~0U : 0U;
+   dst->u[0][0] = src[0].i64[0] >= src[1].i64[0] ? ~0U: 0U;
+   dst->u[1][0] = src[0].i64[1] >= src[1].i64[1] ? ~0U: 0U;
+   dst->u[2][0] = src[0].i64[2] >= src[1].i64[2] ? ~0U: 0U;
+   dst->u[3][0] = src[0].i64[3] >= src[1].i64[3] ? ~0U: 0U;
 }
 
 static void
 micro_u64sge(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->u[0][0] = src[0].u64[0] >= src[1].u64[0] ? ~0U : 0U;
-   dst->u[1][0] = src[0].u64[1] >= src[1].u64[1] ? ~0U : 0U;
-   dst->u[2][0] = src[0].u64[2] >= src[1].u64[2] ? ~0U : 0U;
-   dst->u[3][0] = src[0].u64[3] >= src[1].u64[3] ? ~0U : 0U;
+   dst->u[0][0] = src[0].u64[0] >= src[1].u64[0] ? ~0U: 0U;
+   dst->u[1][0] = src[0].u64[1] >= src[1].u64[1] ? ~0U: 0U;
+   dst->u[2][0] = src[0].u64[2] >= src[1].u64[2] ? ~0U: 0U;
+   dst->u[3][0] = src[0].u64[3] >= src[1].u64[3] ? ~0U: 0U;
 }
 
 static void
 micro_u64max(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->u64[0] = src[0].u64[0] > src[1].u64[0] ? src[0].u64[0] : src[1].u64[0];
-   dst->u64[1] = src[0].u64[1] > src[1].u64[1] ? src[0].u64[1] : src[1].u64[1];
-   dst->u64[2] = src[0].u64[2] > src[1].u64[2] ? src[0].u64[2] : src[1].u64[2];
-   dst->u64[3] = src[0].u64[3] > src[1].u64[3] ? src[0].u64[3] : src[1].u64[3];
+   dst->u64[0] = src[0].u64[0] > src[1].u64[0] ? src[0].u64[0]: src[1].u64[0];
+   dst->u64[1] = src[0].u64[1] > src[1].u64[1] ? src[0].u64[1]: src[1].u64[1];
+   dst->u64[2] = src[0].u64[2] > src[1].u64[2] ? src[0].u64[2]: src[1].u64[2];
+   dst->u64[3] = src[0].u64[3] > src[1].u64[3] ? src[0].u64[3]: src[1].u64[3];
 }
 
 static void
 micro_i64max(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->i64[0] = src[0].i64[0] > src[1].i64[0] ? src[0].i64[0] : src[1].i64[0];
-   dst->i64[1] = src[0].i64[1] > src[1].i64[1] ? src[0].i64[1] : src[1].i64[1];
-   dst->i64[2] = src[0].i64[2] > src[1].i64[2] ? src[0].i64[2] : src[1].i64[2];
-   dst->i64[3] = src[0].i64[3] > src[1].i64[3] ? src[0].i64[3] : src[1].i64[3];
+   dst->i64[0] = src[0].i64[0] > src[1].i64[0] ? src[0].i64[0]: src[1].i64[0];
+   dst->i64[1] = src[0].i64[1] > src[1].i64[1] ? src[0].i64[1]: src[1].i64[1];
+   dst->i64[2] = src[0].i64[2] > src[1].i64[2] ? src[0].i64[2]: src[1].i64[2];
+   dst->i64[3] = src[0].i64[3] > src[1].i64[3] ? src[0].i64[3]: src[1].i64[3];
 }
 
 static void
 micro_u64min(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->u64[0] = src[0].u64[0] < src[1].u64[0] ? src[0].u64[0] : src[1].u64[0];
-   dst->u64[1] = src[0].u64[1] < src[1].u64[1] ? src[0].u64[1] : src[1].u64[1];
-   dst->u64[2] = src[0].u64[2] < src[1].u64[2] ? src[0].u64[2] : src[1].u64[2];
-   dst->u64[3] = src[0].u64[3] < src[1].u64[3] ? src[0].u64[3] : src[1].u64[3];
+   dst->u64[0] = src[0].u64[0] < src[1].u64[0] ? src[0].u64[0]: src[1].u64[0];
+   dst->u64[1] = src[0].u64[1] < src[1].u64[1] ? src[0].u64[1]: src[1].u64[1];
+   dst->u64[2] = src[0].u64[2] < src[1].u64[2] ? src[0].u64[2]: src[1].u64[2];
+   dst->u64[3] = src[0].u64[3] < src[1].u64[3] ? src[0].u64[3]: src[1].u64[3];
 }
 
 static void
 micro_i64min(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->i64[0] = src[0].i64[0] < src[1].i64[0] ? src[0].i64[0] : src[1].i64[0];
-   dst->i64[1] = src[0].i64[1] < src[1].i64[1] ? src[0].i64[1] : src[1].i64[1];
-   dst->i64[2] = src[0].i64[2] < src[1].i64[2] ? src[0].i64[2] : src[1].i64[2];
-   dst->i64[3] = src[0].i64[3] < src[1].i64[3] ? src[0].i64[3] : src[1].i64[3];
+   dst->i64[0] = src[0].i64[0] < src[1].i64[0] ? src[0].i64[0]: src[1].i64[0];
+   dst->i64[1] = src[0].i64[1] < src[1].i64[1] ? src[0].i64[1]: src[1].i64[1];
+   dst->i64[2] = src[0].i64[2] < src[1].i64[2] ? src[0].i64[2]: src[1].i64[2];
+   dst->i64[3] = src[0].i64[3] < src[1].i64[3] ? src[0].i64[3]: src[1].i64[3];
 }
 
 static void
@@ -860,40 +860,40 @@ static void
 micro_u64div(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->u64[0] = src[1].u64[0] ? src[0].u64[0] / src[1].u64[0] : ~0ull;
-   dst->u64[1] = src[1].u64[1] ? src[0].u64[1] / src[1].u64[1] : ~0ull;
-   dst->u64[2] = src[1].u64[2] ? src[0].u64[2] / src[1].u64[2] : ~0ull;
-   dst->u64[3] = src[1].u64[3] ? src[0].u64[3] / src[1].u64[3] : ~0ull;
+   dst->u64[0] = src[1].u64[0] ? src[0].u64[0] / src[1].u64[0]: ~0ull;
+   dst->u64[1] = src[1].u64[1] ? src[0].u64[1] / src[1].u64[1]: ~0ull;
+   dst->u64[2] = src[1].u64[2] ? src[0].u64[2] / src[1].u64[2]: ~0ull;
+   dst->u64[3] = src[1].u64[3] ? src[0].u64[3] / src[1].u64[3]: ~0ull;
 }
 
 static void
 micro_i64div(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->i64[0] = src[1].i64[0] ? src[0].i64[0] / src[1].i64[0] : 0;
-   dst->i64[1] = src[1].i64[1] ? src[0].i64[1] / src[1].i64[1] : 0;
-   dst->i64[2] = src[1].i64[2] ? src[0].i64[2] / src[1].i64[2] : 0;
-   dst->i64[3] = src[1].i64[3] ? src[0].i64[3] / src[1].i64[3] : 0;
+   dst->i64[0] = src[1].i64[0] ? src[0].i64[0] / src[1].i64[0]: 0;
+   dst->i64[1] = src[1].i64[1] ? src[0].i64[1] / src[1].i64[1]: 0;
+   dst->i64[2] = src[1].i64[2] ? src[0].i64[2] / src[1].i64[2]: 0;
+   dst->i64[3] = src[1].i64[3] ? src[0].i64[3] / src[1].i64[3]: 0;
 }
 
 static void
 micro_u64mod(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->u64[0] = src[1].u64[0] ? src[0].u64[0] % src[1].u64[0] : ~0ull;
-   dst->u64[1] = src[1].u64[1] ? src[0].u64[1] % src[1].u64[1] : ~0ull;
-   dst->u64[2] = src[1].u64[2] ? src[0].u64[2] % src[1].u64[2] : ~0ull;
-   dst->u64[3] = src[1].u64[3] ? src[0].u64[3] % src[1].u64[3] : ~0ull;
+   dst->u64[0] = src[1].u64[0] ? src[0].u64[0] % src[1].u64[0]: ~0ull;
+   dst->u64[1] = src[1].u64[1] ? src[0].u64[1] % src[1].u64[1]: ~0ull;
+   dst->u64[2] = src[1].u64[2] ? src[0].u64[2] % src[1].u64[2]: ~0ull;
+   dst->u64[3] = src[1].u64[3] ? src[0].u64[3] % src[1].u64[3]: ~0ull;
 }
 
 static void
 micro_i64mod(union tgsi_double_channel *dst,
              const union tgsi_double_channel *src)
 {
-   dst->i64[0] = src[1].i64[0] ? src[0].i64[0] % src[1].i64[0] : ~0ll;
-   dst->i64[1] = src[1].i64[1] ? src[0].i64[1] % src[1].i64[1] : ~0ll;
-   dst->i64[2] = src[1].i64[2] ? src[0].i64[2] % src[1].i64[2] : ~0ll;
-   dst->i64[3] = src[1].i64[3] ? src[0].i64[3] % src[1].i64[3] : ~0ll;
+   dst->i64[0] = src[1].i64[0] ? src[0].i64[0] % src[1].i64[0]: ~0ll;
+   dst->i64[1] = src[1].i64[1] ? src[0].i64[1] % src[1].i64[1]: ~0ll;
+   dst->i64[2] = src[1].i64[2] ? src[0].i64[2] % src[1].i64[2]: ~0ll;
+   dst->i64[3] = src[1].i64[3] ? src[0].i64[3] % src[1].i64[3]: ~0ll;
 }
 
 static void
@@ -1008,7 +1008,7 @@ tgsi_exec_set_constant_buffers(struct tgsi_exec_machine *mach,
  * allocating temporary storage, setting up constants, etc.
  * After this, we can call tgsi_exec_machine_run() many times.
  */
-void 
+void
 tgsi_exec_machine_bind_shader(
    struct tgsi_exec_machine *mach,
    const struct tgsi_token *tokens,
@@ -1133,7 +1133,7 @@ tgsi_exec_machine_bind_shader(
             unsigned size = parse.FullToken.FullImmediate.Immediate.NrTokens - 1;
             assert( size <= 4 );
             if (mach->ImmLimit >= mach->ImmsReserved) {
-               unsigned newReserved = mach->ImmsReserved ? 2 * mach->ImmsReserved : 128;
+               unsigned newReserved = mach->ImmsReserved ? 2 * mach->ImmsReserved: 128;
                float4 *imms = REALLOC(mach->Imms, mach->ImmsReserved, newReserved * sizeof(float4));
                if (imms) {
                   mach->ImmsReserved = newReserved;
@@ -1145,7 +1145,7 @@ tgsi_exec_machine_bind_shader(
             }
 
             for( i = 0; i < size; i++ ) {
-               mach->Imms[mach->ImmLimit][i] = 
+               mach->Imms[mach->ImmLimit][i] =
 		  parse.FullToken.FullImmediate.u[i].Float;
             }
             mach->ImmLimit += 1;
@@ -1287,10 +1287,10 @@ micro_lt(
    const union tgsi_exec_channel *src2,
    const union tgsi_exec_channel *src3 )
 {
-   dst->f[0] = src0->f[0] < src1->f[0] ? src2->f[0] : src3->f[0];
-   dst->f[1] = src0->f[1] < src1->f[1] ? src2->f[1] : src3->f[1];
-   dst->f[2] = src0->f[2] < src1->f[2] ? src2->f[2] : src3->f[2];
-   dst->f[3] = src0->f[3] < src1->f[3] ? src2->f[3] : src3->f[3];
+   dst->f[0] = src0->f[0] < src1->f[0] ? src2->f[0]: src3->f[0];
+   dst->f[1] = src0->f[1] < src1->f[1] ? src2->f[1]: src3->f[1];
+   dst->f[2] = src0->f[2] < src1->f[2] ? src2->f[2]: src3->f[2];
+   dst->f[3] = src0->f[3] < src1->f[3] ? src2->f[3]: src3->f[3];
 }
 
 static void
@@ -2327,7 +2327,7 @@ exec_txf(struct tgsi_exec_machine *mach,
    default:
       assert(0);
       break;
-   }      
+   }
 
    mach->Sampler->get_texel(mach->Sampler, unit, r[0].i, r[1].i, r[2].i, r[3].i,
                             offsets, rgba);
@@ -2781,8 +2781,8 @@ exec_declaration(struct tgsi_exec_machine *mach,
                break;
 
             case TGSI_INTERPOLATE_COLOR:
-               eval = mach->flatshade_color ? eval_constant_coef : eval_perspective_coef;
-               interp = mach->flatshade_color ? interp_constant_offset : interp_perspective_offset;
+               eval = mach->flatshade_color ? eval_constant_coef: eval_perspective_coef;
+               interp = mach->flatshade_color ? interp_constant_offset: interp_perspective_offset;
                break;
 
             default:
@@ -3097,10 +3097,10 @@ micro_ucmp(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src1,
            const union tgsi_exec_channel *src2)
 {
-   dst->f[0] = src0->u[0] ? src1->f[0] : src2->f[0];
-   dst->f[1] = src0->u[1] ? src1->f[1] : src2->f[1];
-   dst->f[2] = src0->u[2] ? src1->f[2] : src2->f[2];
-   dst->f[3] = src0->u[3] ? src1->f[3] : src2->f[3];
+   dst->f[0] = src0->u[0] ? src1->f[0]: src2->f[0];
+   dst->f[1] = src0->u[1] ? src1->f[1]: src2->f[1];
+   dst->f[2] = src0->u[2] ? src1->f[2]: src2->f[2];
+   dst->f[3] = src0->u[3] ? src1->f[3]: src2->f[3];
 }
 
 static void
@@ -3326,7 +3326,7 @@ exec_double_binary(struct tgsi_exec_machine *mach,
       first_dest_chan = TGSI_CHAN_X;
       second_dest_chan = TGSI_CHAN_Y;
       if (dst_datatype == TGSI_EXEC_DATA_UINT) {
-         first_dest_chan = (wmask & TGSI_WRITEMASK_X) ? TGSI_CHAN_X : TGSI_CHAN_Y;
+         first_dest_chan = (wmask & TGSI_WRITEMASK_X) ? TGSI_CHAN_X: TGSI_CHAN_Y;
          second_dest_chan = -1;
       }
 
@@ -3340,7 +3340,7 @@ exec_double_binary(struct tgsi_exec_machine *mach,
       first_dest_chan = TGSI_CHAN_Z;
       second_dest_chan = TGSI_CHAN_W;
       if (dst_datatype == TGSI_EXEC_DATA_UINT) {
-         first_dest_chan = (wmask & TGSI_WRITEMASK_Z) ? TGSI_CHAN_Z : TGSI_CHAN_W;
+         first_dest_chan = (wmask & TGSI_WRITEMASK_Z) ? TGSI_CHAN_Z: TGSI_CHAN_W;
          second_dest_chan = -1;
       }
 
@@ -4175,10 +4175,10 @@ micro_mod(union tgsi_exec_channel *dst,
           const union tgsi_exec_channel *src0,
           const union tgsi_exec_channel *src1)
 {
-   dst->i[0] = src1->i[0] ? src0->i[0] % src1->i[0] : ~0;
-   dst->i[1] = src1->i[1] ? src0->i[1] % src1->i[1] : ~0;
-   dst->i[2] = src1->i[2] ? src0->i[2] % src1->i[2] : ~0;
-   dst->i[3] = src1->i[3] ? src0->i[3] % src1->i[3] : ~0;
+   dst->i[0] = src1->i[0] ? src0->i[0] % src1->i[0]: ~0;
+   dst->i[1] = src1->i[1] ? src0->i[1] % src1->i[1]: ~0;
+   dst->i[2] = src1->i[2] ? src0->i[2] % src1->i[2]: ~0;
+   dst->i[3] = src1->i[3] ? src0->i[3] % src1->i[3]: ~0;
 }
 
 static void
@@ -4196,10 +4196,10 @@ micro_fseq(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->u[0] = src0->f[0] == src1->f[0] ? ~0 : 0;
-   dst->u[1] = src0->f[1] == src1->f[1] ? ~0 : 0;
-   dst->u[2] = src0->f[2] == src1->f[2] ? ~0 : 0;
-   dst->u[3] = src0->f[3] == src1->f[3] ? ~0 : 0;
+   dst->u[0] = src0->f[0] == src1->f[0] ? ~0: 0;
+   dst->u[1] = src0->f[1] == src1->f[1] ? ~0: 0;
+   dst->u[2] = src0->f[2] == src1->f[2] ? ~0: 0;
+   dst->u[3] = src0->f[3] == src1->f[3] ? ~0: 0;
 }
 
 static void
@@ -4207,10 +4207,10 @@ micro_fsge(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->u[0] = src0->f[0] >= src1->f[0] ? ~0 : 0;
-   dst->u[1] = src0->f[1] >= src1->f[1] ? ~0 : 0;
-   dst->u[2] = src0->f[2] >= src1->f[2] ? ~0 : 0;
-   dst->u[3] = src0->f[3] >= src1->f[3] ? ~0 : 0;
+   dst->u[0] = src0->f[0] >= src1->f[0] ? ~0: 0;
+   dst->u[1] = src0->f[1] >= src1->f[1] ? ~0: 0;
+   dst->u[2] = src0->f[2] >= src1->f[2] ? ~0: 0;
+   dst->u[3] = src0->f[3] >= src1->f[3] ? ~0: 0;
 }
 
 static void
@@ -4218,10 +4218,10 @@ micro_fslt(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->u[0] = src0->f[0] < src1->f[0] ? ~0 : 0;
-   dst->u[1] = src0->f[1] < src1->f[1] ? ~0 : 0;
-   dst->u[2] = src0->f[2] < src1->f[2] ? ~0 : 0;
-   dst->u[3] = src0->f[3] < src1->f[3] ? ~0 : 0;
+   dst->u[0] = src0->f[0] < src1->f[0] ? ~0: 0;
+   dst->u[1] = src0->f[1] < src1->f[1] ? ~0: 0;
+   dst->u[2] = src0->f[2] < src1->f[2] ? ~0: 0;
+   dst->u[3] = src0->f[3] < src1->f[3] ? ~0: 0;
 }
 
 static void
@@ -4229,10 +4229,10 @@ micro_fsne(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->u[0] = src0->f[0] != src1->f[0] ? ~0 : 0;
-   dst->u[1] = src0->f[1] != src1->f[1] ? ~0 : 0;
-   dst->u[2] = src0->f[2] != src1->f[2] ? ~0 : 0;
-   dst->u[3] = src0->f[3] != src1->f[3] ? ~0 : 0;
+   dst->u[0] = src0->f[0] != src1->f[0] ? ~0: 0;
+   dst->u[1] = src0->f[1] != src1->f[1] ? ~0: 0;
+   dst->u[2] = src0->f[2] != src1->f[2] ? ~0: 0;
+   dst->u[3] = src0->f[3] != src1->f[3] ? ~0: 0;
 }
 
 static void
@@ -4240,10 +4240,10 @@ micro_idiv(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->i[0] = src1->i[0] ? src0->i[0] / src1->i[0] : 0;
-   dst->i[1] = src1->i[1] ? src0->i[1] / src1->i[1] : 0;
-   dst->i[2] = src1->i[2] ? src0->i[2] / src1->i[2] : 0;
-   dst->i[3] = src1->i[3] ? src0->i[3] / src1->i[3] : 0;
+   dst->i[0] = src1->i[0] ? src0->i[0] / src1->i[0]: 0;
+   dst->i[1] = src1->i[1] ? src0->i[1] / src1->i[1]: 0;
+   dst->i[2] = src1->i[2] ? src0->i[2] / src1->i[2]: 0;
+   dst->i[3] = src1->i[3] ? src0->i[3] / src1->i[3]: 0;
 }
 
 static void
@@ -4251,10 +4251,10 @@ micro_imax(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->i[0] = src0->i[0] > src1->i[0] ? src0->i[0] : src1->i[0];
-   dst->i[1] = src0->i[1] > src1->i[1] ? src0->i[1] : src1->i[1];
-   dst->i[2] = src0->i[2] > src1->i[2] ? src0->i[2] : src1->i[2];
-   dst->i[3] = src0->i[3] > src1->i[3] ? src0->i[3] : src1->i[3];
+   dst->i[0] = src0->i[0] > src1->i[0] ? src0->i[0]: src1->i[0];
+   dst->i[1] = src0->i[1] > src1->i[1] ? src0->i[1]: src1->i[1];
+   dst->i[2] = src0->i[2] > src1->i[2] ? src0->i[2]: src1->i[2];
+   dst->i[3] = src0->i[3] > src1->i[3] ? src0->i[3]: src1->i[3];
 }
 
 static void
@@ -4262,10 +4262,10 @@ micro_imin(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->i[0] = src0->i[0] < src1->i[0] ? src0->i[0] : src1->i[0];
-   dst->i[1] = src0->i[1] < src1->i[1] ? src0->i[1] : src1->i[1];
-   dst->i[2] = src0->i[2] < src1->i[2] ? src0->i[2] : src1->i[2];
-   dst->i[3] = src0->i[3] < src1->i[3] ? src0->i[3] : src1->i[3];
+   dst->i[0] = src0->i[0] < src1->i[0] ? src0->i[0]: src1->i[0];
+   dst->i[1] = src0->i[1] < src1->i[1] ? src0->i[1]: src1->i[1];
+   dst->i[2] = src0->i[2] < src1->i[2] ? src0->i[2]: src1->i[2];
+   dst->i[3] = src0->i[3] < src1->i[3] ? src0->i[3]: src1->i[3];
 }
 
 static void
@@ -4273,10 +4273,10 @@ micro_isge(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->i[0] = src0->i[0] >= src1->i[0] ? -1 : 0;
-   dst->i[1] = src0->i[1] >= src1->i[1] ? -1 : 0;
-   dst->i[2] = src0->i[2] >= src1->i[2] ? -1 : 0;
-   dst->i[3] = src0->i[3] >= src1->i[3] ? -1 : 0;
+   dst->i[0] = src0->i[0] >= src1->i[0] ? -1: 0;
+   dst->i[1] = src0->i[1] >= src1->i[1] ? -1: 0;
+   dst->i[2] = src0->i[2] >= src1->i[2] ? -1: 0;
+   dst->i[3] = src0->i[3] >= src1->i[3] ? -1: 0;
 }
 
 static void
@@ -4300,10 +4300,10 @@ micro_islt(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->i[0] = src0->i[0] < src1->i[0] ? -1 : 0;
-   dst->i[1] = src0->i[1] < src1->i[1] ? -1 : 0;
-   dst->i[2] = src0->i[2] < src1->i[2] ? -1 : 0;
-   dst->i[3] = src0->i[3] < src1->i[3] ? -1 : 0;
+   dst->i[0] = src0->i[0] < src1->i[0] ? -1: 0;
+   dst->i[1] = src0->i[1] < src1->i[1] ? -1: 0;
+   dst->i[2] = src0->i[2] < src1->i[2] ? -1: 0;
+   dst->i[3] = src0->i[3] < src1->i[3] ? -1: 0;
 }
 
 static void
@@ -4342,10 +4342,10 @@ micro_udiv(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->u[0] = src1->u[0] ? src0->u[0] / src1->u[0] : ~0u;
-   dst->u[1] = src1->u[1] ? src0->u[1] / src1->u[1] : ~0u;
-   dst->u[2] = src1->u[2] ? src0->u[2] / src1->u[2] : ~0u;
-   dst->u[3] = src1->u[3] ? src0->u[3] / src1->u[3] : ~0u;
+   dst->u[0] = src1->u[0] ? src0->u[0] / src1->u[0]: ~0u;
+   dst->u[1] = src1->u[1] ? src0->u[1] / src1->u[1]: ~0u;
+   dst->u[2] = src1->u[2] ? src0->u[2] / src1->u[2]: ~0u;
+   dst->u[3] = src1->u[3] ? src0->u[3] / src1->u[3]: ~0u;
 }
 
 static void
@@ -4365,10 +4365,10 @@ micro_umax(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->u[0] = src0->u[0] > src1->u[0] ? src0->u[0] : src1->u[0];
-   dst->u[1] = src0->u[1] > src1->u[1] ? src0->u[1] : src1->u[1];
-   dst->u[2] = src0->u[2] > src1->u[2] ? src0->u[2] : src1->u[2];
-   dst->u[3] = src0->u[3] > src1->u[3] ? src0->u[3] : src1->u[3];
+   dst->u[0] = src0->u[0] > src1->u[0] ? src0->u[0]: src1->u[0];
+   dst->u[1] = src0->u[1] > src1->u[1] ? src0->u[1]: src1->u[1];
+   dst->u[2] = src0->u[2] > src1->u[2] ? src0->u[2]: src1->u[2];
+   dst->u[3] = src0->u[3] > src1->u[3] ? src0->u[3]: src1->u[3];
 }
 
 static void
@@ -4376,10 +4376,10 @@ micro_umin(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->u[0] = src0->u[0] < src1->u[0] ? src0->u[0] : src1->u[0];
-   dst->u[1] = src0->u[1] < src1->u[1] ? src0->u[1] : src1->u[1];
-   dst->u[2] = src0->u[2] < src1->u[2] ? src0->u[2] : src1->u[2];
-   dst->u[3] = src0->u[3] < src1->u[3] ? src0->u[3] : src1->u[3];
+   dst->u[0] = src0->u[0] < src1->u[0] ? src0->u[0]: src1->u[0];
+   dst->u[1] = src0->u[1] < src1->u[1] ? src0->u[1]: src1->u[1];
+   dst->u[2] = src0->u[2] < src1->u[2] ? src0->u[2]: src1->u[2];
+   dst->u[3] = src0->u[3] < src1->u[3] ? src0->u[3]: src1->u[3];
 }
 
 static void
@@ -4387,10 +4387,10 @@ micro_umod(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->u[0] = src1->u[0] ? src0->u[0] % src1->u[0] : ~0u;
-   dst->u[1] = src1->u[1] ? src0->u[1] % src1->u[1] : ~0u;
-   dst->u[2] = src1->u[2] ? src0->u[2] % src1->u[2] : ~0u;
-   dst->u[3] = src1->u[3] ? src0->u[3] % src1->u[3] : ~0u;
+   dst->u[0] = src1->u[0] ? src0->u[0] % src1->u[0]: ~0u;
+   dst->u[1] = src1->u[1] ? src0->u[1] % src1->u[1]: ~0u;
+   dst->u[2] = src1->u[2] ? src0->u[2] % src1->u[2]: ~0u;
+   dst->u[3] = src1->u[3] ? src0->u[3] % src1->u[3]: ~0u;
 }
 
 static void
@@ -4435,10 +4435,10 @@ micro_useq(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->u[0] = src0->u[0] == src1->u[0] ? ~0 : 0;
-   dst->u[1] = src0->u[1] == src1->u[1] ? ~0 : 0;
-   dst->u[2] = src0->u[2] == src1->u[2] ? ~0 : 0;
-   dst->u[3] = src0->u[3] == src1->u[3] ? ~0 : 0;
+   dst->u[0] = src0->u[0] == src1->u[0] ? ~0: 0;
+   dst->u[1] = src0->u[1] == src1->u[1] ? ~0: 0;
+   dst->u[2] = src0->u[2] == src1->u[2] ? ~0: 0;
+   dst->u[3] = src0->u[3] == src1->u[3] ? ~0: 0;
 }
 
 static void
@@ -4446,10 +4446,10 @@ micro_usge(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->u[0] = src0->u[0] >= src1->u[0] ? ~0 : 0;
-   dst->u[1] = src0->u[1] >= src1->u[1] ? ~0 : 0;
-   dst->u[2] = src0->u[2] >= src1->u[2] ? ~0 : 0;
-   dst->u[3] = src0->u[3] >= src1->u[3] ? ~0 : 0;
+   dst->u[0] = src0->u[0] >= src1->u[0] ? ~0: 0;
+   dst->u[1] = src0->u[1] >= src1->u[1] ? ~0: 0;
+   dst->u[2] = src0->u[2] >= src1->u[2] ? ~0: 0;
+   dst->u[3] = src0->u[3] >= src1->u[3] ? ~0: 0;
 }
 
 static void
@@ -4473,10 +4473,10 @@ micro_uslt(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->u[0] = src0->u[0] < src1->u[0] ? ~0 : 0;
-   dst->u[1] = src0->u[1] < src1->u[1] ? ~0 : 0;
-   dst->u[2] = src0->u[2] < src1->u[2] ? ~0 : 0;
-   dst->u[3] = src0->u[3] < src1->u[3] ? ~0 : 0;
+   dst->u[0] = src0->u[0] < src1->u[0] ? ~0: 0;
+   dst->u[1] = src0->u[1] < src1->u[1] ? ~0: 0;
+   dst->u[2] = src0->u[2] < src1->u[2] ? ~0: 0;
+   dst->u[3] = src0->u[3] < src1->u[3] ? ~0: 0;
 }
 
 static void
@@ -4484,10 +4484,10 @@ micro_usne(union tgsi_exec_channel *dst,
            const union tgsi_exec_channel *src0,
            const union tgsi_exec_channel *src1)
 {
-   dst->u[0] = src0->u[0] != src1->u[0] ? ~0 : 0;
-   dst->u[1] = src0->u[1] != src1->u[1] ? ~0 : 0;
-   dst->u[2] = src0->u[2] != src1->u[2] ? ~0 : 0;
-   dst->u[3] = src0->u[3] != src1->u[3] ? ~0 : 0;
+   dst->u[0] = src0->u[0] != src1->u[0] ? ~0: 0;
+   dst->u[1] = src0->u[1] != src1->u[1] ? ~0: 0;
+   dst->u[2] = src0->u[2] != src1->u[2] ? ~0: 0;
+   dst->u[3] = src0->u[3] != src1->u[3] ? ~0: 0;
 }
 
 static void

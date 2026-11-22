@@ -447,7 +447,7 @@ get_blit_type(const struct wsi_device *wsi,
          WSI_SWAPCHAIN_BUFFER_BLIT : WSI_SWAPCHAIN_NO_BLIT;
    }
 #endif
-#ifdef _WIN32
+#ifdef VK_USE_PLATFORM_WIN32_KHR
    case WSI_IMAGE_TYPE_DXGI: {
       const struct wsi_dxgi_image_params *dxgi_params =
          container_of(params, const struct wsi_dxgi_image_params, base);
@@ -496,7 +496,7 @@ configure_image(const struct wsi_swapchain *chain,
       return wsi_drm_configure_image(chain, pCreateInfo, drm_params, info);
    }
 #endif
-#ifdef _WIN32
+#ifdef VK_USE_PLATFORM_WIN32_KHR
    case WSI_IMAGE_TYPE_DXGI: {
       const struct wsi_dxgi_image_params *dxgi_params =
          container_of(params, const struct wsi_dxgi_image_params, base);
