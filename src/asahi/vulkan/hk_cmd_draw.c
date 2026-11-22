@@ -8,6 +8,7 @@
 #include "agx_abi.h"
 #include "agx_bg_eot.h"
 #include "agx_bo.h"
+#include "asahi/lib/agx_bytes.h"
 #include "agx_compile.h"
 #include "agx_compiler.h"
 #include "asahi/compiler/agx3_graphics_program.h"
@@ -13945,6 +13946,388 @@ hk_draw_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    hk_draw(cmd, draw_id, draw);
 }
 
+/* Batch the remaining eligible records [first_draw_id, draw_count) of an
+ * indirect multi-draw once the previous record has populated the memoised
+ * VDM state update, native bind tail, draw-state offset, and an independent
+ * vertex loader plan.  Every emitted VDM byte, IOTO program byte, stream
+ * chunk boundary, and counter matches calling hk_g17p_emit_indirect_record()
+ * one record at a time.  Returns the next draw_id not yet emitted. */
+static unsigned
+hk_g17p_emit_indirect_batch(struct hk_cmd_buffer *cmd, unsigned first_draw_id,
+                            unsigned draw_count, uint64_t base, uint32_t stride,
+                            struct agx_draw template_draw)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_cs *cs = cmd->current_cs.gfx;
+
+   if (unlikely(dev->frame_anatomy) || first_draw_id >= draw_count ||
+       draw_count > UINT16_MAX + 1u || !stride || (stride & 3u))
+      return first_draw_id;
+
+   const uint64_t first_addr = base + (uint64_t)stride * first_draw_id;
+   const uint64_t span = (uint64_t)stride * (draw_count - 1u - first_draw_id);
+   if (!first_addr || (first_addr & 3u) || span > UINT64_MAX - first_addr ||
+       first_addr + span >= (UINT64_C(1) << 48))
+      return first_draw_id;
+
+   hk_g17p_normalize_indirect_draw(cmd, &template_draw);
+   template_draw.b.ptr = first_addr;
+
+   const enum agx_chip chip = dev->dev.chip;
+   const bool native_agx3 = agx_chip_native_agx3(chip);
+   const bool republishes = hk_gfx_republishes_render_state(cmd);
+
+   struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
+   struct hk_g17p_indirect_loader_batch loader_batch;
+   bool uses_base_param = false;
+   bool uses_draw_id = false;
+   uint32_t pipeline_raw_template = 0;
+
+   /* Contiguous per-draw VDM payload:
+    *   [vdm_state_update][native_bind_tail][draw_state_offset?][indirect_draw]
+    */
+   uint8_t vdm_tmpl[256];
+   unsigned vdm_len = 0;
+
+   if (republishes) {
+      struct hk_linked_shader *linked_vs = gfx->linked[MESA_SHADER_VERTEX];
+      struct hk_shader *sw_vs = hk_bound_sw_vs(gfx);
+      struct hk_linked_shader *linked_hw_vs =
+         hk_linked_hw_vs(cmd, hw_vs, sw_vs, linked_vs);
+      if (!linked_hw_vs)
+         return first_draw_id;
+
+      uses_base_param = linked_vs->b.uses_base_param;
+      uses_draw_id = sw_vs->b.info.uses_draw_id;
+      if (!uses_base_param && !uses_draw_id)
+         return first_draw_id;
+
+      if (!hk_m5_multi_draw_vertex_batch_prepare(cmd, hw_vs, linked_hw_vs,
+                                                 uses_base_param, uses_draw_id,
+                                                 &loader_batch))
+         return first_draw_id;
+
+      /* Verify the memoised VDM VertexProgramVariant state update matches this
+       * draw's inputs so only its 8-byte pipeline pair at bytes 8..15 varies. */
+      const enum agx_vdm_state_update_draw_path draw_path =
+         template_draw.indexed ? AGX_VDM_STATE_UPDATE_DRAW_INDIRECT_INDEXED
+                               : AGX_VDM_STATE_UPDATE_DRAW_INDIRECT_NONINDEXED;
+      const bool rasterization_enabled = hk_native_vertex_template_enabled(
+         hk_rast_discard(cmd), hw_vs->info.writes_external_memory,
+         hk_g17p_xfb_vertex_side_effects(cmd, hw_vs));
+      const struct hk_g17p_vdm_update_key *memo =
+         &gfx->g17p_vdm_update_memo.key;
+      const struct agx_vdm_state_update *enc =
+         &gfx->g17p_vdm_update_memo.encoded;
+      pipeline_raw_template =
+         hw_vs->agx3_vdm_state_update.template_info.raw_state_load_count_18
+         << 3;
+      uint64_t memo_pipeline = 0;
+      uint32_t memo_raw_template = 0;
+      if (!gfx->g17p_vdm_update_memo.valid ||
+          !agx_vdm_state_vertex_pipeline_pair_supported(chip) ||
+          (pipeline_raw_template &
+           ~AGX_VDM_STATE_VERTEX_PIPELINE_TEMPLATE_MASK) != 0 ||
+          memo->hw_vs != hw_vs ||
+          memo->selector != cs->agx3_raw_active_context_selector ||
+          memo->draw_path != draw_path || memo->provoking != gfx->provoking ||
+          memo->rasterization_enabled != rasterization_enabled ||
+          memo->primitive_id != gfx->generate_primitive_id || !memo->ordinary ||
+          memo->selector_valid != cs->agx3_active_context_selector_valid ||
+          enc->length < 16 || enc->length > sizeof(vdm_tmpl) ||
+          !agx_vdm_state_vertex_pipeline_pair_unpack(
+             chip, enc->bytes + 8, AGX_VDM_STATE_VERTEX_PIPELINE_PAIR_LENGTH,
+             &memo_pipeline, &memo_raw_template) ||
+          memo_raw_template != pipeline_raw_template)
+         return first_draw_id;
+
+      memcpy(vdm_tmpl, enc->bytes, enc->length);
+      vdm_len = enc->length;
+
+      if (native_agx3) {
+         const struct hk_g17p_prepared_bind_tail *prepared =
+            &gfx->g17p_bind_tail;
+         if (!hk_g17p_prepared_bind_tail_matches(cmd, prepared))
+            return first_draw_id;
+         const unsigned scissor_bytes =
+            prepared->viewport_count * AGX_SCISSOR_LENGTH;
+         const unsigned depth_bias_bytes =
+            prepared->viewport_count * AGX_DEPTH_BIAS_LENGTH;
+         if (cs->scissor.size < scissor_bytes ||
+             cs->depth_bias.size < depth_bias_bytes ||
+             memcmp((const uint8_t *)cs->scissor.data + cs->scissor.size -
+                       scissor_bytes,
+                    prepared->scissors, scissor_bytes) != 0 ||
+             memcmp((const uint8_t *)cs->depth_bias.data +
+                       cs->depth_bias.size - depth_bias_bytes,
+                    prepared->depth_bias, depth_bias_bytes) != 0 ||
+             vdm_len + prepared->tail.length > sizeof(vdm_tmpl))
+            return first_draw_id;
+
+         memcpy(vdm_tmpl + vdm_len, prepared->tail.bytes,
+                prepared->tail.length);
+         vdm_len += prepared->tail.length;
+      }
+   }
+
+   unsigned indirect_addr_off = 0;
+   if (native_agx3) {
+      uint32_t draw_state_offset = 4;
+      if (republishes &&
+          !hk_g17p_draw_state_offset(cmd, cs, &draw_state_offset))
+         return first_draw_id;
+
+      const struct agx_vdm_hal200_indirect_draw_fields fields = {
+         .draw_state_context_offset = draw_state_offset,
+         .primitive = (uint8_t)gfx->topology,
+         .indexed = template_draw.indexed,
+         .index_size_B =
+            template_draw.indexed ? agx_index_size_to_B(template_draw.index_size)
+                                  : 0,
+         .restart_enable = template_draw.restart,
+         .restart_index = hk_draw_restart_index(cmd, template_draw),
+         .index_buffer = template_draw.index_buffer,
+         .index_buffer_range_B = template_draw.index_buffer_range_B,
+         .indirect_buffer = first_addr,
+      };
+      struct agx_vdm_hal200_indirect_draw encoded;
+      size_t emitted = 0;
+      if (!agx_vdm_hal200_indirect_draw_pack(chip, &fields, &encoded) ||
+          !agx_vdm_hal200_draw_emit(chip, encoded.bytes, encoded.length,
+                                    republishes, vdm_tmpl + vdm_len,
+                                    sizeof(vdm_tmpl) - vdm_len, &emitted))
+         return first_draw_id;
+      indirect_addr_off =
+         vdm_len + (republishes ? 4u : 0u) + (template_draw.indexed ? 16u : 4u);
+      vdm_len += (unsigned)emitted;
+   } else {
+      if (sizeof(vdm_tmpl) - vdm_len < AGX_VDM_INDEX_LIST_INDIRECT_INDEXED_MAX_LENGTH)
+         return first_draw_id;
+      uint32_t *draw_start = (uint32_t *)(vdm_tmpl + vdm_len);
+      uint32_t *draw_end = agx_vdm_draw(
+         draw_start, agx_vdm_index_list_record_chip(chip), template_draw,
+         gfx->topology, hk_draw_restart_index(cmd, template_draw));
+      indirect_addr_off = vdm_len + (template_draw.indexed ? 16u : 4u);
+      vdm_len = (unsigned)((uint8_t *)draw_end - vdm_tmpl);
+   }
+
+   /* Guard the patched word offsets against any future packet layout change. */
+   const uint32_t expect_hi = (uint32_t)((first_addr >> 32) & 0xffffu);
+   const uint32_t expect_lo = (uint32_t)first_addr & 0xfffffffcu;
+   if (indirect_addr_off + 8u > vdm_len ||
+       vdm_len > HK_GFX_DRAW_RESERVATION ||
+       agx_load_le32(vdm_tmpl + indirect_addr_off) != expect_hi ||
+       agx_load_le32(vdm_tmpl + indirect_addr_off + 4) != expect_lo)
+      return first_draw_id;
+
+   const unsigned param_offset =
+      template_draw.indexed
+         ? offsetof(VkDrawIndexedIndirectCommand, vertexOffset)
+         : offsetof(VkDrawIndirectCommand, firstVertex);
+
+   /* Verify that any 2-byte short LDIMM on draw_params stays below 128 across
+    * every batched draw [first_addr, first_addr + span]. */
+   if (republishes && uses_base_param) {
+      for (unsigned r = 0; r < loader_batch.dyn_reloc_count; ++r) {
+         const struct hk_g17p_indirect_loader_reloc *rel =
+            &loader_batch.dyn_relocs[r];
+         if (rel->kind != 0 || !rel->short_mask)
+            continue;
+         const uint64_t off = (uint64_t)param_offset + rel->delta;
+         if (off > UINT64_MAX - (first_addr + span))
+            return first_draw_id;
+         const uint64_t p0 = first_addr + off;
+         const uint64_t p1 = first_addr + span + off;
+         if (((rel->short_mask & 1) &&
+              ((p0 >> 32) != (p1 >> 32) || (uint32_t)p0 >= 128u ||
+               (uint32_t)p1 >= 128u)) ||
+             ((rel->short_mask & 2) && (p1 >> 32) >= 128u))
+            return first_draw_id;
+      }
+   }
+
+   if (republishes)
+      hk_reserve_scratch(cmd, cs, hw_vs);
+
+   const bool cached_cmd_mem = hk_g17p_cached_cmd_memory(&dev->dev);
+   struct hk_ioto_arena *arena = &cmd->ioto;
+   const uint32_t ioto_mask = HK_IOTO_PROGRAM_ALIGNMENT - 1u;
+
+   uint8_t *out = cs->current;
+   uint8_t *cs_end = cs->end;
+   unsigned done = 0;
+   uint64_t last_pipeline_program = 0;
+   uint64_t last_draw_params = 0;
+   uint64_t last_draw_id_ptr = 0;
+
+   /* Chunk draw-ID uploads to stay comfortably within HK_CMD_BO_SIZE. */
+   uint64_t draw_id_chunk_gpu = 0;
+   unsigned draw_id_chunk_start = 0;
+   unsigned draw_id_chunk_end = 0;
+
+   for (unsigned i = first_draw_id; i < draw_count; ++i) {
+      if (unlikely(!hk_cs_space_fits((size_t)(cs_end - out),
+                                     HK_GFX_DRAW_RESERVATION,
+                                     AGX_VDM_STREAM_LINK_LENGTH))) {
+         cs->current = out;
+         hk_ensure_cs_has_space(cmd, cs, HK_GFX_DRAW_RESERVATION);
+         if (vk_command_buffer_has_error(&cmd->vk))
+            break;
+         out = cs->current;
+         cs_end = cs->end;
+      }
+
+      const uint64_t addr = base + (uint64_t)stride * i;
+      uint64_t pipeline_program = 0;
+      if (republishes) {
+         const uint64_t draw_params =
+            uses_base_param ? addr + param_offset : 0;
+         uint64_t draw_id_ptr = 0;
+         if (uses_draw_id) {
+            if (unlikely(i >= draw_id_chunk_end)) {
+               const unsigned chunk_n = MIN2(draw_count - i, 16384u);
+               struct agx_ptr ids =
+                  hk_pool_alloc(cmd, chunk_n * sizeof(uint32_t), 4);
+               if (!ids.cpu)
+                  break;
+               bool chunk_fits = true;
+               for (unsigned r = 0; r < loader_batch.dyn_reloc_count; ++r) {
+                  const struct hk_g17p_indirect_loader_reloc *rel =
+                     &loader_batch.dyn_relocs[r];
+                  if (rel->kind != 1 || !rel->short_mask)
+                     continue;
+                  const uint64_t c0 = ids.gpu + rel->delta;
+                  const uint64_t c1 = c0 + (uint64_t)(chunk_n - 1u) * 4u;
+                  if (((rel->short_mask & 1) &&
+                       ((c0 >> 32) != (c1 >> 32) || (uint32_t)c0 >= 128u ||
+                        (uint32_t)c1 >= 128u)) ||
+                      ((rel->short_mask & 2) && (c1 >> 32) >= 128u)) {
+                     chunk_fits = false;
+                     break;
+                  }
+               }
+               if (unlikely(!chunk_fits))
+                  break;
+               uint32_t *dst = ids.cpu;
+               for (unsigned k = 0; k < chunk_n; ++k)
+                  dst[k] = i + k;
+               draw_id_chunk_gpu = ids.gpu;
+               draw_id_chunk_start = i;
+               draw_id_chunk_end = i + chunk_n;
+            }
+            draw_id_ptr =
+               draw_id_chunk_gpu + (uint64_t)(i - draw_id_chunk_start) * 4u;
+         }
+
+         const uint32_t prog_len = loader_batch.length;
+         uint8_t *prog_dst;
+         uint32_t prog_off;
+         if (likely(arena->map && arena->cursor <= arena->capacity &&
+                    arena->cursor <= UINT32_MAX - ioto_mask)) {
+            prog_off = (arena->cursor + ioto_mask) & ~ioto_mask;
+            if (likely(prog_off <= arena->capacity &&
+                       prog_len <= arena->capacity - prog_off)) {
+               prog_dst = (uint8_t *)arena->map + prog_off;
+               pipeline_program = arena->base + prog_off;
+               arena->cursor = prog_off + prog_len;
+               goto patch_loader;
+            }
+         }
+         struct hk_ioto_reservation res;
+         if (!hk_cmd_reserve_ioto_program_slow(
+                cmd, prog_len, "G17P graphics loader", &res))
+            break;
+         prog_dst = res.map;
+         pipeline_program = res.va;
+         prog_off = (uint32_t)(res.va - arena->base);
+
+      patch_loader:
+         for (unsigned r = 0; r < loader_batch.dyn_reloc_count; ++r) {
+            const struct hk_g17p_indirect_loader_reloc *rel =
+               &loader_batch.dyn_relocs[r];
+            const uint64_t rel_base =
+               (rel->kind == 0 ? draw_params : draw_id_ptr) + rel->delta;
+            uint8_t *rel_out = loader_batch.bytes + rel->offset;
+            const bool low_short = rel->short_mask & 1;
+            hk_g17p_patch_ldimm(rel_out, low_short, rel->dest[0],
+                                (uint32_t)rel_base);
+            hk_g17p_patch_ldimm(rel_out + (low_short ? 2 : 8),
+                                rel->short_mask & 2, rel->dest[1],
+                                (uint32_t)(rel_base >> 32));
+         }
+         memcpy(prog_dst, loader_batch.bytes, prog_len);
+         if (unlikely(!cached_cmd_mem))
+            agx_bo_assert_range(arena->bo, prog_off, prog_len);
+
+         struct agx_vdm_state_vertex_pipeline_pair pair;
+         if (unlikely(!pipeline_program ||
+                      !agx_vdm_state_vertex_pipeline_pair_pack(
+                         chip, pipeline_program, pipeline_raw_template,
+                         &pair))) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            break;
+         }
+         static_assert(sizeof(pair.bytes) == 8, "pipeline pair is two words");
+         memcpy(vdm_tmpl + 8, pair.bytes, sizeof(pair.bytes));
+
+         last_pipeline_program = pipeline_program;
+         last_draw_params = draw_params;
+         last_draw_id_ptr = draw_id_ptr;
+      }
+
+      agx_store_le32(vdm_tmpl + indirect_addr_off,
+                     (uint32_t)((addr >> 32) & 0xffffu));
+      agx_store_le32(vdm_tmpl + indirect_addr_off + 4,
+                     (uint32_t)addr & 0xfffffffcu);
+      memcpy(out, vdm_tmpl, vdm_len);
+      out += vdm_len;
+      done++;
+   }
+
+   cs->current = out;
+   if (!done)
+      return first_draw_id;
+
+   cs->g17p_primitive_bound = UINT64_MAX;
+   cs->stats.calls += done;
+   cs->stats.cmds += done;
+   hk_upload_stat(cmd, draws, done);
+   if (native_agx3 || (agx_chip_g17_m5(chip) && template_draw.indexed))
+      cs->restart_index_set = false;
+
+   if (!native_agx3 || gfx->render.view_mask) {
+      cs->g17p_layer_zero_unknown = true;
+   } else if (gfx->descriptors.root.draw.no_attachments ||
+              (hw_vs && hw_vs->info.g17p_default_layer_zero)) {
+      cs->g17p_layer_zero_draws += done;
+   } else {
+      cs->g17p_layer_zero_unknown = true;
+   }
+
+   if (republishes) {
+      arena->programs += done;
+      arena->program_bytes += (uint64_t)done * loader_batch.length;
+      gfx->draw_params = last_draw_params;
+      gfx->g17p_draw_params_host_valid = false;
+      if (uses_draw_id) {
+         gfx->draw_id_ptr = last_draw_id_ptr;
+         gfx->g17p_draw_id_value = first_draw_id + done - 1u;
+         gfx->g17p_draw_id_host_valid = true;
+         hk_upload_stat(cmd, draw_id_uploads, done);
+         hk_upload_stat(cmd, draw_id_bytes, done * sizeof(uint32_t));
+      } else {
+         gfx->draw_id_ptr = 0;
+         gfx->g17p_draw_id_host_valid = false;
+      }
+      hk_m5_multi_draw_vertex_batch_finish(cmd, &loader_batch,
+                                           last_pipeline_program,
+                                           last_draw_params, last_draw_id_ptr);
+   }
+
+   return first_draw_id + done;
+}
+
 static void
 hk_draw_indirect_inner(VkCommandBuffer commandBuffer, uint64_t base,
                        uint32_t drawCount, uint32_t stride)
@@ -13970,10 +14353,29 @@ hk_draw_indirect_inner(VkCommandBuffer commandBuffer, uint64_t base,
    const struct hk_device *dev = hk_cmd_buffer_device(cmd);
    int eligible =
       agx_chip_native_or_m5(dev->dev.chip) ? -1 : 0;
+   bool batch_failed = false;
+   const struct hk_g17p_gfx_loader *failed_loader = NULL;
    for (unsigned draw_id = 0; draw_id < drawCount; ++draw_id) {
-      uint64_t addr = base + stride * draw_id;
-      hk_draw_indirect_record(cmd, draw_id, agx_draw_indirect(addr),
-                              &eligible);
+      uint64_t addr = base + (uint64_t)stride * draw_id;
+      struct agx_draw draw = agx_draw_indirect(addr);
+      hk_draw_indirect_record(cmd, draw_id, draw, &eligible);
+      if (!batch_failed && eligible > 0 && draw_id + 1u < drawCount &&
+          !vk_command_buffer_has_error(&cmd->vk)) {
+         const struct hk_g17p_gfx_loader *cur_loader =
+            cmd->state.gfx.g17p_ioto[0].loader;
+         if (!failed_loader || cur_loader != failed_loader) {
+            unsigned next = hk_g17p_emit_indirect_batch(
+               cmd, draw_id + 1u, drawCount, base, stride, draw);
+            if (next > draw_id + 1u) {
+               draw_id = next - 1u;
+               failed_loader = NULL;
+            } else if (cur_loader) {
+               failed_loader = cur_loader;
+            } else {
+               batch_failed = true;
+            }
+         }
+      }
    }
 }
 
@@ -14084,14 +14486,32 @@ hk_draw_indexed_indirect_inner(VkCommandBuffer commandBuffer, uint64_t buffer,
    const struct hk_device *dev = hk_cmd_buffer_device(cmd);
    int eligible =
       agx_chip_native_or_m5(dev->dev.chip) ? -1 : 0;
+   bool batch_failed = false;
+   const struct hk_g17p_gfx_loader *failed_loader = NULL;
    for (unsigned draw_id = 0; draw_id < drawCount; ++draw_id) {
-      uint64_t addr = buffer + stride * draw_id;
+      uint64_t addr = buffer + (uint64_t)stride * draw_id;
       struct hk_addr_range buf = cmd->state.gfx.index.buffer;
+      struct agx_draw draw =
+         agx_draw_indexed_indirect(addr, buf.addr, buf.range, 0, 0);
 
-      hk_draw_indirect_record(
-         cmd, draw_id,
-         agx_draw_indexed_indirect(addr, buf.addr, buf.range, 0, 0),
-         &eligible);
+      hk_draw_indirect_record(cmd, draw_id, draw, &eligible);
+      if (!batch_failed && eligible > 0 && draw_id + 1u < drawCount &&
+          !vk_command_buffer_has_error(&cmd->vk)) {
+         const struct hk_g17p_gfx_loader *cur_loader =
+            cmd->state.gfx.g17p_ioto[0].loader;
+         if (!failed_loader || cur_loader != failed_loader) {
+            unsigned next = hk_g17p_emit_indirect_batch(
+               cmd, draw_id + 1u, drawCount, buffer, stride, draw);
+            if (next > draw_id + 1u) {
+               draw_id = next - 1u;
+               failed_loader = NULL;
+            } else if (cur_loader) {
+               failed_loader = cur_loader;
+            } else {
+               batch_failed = true;
+            }
+         }
+      }
    }
 }
 

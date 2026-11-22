@@ -41,6 +41,7 @@
 #include "hk_cs_root_size.h"
 #include "hk_descriptor_set.h"
 #include "hk_drm_render_core.h"
+#include "hk_g17p_patch.h"
 #include "hk_ioto_arena_core.h"
 #include "hk_pipeline_statistics_core.h"
 
@@ -2790,6 +2791,45 @@ void hk_m5_pass_merge_note_set_bind(struct hk_cmd_buffer *cmd);
 uint64_t hk_m5_multi_draw_vertex_program(struct hk_cmd_buffer *cmd,
                                          struct hk_shader *s,
                                          struct hk_linked_shader *linked);
+
+/* Pre-patched vertex stage loader template for a batched eligible indirect
+ * multi-draw (hk_cmd_buffer.c / hk_cmd_draw.c).  All non-draw-varying
+ * relocations are already applied to `bytes`; each draw patches only the
+ * LDIMM pairs listed in `dyn_relocs` (both 8-byte long and 2-byte short forms). */
+#define HK_G17P_INDIRECT_LOADER_BATCH_MAX_BYTES 512u
+
+struct hk_g17p_indirect_loader_reloc {
+   uint64_t dest[2];
+   uint32_t delta;
+   uint16_t offset;
+   /* 0 = DRAW_PARAMS, 1 = DRAW_ID */
+   uint8_t kind;
+   /* Same encoding as hk_g17p_patch_reloc.short_mask. */
+   uint8_t short_mask;
+};
+
+struct hk_g17p_indirect_loader_batch {
+   const struct hk_g17p_gfx_loader *loader;
+   struct hk_linked_shader *linked;
+   uint16_t length;
+   uint8_t range_count;
+   uint8_t dyn_reloc_count;
+   uint8_t source[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   struct agx3_ioto_uniform_range
+      ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   struct hk_g17p_indirect_loader_reloc dyn_relocs[HK_G17P_PATCH_MAX_RELOCS];
+   uint8_t bytes[HK_G17P_INDIRECT_LOADER_BATCH_MAX_BYTES];
+};
+
+bool hk_m5_multi_draw_vertex_batch_prepare(
+   struct hk_cmd_buffer *cmd, struct hk_shader *s,
+   struct hk_linked_shader *linked, bool uses_base_param, bool uses_draw_id,
+   struct hk_g17p_indirect_loader_batch *batch);
+
+void hk_m5_multi_draw_vertex_batch_finish(
+   struct hk_cmd_buffer *cmd,
+   const struct hk_g17p_indirect_loader_batch *batch, uint64_t last_program,
+   uint64_t last_draw_params, uint64_t last_draw_id_ptr);
 
 void hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
                                   const VkCommandBufferBeginInfo *pBeginInfo);

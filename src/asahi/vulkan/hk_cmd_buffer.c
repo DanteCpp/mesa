@@ -3715,6 +3715,108 @@ hk_m5_multi_draw_vertex_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    return hk_upload_usc_words_internal(cmd, s, linked);
 }
 
+bool
+hk_m5_multi_draw_vertex_batch_prepare(
+   struct hk_cmd_buffer *cmd, struct hk_shader *s,
+   struct hk_linked_shader *linked, bool uses_base_param, bool uses_draw_id,
+   struct hk_g17p_indirect_loader_batch *batch)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_g17p_graphics_ioto_cache_entry *cached = &gfx->g17p_ioto[0];
+   const struct hk_g17p_launch *launch = hk_g17p_launch_slot(cmd, 0, linked);
+
+   if (s->info.stage != MESA_SHADER_VERTEX || s->info.agx3_gen1_fragment_rq ||
+       !launch->valid || launch->s != s || launch->linked != linked ||
+       !launch->loader || cached->loader != launch->loader ||
+       cached->loader_linked != linked || !cached->loader_program ||
+       launch->flags != hk_g17p_launch_flags(cmd, s))
+      return false;
+
+   const struct hk_g17p_gfx_loader *l = launch->loader;
+   const unsigned count = launch->count;
+   if (!l->length || l->length > HK_G17P_INDIRECT_LOADER_BATCH_MAX_BYTES ||
+       count != l->range_count || count > HK_AGX3_G17P_GRAPHICS_MAX_RANGES)
+      return false;
+
+   bool is_dyn[HK_AGX3_G17P_GRAPHICS_MAX_RANGES] = {0};
+   for (unsigned i = 0; i < count; ++i) {
+      const uint8_t src = launch->source[i];
+      if (src == HK_G17P_RANGE_SOURCE_DRAW_PARAMS ||
+          src == HK_G17P_RANGE_SOURCE_DRAW_ID)
+         is_dyn[i] = true;
+   }
+
+   /* Every draw-varying range must be its own cluster so advancing its address
+    * across draws cannot violate any shared-base delta in the patch plan. */
+   if (l->plan.shared) {
+      for (unsigned i = 0; i < count; ++i) {
+         const unsigned leader = l->plan.leader[i];
+         if (leader != i && (is_dyn[i] || is_dyn[leader]))
+            return false;
+      }
+   }
+
+   unsigned dyn_reloc_count = 0;
+   bool changes_per_draw = false;
+   for (unsigned r = 0; r < l->plan.reloc_count; ++r) {
+      const struct hk_g17p_patch_reloc *rel = &l->plan.relocs[r];
+      if (!is_dyn[rel->range])
+         continue;
+      const uint8_t kind =
+         launch->source[rel->range] == HK_G17P_RANGE_SOURCE_DRAW_PARAMS ? 0
+                                                                        : 1;
+      if ((kind == 0 && uses_base_param) || (kind == 1 && uses_draw_id))
+         changes_per_draw = true;
+      batch->dyn_relocs[dyn_reloc_count++] =
+         (struct hk_g17p_indirect_loader_reloc){
+            .dest = {rel->dest[0], rel->dest[1]},
+            .delta = rel->delta,
+            .offset = rel->offset,
+            .kind = kind,
+            .short_mask = rel->short_mask,
+         };
+   }
+
+   /* Require at least one relocation whose source address advances per draw so
+    * every batched draw genuinely emits a fresh loader program (matching
+    * hk_g17p_gfx_loader_publish()'s memcmp miss). */
+   if (!dyn_reloc_count || !changes_per_draw)
+      return false;
+
+   batch->loader = l;
+   batch->linked = linked;
+   batch->length = l->length;
+   batch->range_count = count;
+   batch->dyn_reloc_count = dyn_reloc_count;
+   memcpy(batch->source, launch->source, count);
+   memcpy(batch->ranges, cached->loader_ranges,
+          count * sizeof(batch->ranges[0]));
+   memcpy(batch->bytes, l->bytes, l->length);
+   hk_g17p_patch_plan_apply(&l->plan, batch->ranges, batch->bytes);
+   return true;
+}
+
+void
+hk_m5_multi_draw_vertex_batch_finish(
+   struct hk_cmd_buffer *cmd,
+   const struct hk_g17p_indirect_loader_batch *batch, uint64_t last_program,
+   uint64_t last_draw_params, uint64_t last_draw_id_ptr)
+{
+   struct hk_g17p_graphics_ioto_cache_entry *cached =
+      &cmd->state.gfx.g17p_ioto[0];
+   cached->loader = batch->loader;
+   cached->loader_linked = batch->linked;
+   cached->loader_program = last_program;
+   memcpy(cached->loader_ranges, batch->ranges,
+          batch->range_count * sizeof(batch->ranges[0]));
+   for (unsigned i = 0; i < batch->range_count; ++i) {
+      if (batch->source[i] == HK_G17P_RANGE_SOURCE_DRAW_PARAMS)
+         cached->loader_ranges[i].address = last_draw_params;
+      else if (batch->source[i] == HK_G17P_RANGE_SOURCE_DRAW_ID)
+         cached->loader_ranges[i].address = last_draw_id_ptr;
+   }
+}
+
 static uint64_t
 hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked)
