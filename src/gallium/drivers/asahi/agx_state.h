@@ -17,6 +17,7 @@
 #include "asahi/lib/agx_scratch.h"
 #include "asahi/lib/agx_tilebuffer.h"
 #include "asahi/lib/agx_uvs.h"
+#include "asahi/lib/agx_vdm_hal200_bind_tail_core.h"
 #include "asahi/lib/pool.h"
 #include "compiler/shader_enums.h"
 #include "gallium/auxiliary/util/u_blitter.h"
@@ -546,6 +547,25 @@ struct agx_encoder {
  * limit. */
 #define AGX_G17G_RENDER_PRIMS_PLAIN (512 * 1024)
 
+struct agx_g17p_bind_state_cache {
+   bool valid;
+   uint8_t viewport_count;
+   bool generate_primitive_id;
+   enum mesa_prim reduced_prim;
+   uint32_t vs_uvs_size;
+   uint32_t vs_uvs_osel;
+   uint32_t counts_32;
+   uint32_t counts_16;
+   uint64_t varyings;
+   struct agx_compiled_shader *fs;
+   struct agx_linked_shader *fs_linked;
+   uint64_t fragment_program;
+   size_t scissor_size;
+   size_t depth_bias_size;
+   uint32_t draw_state_offset;
+   struct agx_vdm_hal200_bind_tail tail;
+};
+
 struct agx_batch {
    struct agx_context *ctx;
    struct pipe_framebuffer_state key;
@@ -563,6 +583,7 @@ struct agx_batch {
    uint64_t g17p_emrt_heap;
    struct agx_compiled_shader *g17p_fragment_shader;
    struct agx_linked_shader *g17p_fragment_linked;
+   struct agx_g17p_bind_state_cache g17p_bind_state;
 
    /* G17G: primitives drawn into this render (see AGX_G17G_RENDER_PRIMS) */
    uint64_t g17g_prims;
@@ -956,6 +977,8 @@ struct agx_context {
    struct agx_batch *batch;
    struct agx_bo *timestamps;
    uint32_t timestamp_handle;
+   struct agx_bo *draw_id_bo;
+   unsigned draw_id_bo_count;
 
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
    uint32_t vb_mask;

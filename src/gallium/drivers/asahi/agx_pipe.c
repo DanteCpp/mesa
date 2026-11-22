@@ -2169,6 +2169,9 @@ agx_destroy_context(struct pipe_context *pctx)
       agx_bo_unreference(dev, ctx->timestamps);
    }
 
+   if (ctx->draw_id_bo)
+      agx_bo_unreference(dev, ctx->draw_id_bo);
+
    u_rwlock_wrunlock(&screen->destroy_lock);
 
    pipe_resource_reference(&ctx->heap, NULL);
