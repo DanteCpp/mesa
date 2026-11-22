@@ -443,7 +443,9 @@ TEST(M5CopySchedule, SplitLoadChainsInterleaveIndependentAlu)
 
 TEST(M5CopySchedule, AGX3BDeviceLoadCapAndHoisting)
 {
-   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(0, AGX3B_NUM_REGS), 16);
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(0, AGX3B_NUM_REGS), 64);
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(34, AGX3B_NUM_REGS), 64);
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(48, AGX3B_NUM_REGS), 64);
    EXPECT_EQ(agx_ilp_agx3b_device_load_cap(100, AGX3B_NUM_REGS), 116);
    EXPECT_EQ(agx_ilp_agx3b_device_load_cap(144, AGX3B_NUM_REGS), 160);
    EXPECT_EQ(agx_ilp_agx3b_device_load_cap(160, AGX3B_NUM_REGS), 168);
@@ -463,7 +465,7 @@ TEST(M5CopySchedule, AGX3BDeviceLoadCapAndHoisting)
    s.key.dev.chip = AGX_CHIP_G17P;
    emit_wide_load_uses(&s, 8, 4, 0);
    agx_ilp_schedule(s.b->shader);
-   EXPECT_EQ(max_device_loads_in_flight(s.body), 2u);
+   EXPECT_EQ(max_device_loads_in_flight(s.body), 4u);
    ralloc_free(s.mem);
 
    /* A cube-array bias-min sample lowers RA's register budget to 112 halves;
@@ -485,4 +487,182 @@ TEST(M5CopySchedule, AGX3BDeviceLoadCapAndHoisting)
    EXPECT_EQ(agx_ilp_agx3b_device_load_cap(100, cube_budget), 0);
    agx_ilp_schedule(cube.b->shader);
    ralloc_free(cube.mem);
+}
+
+/* Contiguous narrow loads from the same (base, index) cache-line stream stay
+ * capped at 2 in flight per stream, while distinct-index strided loads plus
+ * vec4 loads hoist up to the 32-half register budget. */
+TEST(M5CopySchedule, SameCacheLineStreamCapsScalarHoisting)
+{
+   /* Case 1: 16 byte-offset scalar loads across 2 base+index streams (+0B..+7B)
+    * should keep at most 4 loads in flight (2 per stream). */
+   {
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      s.key.dev.chip = AGX_CHIP_G17P;
+      agx_builder *b = s.b;
+      b->cursor = agx_after_block(s.body);
+      agx_index base0 = agx_preload(b, agx_register(2, AGX_SIZE_64));
+      agx_index base1 = agx_preload(b, agx_register(6, AGX_SIZE_64));
+      agx_index idx0 = agx_preload(b, agx_register(10, AGX_SIZE_32));
+      agx_index idx1 = agx_preload(b, agx_register(12, AGX_SIZE_32));
+      agx_index acc = agx_mov_imm(b, 32, 0);
+      for (unsigned i = 0; i < 8; ++i) {
+         agx_index v0 = agx_temp(b->shader, AGX_SIZE_32);
+         agx_instr *l0 = agx_device_load_to(b, v0, base0, idx0, AGX_FORMAT_I8,
+                                            0x1, 0, false);
+         l0->memory_byte_offset = i;
+         agx_index v1 = agx_temp(b->shader, AGX_SIZE_32);
+         agx_instr *l1 = agx_device_load_to(b, v1, base1, idx1, AGX_FORMAT_I8,
+                                            0x1, 0, false);
+         l1->memory_byte_offset = i;
+         acc = agx_iadd(b, acc, agx_iadd(b, v0, v1, 0), 0);
+      }
+      agx_unit_test(b, acc);
+      agx_ilp_schedule(b->shader);
+      EXPECT_EQ(max_device_loads_in_flight(s.body), 4u);
+      ralloc_free(s.mem);
+   }
+
+   /* Case 2: 8 distinct-index scalar loads + 2 vec4 loads (32 halves total)
+    * should hoist all 10 loads ahead of their first use. */
+   {
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      s.key.dev.chip = AGX_CHIP_G17P;
+      agx_builder *b = s.b;
+      b->cursor = agx_after_block(s.body);
+      agx_index base_px = agx_preload(b, agx_register(2, AGX_SIZE_64));
+      agx_index base_w = agx_preload(b, agx_register(6, AGX_SIZE_64));
+      agx_index idx_px = agx_preload(b, agx_register(10, AGX_SIZE_32));
+      agx_index idx_w = agx_preload(b, agx_register(12, AGX_SIZE_32));
+      agx_index acc = agx_mov_imm(b, 32, 0);
+      agx_index w0 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_device_load_to(b, w0, base_w, idx_w, AGX_FORMAT_I32, 0xf, 0, false);
+      agx_instr *sw0 = agx_split(b, 4, w0);
+      for (unsigned c = 0; c < 4; ++c)
+         sw0->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+      for (unsigned i = 0; i < 4; ++i) {
+         agx_index row = agx_iadd(b, idx_px, agx_mov_imm(b, 32, i * 1024), 0);
+         agx_index px = agx_temp(b->shader, AGX_SIZE_32);
+         agx_device_load_to(b, px, base_px, row, AGX_FORMAT_I32, 0x1, 0, false);
+         acc = agx_iadd(b, acc, agx_iadd(b, px, sw0->dest[i], 0), 0);
+      }
+      agx_index w1 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_instr *lw1 = agx_device_load_to(b, w1, base_w, idx_w, AGX_FORMAT_I32,
+                                          0xf, 0, false);
+      lw1->memory_byte_offset = 16;
+      agx_instr *sw1 = agx_split(b, 4, w1);
+      for (unsigned c = 0; c < 4; ++c)
+         sw1->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+      for (unsigned i = 0; i < 4; ++i) {
+         agx_index row =
+            agx_iadd(b, idx_px, agx_mov_imm(b, 32, (i + 4) * 1024), 0);
+         agx_index px = agx_temp(b->shader, AGX_SIZE_32);
+         agx_device_load_to(b, px, base_px, row, AGX_FORMAT_I32, 0x1, 0, false);
+         acc = agx_iadd(b, acc, agx_iadd(b, px, sw1->dest[i], 0), 0);
+      }
+      agx_unit_test(b, acc);
+      agx_ilp_schedule(b->shader);
+      EXPECT_EQ(max_device_loads_in_flight(s.body), 10u);
+      ralloc_free(s.mem);
+   }
+
+   /* Case 3: With a cube-array bias-min sample lowering RA's budget to 112
+    * halves (cap = 112 - 24 = 88), halves-budgeted device-load hoisting falls
+    * back to stay within the reduced RA budget instead of hoisting all 10
+    * distinct-stride loads. */
+   {
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      s.key.dev.chip = AGX_CHIP_G17P;
+      agx_builder *b = s.b;
+      b->cursor = agx_after_block(s.body);
+      agx_index coords = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_collect_to(b, coords, 4);
+      agx_texture_sample_to(b, agx_temp(b->shader, AGX_SIZE_16), coords,
+                            agx_immediate(0), agx_immediate(0),
+                            agx_immediate(0), agx_immediate(0), agx_null(),
+                            AGX_DIM_CUBE_ARRAY,
+                            AGX_LOD_MODE_AUTO_LOD_BIAS_MIN, 0xf, false, false,
+                            false, AGX_GATHER_NONE, false);
+      EXPECT_EQ(agx3_cube_register_budget(b->shader), 112u);
+
+      agx_index base = agx_preload(b, agx_register(2, AGX_SIZE_64));
+      agx_index idx = agx_preload(b, agx_register(6, AGX_SIZE_32));
+      agx_index held[38];
+      for (unsigned i = 0; i < 38; ++i)
+         held[i] = agx_mov_imm(b, 32, 2000 + i);
+      agx_index acc = agx_mov_imm(b, 32, 0);
+      for (unsigned i = 0; i < 8; ++i) {
+         agx_index row = agx_iadd(b, idx, agx_mov_imm(b, 32, i * 1024), 0);
+         agx_index px = agx_temp(b->shader, AGX_SIZE_32);
+         agx_device_load_to(b, px, base, row, AGX_FORMAT_I32, 0x1, 0, false);
+         acc = agx_iadd(b, acc, px, 0);
+      }
+      for (unsigned i = 0; i < 38; ++i)
+         acc = agx_iadd(b, acc, held[i], 0);
+      agx_unit_test(b, acc);
+      agx_ilp_schedule(b->shader);
+      /* 38 live 32-bit values + base/idx/acc leaves < 8 halves below the
+       * 88-half cube-array cap (112 - 24 headroom), whereas the normal
+       * 192-half budget would hoist all 8 distinct-stride loads. */
+      EXPECT_LT(max_device_loads_in_flight(s.body), 8u);
+      ralloc_free(s.mem);
+   }
+}
+
+/* Address setup for later device loads must not interleave breadth-first ahead
+ * of earlier loads: when ordered stores (such as local_store in tiled GEMM
+ * staging loops) prevent later loads from hoisting past an earlier store,
+ * breadth-first address interleaving inflates live address registers and delays
+ * the first load without increasing loads in flight. */
+TEST(M5CopySchedule, HoistedLoadSetupKeepsProgramOrder)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   s.key.dev.chip = AGX_CHIP_G17P;
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+
+   agx_index base = agx_preload(b, agx_register(2, AGX_SIZE_64));
+   agx_index row = agx_preload(b, agx_register(6, AGX_SIZE_32));
+   agx_index stride = agx_preload(b, agx_register(8, AGX_SIZE_32));
+   agx_index col = agx_preload(b, agx_register(10, AGX_SIZE_32));
+   agx_index lidx = agx_preload(b, agx_register(12, AGX_SIZE_16));
+
+   agx_instr *first_load = NULL;
+   agx_instr *later_addr = NULL;
+   for (unsigned i = 0; i < 6; ++i) {
+      agx_index r = agx_iadd(b, row, agx_mov_imm(b, 32, i), 0);
+      agx_index idx = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *addr = agx_imad_to(b, idx, r, stride, col, 0);
+      agx_index v = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *ld = agx_device_load_to(b, v, base, idx, AGX_FORMAT_I32, 0x1,
+                                         0, false);
+      agx_local_store(b, v, agx_immediate(i * 4), lidx, AGX_FORMAT_I32, 0x1);
+      if (i == 0)
+         first_load = ld;
+      else if (i == 1)
+         later_addr = addr;
+   }
+
+   agx_ilp_schedule(b->shader);
+
+   unsigned first_load_pos = ~0u, later_addr_pos = ~0u, pos = 0;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I == first_load)
+         first_load_pos = pos;
+      if (I == later_addr)
+         later_addr_pos = pos;
+      ++pos;
+   }
+   ASSERT_NE(first_load_pos, ~0u);
+   ASSERT_NE(later_addr_pos, ~0u);
+   EXPECT_LT(first_load_pos, later_addr_pos);
+   ralloc_free(s.mem);
 }
