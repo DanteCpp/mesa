@@ -420,3 +420,21 @@ zink_screen_fence_init(struct pipe_screen *pscreen)
    pscreen->fence_finish = fence_finish;
    pscreen->fence_get_fd = fence_get_fd;
 }
+
+/* G6 r7 (H, Windows d3d10umd): wait until zink's submit thread has handed the batch behind a flush fence to the
+ * driver (the queue submit returned), not for the GPU. Safe from another thread while the fence is referenced. */
+bool
+zink_fence_wait_flushed(struct pipe_fence_handle *pfence, uint64_t timeout_ns)
+{
+   struct zink_tc_fence *mfence = (struct zink_tc_fence *)pfence;
+   if (!mfence)
+      return true;
+   int64_t abs_timeout = os_time_get_absolute_timeout(timeout_ns);
+   if (!util_queue_fence_wait_timeout(&mfence->ready, abs_timeout))
+      return false;
+   struct zink_fence *fence = mfence->fence;
+   if (!fence || fence->completed)
+      return true;
+   struct zink_batch_state *bs = zink_batch_state(fence);
+   return util_queue_fence_wait_timeout(&bs->flush_completed, abs_timeout);
+}

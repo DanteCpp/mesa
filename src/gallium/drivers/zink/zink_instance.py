@@ -153,8 +153,8 @@ zink_create_instance(struct zink_screen *screen, struct zink_instance_info *inst
 
    GET_PROC_ADDR_INSTANCE_LOCAL(screen, NULL, EnumerateInstanceExtensionProperties);
    GET_PROC_ADDR_INSTANCE_LOCAL(screen, NULL, EnumerateInstanceLayerProperties);
-   if (!vk_EnumerateInstanceExtensionProperties ||
-       !vk_EnumerateInstanceLayerProperties)
+   /* a directly loaded ICD (ZINK_VULKAN_ICD) has no layer enumeration: no layers */
+   if (!vk_EnumerateInstanceExtensionProperties)
       return NULL;
 
    // Build up the extensions from the reported ones but only for the unnamed layer
@@ -184,7 +184,9 @@ zink_create_instance(struct zink_screen *screen, struct zink_instance_info *inst
     // Build up the layers from the reported ones
     uint32_t layer_count = 0;
 
-    if (vk_EnumerateInstanceLayerProperties(&layer_count, NULL) != VK_SUCCESS) {
+    if (!vk_EnumerateInstanceLayerProperties) {
+        /* no loader: no layers */
+    } else if (vk_EnumerateInstanceLayerProperties(&layer_count, NULL) != VK_SUCCESS) {
         if (!screen->driver_name_is_inferred)
            mesa_loge("ZINK: vkEnumerateInstanceLayerProperties failed");
     } else {

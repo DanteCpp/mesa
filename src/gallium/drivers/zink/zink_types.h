@@ -1761,6 +1761,7 @@ struct zink_context {
    struct zink_batch_state *free_batch_states; //unused batch states
    struct zink_batch_state *last_free_batch_state; //for appending
    bool oom_flush;
+   bool g18_no_sync_flush; /* G6 r7 (H): zink_flush_nosync: do not wait for the submit thread */
    bool oom_stall;
    bool track_renderpasses;
    bool no_reorder;

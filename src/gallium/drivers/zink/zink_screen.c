@@ -3036,6 +3036,30 @@ init_driver_workarounds(struct zink_screen *screen)
    if (screen->info.props.limits.maxBoundDescriptorSets < ZINK_DESCRIPTOR_ALL_TYPES ||
        zink_debug & (ZINK_DEBUG_COMPACT | ZINK_DEBUG_NOSHOBJ))
       screen->info.have_EXT_shader_object = false;
+   /* G6 track H: G18_ZINK_OFF=<name,...> stops zink from using these
+    * extensions (the device keeps them), to find which path loses the D3D11 triangle on the M6 */
+   {
+      const char *off = getenv("G18_ZINK_OFF");
+      if (off) {
+#define G18_OFF(n, f) if (strstr(off, n)) { screen->info.f = false; mesa_logw("G18_ZINK_OFF: %s off", n); }
+         G18_OFF("vids", have_EXT_vertex_input_dynamic_state)
+         G18_OFF("multidraw", have_EXT_multi_draw)
+         G18_OFF("eds1", have_EXT_extended_dynamic_state)
+         G18_OFF("eds2", have_EXT_extended_dynamic_state2)
+         G18_OFF("eds3", have_EXT_extended_dynamic_state3)
+         G18_OFF("cwe", have_EXT_color_write_enable)
+         G18_OFF("dcc", have_EXT_depth_clip_control)
+         G18_OFF("dce", have_EXT_depth_clip_enable)
+         G18_OFF("pv", have_EXT_provoking_vertex)
+         G18_OFF("lrast", have_EXT_line_rasterization)
+         G18_OFF("ptlr", have_EXT_primitive_topology_list_restart)
+         G18_OFF("gpl", have_EXT_graphics_pipeline_library)
+         G18_OFF("dbuf", have_EXT_descriptor_buffer)
+         G18_OFF("afl", have_EXT_attachment_feedback_loop_dynamic_state)
+         G18_OFF("dlocal", have_KHR_dynamic_rendering_local_read)
+#undef G18_OFF
+      }
+   }
    /* EDS2 is only used with EDS1 */
    if (!screen->info.have_EXT_extended_dynamic_state) {
       screen->info.have_EXT_extended_dynamic_state2 = false;
@@ -3548,17 +3572,32 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    u_trace_state_init();
 
-   screen->loader_lib = util_dl_open(VK_LIBNAME);
+   /* ZINK_VULKAN_ICD=<driver library>: load a Vulkan ICD directly (no loader), through its
+    * vk_icdGetInstanceProcAddr; vkGetDeviceProcAddr is resolved once the instance exists. */
+   const char *icd_path = os_get_option("ZINK_VULKAN_ICD");
+   bool direct_icd = icd_path && *icd_path;
+   screen->loader_lib = util_dl_open(direct_icd ? icd_path: VK_LIBNAME);
    if (!screen->loader_lib) {
       if (!screen->driver_name_is_inferred)
-         mesa_loge("ZINK: failed to load "VK_LIBNAME);
+         mesa_loge("ZINK: failed to load %s", direct_icd ? icd_path: VK_LIBNAME);
       goto fail;
    }
 
-   screen->vk_GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)util_dl_get_proc_address(screen->loader_lib, "vkGetInstanceProcAddr");
-   screen->vk_GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)util_dl_get_proc_address(screen->loader_lib, "vkGetDeviceProcAddr");
+   if (direct_icd) {
+      typedef VkResult (VKAPI_PTR *negotiate_fn)(uint32_t *);
+      negotiate_fn negotiate = (negotiate_fn)
+         util_dl_get_proc_address(screen->loader_lib, "vk_icdNegotiateLoaderICDInterfaceVersion");
+      uint32_t icd_version = 5;
+      if (negotiate)
+         negotiate(&icd_version);
+      screen->vk_GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)util_dl_get_proc_address(screen->loader_lib, "vk_icdGetInstanceProcAddr");
+      screen->vk_GetDeviceProcAddr = NULL;
+   } else {
+      screen->vk_GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)util_dl_get_proc_address(screen->loader_lib, "vkGetInstanceProcAddr");
+      screen->vk_GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)util_dl_get_proc_address(screen->loader_lib, "vkGetDeviceProcAddr");
+   }
    if (!screen->vk_GetInstanceProcAddr ||
-       !screen->vk_GetDeviceProcAddr) {
+       (!direct_icd && !screen->vk_GetDeviceProcAddr)) {
       if (!screen->driver_name_is_inferred)
          mesa_loge("ZINK: failed to get proc address");
       goto fail;
@@ -3594,6 +3633,15 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    screen->instance = instance;
    screen->instance_info = &instance_info;
    simple_mtx_unlock(&instance_lock);
+
+   if (!screen->vk_GetDeviceProcAddr) {
+      screen->vk_GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)
+         screen->vk_GetInstanceProcAddr(screen->instance, "vkGetDeviceProcAddr");
+      if (!screen->vk_GetDeviceProcAddr) {
+         mesa_loge("ZINK: no vkGetDeviceProcAddr from the ICD");
+         goto fail;
+      }
+   }
 
    if (zink_debug & ZINK_DEBUG_VALIDATION) {
       if (!screen->instance_info->have_layer_KHRONOS_validation &&

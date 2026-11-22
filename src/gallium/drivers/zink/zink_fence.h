@@ -65,4 +65,10 @@ zink_screen_fence_init(struct pipe_screen *pscreen);
 
 void
 zink_fence_clear_resources(struct zink_screen *screen, struct zink_fence *fence);
+/* G6 r7 (H): see zink_fence.c */
+bool
+zink_fence_wait_flushed(struct pipe_fence_handle *pfence, uint64_t timeout_ns);
+void
+zink_flush_nosync(struct pipe_context *pctx, struct pipe_fence_handle **pfence);
+
 #endif

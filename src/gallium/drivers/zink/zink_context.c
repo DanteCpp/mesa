@@ -4626,9 +4626,20 @@ zink_flush(struct pipe_context *pctx,
       }
    }
    if (bs) {
-      if (!(flags & (PIPE_FLUSH_DEFERRED | PIPE_FLUSH_ASYNC)))
+      if (!(flags & (PIPE_FLUSH_DEFERRED | PIPE_FLUSH_ASYNC)) && !ctx->g18_no_sync_flush)
          sync_flush(ctx, bs);
    }
+}
+
+/* G6 r7 (H, Windows d3d10umd): a flush that returns once the batch is queued to zink's submit thread (the
+ * fence's zink_fence_wait_flushed tells when it was submitted) instead of waiting for the submit itself */
+void
+zink_flush_nosync(struct pipe_context *pctx, struct pipe_fence_handle **pfence)
+{
+   struct zink_context *ctx = zink_context(pctx);
+   ctx->g18_no_sync_flush = zink_screen(pctx->screen)->threaded_submit;
+   zink_flush(pctx, pfence, 0);
+   ctx->g18_no_sync_flush = false;
 }
 
 void

@@ -1411,7 +1411,14 @@ zink_tgsi_to_nir(struct pipe_screen *screen, const struct tgsi_token *tokens)
       fprintf(stderr, "---8<---\n\n");
    }
 
-   return tgsi_to_nir(tokens, screen, false);
+   struct nir_shader *nir = tgsi_to_nir(tokens, screen, false);
+   /* G6 track H: G18_ZINK_NIR=1 prints the NIR right after tgsi_to_nir */
+   if (nir && getenv("G18_ZINK_NIR")) {
+      fprintf(stderr, "G18ZINK after tgsi_to_nir:\n---8<---\n");
+      nir_print_shader(nir, stderr);
+      fprintf(stderr, "---8<---\n");
+   }
+   return nir;
 }
 
 
@@ -5892,6 +5899,12 @@ zink_shader_init(struct zink_screen *screen, struct zink_shader *zs)
    }
    zink_shader_serialize_blob(nir, &zs->blob);
    memcpy(&zs->info, &nir->info, sizeof(nir->info));
+   /* G6 track H: G18_ZINK_NIR=1 prints the NIR at the end of zink_shader_init */
+   if (getenv("G18_ZINK_NIR")) {
+      fprintf(stderr, "G18ZINK after zink_shader_init:\n---8<---\n");
+      nir_print_shader(nir, stderr);
+      fprintf(stderr, "---8<---\n");
+   }
 }
 
 void
