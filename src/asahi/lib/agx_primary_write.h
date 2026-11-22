@@ -24,6 +24,9 @@ struct agx_primary_write_set {
    struct agx_primary_write_range ranges[AGX_PRIMARY_WRITE_RANGES];
    uint32_t count;
    bool observed, incomplete;
+   /* Conservative fallback under v6: declare all currently-mapped primary BOs
+    * in this VM as written (sound superset for compute/UAV/ambiguous streams). */
+   bool conservative_primaries;
    uint32_t causes; /* AGX_PRIMARY_WRITE_CAUSE_*, nonzero iff a refusal reason was recorded */
 };
 

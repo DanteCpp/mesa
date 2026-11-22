@@ -2278,7 +2278,8 @@ hk_GetDeviceImageSubresourceLayoutKHR(
 
 static bool
 hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
-                    struct hk_device_memory *mem, uint64_t memory_offset_B)
+                    struct hk_device_memory *mem, uint64_t memory_offset_B,
+                    bool need_host_map)
 {
    if (plane->va) {
 #if 0
@@ -2302,7 +2303,12 @@ hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
                                   &bo_offset_B))
          return false;
 
-      plane->map = agx_bo_map(mem->bo) + bo_offset_B;
+      if (need_host_map) {
+         void *bo_map = agx_bo_map(mem->bo);
+         plane->map = bo_map ? (uint8_t *)bo_map + bo_offset_B : NULL;
+      } else {
+         plane->map = NULL;
+      }
       plane->rem = mem_size_B - bo_offset_B;
    }
 
@@ -2333,17 +2339,21 @@ hk_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
 
       assert(mem);
       const uint64_t offset_B = pBindInfos[i].memoryOffset;
+      const bool need_host_map =
+         (image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT) != 0;
       if (image->disjoint) {
          const VkBindImagePlaneMemoryInfo *plane_info = vk_find_struct_const(
             pBindInfos[i].pNext, BIND_IMAGE_PLANE_MEMORY_INFO);
          uint8_t plane =
             hk_image_aspects_to_plane(image, plane_info->planeAspect);
-         if (!hk_image_plane_bind(dev, &image->planes[plane], mem, offset_B))
+         if (!hk_image_plane_bind(dev, &image->planes[plane], mem, offset_B,
+                                  need_host_map))
             return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                              "image plane %u exceeds bound memory", plane);
       } else {
          for (unsigned plane = 0; plane < image->plane_count; plane++) {
-            if (!hk_image_plane_bind(dev, &image->planes[plane], mem, offset_B))
+            if (!hk_image_plane_bind(dev, &image->planes[plane], mem, offset_B,
+                                     need_host_map))
                return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                                 "image plane %u exceeds bound memory", plane);
          }

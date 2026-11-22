@@ -58,6 +58,13 @@ enum agx_bo_flags {
     * winsys. Bit 9: upstream took bit 8 for AGX_BO_HOST_PTR.
     */
    AGX_BO_SCANOUT_DONOR = 1 << 9,
+
+   /* Windows D3DKMT only: KMD-authoritative primary/direct-scanout flag
+    * (AGXW_ALLOC_PRIMARY | AGXW_ALLOC_DIRECT_SCANOUT) used by the v6
+    * primary-write contract to track only actual primaries without overflowing
+    * read/write range caps on non-primary shared surfaces.
+    */
+   AGX_BO_PRIMARY = 1 << 10,
 };
 
 enum agx_va_flags {

@@ -2086,15 +2086,21 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             hk_sync_load_resolved(cs, resolved++);
          if (dev->dev.primary_write_contract) {
             if (!cs->primary_writes.observed || cs->primary_writes.incomplete) {
+               /* Log first occurrence of each untracked cause, then fall back
+                * cleanly to a conservative all-mapped-primaries write set in
+                * the WDDM winsys rather than killing the device with
+                * VK_ERROR_DEVICE_LOST on compute/UAV/meta streams (DWM). */
                hk_v6_log_refusal(cs);
-               hk_v6_log_lost(dev, "untracked primary write (see the refused kind=write-set line)");
-               util_dynarray_fini(&primary_sets);
-               util_dynarray_fini(&payload);
-               hk_cmd_pending_end(dev, pending, queue, VK_ERROR_DEVICE_LOST);
-               return vk_device_set_lost(&dev->vk,
-                        "Untracked primary write: shader/descriptor/meta operation refused");
+               struct agx_primary_write_set conservative = {
+                  .observed = true,
+                  .incomplete = false,
+                  .conservative_primaries = true,
+                  .causes = cs->primary_writes.causes,
+               };
+               util_dynarray_append(&primary_sets, conservative);
+            } else {
+               util_dynarray_append(&primary_sets, cs->primary_writes);
             }
-            util_dynarray_append(&primary_sets, cs->primary_writes);
          }
          struct drm_asahi_cmd_header header =
             agx_cmd_header(cs->type == HK_CS_CDM, cs->sync.barrier[HK_SYNC_VDM],

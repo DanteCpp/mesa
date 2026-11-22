@@ -590,6 +590,10 @@ d3dkmt_adopt_allocation(
  * bo->uapi_handle carries the D3DKMT allocation handle that every kernel-
  * facing call site already passes.
  */
+static int d3dkmt_query_allocation(struct agx_d3dkmt_winsys *ws,
+                                   agx_kmt_handle allocation,
+                                   struct agx_d3dkmt_allocation_info *info);
+
 static struct agx_bo *
 d3dkmt_bo_alloc(struct agx_device *dev, size_t size, size_t align,
                 enum agx_bo_flags flags)
@@ -609,6 +613,16 @@ d3dkmt_bo_alloc(struct agx_device *dev, size_t size, size_t align,
                                  external_type, &record)) {
       d3dkmt_log_flushed("D3DKMTCreateAllocation2 failed\n");
       return NULL;
+   }
+
+   if (external_type != AGX_D3DKMT_EXTERNAL_MEMORY_NONE) {
+      struct agx_d3dkmt_allocation_info kmd;
+      if (d3dkmt_query_allocation(ws, record.allocation, &kmd) == 0) {
+         if (kmd.flags & (AGXW_ALLOC_PRIMARY | AGXW_ALLOC_DIRECT_SCANOUT))
+            flags |= AGX_BO_PRIMARY;
+         if (kmd.flags & AGXW_ALLOC_NO_CPU_MAP)
+            record.cpu_mapping_forbidden = true;
+      }
    }
 
    struct agx_bo *bo =
@@ -886,6 +900,16 @@ agx_d3dkmt_bo_create_external(
    if (!d3dkmt_create_allocation(ws, size, flags, external_type, &record))
       return NULL;
 
+   {
+      struct agx_d3dkmt_allocation_info kmd;
+      if (d3dkmt_query_allocation(ws, record.allocation, &kmd) == 0) {
+         if (kmd.flags & (AGXW_ALLOC_PRIMARY | AGXW_ALLOC_DIRECT_SCANOUT))
+            flags |= AGX_BO_PRIMARY;
+         if (kmd.flags & AGXW_ALLOC_NO_CPU_MAP)
+            record.cpu_mapping_forbidden = true;
+      }
+   }
+
    struct agx_bo *bo =
       d3dkmt_adopt_allocation(dev, size, align, flags, &record);
    if (bo != NULL) {
@@ -933,6 +957,8 @@ agx_d3dkmt_bo_import_external(
    const size_t size = (size_t)checked_size;
    record.cpu_mapping_forbidden =
       (kmd.flags & AGXW_ALLOC_NO_CPU_MAP) != 0;
+   if (kmd.flags & (AGXW_ALLOC_PRIMARY | AGXW_ALLOC_DIRECT_SCANOUT))
+      flags |= AGX_BO_PRIMARY;
 
    struct agx_bo *bo =
       d3dkmt_adopt_allocation(dev, size, AIL_PAGESIZE, flags, &record);
@@ -989,7 +1015,9 @@ agx_d3dkmt_bo_import_local(struct agx_device *dev,
       return NULL;
    }
 
-   const enum agx_bo_flags flags = AGX_BO_SHARED | AGX_BO_SHAREABLE;
+   enum agx_bo_flags flags = AGX_BO_SHARED | AGX_BO_SHAREABLE;
+   if (kmd.flags & (AGXW_ALLOC_PRIMARY | AGXW_ALLOC_DIRECT_SCANOUT))
+      flags |= AGX_BO_PRIMARY;
    struct agx_bo *bo = d3dkmt_adopt_allocation(
       dev, size, AIL_PAGESIZE, flags, &record);
    if (bo == NULL) {
@@ -1434,7 +1462,8 @@ d3dkmt_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
       bo->_map = NULL;
       bo->_map_size = 0;
       agx_d3dkmt_fail(st);
-      d3dkmt_log_flushed("D3DKMTLock2 failed: handle=%u\n", bo->uapi_handle);
+      d3dkmt_log_flushed("D3DKMTLock2 failed: handle=%u st=0x%08x\n",
+                         bo->uapi_handle, (unsigned)st);
       return;
    }
 
@@ -1526,7 +1555,8 @@ d3dkmt_build_read_set(struct agx_device *dev, struct agx_bo *staging,
       if (bo->refcnt <= 0 || bo->va == NULL || bo->size == 0 ||
           !agx_d3dkmt_read_set_names_bo(
              v6, bo->_map != NULL,
-             (bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) != 0))
+             v6 ? ((bo->flags & AGX_BO_PRIMARY) != 0)
+                : ((bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) != 0)))
          continue;
       gpu_va = bo->va->addr;
       if (agx_d3dkmt_read_range_add_layout(
@@ -1844,18 +1874,44 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    int ret = -1;
 
    const struct agx_primary_write_set *primary = virt ? virt->primary_writes : NULL;
-   if (dev->primary_write_contract &&
-       (!primary || !primary->observed || primary->incomplete ||
-        primary->count > AGX_PRIMARY_WRITE_RANGES)) {
-      if (agx_d3dkmt_v6_first(ws, AGX_D3DKMT_V6_WRITE_SET))
-         d3dkmt_log_flushed("agxw-v6: refused kind=write-set where=winsys set=%s observed=%d "
-                            "incomplete=%d causes=0x%x ranges=%u\n",
-                            primary ? "yes" : "none", primary ? (int)primary->observed : 0,
-                            primary ? (int)primary->incomplete : 0,
-                            primary ? (unsigned)primary->causes : 0u,
-                            primary ? (unsigned)primary->count : 0u);
-      errno = ENOTSUP;
-      return -1;
+   struct agx_primary_write_set resolved_primary = {0};
+   if (dev->primary_write_contract) {
+      if (!primary || !primary->observed || primary->incomplete ||
+          (!primary->conservative_primaries &&
+           primary->count > AGX_PRIMARY_WRITE_RANGES)) {
+         if (agx_d3dkmt_v6_first(ws, AGX_D3DKMT_V6_WRITE_SET))
+            d3dkmt_log_flushed("agxw-v6: refused kind=write-set where=winsys set=%s observed=%d "
+                               "incomplete=%d causes=0x%x ranges=%u\n",
+                               primary ? "yes" : "none", primary ? (int)primary->observed : 0,
+                               primary ? (int)primary->incomplete : 0,
+                               primary ? (unsigned)primary->causes : 0u,
+                               primary ? (unsigned)primary->count : 0u);
+         errno = ENOTSUP;
+         return -1;
+      }
+      if (primary->conservative_primaries) {
+         resolved_primary.observed = true;
+         simple_mtx_lock(&dev->bo_map_lock);
+         for (uint32_t handle = 0; handle < dev->max_handle; handle++) {
+            struct agx_bo *bo = agx_lookup_bo(dev, handle);
+            if (bo->refcnt <= 0 || bo->va == NULL || bo->size == 0 ||
+                (bo->flags & AGX_BO_PRIMARY) == 0)
+               continue;
+            agx_primary_write_add(&resolved_primary, bo->va->addr, bo->size);
+         }
+         simple_mtx_unlock(&dev->bo_map_lock);
+         if (resolved_primary.incomplete ||
+             resolved_primary.count > AGX_PRIMARY_WRITE_RANGES) {
+            if (agx_d3dkmt_v6_first(ws, AGX_D3DKMT_V6_WRITE_SET))
+               d3dkmt_log_flushed("agxw-v6: refused kind=write-set where=conservative "
+                                  "causes=0x%x ranges=%u\n",
+                                  (unsigned)resolved_primary.causes,
+                                  (unsigned)resolved_primary.count);
+            errno = ENOTSUP;
+            return -1;
+         }
+         primary = &resolved_primary;
+      }
    }
 
    const uint32_t n_in = submit->in_sync_count;
