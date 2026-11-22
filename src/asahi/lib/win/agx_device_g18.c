@@ -535,15 +535,13 @@ agx_g18_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
          }
          mtx_unlock(&agx_g18_async.lock);
       } else {
-         /* Compute only: the kernel retires a pending frame first and runs
-          * every command to completion. */
+         /* Compute only: serialize with async renders on the render node's
+          * one job slot so pending state stays exact across threads. */
+         mtx_lock(&agx_g18_async.lock);
          ret = agx_g18_asahi_call(dev, DRM_IOCTL_ASAHI_SUBMIT, &k);
-         if (!ret && agx_g18_async.enabled == 1) {
-            mtx_lock(&agx_g18_async.lock);
-            /* The render node's one job slot: any call retires it. */
+         if (!ret)
             agx_g18_async.pending = false;
-            mtx_unlock(&agx_g18_async.lock);
-         }
+         mtx_unlock(&agx_g18_async.lock);
       }
    }
    if (ret)
@@ -872,9 +870,6 @@ agx_g18_sync_wait_impl(uint32_t *handles, uint64_t *points,
    if (num_handles == 0)
       return 0;
 
-   if (retire)
-      agx_g18_async_retire();
-
    struct timespec deadline = {
       .tv_sec = timeout_nsec / 1000000000ll,
       .tv_nsec = timeout_nsec % 1000000000ll,
@@ -901,6 +896,12 @@ agx_g18_sync_wait_impl(uint32_t *handles, uint64_t *points,
 
       if (all ? done == num_handles : done > 0) {
          mtx_unlock(&agx_g18_syncs.lock);
+         /* Retire AFTER observing the signal: any G18_SUBMIT_ASYNC that
+          * produced this signal already set agx_g18_async.pending before
+          * acquiring agx_g18_syncs.lock, so retiring here guarantees the
+          * GPU has finished before the waiter touches its buffers. */
+         if (retire && !avail)
+            agx_g18_async_retire();
          if (first_signaled)
             *first_signaled = first;
          return 0;
@@ -993,7 +994,6 @@ agx_g18_sync_query(struct util_sync_provider *p, uint32_t *handles,
 {
    (void)p, (void)flags;
    int ret = 0;
-   agx_g18_async_retire();
    mtx_lock(&agx_g18_syncs.lock);
    for (uint32_t i = 0; i < count; i++) {
       struct agx_g18_syncobj *o = agx_g18_sync_get(handles[i]);
@@ -1004,6 +1004,9 @@ agx_g18_sync_query(struct util_sync_provider *p, uint32_t *handles,
       points[i] = o->value;
    }
    mtx_unlock(&agx_g18_syncs.lock);
+   /* Retire AFTER reading the table so every signal reflected in points[]
+    * has completed on the GPU before the caller observes it. */
+   agx_g18_async_retire();
    return ret;
 }
 
