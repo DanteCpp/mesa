@@ -77,6 +77,13 @@ struct hk_physical_device {
    bool d3dkmt;
    struct agx_kmt_luid adapter_luid;
 
+   /*
+    * Opened on the g18win render node (\\.\G18Win0) through the G18
+    * backend (asahi/lib/win/agx_device_g18.c): a DRM-like device with
+    * user-mode syncs, write-combined maps only and host-pointer imports.
+    */
+   bool g18;
+
    /* Only used for VK_EXT_memory_budget */
    struct agx_device dev;
 
@@ -141,6 +148,9 @@ VkResult hk_create_win_physical_device(struct vk_instance *vk_instance,
                                        const struct agx_kmt_luid *luid,
                                        struct vk_physical_device **pdev_out);
 VkResult hk_enumerate_physical_devices_win(struct vk_instance *vk_instance);
+/* The g18win render node, if it is there and live. */
+VkResult hk_create_g18_physical_device(struct vk_instance *vk_instance,
+                                       struct vk_physical_device **pdev_out);
 #endif
 
 void hk_physical_device_destroy(struct vk_physical_device *vk_device);

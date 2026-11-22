@@ -1108,13 +1108,31 @@ hk_GetPhysicalDeviceImageFormatProperties2(
 
 #ifdef _WIN32
       case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT:
-         ext_mem_props = &hk_opaque_win32_mem_props;
-         break;
-
       case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT:
-         ext_mem_props = &hk_opaque_win32_kmt_mem_props;
+         if (!pdev->vk.supported_extensions.KHR_external_memory_win32) {
+            return vk_errorf(pdev, VK_ERROR_FORMAT_NOT_SUPPORTED,
+                             "no Win32 memory handles on this device");
+         }
+         ext_mem_props =
+            external_info->handleType ==
+                  VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+               ? &hk_opaque_win32_mem_props
+               : &hk_opaque_win32_kmt_mem_props;
          break;
 #endif
+
+      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
+         /* Linear images over imported host memory: the G18 render node's
+          * zero-copy path for the D3D UMD's locked WDDM allocations. The
+          * pitch is the linear one; the UMD allocates them so. */
+         if (!pdev->g18 ||
+             pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR ||
+             !pdev->vk.supported_extensions.EXT_external_memory_host) {
+            return vk_errorf(pdev, VK_ERROR_FORMAT_NOT_SUPPORTED,
+                             "host allocations are linear images only");
+         }
+         ext_mem_props = &hk_host_ptr_mem_props;
+         break;
 
       default:
          /* From the Vulkan 1.3.256 spec:

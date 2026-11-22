@@ -326,10 +326,15 @@ hk_GetMemoryHostPointerPropertiesEXT(
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    /* The application's own mapping is cacheable, and the GPU coherent with
-    * it: offer the cached types. */
+    * it: offer the cached types. The G18 render node has none (its maps are
+    * write-combined); its imports are the D3D UMD's WDDM allocations, so it
+    * offers the host-visible ones. */
+   const VkMemoryPropertyFlags host_flags =
+      pdev->g18 ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                : VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
    uint32_t type_bits = 0;
    for (unsigned t = 0; t < pdev->mem_type_count; t++) {
-      if (pdev->mem_types[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+      if (pdev->mem_types[t].propertyFlags & host_flags)
          type_bits |= 1u << t;
    }
 
@@ -782,10 +787,17 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
             : mem->bo->va->addr;
    }
 
-   /* Shadow map in case this is used for a sparse resident buffer */
-   int ret = agx_bo_bind(&dev->dev, mem->bo,
-                         agx_rw_addr_to_ro(&dev->dev, mem->bo->va->addr),
-                         mem->bo->size, 0, DRM_ASAHI_BIND_READ);
+   /* Shadow map in case this is used for a sparse resident buffer. Not for
+    * a G18 host import, which never backs sparse residency: its one range
+    * of leaves lets the render node tell an old import's leaves from a newer
+    * import of the same pages (agx_bo_free()). */
+   const bool g18_host_import =
+      pdev->g18 && host_info && host_info->handleType;
+   int ret = g18_host_import
+                ? 0
+                : agx_bo_bind(&dev->dev, mem->bo,
+                              agx_rw_addr_to_ro(&dev->dev, mem->bo->va->addr),
+                              mem->bo->size, 0, DRM_ASAHI_BIND_READ);
    if (ret) {
       /* The bind fails once the VM carries a sticky error. */
       hk_memory_release_replay_va(dev, mem);

@@ -546,13 +546,17 @@ hk_GetPhysicalDeviceExternalBufferProperties(
    }
 #ifdef _WIN32
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT:
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT: {
+      VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
+      if (!pdev->vk.supported_extensions.KHR_external_memory_win32)
+         goto unsupported;
       pExternalBufferProperties->externalMemoryProperties =
-         hk_opaque_win32_mem_props;
+         pExternalBufferInfo->handleType ==
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+            ? hk_opaque_win32_mem_props
+            : hk_opaque_win32_kmt_mem_props;
       return;
-   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT:
-      pExternalBufferProperties->externalMemoryProperties =
-         hk_opaque_win32_kmt_mem_props;
-      return;
+   }
 #endif
    default:
       goto unsupported;

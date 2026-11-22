@@ -48,6 +48,21 @@ hk_enumerate_physical_devices_win(struct vk_instance *_instance)
    struct vk_physical_device *pdevice;
    VkResult result;
 
+   /*
+    * The g18win render node first. Where it opens it is the GPU, and the
+    * WDDM adapter of the same machine is not an AGX D3DKMT adapter, so the
+    * walk below is skipped.
+    */
+   if (path == NULL) {
+      result = hk_create_g18_physical_device(_instance, &pdevice);
+      if (result == VK_SUCCESS) {
+         list_addtail(&pdevice->link, &instance->vk.physical_devices.list);
+         return VK_SUCCESS;
+      }
+      if (result != VK_ERROR_INCOMPATIBLE_DRIVER)
+         return result;
+   }
+
    if (path != NULL) {
       /*
        * Legacy private-ioctl backend, for patch 0009's user-mode shim only,

@@ -55,6 +55,7 @@
 #include "asahi/lib/agx_device_d3dkmt.h"
 #include "asahi/lib/agx_bridge_vma.h"
 #include "asahi/lib/agx_device_win.h"
+#include "asahi/lib/win/agx_device_g18.h"
 #endif
 
 static uint32_t
@@ -2295,6 +2296,11 @@ hk_physical_device_init_common(struct hk_instance *instance,
       supported_extensions.EXT_shader_atomic_float2 = true;
    }
 
+   /* The G18 render node has no WDDM allocations to share: no Win32
+    * handles. */
+   if (pdev->g18)
+      supported_extensions.KHR_external_memory_win32 = false;
+
    struct vk_features supported_features;
    /* G17P runs mesh shaders natively and task shaders in software. */
    if (pdev->dev.chip == AGX_CHIP_G17P)
@@ -2305,6 +2311,12 @@ hk_physical_device_init_common(struct hk_instance *instance,
    struct vk_properties properties;
    hk_get_device_properties(&pdev->dev, instance, &supported_features,
                             &properties);
+
+   /* G18: the D3D UMD's WDDM allocations are 4 KiB aligned for the CPU; the
+    * render node checks the 16 KiB physical page and imports whole 16 KiB
+    * pages (agx_g18_bo_import_host_ptr()). */
+   if (pdev->g18)
+      properties.minImportedHostPointerAlignment = 4096;
 
    properties.drmHasRender = os->drm_has_render;
    properties.drmRenderMajor = os->drm_render_major;
@@ -2378,13 +2390,16 @@ hk_physical_device_init_common(struct hk_instance *instance,
       .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT,
    };
 
-   pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
-      .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
-                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-      .heapIndex = sysmem_heap_idx,
-   };
+   /* The G18 render node maps BOs write-combined only. */
+   if (!pdev->g18) {
+      pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
+         .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
+                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+         .heapIndex = sysmem_heap_idx,
+      };
+   }
 
    pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
       .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -2705,6 +2720,68 @@ fail_pdev_alloc:
 fail_hdev:
    if (hdev != INVALID_HANDLE_VALUE)
       CloseHandle(hdev);
+   return result;
+}
+
+/*
+ * The g18win render node (\\.\G18Win0): one well-known device, a physical
+ * device if it opens, speaks the asahi uAPI and is live. Its own open presets
+ * the backend's operations (agx_g18_open_device()), as the other Windows
+ * backends do.
+ */
+VkResult
+hk_create_g18_physical_device(struct vk_instance *_instance,
+                              struct vk_physical_device **pdev_out)
+{
+   struct hk_instance *instance = (struct hk_instance *)_instance;
+   VkResult result;
+
+   struct hk_physical_device *pdev =
+      vk_zalloc(&instance->vk.alloc, sizeof(*pdev), 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+   if (pdev == NULL)
+      return vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   pdev->master_fd = -1;
+   pdev->g18 = true;
+
+   if (!agx_g18_open_device(&pdev->dev)) {
+      vk_free(&instance->vk.alloc, pdev);
+      return VK_ERROR_INCOMPATIBLE_DRIVER;
+   }
+
+   if (!agx_open_device(NULL, &pdev->dev)) {
+      agx_g18_close_fd(pdev->dev.fd);
+      vk_free(&instance->vk.alloc, pdev);
+      return VK_ERROR_INCOMPATIBLE_DRIVER;
+   }
+
+   /* One node per system: a fixed key for the process-wide heap record
+    * that no adapter LUID (a LowPart/HighPart pair) produces. */
+   struct hk_physical_device_os_info os = {
+      .device_key = UINT64_C(0xffffffff47313857),
+   };
+
+   struct util_sync_provider *probe =
+      agx_g18_sync_provider_create(pdev->dev.fd);
+   if (!probe) {
+      result = vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto fail_agx_device;
+   }
+   os.syncobj_sync_type = vk_drm_syncobj_get_type_from_provider(probe);
+   probe->finalize(probe);
+
+   result = hk_physical_device_init_common(instance, pdev, &os);
+   if (result != VK_SUCCESS)
+      goto fail_agx_device;
+
+   *pdev_out = &pdev->vk;
+   return VK_SUCCESS;
+
+fail_agx_device:
+   /* agx_close_device() releases the render node's pseudo-fd. */
+   agx_close_device(&pdev->dev);
+   vk_free(&instance->vk.alloc, pdev);
    return result;
 }
 #endif /* _WIN32 */

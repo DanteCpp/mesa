@@ -156,8 +156,11 @@ queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
                    struct vk_queue_submit *submit)
 {
 #ifdef _WIN32
-   switch (hk_empty_submit_path(true, submit->wait_count,
-                                submit->signal_count)) {
+   /* The D3DKMT winsys only: the G18 render node's syncs are user mode, so
+    * the queue timeline carries an empty submit without blocking here, and
+    * its asynchronous renders are not serialized by a CPU wait. */
+   switch (hk_empty_submit_path(hk_device_physical(dev)->d3dkmt,
+                                submit->wait_count, submit->signal_count)) {
    case HK_EMPTY_SUBMIT_CPU_SIGNAL:
       return queue_signal_empty_on_cpu(dev, queue, submit);
 

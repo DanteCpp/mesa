@@ -62,6 +62,7 @@
 #include <windows.h>
 #include "asahi/lib/agx_device_d3dkmt.h"
 #include "asahi/lib/agx_device_win.h"
+#include "asahi/lib/win/agx_device_g18.h"
 #endif
 
 static bool
@@ -1130,7 +1131,15 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
     * render node, and the reason agx_d3dkmt_open_device() is keyed on LUID
     * rather than on a handle the caller already holds.
     */
-   if (!pdev->d3dkmt) {
+   if (pdev->g18) {
+      /* The render node again: the logical device has its own file, VM and
+       * handles, as on Linux. */
+      if (!agx_g18_open_device(&dev->dev)) {
+         result = vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                            "failed to open the render node");
+         goto fail_init;
+      }
+   } else if (!pdev->d3dkmt) {
       dev->dev.hdev =
          CreateFileA(pdev->device_path, GENERIC_READ | GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
@@ -1185,7 +1194,9 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->dev.bo_cache.size_counter = pdev->mem_heaps[0].cached;
 
 #ifdef _WIN32
-   if (pdev->d3dkmt) {
+   if (pdev->g18) {
+      /* agx_g18_open_device() above preset the operations. */
+   } else if (pdev->d3dkmt) {
       if (!agx_d3dkmt_open_device(&dev->dev, &pdev->adapter_luid)) {
          result = vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                             "Failed to open D3DKMT adapter");
@@ -1219,8 +1230,15 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
     * that Linux-shaped helper.
     */
 #ifdef _WIN32
-   dev->vk.sync = pdev->d3dkmt ? util_sync_provider_d3dkmt(&dev->dev)
-                               : util_sync_provider_ntagx(dev->dev.hdev);
+   if (pdev->g18) {
+      /* User-mode sync objects, the table the SUBMIT op waits on and
+       * signals. Transfers are its own, so payload copies go through it. */
+      dev->vk.sync = agx_g18_sync_provider_create(dev->dev.fd);
+      dev->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
+   } else {
+      dev->vk.sync = pdev->d3dkmt ? util_sync_provider_d3dkmt(&dev->dev)
+                                  : util_sync_provider_ntagx(dev->dev.hdev);
+   }
    if (!dev->vk.sync) {
       result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       goto fail_dev;
@@ -1480,7 +1498,9 @@ fail_fd:
     * agx_close_device) when agx_open_device() itself failed, so the raw
     * handle from the open()/CreateFileA() above is still live here. */
 #ifdef _WIN32
-   if (pdev->d3dkmt)
+   if (pdev->g18)
+      agx_g18_close_fd(dev->dev.fd);
+   else if (pdev->d3dkmt)
       agx_d3dkmt_close_device(&dev->dev);
    else
       CloseHandle((HANDLE)dev->dev.hdev);
