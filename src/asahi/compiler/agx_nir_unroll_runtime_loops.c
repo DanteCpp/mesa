@@ -651,6 +651,38 @@ latch_register(nir_loop *loop, nir_def *value)
    return NULL;
 }
 
+static bool outer_invariant(nir_def *def, nir_loop *outer, unsigned depth);
+static nir_def *rematerialize(nir_builder *b, nir_def *def, nir_loop *loop,
+                              struct hash_table *remap);
+
+/* Compute guard_bound(bound, k) at the outermost enclosing loop preheader
+ * where `bound` is loop-invariant (or rematerializable from values defined
+ * before that loop), so pure ALU guard computations are not repeated inside
+ * outer pixel loops and can move to the uniform preamble. */
+static nir_def *
+guard_bound_hoisted(nir_function_impl *impl, nir_loop *loop, nir_loop *anchor,
+                    const struct counted_loop *cl, nir_def *bound, unsigned k)
+{
+   nir_loop *outermost = anchor;
+   for (nir_cf_node *p = loop->cf_node.parent; p; p = p->parent) {
+      if (p->type == nir_cf_node_loop) {
+         nir_loop *pl = nir_cf_node_as_loop(p);
+         if (outer_invariant(bound, pl, 8))
+            outermost = pl;
+         else
+            break;
+      }
+   }
+   nir_builder gb = nir_builder_at(nir_before_cf_node(&outermost->cf_node));
+   nir_def *bdef = bound;
+   if (outermost != anchor && !def_outside_loop(bound, outermost)) {
+      struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+      bdef = rematerialize(&gb, bound, outermost, remap);
+      _mesa_hash_table_destroy(remap, NULL);
+   }
+   return guard_bound(&gb, cl, bdef, k);
+}
+
 /* later_bounds: the bounds computed for the loops unrolled after this one,
  * which may name a value this loop leaves (plain pointers, not uses). */
 static void
@@ -660,10 +692,11 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
    nir_loop *loop = cl->loop;
    nir_builder b = nir_builder_create(impl);
 
-   /* The guard bound, in the preheader. */
+   /* The guard bound, hoisted to the outermost enclosing loop preheader where
+    * `bound` is invariant. */
    nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
    b.cursor = nir_after_block_before_jump(pre);
-   nir_def *g = guard_bound(&b, cl, bound, factor);
+   nir_def *g = guard_bound_hoisted(impl, loop, loop, cl, bound, factor);
 
    /* A rotated loop runs its body before its test, so the original loop,
     * reached after the main loop, runs at least one more iteration. When

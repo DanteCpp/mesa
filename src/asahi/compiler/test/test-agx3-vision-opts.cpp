@@ -2575,3 +2575,136 @@ TEST(AGX3VisionOpts, Agx3bDirectByteFromWordU2f32)
    EXPECT_EQ(agx3b_instrs, agx3c_instrs);
    EXPECT_LT(agx3b_instrs, agx2_instrs);
 }
+
+TEST(AGX3VisionOpts, HoistRuntimeUnrollGuardBound)
+{
+   auto count_entry_bcsels = [](nir_shader *shader) {
+      unsigned n = 0;
+      nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+      nir_block *entry = nir_start_block(impl);
+      nir_foreach_instr(instr, entry) {
+         if (instr->type == nir_instr_type_alu &&
+             nir_instr_as_alu(instr)->op == nir_op_bcsel)
+            n++;
+      }
+      return n;
+   };
+
+   /* Positive control: inner counted loop nested inside two outer loops with
+    * an outer-invariant bound hoists guard_bound() into entry before both
+    * outer loops. */
+   {
+      nir_builder b = make_compute_shader("hoist-guard-bound-2d");
+      nir_def *in = make_desc_base(&b, 4);
+      nir_def *wbuf = make_desc_base(&b, 8);
+      nir_def *out = make_desc_base(&b, 12);
+      nir_def *h = nir_load_preamble(&b, 1, 32, .base = 16);
+      nir_def *w = nir_load_preamble(&b, 1, 32, .base = 20);
+      nir_def *klen = nir_load_preamble(&b, 1, 32, .base = 24);
+
+      nir_variable *y_var = nir_local_variable_create(b.impl, glsl_int_type(), "y");
+      nir_variable *x_var = nir_local_variable_create(b.impl, glsl_int_type(), "x");
+      nir_variable *k_var = nir_local_variable_create(b.impl, glsl_int_type(), "k");
+      nir_variable *acc_var = nir_local_variable_create(b.impl, glsl_float_type(), "acc");
+      nir_store_var(&b, y_var, nir_imm_int(&b, 0), 1);
+
+      nir_loop *y_loop = nir_push_loop(&b);
+      {
+         nir_def *y = nir_load_var(&b, y_var);
+         nir_break_if(&b, nir_ige(&b, y, h));
+         nir_store_var(&b, x_var, nir_imm_int(&b, 0), 1);
+         nir_loop *x_loop = nir_push_loop(&b);
+         {
+            nir_def *x = nir_load_var(&b, x_var);
+            nir_break_if(&b, nir_ige(&b, x, w));
+            nir_store_var(&b, k_var, nir_imm_int(&b, 0), 1);
+            nir_store_var(&b, acc_var, nir_imm_float(&b, 0.0f), 1);
+            nir_loop *k_loop = nir_push_loop(&b);
+            {
+               nir_def *k = nir_load_var(&b, k_var);
+               nir_break_if(&b, nir_ige(&b, k, klen));
+               nir_def *idx = nir_iadd(&b, nir_iadd(&b, y, x), k);
+               nir_def *p = nir_load_agx(
+                  &b, 1, 32, in, idx,
+                  .access = (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                  .base = 0, .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+               nir_def *wt = nir_load_agx(
+                  &b, 1, 32, wbuf, k,
+                  .access = (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                  .base = 0, .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+               nir_store_var(&b, acc_var,
+                             nir_ffma(&b, nir_u2f32(&b, p), wt, nir_load_var(&b, acc_var)), 1);
+               nir_store_var(&b, k_var, nir_iadd_imm(&b, k, 1), 1);
+            }
+            nir_pop_loop(&b, k_loop);
+            nir_store_agx(&b, nir_load_var(&b, acc_var), out, nir_iadd(&b, y, x),
+                          .access = ACCESS_NON_READABLE, .base = 0,
+                          .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+            nir_store_var(&b, x_var, nir_iadd_imm(&b, x, 1), 1);
+         }
+         nir_pop_loop(&b, x_loop);
+         nir_store_var(&b, y_var, nir_iadd_imm(&b, y, 1), 1);
+      }
+      nir_pop_loop(&b, y_loop);
+
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+
+      unsigned widest = 0;
+      EXPECT_TRUE(agx_nir_unroll_runtime_loops(b.shader, 8, 320, &widest));
+      nir_validate_shader(b.shader, "hoist guard bound 2d");
+      EXPECT_EQ(widest, 8u);
+      EXPECT_GE(count_entry_bcsels(b.shader), 1u);
+      ralloc_free(b.shader);
+   }
+
+   /* Negative control: inner bound depends on the outer loop IV, so
+    * guard_bound() stays inside the outer loop and does not hoist to entry. */
+   {
+      nir_builder b = make_compute_shader("hoist-guard-bound-variant");
+      nir_def *in = make_desc_base(&b, 4);
+      nir_def *out = make_desc_base(&b, 8);
+      nir_def *h = nir_load_preamble(&b, 1, 32, .base = 16);
+
+      nir_variable *y_var = nir_local_variable_create(b.impl, glsl_int_type(), "y");
+      nir_variable *k_var = nir_local_variable_create(b.impl, glsl_int_type(), "k");
+      nir_variable *acc_var = nir_local_variable_create(b.impl, glsl_int_type(), "acc");
+      nir_store_var(&b, y_var, nir_imm_int(&b, 0), 1);
+
+      nir_loop *y_loop = nir_push_loop(&b);
+      {
+         nir_def *y = nir_load_var(&b, y_var);
+         nir_break_if(&b, nir_ige(&b, y, h));
+         nir_def *bound = nir_iadd_imm(&b, y, 16);
+         nir_store_var(&b, k_var, nir_imm_int(&b, 0), 1);
+         nir_store_var(&b, acc_var, nir_imm_int(&b, 0), 1);
+         nir_loop *k_loop = nir_push_loop(&b);
+         {
+            nir_def *k = nir_load_var(&b, k_var);
+            nir_break_if(&b, nir_ige(&b, k, bound));
+            nir_def *v = nir_load_agx(
+               &b, 1, 32, in, k,
+               .access = (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+               .base = 0, .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+            nir_store_var(&b, acc_var, nir_iadd(&b, nir_load_var(&b, acc_var), v), 1);
+            nir_store_var(&b, k_var, nir_iadd_imm(&b, k, 1), 1);
+         }
+         nir_pop_loop(&b, k_loop);
+         nir_store_agx(&b, nir_load_var(&b, acc_var), out, y,
+                       .access = ACCESS_NON_READABLE, .base = 0,
+                       .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+         nir_store_var(&b, y_var, nir_iadd_imm(&b, y, 1), 1);
+      }
+      nir_pop_loop(&b, y_loop);
+
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+
+      EXPECT_TRUE(agx_nir_unroll_runtime_loops(b.shader, 8, 320, NULL));
+      nir_validate_shader(b.shader, "hoist guard bound variant");
+      EXPECT_EQ(count_entry_bcsels(b.shader), 0u);
+      ralloc_free(b.shader);
+   }
+}
