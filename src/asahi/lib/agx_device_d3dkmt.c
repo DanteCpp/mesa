@@ -1930,13 +1930,16 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
                                            &ws->policy.layout) != 0) {
       if (agx_d3dkmt_v6_first(ws, AGX_D3DKMT_V6_VALIDATOR)) {
          const uint32_t w = dev->primary_write_contract ? primary->count : 0;
+         const struct agxw_submit_read_range *wvec = read_ranges + priv->read_range_count;
          d3dkmt_log_flushed("agxw-v6: refused kind=validator reads=%u read_pages=%llu "
-                            "writes=%u write_pages=%llu bytes=%u\n",
+                            "writes=%u write_pages=%llu bytes=%u w0=0x%llx+0x%llx\n",
                             priv->read_range_count,
                             (unsigned long long)d3dkmt_v6_pages(read_ranges, priv->read_range_count),
                             w,
-                            (unsigned long long)d3dkmt_v6_pages(read_ranges + priv->read_range_count, w),
-                            priv_size);
+                            (unsigned long long)d3dkmt_v6_pages(wvec, w),
+                            priv_size,
+                            (unsigned long long)(w ? wvec[0].gpu_va : 0ull),
+                            (unsigned long long)(w ? wvec[0].length : 0ull));
       }
       errno = EINVAL;
       goto out;

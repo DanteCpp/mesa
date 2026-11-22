@@ -1221,6 +1221,37 @@ test_primary_write_private_and_causes(void)
    CHECK_EQ(s.ranges[0].size, 0x8000);
    CHECK(!s.incomplete);
 
+   /* Boot 186 regression: suballocated unaligned DXVK staging/render spans
+    * must round outward to 16 KiB pages so Contract Rule G1 passes. */
+   memset(&s, 0, sizeof(s));
+   agx_primary_write_add(&s, 0x1500000100ull, 0x4000);
+   CHECK(!s.incomplete);
+   CHECK_EQ(s.count, 1);
+   CHECK_EQ(s.ranges[0].address, 0x1500000000ull);
+   CHECK_EQ(s.ranges[0].size, 0x8000);
+
+   memset(&s, 0, sizeof(s));
+   agx_primary_write_add(&s, 0x1500000100ull, 0x40000);
+   CHECK(!s.incomplete);
+   CHECK_EQ(s.count, 1);
+   CHECK_EQ(s.ranges[0].address, 0x1500000000ull);
+   CHECK_EQ(s.ranges[0].size, 0x44000);
+
+   /* Two unaligned writes in the same page coalesce to one aligned page. */
+   memset(&s, 0, sizeof(s));
+   agx_primary_write_add(&s, 0x1500000010ull, 0x10);
+   agx_primary_write_add(&s, 0x1500000100ull, 0x100);
+   CHECK(!s.incomplete);
+   CHECK_EQ(s.count, 1);
+   CHECK_EQ(s.ranges[0].address, 0x1500000000ull);
+   CHECK_EQ(s.ranges[0].size, 0x4000);
+
+   /* Sub-page address < 0x4000 refuses (aligned_start == 0). */
+   memset(&s, 0, sizeof(s));
+   agx_primary_write_add(&s, 0x100, 0x40);
+   CHECK(s.incomplete);
+   CHECK_EQ(s.causes, AGX_PRIMARY_WRITE_CAUSE_RANGES);
+
    /* Every cause has a name for the log line. */
    CHECK(strcmp(agx_primary_write_cause_name(AGX_PRIMARY_WRITE_CAUSE_HELPER_UNPROVEN),
                 "helper-unproven") == 0);

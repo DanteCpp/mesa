@@ -6,6 +6,7 @@
 #include <string.h>
 
 #define AGX_PRIMARY_WRITE_RANGES 20u
+#define AGX_PRIMARY_WRITE_PAGE_SIZE 16384u
 
 /* Why a set is incomplete (a command the driver refuses to submit under the
  * version-6 contract). Bits accumulate; the log names them. */
@@ -43,7 +44,23 @@ agx_primary_write_add(struct agx_primary_write_set *s, uint64_t start,
       agx_primary_write_refuse(s, AGX_PRIMARY_WRITE_CAUSE_RANGES);
       return;
    }
-   uint64_t end = start + size;
+   /* Contract rule G1 (agxw_va_range_is_bindable): every v6 write range must
+    * be 16 KiB-aligned on both ends. Suballocated DXVK staging/render buffers
+    * can carry byte-aligned offsets/lengths, so expand conservatively to the
+    * covering 16 KiB page span before coalescing. */
+   const uint64_t mask = (uint64_t)AGX_PRIMARY_WRITE_PAGE_SIZE - 1u;
+   uint64_t raw_end = start + size;
+   if (raw_end > UINT64_MAX - mask) {
+      agx_primary_write_refuse(s, AGX_PRIMARY_WRITE_CAUSE_RANGES);
+      return;
+   }
+   uint64_t aligned_start = start & ~mask;
+   uint64_t end = (raw_end + mask) & ~mask;
+   if (!aligned_start || end <= aligned_start) {
+      agx_primary_write_refuse(s, AGX_PRIMARY_WRITE_CAUSE_RANGES);
+      return;
+   }
+   start = aligned_start;
    uint32_t first = 0, last;
    while (first < s->count &&
           s->ranges[first].address + s->ranges[first].size < start) first++;
