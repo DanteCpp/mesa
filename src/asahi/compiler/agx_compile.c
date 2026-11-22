@@ -1094,9 +1094,10 @@ agx_unpack_integer_8_agx3(agx_builder *b, agx_index dest,
 {
    agx_index channels[4] = {agx_null()};
 
-   /* AGX3C: unpack each byte in one 16-bit operation: even bytes mask
+   /* AGX3B/AGX3C: unpack each byte in one 16-bit operation: even bytes mask
     * the low byte and odd bytes shift right by 8, clearing the upper byte. */
-   if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+   if ((b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+        b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
        !b->shader->key->dev.emit_agx3d) {
       for (unsigned i = 0; i < nr_channels; ++i) {
          channels[i] = (i & 1) ? agx_ushr(b, halfs[i / 2], agx_immediate(8))
@@ -2143,6 +2144,30 @@ agx_emit_store(agx_builder *b, nir_intrinsic_instr *instr)
       assert(nr_packed == DIV_ROUND_UP(nr, 2));
       value = agx_emit_collect(b, nr_packed, packed);
       mask = BITFIELD_MASK(nr);
+   } else if ((b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+               b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+              !b->shader->key->dev.emit_agx3d &&
+              fmt == AGX_FORMAT_I8 &&
+              nir_src_bit_size(instr->src[0]) == 8 &&
+              nir_src_num_components(instr->src[0]) == 1) {
+      /* A scalar W8 device_store writes only the low 8 bits of its 16-bit
+       * source register, so skip an explicit u2u8 0xff mask when feeding one. */
+      nir_scalar sc_val = nir_scalar_resolved(instr->src[0].ssa, 0);
+      if (nir_scalar_is_alu(sc_val) &&
+          nir_scalar_alu_op(sc_val) == nir_op_u2u8) {
+         nir_scalar wide = nir_scalar_chase_alu_src(sc_val, 0);
+         if (wide.def->num_components == 1 && wide.def->bit_size == 16) {
+            value = agx_def_index(wide.def);
+         } else if (wide.def->num_components == 1 && wide.def->bit_size == 32) {
+            value = agx_temp(b->shader, AGX_SIZE_16);
+            agx_subdivide_to(b, value, agx_def_index(wide.def), 0);
+         } else {
+            value = agx_recollect_vector(b, instr->src[0]);
+         }
+      } else {
+         value = agx_recollect_vector(b, instr->src[0]);
+      }
+      mask = 1;
    } else {
       value = agx_recollect_vector(b, instr->src[0]);
       mask = BITFIELD_MASK(nir_src_num_components(instr->src[0]));
@@ -4761,17 +4786,20 @@ agx_lower_agx3_half_converts(agx_context *ctx)
             I->src[0].value != AGX_CONVERT_S8_TO_F)))
          continue;
 
-      /* M5 converts a signed byte to a half or a float natively (every
-       * byte value at every position of a half, both result widths, tested
-       * on G17C). G18 keeps the halfword fallback below. */
-      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !is_g18g &&
+      /* AGX3B/AGX3C convert signed bytes to f16/f32 and unsigned bytes to f32
+       * natively (verified by exhaustive sweep of every byte value and
+       * position on G17C and G17P B1 hardware). G18 keeps the halfword
+       * fallback below. */
+      if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+           ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) && !is_g18g &&
           I->src[0].value == AGX_CONVERT_S8_TO_F && I->round == AGX_ROUND_RTE &&
           (I->dest[0].size == AGX_SIZE_16 || I->dest[0].size == AGX_SIZE_32) &&
           I->src[1].size == AGX_SIZE_16 && !I->src[1].abs && !I->src[1].neg &&
           !I->src[1].memory)
          continue;
 
-      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !is_g18g &&
+      if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+           ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) && !is_g18g &&
           I->src[0].value == AGX_CONVERT_U8_TO_F && I->round == AGX_ROUND_RTE &&
           I->dest[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_16 &&
           !I->src[1].abs && !I->src[1].neg && !I->src[1].memory)
