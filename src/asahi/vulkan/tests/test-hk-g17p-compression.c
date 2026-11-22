@@ -206,6 +206,12 @@ check_shape(VkFormat format, bool is_depth)
    VkBaseInStructure wsi = {.sType = HK_G17P_WSI_IMAGE_CREATE_INFO_MESA};
    i = base; i.pNext = &wsi;
    CHECK(!ELIGIBLE(i));
+   VkBaseInStructure aurora_rt = {.sType = HK_AURORA_RUNTIME_RESOURCE_STYPE};
+   i = base; i.pNext = &aurora_rt;
+   CHECK(!ELIGIBLE(i));
+   list.pNext = &aurora_rt;
+   i = base; i.pNext = &list;
+   CHECK(!ELIGIBLE(i));
 }
 
 static void
@@ -550,6 +556,10 @@ check_m5_depth(void)
       CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
       list.pNext = &wsi;
       CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      VkBaseInStructure aurora_rt = {.sType = HK_AURORA_RUNTIME_RESOURCE_STYPE};
+      list.pNext = &aurora_rt;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17G, 0, &c));
    }
 
    /* No stencil-only or other depth/stencil formats. */
@@ -611,6 +621,24 @@ check_m5_color(void)
    c = i;
    c.format = VK_FORMAT_R8G8_UNORM;
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   /* Aurora runtime-owned shared textures stay uncompressed so cross-process
+    * external-memory openers see the exact same plain layout. */
+   VkBaseInStructure aurora_rt = {.sType = HK_AURORA_RUNTIME_RESOURCE_STYPE};
+   VkImageFormatListCreateInfo list = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+      .pNext = &aurora_rt,
+   };
+   c = image(VK_FORMAT_B8G8R8A8_UNORM, 2282, 1170, 1, usage);
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17G, 0, &c));
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.pNext = &aurora_rt;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17G, 0, &c));
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c.pNext = &list;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17G, 0, &c));
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   list.pNext = NULL;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17G, 0, &c));
 }
 
 static void

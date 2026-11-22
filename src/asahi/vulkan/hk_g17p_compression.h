@@ -141,6 +141,11 @@ hk_g17p_compression_depth_format(VkFormat format)
 /* Mesa-private WSI image marker (src/vulkan/wsi/wsi_common_private.h). */
 #define HK_G17P_WSI_IMAGE_CREATE_INFO_MESA ((VkStructureType)1000001002)
 
+/* Aurora-private runtime-owned shared image marker (DXVK patch 0018).
+ * Runtime-owned textures are opened across processes via external memory
+ * (plain uncompressed layout), so the creating side must stay plain too. */
+#define HK_AURORA_RUNTIME_RESOURCE_STYPE ((VkStructureType)0x7ff84159u)
+
 /* Whether plane `plane` of an image created with `info` is compressed on
  * `chip`. There is no opt-out: every eligible G17P image takes the compressed
  * path. The generic hk_can_compress() checks (sparse, mutable-format
@@ -203,7 +208,8 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
          if (external.handleTypes)
             return false;
       }
-      if (type == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
+      if (type == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA ||
+          type == HK_AURORA_RUNTIME_RESOURCE_STYPE)
          return false;
       next = following;
    }
@@ -470,7 +476,8 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
          if (external.handleTypes)
             return false;
       }
-      if (type == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
+      if (type == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA ||
+          type == HK_AURORA_RUNTIME_RESOURCE_STYPE)
          return false;
       next = following;
    }
@@ -594,7 +601,8 @@ hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
          if (external.handleTypes)
             return false;
       }
-      if (type == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
+      if (type == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA ||
+          type == HK_AURORA_RUNTIME_RESOURCE_STYPE)
          return false;
       next = following;
    }
