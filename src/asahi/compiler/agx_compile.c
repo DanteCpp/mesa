@@ -16591,11 +16591,23 @@ agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
       assign_coefficient_regs(nir, &info->varyings.fs);
    }
 
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
+   const bool agx3b_compute =
+      key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !key->dev.emit_agx3d &&
+      mesa_shader_stage_is_compute(nir->info.stage);
+
+   if (agx3b_compute) {
+      bool unswitched_if = false;
+      NIR_PASS(unswitched_if, nir, agx_nir_opt_unswitch_invariant_if);
+      if (unswitched_if)
+         nir_divergence_analysis(nir);
+   }
+
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C || agx3b_compute) {
       /* Hoist only what the register file can hold through the loop: the
        * file a workgroup allows (agx_ra), less what spilling reserves.
        */
-      unsigned regs = ROUND_DOWN_TO(AGX3C_NUM_REGS, 8);
+      unsigned regs = ROUND_DOWN_TO(
+         agx3b_compute ? AGX3B_NUM_REGS : AGX3C_NUM_REGS, 8);
       if (mesa_shader_stage_is_compute(nir->info.stage)) {
          const unsigned threads = nir->info.workgroup_size_variable
             ? 1024
@@ -16604,7 +16616,19 @@ agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
          regs = MIN2(regs, agx_max_registers_for_occupancy(threads));
       }
 
-      NIR_PASS(_, nir, agx_nir_opt_licm, regs - 8);
+      unsigned licm_budget = regs - 8;
+      bool licm_speculative = false;
+      if (agx3b_compute) {
+         /* Empirically cap AGX3B compute LICM at 64 half-registers: while
+          * agx_max_registers_for_occupancy allows up to 104 halves, capping
+          * hoisted live-in demand at 64 halves avoids Dynamic Caching and
+          * register-pressure regressions measured on G17P compute loops.
+          * Enable speculative pure-ALU/preamble hoisting on non-internal
+          * compute shaders. */
+         licm_budget = MIN2(licm_budget, 64);
+         licm_speculative = !nir->info.internal;
+      }
+      NIR_PASS(_, nir, agx_nir_opt_licm, licm_budget, licm_speculative);
    }
 
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
@@ -16613,7 +16637,7 @@ agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, nir_opt_dce);
    }
 
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C || agx3b_compute) {
       NIR_PASS(_, nir, agx_nir_opt_canonical_minmax);
       NIR_PASS(_, nir, nir_opt_dce);
    }

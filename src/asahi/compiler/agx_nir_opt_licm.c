@@ -155,9 +155,48 @@ instr_invariant(nir_instr *instr, struct invariance *inv)
    }
 }
 
+/* Pure, side-effect-free instructions safe to hoist speculatively out of
+ * loops whose body follows a header exit test (e.g. `if (i >= n) break;`).
+ */
 static bool
-loop_hoists(nir_loop *loop)
+instr_speculatable(nir_instr *instr, nir_loop *loop)
 {
+   /* Only speculatively hoist from top-level loop blocks (e.g. loop body
+    * following a header break), not from inside conditional branches.
+    */
+   if (instr->block->cf_node.parent != &loop->cf_node)
+      return false;
+
+   if (instr->type == nir_instr_type_intrinsic)
+      return nir_instr_as_intrinsic(instr)->intrinsic ==
+             nir_intrinsic_load_preamble;
+
+   if (instr->type != nir_instr_type_alu)
+      return false;
+
+   switch (nir_instr_as_alu(instr)->op) {
+   case nir_op_idiv:
+   case nir_op_udiv:
+   case nir_op_imod:
+   case nir_op_umod:
+   case nir_op_irem:
+      return false;
+   default:
+      return true;
+   }
+}
+
+static bool
+agx_licm_filter(nir_instr *instr, nir_loop *loop, bool block_dominates_exit)
+{
+   return block_dominates_exit || instr_speculatable(instr, loop);
+}
+
+static bool
+loop_hoists(nir_loop *loop, bool *has_terminate)
+{
+   *has_terminate = false;
+
    if (!nir_loop_has_back_edge(loop))
       return false;
 
@@ -171,7 +210,7 @@ loop_hoists(nir_loop *loop)
                  nir_intrinsic_terminate ||
               nir_instr_as_intrinsic(instr)->intrinsic ==
                  nir_intrinsic_terminate_if))
-            return false;
+            *has_terminate = true;
       }
    }
 
@@ -205,7 +244,8 @@ use_stays_in_loop(struct licm_estimate *est, nir_src *use, nir_loop *loop)
 
 /* Halves of hoisted results that instructions staying in the loop read */
 static unsigned
-loop_hoist_cost(struct licm_estimate *est, unsigned ssa_alloc, nir_loop *loop)
+loop_hoist_cost(struct licm_estimate *est, unsigned ssa_alloc, nir_loop *loop,
+                bool has_terminate, bool speculative)
 {
    struct invariance inv = {est, loop};
    nir_block *exit = nir_loop_successor_block(loop);
@@ -214,12 +254,12 @@ loop_hoist_cost(struct licm_estimate *est, unsigned ssa_alloc, nir_loop *loop)
    memset(est->invariant, 0, BITSET_BYTES(ssa_alloc));
 
    nir_foreach_block_in_cf_node(block, &loop->cf_node) {
-      if (!nir_block_dominates(block, exit))
-         continue;
+      bool dom_exit = !has_terminate && nir_block_dominates(block, exit);
 
       nir_foreach_instr(instr, block) {
          nir_def *def = nir_instr_def(instr);
-         if (def && instr_invariant(instr, &inv))
+         if (def && instr_invariant(instr, &inv) &&
+             (dom_exit || (speculative && instr_speculatable(instr, loop))))
             BITSET_SET(est->invariant, def->index);
       }
    }
@@ -244,27 +284,29 @@ loop_hoist_cost(struct licm_estimate *est, unsigned ssa_alloc, nir_loop *loop)
 
 static bool
 loops_fit(struct licm_estimate *est, unsigned ssa_alloc,
-          struct exec_list *list, unsigned budget)
+          struct exec_list *list, unsigned budget, bool speculative)
 {
    foreach_list_typed(nir_cf_node, node, node, list) {
       switch (node->type) {
       case nir_cf_node_if: {
          nir_if *nif = nir_cf_node_as_if(node);
-         if (!loops_fit(est, ssa_alloc, &nif->then_list, budget) ||
-             !loops_fit(est, ssa_alloc, &nif->else_list, budget))
+         if (!loops_fit(est, ssa_alloc, &nif->then_list, budget, speculative) ||
+             !loops_fit(est, ssa_alloc, &nif->else_list, budget, speculative))
             return false;
          break;
       }
 
       case nir_cf_node_loop: {
          nir_loop *loop = nir_cf_node_as_loop(node);
-         if (loop_hoists(loop)) {
-            unsigned cost = loop_hoist_cost(est, ssa_alloc, loop);
+         bool has_terminate = false;
+         if (loop_hoists(loop, &has_terminate) && (!has_terminate || speculative)) {
+            unsigned cost =
+               loop_hoist_cost(est, ssa_alloc, loop, has_terminate, speculative);
             if (cost && loop_peak(est, loop) + cost > budget)
                return false;
          }
 
-         if (!loops_fit(est, ssa_alloc, &loop->body, budget))
+         if (!loops_fit(est, ssa_alloc, &loop->body, budget, speculative))
             return false;
          break;
       }
@@ -282,7 +324,7 @@ loops_fit(struct licm_estimate *est, unsigned ssa_alloc,
  * halves with the invariants hoisted.
  */
 bool
-agx_nir_opt_licm(nir_shader *shader, unsigned budget)
+agx_nir_opt_licm(nir_shader *shader, unsigned budget, bool speculative)
 {
    nir_foreach_function_impl(impl, shader) {
       nir_metadata_require(impl, nir_metadata_block_index |
@@ -302,12 +344,12 @@ agx_nir_opt_licm(nir_shader *shader, unsigned budget)
             nir_foreach_def(instr, record_halves, &est);
       }
 
-      bool fits = loops_fit(&est, impl->ssa_alloc, &impl->body, budget);
+      bool fits = loops_fit(&est, impl->ssa_alloc, &impl->body, budget, speculative);
       ralloc_free(mem_ctx);
 
       if (!fits)
          return false;
    }
 
-   return nir_opt_licm(shader, NULL);
+   return nir_opt_licm(shader, speculative ? agx_licm_filter : NULL);
 }

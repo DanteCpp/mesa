@@ -94,7 +94,7 @@ struct nir_def *agx_nir_quad_ddy(struct nir_builder *b, struct nir_def *v);
  * still guarantees it for any AGX3 target. */
 bool agx_nir_lower_shared_element_index(struct nir_shader *s);
 bool agx_nir_opt_shared_byte_offsets(struct nir_shader *s);
-bool agx_nir_opt_licm(struct nir_shader *shader, unsigned budget);
+bool agx_nir_opt_licm(struct nir_shader *shader, unsigned budget, bool speculative);
 bool agx_nir_lower_fminmax(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_fminmax_signed_zero(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_word_bounds(struct nir_shader *s);
@@ -373,6 +373,7 @@ bool agx_nir_opt_uniform_stride(struct nir_shader *shader);
 bool agx_nir_fold_m5_offsets(struct nir_shader *shader);
 bool agx_nir_unroll_runtime_loops(struct nir_shader *shader, unsigned factor,
                                   unsigned max_instrs, unsigned *widest);
+bool agx_nir_opt_unswitch_invariant_if(struct nir_shader *shader);
 bool agx_nir_unroll_and_jam(struct nir_shader *shader, unsigned factor,
                             unsigned *widest);
 bool agx_nir_opt_u8_absdiff_fp(struct nir_shader *shader);

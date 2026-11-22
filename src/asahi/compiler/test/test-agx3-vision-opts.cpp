@@ -6,6 +6,7 @@
 #include "util/format/u_format.h"
 extern "C" {
 #include "agx_nir.h"
+#include "agx_compiler.h"
 }
 
 static nir_builder
@@ -1514,4 +1515,484 @@ TEST(AGX3VisionOpts, Exact3x3OuterPeelAndGuards)
       }
       ralloc_free(b.shader);
    }
+}
+
+TEST(AGX3VisionOpts, Wave4InvariantIfUnswitch)
+{
+   for (int mode = 0; mode < 4; ++mode) {
+      /* mode 0: positive (invariant if with >= 12 work instrs & >= 2 invariant ALU)
+       * mode 1: negative (loop-variant condition)
+       * mode 2: negative (arm contains break)
+       * mode 3: negative (loop contains barrier)
+       */
+      nir_builder b = make_compute_shader("wave4_test");
+      nir_def *base = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *out = nir_load_preamble(&b, 1, 64, .base = 4);
+      nir_def *n = nir_load_preamble(&b, 1, 32, .base = 8);
+      nir_def *y = nir_load_preamble(&b, 1, 32, .base = 10);
+      nir_def *stride = nir_load_preamble(&b, 1, 32, .base = 12);
+      nir_def *flag = nir_ine_imm(&b, nir_load_preamble(&b, 1, 32, .base = 14), 0);
+
+      nir_variable *x_var =
+         nir_local_variable_create(b.impl, glsl_int_type(), "x");
+      nir_store_var(&b, x_var, nir_imm_int(&b, 0), 1);
+
+      nir_loop *loop = nir_push_loop(&b);
+      {
+         nir_def *x = nir_load_var(&b, x_var);
+         nir_if *ex = nir_push_if(&b, nir_ige(&b, x, n));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, ex);
+
+         if (mode == 3) {
+            nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                        .memory_scope = SCOPE_WORKGROUP,
+                        .memory_semantics = NIR_MEMORY_ACQ_REL,
+                        .memory_modes = nir_var_mem_shared);
+         }
+
+         nir_def *cond = (mode == 1) ? nir_ilt(&b, x, y) : flag;
+         nir_if *nif = nir_push_if(&b, cond);
+         {
+            if (mode == 2) {
+               nir_jump(&b, nir_jump_break);
+            } else {
+               nir_def *yf = nir_i2f32(&b, y);
+               nir_def *ys = nir_fmul_imm(&b, yf, 0.5f);
+               nir_def *y0 = nir_f2i32(&b, ys);
+               nir_def *y1 = nir_iadd_imm(&b, y0, 1);
+               nir_def *r0 = nir_imul(&b, y0, stride);
+               nir_def *r1 = nir_imul(&b, y1, stride);
+               nir_def *xf = nir_i2f32(&b, x);
+               nir_def *xs = nir_fmul_imm(&b, xf, 0.5f);
+               nir_def *x0 = nir_f2i32(&b, xs);
+               nir_def *v0 = nir_load_agx(&b, 1, 8, base, nir_iadd(&b, r0, x0),
+                                          .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                          .format = PIPE_FORMAT_R8_UINT);
+               nir_def *v1 = nir_load_agx(&b, 1, 8, base, nir_iadd(&b, r1, x0),
+                                          .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                          .format = PIPE_FORMAT_R8_UINT);
+               nir_def *sum = nir_iadd(&b, nir_u2u32(&b, v0), nir_u2u32(&b, v1));
+               nir_def *avg = nir_ushr_imm(&b, sum, 1);
+               nir_store_agx(&b, nir_u2u8(&b, avg), out, nir_iadd(&b, nir_imul(&b, y, stride), x),
+                             .format = PIPE_FORMAT_R8_UINT);
+            }
+         }
+         nir_push_else(&b, nif);
+         {
+            nir_def *idx = nir_iadd(&b, nir_imul(&b, y, stride), x);
+            nir_def *v = nir_load_agx(&b, 1, 8, base, idx,
+                                      .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                      .format = PIPE_FORMAT_R8_UINT);
+            nir_store_agx(&b, v, out, idx, .format = PIPE_FORMAT_R8_UINT);
+         }
+         nir_pop_if(&b, nif);
+
+         nir_store_var(&b, x_var, nir_iadd_imm(&b, x, 1), 1);
+      }
+      nir_pop_loop(&b, loop);
+
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      bool changed = agx_nir_opt_unswitch_invariant_if(b.shader);
+      nir_validate_shader(b.shader, "unswitch invariant if");
+
+      unsigned loops = 0, max_depth = 0;
+      count_loop_shape(b.impl, &loops, &max_depth);
+      if (mode == 0) {
+         EXPECT_TRUE(changed);
+         EXPECT_EQ(loops, 2u);
+         EXPECT_EQ(max_depth, 1u);
+      } else {
+         EXPECT_FALSE(changed);
+         EXPECT_EQ(loops, 1u);
+      }
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(AGX3VisionOpts, Wave4Pack64StoreLoadForward)
+{
+   for (int match = 0; match < 2; ++match) {
+      nir_builder b = make_compute_shader("wave4_test");
+      nir_def *lo0 = nir_load_preamble(&b, 1, 32, .base = 0);
+      nir_def *hi0 = nir_load_preamble(&b, 1, 32, .base = 2);
+      nir_def *lo1 = nir_load_preamble(&b, 1, 32, .base = 0);
+      nir_def *hi1 = nir_load_preamble(&b, 1, 32, .base = match ? 2 : 4);
+      nir_def *base0 = nir_pack_64_2x32_split(&b, lo0, hi0);
+      nir_def *base1 = nir_pack_64_2x32_split(&b, lo1, hi1);
+      nir_def *idx = nir_load_preamble(&b, 1, 32, .base = 8);
+      nir_def *val = nir_u2u8(&b, nir_load_preamble(&b, 1, 32, .base = 10));
+      nir_def *out = nir_load_preamble(&b, 1, 64, .base = 12);
+
+      nir_store_agx(&b, val, base0, idx, .format = PIPE_FORMAT_R8_UINT);
+      nir_def *reloaded = nir_load_agx(&b, 1, 8, base1, idx,
+                                       .format = PIPE_FORMAT_R8_UINT);
+      nir_store_agx(&b, reloaded, out, idx, .format = PIPE_FORMAT_R8_UINT);
+
+      bool changed = agx_nir_opt_forward_merge_loads(b.shader);
+      nir_opt_dce(b.shader);
+      nir_validate_shader(b.shader, "pack64 store load forward");
+
+      if (match) {
+         EXPECT_TRUE(changed);
+         EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_load_agx), 0u);
+      } else {
+         EXPECT_FALSE(changed);
+         EXPECT_EQ(count_intrinsics(b.shader, nir_intrinsic_load_agx), 1u);
+      }
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(AGX3VisionOpts, Wave4SpeculativeLicm)
+{
+   for (int spec = 0; spec < 2; ++spec) {
+      nir_builder b = make_compute_shader("wave4_test");
+      nir_def *base = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *out = nir_load_preamble(&b, 1, 64, .base = 4);
+      nir_def *n = nir_load_preamble(&b, 1, 32, .base = 8);
+      nir_def *y = nir_load_preamble(&b, 1, 32, .base = 10);
+      nir_def *stride = nir_load_preamble(&b, 1, 32, .base = 12);
+
+      nir_variable *x_var =
+         nir_local_variable_create(b.impl, glsl_int_type(), "x");
+      nir_store_var(&b, x_var, nir_imm_int(&b, 0), 1);
+
+      nir_loop *loop = nir_push_loop(&b);
+      {
+         nir_def *x = nir_load_var(&b, x_var);
+         nir_if *ex = nir_push_if(&b, nir_ige(&b, x, n));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, ex);
+
+         /* Top-level invariant ALU: should hoist only when spec == 1. */
+         nir_def *row = nir_imul(&b, y, stride);
+         /* Top-level invariant load: must NEVER speculatively hoist past break. */
+         nir_def *inv_ld = nir_load_agx(&b, 1, 32, base, row,
+                                        .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                        .format = PIPE_FORMAT_R32_UINT);
+         /* Nested-if invariant ALU: must NEVER speculatively hoist from branch. */
+         nir_variable *acc =
+            nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+         nir_store_var(&b, acc, inv_ld, 1);
+         nir_if *cond = nir_push_if(&b, nir_ieq_imm(&b, x, 0));
+         {
+            nir_def *cold = nir_iadd_imm(&b, nir_imul(&b, y, y), 7);
+            nir_store_var(&b, acc, nir_iadd(&b, inv_ld, cold), 1);
+         }
+         nir_pop_if(&b, cond);
+
+         nir_store_agx(&b, nir_load_var(&b, acc), out, nir_iadd(&b, row, x),
+                       .format = PIPE_FORMAT_R32_UINT);
+         nir_store_var(&b, x_var, nir_iadd_imm(&b, x, 1), 1);
+      }
+      nir_pop_loop(&b, loop);
+
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      agx_nir_opt_licm(b.shader, 64, spec != 0);
+      nir_validate_shader(b.shader, "speculative licm");
+
+      unsigned imul_in_loop = 0, loads_in_loop = 0;
+      nir_foreach_block(block, b.impl) {
+         bool in_loop = false;
+         for (nir_cf_node *n = block->cf_node.parent; n; n = n->parent) {
+            if (n->type == nir_cf_node_loop)
+               in_loop = true;
+         }
+         if (!in_loop)
+            continue;
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_alu &&
+                nir_instr_as_alu(instr)->op == nir_op_imul)
+               imul_in_loop++;
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_agx)
+               loads_in_loop++;
+         }
+      }
+
+      /* Invariant load must always stay inside the loop. */
+      EXPECT_EQ(loads_in_loop, 1u);
+      /* Top-level imul hoists only when speculative; nested-if imul stays. */
+      EXPECT_EQ(imul_in_loop, spec ? 1u : 2u);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(AGX3VisionOpts, Wave4InvariantIfUnswitchLiveOutAndTwoBreaks)
+{
+   /* Case A: ALU live-out value used after the loop -> unswitches cleanly and
+    * preserves valid NIR. */
+   {
+      nir_builder b = make_compute_shader("unswitch_live_out");
+      nir_def *base = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *out_base = nir_load_preamble(&b, 1, 64, .base = 4);
+      nir_def *flag = nir_load_preamble(&b, 1, 32, .base = 8);
+      nir_def *k = nir_load_preamble(&b, 1, 32, .base = 10);
+      nir_def *n = nir_load_preamble(&b, 1, 32, .base = 12);
+      nir_def *cond = nir_ine_imm(&b, flag, 0);
+
+      nir_variable *iv_v = nir_local_variable_create(b.impl, glsl_uint_type(), "iv");
+      nir_variable *acc_v = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_store_var(&b, iv_v, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, acc_v, nir_imm_int(&b, 0), 1);
+
+      nir_loop *loop = nir_push_loop(&b);
+      nir_def *iv = nir_load_var(&b, iv_v);
+      nir_if *brk = nir_push_if(&b, nir_ige(&b, iv, n));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, brk);
+
+      nir_if *inv_if = nir_push_if(&b, cond);
+      nir_def *t = nir_iadd_imm(&b, k, 3);
+      nir_def *t2 = nir_imul_imm(&b, t, 5);
+      nir_def *v = nir_load_agx(&b, 1, 32, base, iv,
+                                .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                .format = PIPE_FORMAT_R32_UINT);
+      for (int i = 0; i < 12; ++i)
+         v = nir_iadd(&b, v, t2);
+      nir_store_var(&b, acc_v, nir_iadd(&b, nir_load_var(&b, acc_v), v), 1);
+      nir_push_else(&b, inv_if);
+      nir_store_var(&b, acc_v, nir_iadd(&b, nir_load_var(&b, acc_v), k), 1);
+      nir_pop_if(&b, inv_if);
+
+      nir_store_var(&b, iv_v, nir_iadd_imm(&b, iv, 1), 1);
+      nir_pop_loop(&b, loop);
+
+      /* Live-out ALU accumulator used after the loop */
+      nir_def *final_acc = nir_load_var(&b, acc_v);
+      nir_store_agx(&b, final_acc, out_base, nir_imm_int(&b, 0),
+                    .format = PIPE_FORMAT_R32_UINT);
+
+      nir_lower_vars_to_ssa(b.shader);
+      nir_opt_dce(b.shader);
+      nir_validate_shader(b.shader, "before unswitch live_out");
+      bool progress = agx_nir_opt_unswitch_invariant_if(b.shader);
+      nir_validate_shader(b.shader, "after unswitch live_out");
+      EXPECT_TRUE(progress);
+      ralloc_free(b.shader);
+   }
+
+   /* Case B: Loop with two breaks feeding a successor-block phi -> must be
+    * refused safely so the exit phi never references stale break blocks. */
+   {
+      nir_builder b = make_compute_shader("unswitch_two_breaks");
+      nir_def *base = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *out_base = nir_load_preamble(&b, 1, 64, .base = 4);
+      nir_def *flag = nir_load_preamble(&b, 1, 32, .base = 8);
+      nir_def *k = nir_load_preamble(&b, 1, 32, .base = 10);
+      nir_def *n = nir_load_preamble(&b, 1, 32, .base = 12);
+      nir_def *cond = nir_ine_imm(&b, flag, 0);
+
+      nir_variable *iv_v = nir_local_variable_create(b.impl, glsl_uint_type(), "iv");
+      nir_variable *res_v = nir_local_variable_create(b.impl, glsl_uint_type(), "res");
+      nir_store_var(&b, iv_v, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, res_v, nir_imm_int(&b, 0), 1);
+
+      nir_loop *loop = nir_push_loop(&b);
+      nir_def *iv = nir_load_var(&b, iv_v);
+      nir_if *brk1 = nir_push_if(&b, nir_ige(&b, iv, n));
+      nir_store_var(&b, res_v, nir_imm_int(&b, 1), 1);
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, brk1);
+
+      nir_if *inv_if = nir_push_if(&b, cond);
+      nir_def *t = nir_iadd_imm(&b, k, 3);
+      nir_def *t2 = nir_imul_imm(&b, t, 5);
+      nir_def *v = nir_load_agx(&b, 1, 32, base, iv,
+                                .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                .format = PIPE_FORMAT_R32_UINT);
+      for (int i = 0; i < 12; ++i)
+         v = nir_iadd(&b, v, t2);
+      nir_store_var(&b, res_v, v, 1);
+      nir_push_else(&b, inv_if);
+      nir_store_var(&b, res_v, k, 1);
+      nir_pop_if(&b, inv_if);
+
+      nir_if *brk2 = nir_push_if(&b, nir_ieq_imm(&b, nir_load_var(&b, res_v), 42));
+      nir_store_var(&b, res_v, nir_imm_int(&b, 2), 1);
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, brk2);
+
+      nir_store_var(&b, iv_v, nir_iadd_imm(&b, iv, 1), 1);
+      nir_pop_loop(&b, loop);
+
+      nir_store_agx(&b, nir_load_var(&b, res_v), out_base, nir_imm_int(&b, 0),
+                    .format = PIPE_FORMAT_R32_UINT);
+
+      nir_lower_vars_to_ssa(b.shader);
+      nir_opt_dce(b.shader);
+      nir_validate_shader(b.shader, "before unswitch two_breaks");
+      bool progress = agx_nir_opt_unswitch_invariant_if(b.shader);
+      nir_validate_shader(b.shader, "after unswitch two_breaks");
+      EXPECT_FALSE(progress);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(AGX3VisionOpts, Wave4Agx3bCodegenW8ConvertAndUniformBase)
+{
+   unsigned instrs_by_mode[4] = {};
+
+   for (int mode = 0; mode < 4; ++mode) {
+      /* mode 0: aligned low uniform bases (u0:u1, u4:u5), R8_UINT vec4 unpack + u2f32 + u2u8 store
+       * mode 1: aligned low uniform bases, R8_SINT -> i2f16 & i2f32
+       * mode 2: high/unaligned uniform bases (u2:u3, u256:u257)
+       * mode 3: coherent store with aligned low uniform base
+       */
+      nir_builder b = make_compute_shader("wave4_test");
+      b.shader->info.internal = false;
+      int in_base_u = (mode == 2) ? 2 : 0;
+      int out_base_u = (mode == 2) ? 256 : 4;
+      nir_def *in_base = nir_pack_64_2x32_split(
+         &b, nir_load_preamble(&b, 1, 32, .base = in_base_u),
+         nir_load_preamble(&b, 1, 32, .base = in_base_u + 2));
+      nir_def *out_base = nir_pack_64_2x32_split(
+         &b, nir_load_preamble(&b, 1, 32, .base = out_base_u),
+         nir_load_preamble(&b, 1, 32, .base = out_base_u + 2));
+      nir_def *idx = nir_load_preamble(&b, 1, 32, .base = 12);
+
+      if (mode == 1) {
+         nir_def *sv = nir_load_agx(&b, 2, 8, in_base, idx,
+                                    .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                    .format = PIPE_FORMAT_R8_UINT);
+         nir_def *f16 = nir_i2f16(&b, nir_channel(&b, sv, 0));
+         nir_def *f32 = nir_i2f32(&b, nir_channel(&b, sv, 1));
+         nir_def *sum = nir_fadd(&b, nir_f2f32(&b, f16), f32);
+         nir_store_agx(&b, sum, out_base, idx, .format = PIPE_FORMAT_R32_UINT);
+      } else {
+         nir_def *uv = nir_load_agx(&b, 4, 8, in_base, idx,
+                                    .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                                    .format = PIPE_FORMAT_R8_UINT);
+         nir_def *acc = nir_u2f32(&b, nir_channel(&b, uv, 0));
+         acc = nir_fadd(&b, acc, nir_u2f32(&b, nir_channel(&b, uv, 1)));
+         acc = nir_fadd(&b, acc, nir_u2f32(&b, nir_channel(&b, uv, 2)));
+         acc = nir_fadd(&b, acc, nir_u2f32(&b, nir_channel(&b, uv, 3)));
+         nir_def *byte_out = nir_u2u8(&b, nir_f2u32(&b, acc));
+         gl_access_qualifier st_acc =
+            (mode == 3) ? ACCESS_COHERENT : (gl_access_qualifier)0;
+         nir_store_agx(&b, byte_out, out_base, idx,
+                       .access = st_acc, .format = PIPE_FORMAT_R8_UINT);
+      }
+
+      struct agx_shader_key key = {};
+      key.dev.chip = AGX_CHIP_G17P;
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.has_scratch = true;
+      key.no_preamble = true;
+
+      agx_preprocess_nir(b.shader);
+      struct agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_GT(part.info.main_size, 0u);
+      EXPECT_EQ(part.info.scratch_size, 0u);
+      instrs_by_mode[mode] = part.info.stats.instrs;
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* Mode 0 (folded aligned low uniforms) must emit fewer instructions than
+    * mode 2 (unaligned/high uniform bases) and mode 3 (coherent store). */
+   EXPECT_LT(instrs_by_mode[0], instrs_by_mode[2]);
+   EXPECT_LT(instrs_by_mode[0], instrs_by_mode[3]);
+
+   /* Direct IR verification of AGX3B uniform-base folding:
+    * aligned low uniforms fold on non-coherent load/store, while unaligned,
+    * high (>= 256), and coherent stores must not fold. */
+   for (int tc = 0; tc < 4; ++tc) {
+      nir_builder nb = make_compute_shader("uniform_base_ir");
+      nb.shader->info.internal = false;
+      void *mem_ctx = ralloc_context(NULL);
+      struct agx_shader_key key = {};
+      key.dev.chip = AGX_CHIP_G17P;
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+
+      agx_context *ctx = rzalloc(mem_ctx, agx_context);
+      ctx->nir = nb.shader;
+      ctx->stage = MESA_SHADER_COMPUTE;
+      ctx->key = &key;
+      list_inithead(&ctx->blocks);
+
+      agx_block *blk = rzalloc(ctx, agx_block);
+      list_inithead(&blk->instructions);
+      list_addtail(&blk->link, &ctx->blocks);
+
+      agx_builder ab = agx_init_builder(ctx, agx_after_block(blk));
+      unsigned lo_u = (tc == 1) ? 2 : (tc == 2) ? 256 : 4;
+      agx_index base = agx_temp(ctx, AGX_SIZE_64);
+      agx_instr *col = agx_collect_to(&ab, base, 2);
+      col->src[0] = agx_uniform(lo_u, AGX_SIZE_32);
+      col->src[1] = agx_uniform(lo_u + 2, AGX_SIZE_32);
+
+      agx_index idx = agx_temp(ctx, AGX_SIZE_32);
+      agx_mov_imm_to(&ab, idx, 0);
+      agx_index val = agx_temp(ctx, AGX_SIZE_32);
+      agx_mov_imm_to(&ab, val, 1);
+
+      agx_instr *ld = agx_device_load_to(&ab, agx_temp(ctx, AGX_SIZE_32), base,
+                                         idx, AGX_FORMAT_I32, 0x1, 0, false);
+      agx_instr *st = agx_device_store(&ab, val, base, idx, AGX_FORMAT_I32,
+                                       0x1, 0, tc == 3 /* coherent */);
+      agx_optimizer_forward(ctx);
+
+      if (tc == 0) {
+         /* Aligned low uniform, non-coherent: both load and store fold. */
+         EXPECT_EQ(ld->src[0].type, AGX_INDEX_UNIFORM);
+         EXPECT_EQ(ld->src[0].value, 4u);
+         EXPECT_EQ(ld->src[0].size, AGX_SIZE_64);
+         EXPECT_EQ(st->src[1].type, AGX_INDEX_UNIFORM);
+         EXPECT_EQ(st->src[1].value, 4u);
+         EXPECT_EQ(st->src[1].size, AGX_SIZE_64);
+      } else if (tc == 1 || tc == 2) {
+         /* Unaligned (u2:u3) or high (u256:u257): neither folds. */
+         EXPECT_NE(ld->src[0].type, AGX_INDEX_UNIFORM);
+         EXPECT_NE(st->src[1].type, AGX_INDEX_UNIFORM);
+      } else {
+         /* Coherent store: load still folds, coherent store does not. */
+         EXPECT_EQ(ld->src[0].type, AGX_INDEX_UNIFORM);
+         EXPECT_NE(st->src[1].type, AGX_INDEX_UNIFORM);
+      }
+
+      ralloc_free(mem_ctx);
+      ralloc_free(nb.shader);
+   }
+
+   /* Verify scalar W8 store peels the u2u8 0xff mask on AGX3B:
+    * mode 0: store_agx(R8_UINT, u2u8(x)) peels the 0xff mask (only the two
+    *         uniform->GPR movs remain: alu == 2).
+    * mode 1: store_agx(R8_UINT, u2u8(iand(x, 0x7f))) keeps the explicit
+    *         0x7f mask (alu == 3).
+    * mode 2: store_agx(R16_UINT, u2u16(u2u8(x))) cannot peel the 0xff mask
+    *         because a W16 store writes all 16 bits (alu == 4). */
+   unsigned alu_cnt[3] = {0, 0, 0};
+   for (int mode = 0; mode < 3; ++mode) {
+      nir_builder b = make_compute_shader("w8_store_peel");
+      b.shader->info.internal = false;
+      nir_def *out_base = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *idx = nir_load_preamble(&b, 1, 32, .base = 4);
+      nir_def *val32 = nir_load_preamble(&b, 1, 32, .base = 6);
+      if (mode == 1)
+         val32 = nir_iand_imm(&b, val32, 0x7f);
+      nir_def *val8 = nir_u2u8(&b, val32);
+      if (mode == 2)
+         nir_store_agx(&b, nir_u2u16(&b, val8), out_base, idx, .format = PIPE_FORMAT_R16_UINT);
+      else
+         nir_store_agx(&b, val8, out_base, idx, .format = PIPE_FORMAT_R8_UINT);
+
+      struct agx_shader_key key = {};
+      key.dev.chip = AGX_CHIP_G17P;
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.no_preamble = true;
+      agx_preprocess_nir(b.shader);
+      struct agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      alu_cnt[mode] = part.info.stats.alu;
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+   EXPECT_EQ(alu_cnt[0], 2u);
+   EXPECT_EQ(alu_cnt[1], 3u);
+   EXPECT_EQ(alu_cnt[2], 4u);
 }

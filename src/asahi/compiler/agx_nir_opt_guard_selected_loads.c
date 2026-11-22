@@ -503,6 +503,17 @@ same_base_ptr(nir_def *a, nir_def *b)
           nir_intrinsic_base(ina) == nir_intrinsic_base(inb))
          return true;
    }
+   if (ia->type == nir_instr_type_alu && ib->type == nir_instr_type_alu) {
+      nir_alu_instr *aa = nir_instr_as_alu(ia);
+      nir_alu_instr *ab = nir_instr_as_alu(ib);
+      if (aa->op == nir_op_pack_64_2x32_split &&
+          ab->op == nir_op_pack_64_2x32_split) {
+         return atom_cmp(scalar_atom(nir_scalar_resolved(aa->src[0].src.ssa, aa->src[0].swizzle[0])),
+                         scalar_atom(nir_scalar_resolved(ab->src[0].src.ssa, ab->src[0].swizzle[0]))) == 0 &&
+                atom_cmp(scalar_atom(nir_scalar_resolved(aa->src[1].src.ssa, aa->src[1].swizzle[0])),
+                         scalar_atom(nir_scalar_resolved(ab->src[1].src.ssa, ab->src[1].swizzle[0]))) == 0;
+      }
+   }
    return false;
 }
 

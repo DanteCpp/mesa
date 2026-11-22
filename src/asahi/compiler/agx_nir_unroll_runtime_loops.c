@@ -1645,3 +1645,239 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
    }
    return any;
 }
+
+static bool
+pure_loop_invariant(nir_def *def, nir_loop *loop, unsigned depth)
+{
+   if (def_outside_loop(def, loop))
+      return true;
+   if (depth == 0)
+      return false;
+   nir_instr *instr = nir_def_instr(def);
+   switch (instr->type) {
+   case nir_instr_type_load_const:
+   case nir_instr_type_undef:
+      return true;
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i)
+         if (!pure_loop_invariant(alu->src[i].src.ssa, loop, depth - 1))
+            return false;
+      return true;
+   }
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_load_preamble ||
+          intr->intrinsic == nir_intrinsic_load_push_constant) {
+         const nir_intrinsic_info *info = &nir_intrinsic_infos[intr->intrinsic];
+         for (unsigned i = 0; i < info->num_srcs; ++i)
+            if (!pure_loop_invariant(intr->src[i].ssa, loop, depth - 1))
+               return false;
+         return true;
+      }
+      return false;
+   }
+   default:
+      return false;
+   }
+}
+
+static bool
+cf_list_has_jump(struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_block) {
+         if (nir_block_ends_in_jump(nir_cf_node_as_block(node)))
+            return true;
+      } else if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (cf_list_has_jump(&nif->then_list) ||
+             cf_list_has_jump(&nif->else_list))
+            return true;
+      } else if (node->type == nir_cf_node_loop) {
+         if (cf_list_has_jump(&nir_cf_node_as_loop(node)->body))
+            return true;
+      }
+   }
+   return false;
+}
+
+static void
+count_arm_work(struct exec_list *list, nir_loop *loop, unsigned *total,
+               unsigned *inv_alu)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_block) {
+         nir_foreach_instr(instr, nir_cf_node_as_block(node)) {
+            if (instr->type == nir_instr_type_load_const ||
+                instr->type == nir_instr_type_undef ||
+                instr->type == nir_instr_type_phi)
+               continue;
+            (*total)++;
+            if (instr->type == nir_instr_type_alu &&
+                pure_loop_invariant(&nir_instr_as_alu(instr)->def, loop, 8))
+               (*inv_alu)++;
+         }
+      } else if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         count_arm_work(&nif->then_list, loop, total, inv_alu);
+         count_arm_work(&nif->else_list, loop, total, inv_alu);
+      }
+   }
+}
+
+/* Duplicating a loop around an invariant condition uses the same
+ * extract/clone/reinsert transform as outer-loop splitting, so reuse its
+ * structural guards: no derefs/barriers/atomics/subgroups/return/halt
+ * (splittable_outer), no non-ALU live-outs (live_outs_are_alu), and no phis
+ * in the loop successor block (which would keep stale break-block sources
+ * once the loop moves into outer_if->then_list).
+ *
+ * The 192-instruction cap is 3/4 of the 256-instruction outer-loop split cap
+ * so duplicating an innermost loop stays well within instruction-cache limits. */
+static bool
+loop_safe_to_unswitch_if(nir_loop *loop)
+{
+   if (!nir_loop_has_back_edge(loop) || loop_has_nested_loop(&loop->body))
+      return false;
+   if (nir_loop_has_continue_construct(loop) || count_instrs(loop) > 192)
+      return false;
+
+   nir_block *after = nir_cf_node_as_block(nir_cf_node_next(&loop->cf_node));
+   if (nir_block_first_instr(after) &&
+       nir_block_first_instr(after)->type == nir_instr_type_phi)
+      return false;
+
+   if (!splittable_outer(loop) || !live_outs_are_alu(loop))
+      return false;
+
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      if (nir_block_ends_in_return_or_halt(block))
+         return false;
+   }
+   return true;
+}
+
+bool
+agx_nir_opt_unswitch_invariant_if(nir_shader *shader)
+{
+   bool any = false;
+
+   nir_foreach_function_impl(impl, shader) {
+      nir_metadata_require(impl, nir_metadata_block_index);
+      nir_index_ssa_defs(impl);
+
+      struct util_dynarray loops;
+      util_dynarray_init(&loops, NULL);
+      collect_loops(&impl->body, &loops);
+
+      bool impl_progress = false;
+      nir_builder b = nir_builder_create(impl);
+
+      util_dynarray_foreach(&loops, nir_loop *, lp) {
+         nir_loop *loop = *lp;
+         if (!loop_safe_to_unswitch_if(loop))
+            continue;
+
+         nir_if *target = NULL;
+         unsigned target_ord = 0, ord = 0;
+         foreach_list_typed(nir_cf_node, node, node, &loop->body) {
+            if (node->type != nir_cf_node_if)
+               continue;
+            nir_if *nif = nir_cf_node_as_if(node);
+            unsigned cur_ord = ord++;
+            if (cf_list_has_jump(&nif->then_list) ||
+                cf_list_has_jump(&nif->else_list))
+               continue;
+            /* Depth 8 matches outer_invariant() in outer-loop splitting. */
+            if (!pure_loop_invariant(nif->condition.ssa, loop, 8))
+               continue;
+
+            /* Require at least one substantial arm (>= 12 ops, so a small
+             * select/copy is not worth duplicating the loop for) and at least
+             * 2 loop-invariant ALU/preamble ops exposed across the arms for
+             * subsequent LICM. */
+            unsigned t_tot = 0, t_inv = 0, e_tot = 0, e_inv = 0;
+            count_arm_work(&nif->then_list, loop, &t_tot, &t_inv);
+            count_arm_work(&nif->else_list, loop, &e_tot, &e_inv);
+            if ((t_tot < 12 && e_tot < 12) || (t_inv + e_inv) < 2)
+               continue;
+
+            target = nif;
+            target_ord = cur_ord;
+            break;
+         }
+         if (!target)
+            continue;
+
+         b.cursor = nir_before_cf_node(&loop->cf_node);
+         struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+         nir_def *cond = remat_outer(&b, target->condition.ssa, loop, remap);
+         _mesa_hash_table_destroy(remap, NULL);
+
+         nir_foreach_block_in_cf_node(block, &loop->cf_node)
+            nir_lower_phis_to_regs_block(block, true);
+         nir_foreach_block_in_cf_node(block, &loop->cf_node)
+            nir_lower_ssa_defs_to_regs_block(block);
+
+         b.cursor = nir_before_cf_node(&loop->cf_node);
+         nir_if *outer_if = nir_push_if(&b, cond);
+         nir_pop_if(&b, outer_if);
+
+         nir_cf_list orig_list, clone_list;
+         nir_cf_extract(&orig_list, nir_before_cf_node(&loop->cf_node),
+                        nir_after_cf_node(&loop->cf_node));
+         struct hash_table *cmap = _mesa_pointer_hash_table_create(NULL);
+         nir_cf_list_clone(&clone_list, &orig_list, &outer_if->cf_node, cmap);
+         _mesa_hash_table_destroy(cmap, NULL);
+
+         nir_cf_reinsert(&orig_list, nir_before_cf_list(&outer_if->then_list));
+         nir_cf_reinsert(&clone_list, nir_before_cf_list(&outer_if->else_list));
+
+         for (unsigned arm = 0; arm < 2; ++arm) {
+            struct exec_list *arm_list =
+               arm == 0 ? &outer_if->then_list : &outer_if->else_list;
+            nir_loop *arm_loop = NULL;
+            foreach_list_typed(nir_cf_node, n, node, arm_list) {
+               if (n->type == nir_cf_node_loop) {
+                  arm_loop = nir_cf_node_as_loop(n);
+                  break;
+               }
+            }
+            assert(arm_loop);
+            unsigned k = 0;
+            foreach_list_typed(nir_cf_node, n, node, &arm_loop->body) {
+               if (n->type != nir_cf_node_if)
+                  continue;
+               if (k++ == target_ord) {
+                  nir_if *arm_if = nir_cf_node_as_if(n);
+                  b.cursor = nir_before_cf_node(&arm_if->cf_node);
+                  nir_src_rewrite(&arm_if->condition,
+                                  nir_imm_bool(&b, arm == 0));
+                  break;
+               }
+            }
+         }
+
+         impl_progress = true;
+         /* Re-index after modifying CF before considering outer loops. */
+         nir_progress(true, impl, nir_metadata_none);
+         nir_lower_reg_intrinsics_to_ssa_impl(impl);
+         nir_metadata_require(impl, nir_metadata_block_index);
+         nir_index_ssa_defs(impl);
+      }
+
+      util_dynarray_fini(&loops);
+      if (impl_progress)
+         any = true;
+   }
+
+   if (any) {
+      NIR_PASS(_, shader, nir_opt_dead_cf);
+      NIR_PASS(_, shader, nir_opt_copy_prop);
+      NIR_PASS(_, shader, nir_opt_dce);
+      NIR_PASS(_, shader, nir_opt_cse);
+   }
+
+   return any;
+}
