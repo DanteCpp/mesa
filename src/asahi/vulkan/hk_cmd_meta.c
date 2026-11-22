@@ -2235,7 +2235,8 @@ hk_g17p_compressed_blit_supported(const struct hk_device *dev,
                                   const struct hk_image *dst,
                                   const VkBlitImageInfo2 *info)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P || info->regionCount == 0 ||
+   if (!agx_chip_gen9_color_compression(dev->dev.chip) ||
+       info->regionCount == 0 ||
        !(src->planes[0].layout.compressed || dst->planes[0].layout.compressed))
       return false;
 
@@ -2260,7 +2261,7 @@ hk_g17p_compressed_blit_supported(const struct hk_device *dev,
       if (ail_is_level_logically_compressed(&dst->planes[0].layout, level) &&
           ((uint32_t)region->dstOffsets[1].x != width ||
            (uint32_t)region->dstOffsets[1].y != height ||
-           hk_g17p_mip_level_through_pbe(width, height)))
+           hk_mip_level_through_pbe(dev->dev.chip, width, height)))
          return false;
    }
    return true;

@@ -379,10 +379,12 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
     * For small images the render passes dominate: 200 128x128 textures
     * uploaded and mipmapped in one command buffer took 2.6 times as
     * long compressed. From the size where a render pass also beats
-    * compute for a mip level (HK_G17P_MIP_PBE_MIN_TEXELS), compression
-    * wins: on the A18 Pro a 2048x2048 texture uploads in 0.55-0.64 of
-    * the time, generates its mips in 0.40-0.57 and samples in
-    * 0.69-0.84. Keep only the small ones plain. Images that are also
+    * compute for a mip level (hk_mip_level_through_pbe():
+    * HK_G17P_MIP_PBE_MIN_TEXELS on dual-submission chips,
+    * HK_CLASSIC_MIP_PBE_MIN_TEXELS on classic-submission chips),
+    * compression wins: on the A18 Pro a 2048x2048 texture uploads in
+    * 0.55-0.64 of the time, generates its mips in 0.40-0.57 and samples
+    * in 0.69-0.84. Keep only the small ones plain. Images that are also
     * attachments are compressed at any size.
     *
     * The same holds without mips and for every compressed colour format:
@@ -393,8 +395,8 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
    if (!(info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                         VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
                         VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) &&
-       !hk_g17p_mip_level_through_pbe(info->extent.width,
-                                      info->extent.height))
+       !hk_mip_level_through_pbe(chip, info->extent.width,
+                                 info->extent.height))
       return false;
    return true;
 }
