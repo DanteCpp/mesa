@@ -1860,6 +1860,10 @@ struct hk_cmd_buffer {
    /* Recorded dependencies between control streams, see hk_sync.h. */
    struct hk_sync_state sync;
 
+   /* The hazard tracker uses a bounding interval for nested transfers.
+    * The WDDM page walker needs the individual mapped destinations. */
+   struct agx_primary_write_set primary_xfer_writes;
+
    /* Tile hazards: struct hk_sync_pass_record for every recorded pass
     * instance footprint, in recording order. Cleared by hk_sync_reset. */
    struct util_dynarray sync_pass_records;
@@ -1982,8 +1986,11 @@ hk_sync_xfer_begin(struct hk_cmd_buffer *cmd)
 {
    /* An outermost transfer without a known destination may write anything
     * (hk_sync_note_xfer_write()). */
-   if (cmd->sync.xfer_depth++ == 0)
+   if (cmd->sync.xfer_depth++ == 0) {
       cmd->sync.xfer_dst = (struct hk_sync_xfer_dst){0};
+      if (hk_cmd_buffer_device(cmd)->dev.primary_write_contract)
+         cmd->primary_xfer_writes = (struct agx_primary_write_set){0};
+   }
 }
 
 /* As hk_sync_xfer_begin(), for a transfer whose writes stay inside the GPU
@@ -1999,6 +2006,12 @@ hk_sync_xfer_begin_dst(struct hk_cmd_buffer *cmd, uint64_t lo, uint64_t hi,
                        bool primary_private)
 {
    struct hk_sync_xfer_dst *dst = &cmd->sync.xfer_dst;
+   if (hk_cmd_buffer_device(cmd)->dev.primary_write_contract) {
+      if (!cmd->sync.xfer_depth)
+         cmd->primary_xfer_writes = (struct agx_primary_write_set){0};
+      if (!primary_private && lo < hi)
+         agx_primary_write_add(&cmd->primary_xfer_writes, lo, hi - lo);
+   }
    if (cmd->sync.xfer_depth++ == 0) {
       *dst = (struct hk_sync_xfer_dst){
          .lo = lo,
@@ -2056,7 +2069,7 @@ hk_primary_note_compute(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    }
    if (d->primary_private)
       return;
-   agx_primary_write_add(&cs->primary_writes, d->lo, d->hi - d->lo);
+   agx_primary_write_merge(&cs->primary_writes, &cmd->primary_xfer_writes);
 }
 
 /* A BO is private when it is mapped and neither shared nor shareable: such a

@@ -4407,6 +4407,20 @@ hk_cs_capture_fragment_attachments(const struct hk_device *dev,
          continue;
       }
 
+      /* Report the source geometry of large attachment declarations during
+       * J813 bring-up. The submit journal records only the merged interval. */
+      if (primary && size >= (32u << 20)) {
+         static uint32_t large_attachments_logged;
+         if (__atomic_fetch_add(&large_attachments_logged, 1, __ATOMIC_RELAXED) < 12) {
+            fprintf(stderr, "agxw-v6: attachment %ux%u format=%u plane=%u "
+                    "va=0x%" PRIx64 " size=0x%" PRIx64 " remaining=0x%x\n",
+                    image->vk.extent.width, image->vk.extent.height,
+                    (unsigned)image->vk.format, (unsigned)image_plane,
+                    plane->addr, size, plane->rem);
+            fflush(stderr);
+         }
+      }
+
       hk_drm_attachment_set_add(set, plane->addr, size);
    }
 }

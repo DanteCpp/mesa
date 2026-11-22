@@ -2151,6 +2151,10 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
                             named_bos, v6p->primary_write_range_count,
                             (unsigned long long)d3dkmt_v6_pages(w, v6p->primary_write_range_count),
                             (unsigned)st);
+         for (uint32_t i = 0; i < v6p->read_range_count; i++)
+            d3dkmt_log_flushed("agxw-v6:   read[%u] va=0x%llx len=0x%llx\n", i,
+                               (unsigned long long)read_ranges[i].gpu_va,
+                               (unsigned long long)read_ranges[i].length);
          for (uint32_t i = 0; i < v6p->primary_write_range_count; i++)
             d3dkmt_log_flushed("agxw-v6:   write[%u] va=0x%llx len=0x%llx\n", i,
                                (unsigned long long)w[i].gpu_va,
