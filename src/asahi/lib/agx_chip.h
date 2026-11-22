@@ -1129,6 +1129,28 @@ agx_chip_cooperative_matrix_supported(enum agx_chip chip)
           agx_chip_g17_m5(chip);
 }
 
+/* Per-chip UVS capacity shared by the Vulkan API limits, PPP state check, and
+ * HAL300 graphics record packer. G17P and M5 use 8-bit UVS indices with up to
+ * 125 user words (124 API + default Layer) and 139 total words (position +
+ * 125 user + PointSize + Layer + 8 clip distances). */
+static inline unsigned
+agx_chip_max_vgt_output_components(enum agx_chip chip)
+{
+   return agx_chip_g17p_or_m5(chip) ? 128 : 116;
+}
+
+static inline unsigned
+agx_chip_max_uvs_user_words(enum agx_chip chip)
+{
+   return agx_chip_g17p_or_m5(chip) ? 125 : 124;
+}
+
+static inline unsigned
+agx_chip_max_uvs_words(enum agx_chip chip)
+{
+   return agx_chip_g17p_or_m5(chip) ? 139 : 128;
+}
+
 /* Stable name for diagnostics, e.g. "G15G". Never NULL. */
 static inline const char *
 agx_chip_name(enum agx_chip chip)
