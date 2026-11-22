@@ -2899,7 +2899,7 @@ agx3_tile_store_bank(agx_context *ctx)
  * operand of a plain cube sample both have seven-bit source fields.
  * Keep the allocation budget aligned to the largest SSA vector, so rounding
  * demand for live-range splitting cannot exceed the reduced file. */
-static unsigned
+unsigned
 agx3_cube_register_budget(agx_context *ctx)
 {
    unsigned budget = AGX3B_NUM_REGS;

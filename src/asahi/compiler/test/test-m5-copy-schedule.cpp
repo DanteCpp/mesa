@@ -392,3 +392,49 @@ TEST(M5CopySchedule, ComputeDeviceLoadsFollowTheProgramPeak)
       ralloc_free(s.mem);
    }
 }
+
+TEST(M5CopySchedule, AGX3BDeviceLoadCapAndHoisting)
+{
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(0, AGX3B_NUM_REGS), 16);
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(100, AGX3B_NUM_REGS), 116);
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(144, AGX3B_NUM_REGS), 160);
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(160, AGX3B_NUM_REGS), 168);
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(168, AGX3B_NUM_REGS), 168);
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(169, AGX3B_NUM_REGS), 0);
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(192, AGX3B_NUM_REGS), 0);
+
+   /* Cube-array / bias-min budget (112 halves): headroom stops growth at 88. */
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(72, 112), 88);
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(88, 112), 88);
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(89, 112), 0);
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(100, 112), 0);
+
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   s.key.dev.chip = AGX_CHIP_G17P;
+   emit_wide_load_uses(&s, 8, 4, 0);
+   agx_ilp_schedule(s.b->shader);
+   EXPECT_EQ(max_device_loads_in_flight(s.body), 2u);
+   ralloc_free(s.mem);
+
+   /* A cube-array bias-min sample lowers RA's register budget to 112 halves;
+    * verify ILP hoisting respects that budget rather than AGX3B_NUM_REGS. */
+   copy_shader cube;
+   copy_shader_init(&cube, MESA_SHADER_COMPUTE, false);
+   cube.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   cube.key.dev.chip = AGX_CHIP_G17P;
+   cube.b->cursor = agx_after_block(cube.body);
+   agx_index coords = agx_vec_temp(cube.b->shader, AGX_SIZE_32, 4);
+   agx_collect_to(cube.b, coords, 4);
+   agx_texture_sample_to(cube.b, agx_temp(cube.b->shader, AGX_SIZE_16), coords,
+                         agx_immediate(0), agx_immediate(0), agx_immediate(0),
+                         agx_immediate(0), agx_null(), AGX_DIM_CUBE_ARRAY,
+                         AGX_LOD_MODE_AUTO_LOD_BIAS_MIN, 0xf, false, false,
+                         false, AGX_GATHER_NONE, false);
+   const unsigned cube_budget = agx3_cube_register_budget(cube.b->shader);
+   EXPECT_EQ(cube_budget, 112u);
+   EXPECT_EQ(agx_ilp_agx3b_device_load_cap(100, cube_budget), 0);
+   agx_ilp_schedule(cube.b->shader);
+   ralloc_free(cube.mem);
+}
