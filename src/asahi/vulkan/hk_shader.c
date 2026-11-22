@@ -3349,7 +3349,10 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * 32-bit byte index register (agx_optimize_nir()'s byte_indices), so the
     * per-load check needs no 64-bit add, while a shared record address adds
     * one (low add, carry, high add) for every record. */
-   STATIC_ASSERT(HK_MIN_UBO_ALIGNMENT <= AGX_ZERO_PAGE_SIZE);
+   STATIC_ASSERT(HK_MIN_UBO_ALIGNMENT >= 16);
+   STATIC_ASSERT((BRL_MAX_UBO_RANGE & (BRL_MAX_UBO_RANGE - 1)) == 0);
+   STATIC_ASSERT(HK_MIN_UBO_ALIGNMENT <= BRL_MAX_UBO_RANGE);
+   STATIC_ASSERT(BRL_MAX_UBO_RANGE <= AGX_ZERO_PAGE_SIZE);
    if (rs->uniform_buffers ==
           VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT &&
        agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX3B)
