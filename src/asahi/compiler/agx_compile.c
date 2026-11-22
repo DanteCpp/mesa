@@ -10325,6 +10325,20 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       NIR_PASS(_, nir, nir_opt_dce);
    }
 
+   /* Fuse nested guards, hoist independent load/test prefixes across pure
+    * ifs to overlap memory latency, and coalesce adjacent expensive
+    * divergent ifs under a combined fast-path guard. Runs across AGX3B and
+    * AGX3C (excluding G18G). */
+   if ((byte_indices || m5) && !g18_scans) {
+      bool guarded = false;
+      NIR_PASS(guarded, nir, agx_nir_opt_guard_chains);
+      if (guarded) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
+
    /* Only AGX3 compute shaders defer element-index lowering here; AGX2 never
     * sets shared_element_index_agx and must keep its existing scalar shared
     * lowering. Frontends that ran agx_preprocess_nir() with g17p == false
