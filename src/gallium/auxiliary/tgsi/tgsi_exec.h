@@ -37,6 +37,10 @@
 extern "C" {
 #endif
 
+extern volatile unsigned long long tgsi_exec_runs;
+extern volatile unsigned long long tgsi_exec_loop_iters;
+extern volatile unsigned long long tgsi_exec_fs_runs;
+
 #define TGSI_CHAN_X 0
 #define TGSI_CHAN_Y 1
 #define TGSI_CHAN_Z 2

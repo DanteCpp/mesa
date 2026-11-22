@@ -64,6 +64,11 @@
 #include "util/u_math.h"
 #include "util/rounding.h"
 
+/* progress counters read by the d3d10umd draw watchdog */
+volatile unsigned long long tgsi_exec_runs;
+volatile unsigned long long tgsi_exec_loop_iters;
+volatile unsigned long long tgsi_exec_fs_runs;
+
 
 #define DEBUG_EXECUTION 0
 
@@ -5197,6 +5202,7 @@ exec_instruction(
       assert(mach->ContStackTop > 0);
       mach->ContMask = mach->ContStack[mach->ContStackTop - 1];
       UPDATE_EXEC_MASK(mach);
+      tgsi_exec_loop_iters++;
       if (mach->ExecMask) {
          /* repeat loop: jump to instruction just past BGNLOOP */
          assert(mach->LoopLabelStackTop > 0);
@@ -5791,6 +5797,10 @@ uint
 tgsi_exec_machine_run( struct tgsi_exec_machine *mach, int start_pc )
 {
    unsigned i;
+
+   tgsi_exec_runs++;
+   if (mach->ShaderType == MESA_SHADER_FRAGMENT)
+      tgsi_exec_fs_runs++;
 
    mach->pc = start_pc;
 

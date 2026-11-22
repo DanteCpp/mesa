@@ -57,6 +57,7 @@ struct gdi_sw_displaytarget
    unsigned size;
 
    void *data;
+   bool user_memory; /* data is not ours (GDI_SW_HANDLE_TYPE_USER_MEMORY) */
 
    BITMAPV5HEADER bmi;
 };
@@ -134,19 +135,18 @@ gdi_sw_displaytarget_destroy(struct sw_winsys *winsys,
 {
    struct gdi_sw_displaytarget *gdt = gdi_sw_displaytarget(dt);
 
-   align_free(gdt->data);
+   if (!gdt->user_memory)
+      align_free(gdt->data);
    FREE(gdt);
 }
 
 
 static struct sw_displaytarget *
-gdi_sw_displaytarget_create(struct sw_winsys *winsys,
-                                  unsigned tex_usage,
-                                  enum pipe_format format,
-                                  unsigned width, unsigned height,
-                                  unsigned alignment,
-                                  const void *front_private,
-                                  unsigned *stride)
+gdi_sw_displaytarget_create_common(enum pipe_format format,
+                                   unsigned width, unsigned height,
+                                   unsigned alignment, void *user_data,
+                                   unsigned user_stride,
+                                   unsigned *stride)
 {
    struct gdi_sw_displaytarget *gdt;
    unsigned cpp;
@@ -163,10 +163,16 @@ gdi_sw_displaytarget_create(struct sw_winsys *winsys,
    bpp = util_format_get_blocksizebits(format);
    cpp = util_format_get_blocksize(format);
    
-   gdt->stride = align(width * cpp, alignment);
-   gdt->size = gdt->stride * height;
-   
-   gdt->data = align_malloc(gdt->size, alignment);
+   if (user_data) {
+      gdt->stride = user_stride;
+      gdt->size = gdt->stride * height;
+      gdt->data = user_data;
+      gdt->user_memory = true;
+   } else {
+      gdt->stride = align(width * cpp, alignment);
+      gdt->size = gdt->stride * height;
+      gdt->data = align_malloc(gdt->size, alignment);
+   }
    if(!gdt->data)
       goto no_data;
 
@@ -215,13 +221,30 @@ no_gdt:
 
 
 static struct sw_displaytarget *
+gdi_sw_displaytarget_create(struct sw_winsys *winsys,
+                                  unsigned tex_usage,
+                                  enum pipe_format format,
+                                  unsigned width, unsigned height,
+                                  unsigned alignment,
+                                  const void *front_private,
+                                  unsigned *stride)
+{
+   return gdi_sw_displaytarget_create_common(format, width, height, alignment,
+                                             NULL, 0, stride);
+}
+
+
+static struct sw_displaytarget *
 gdi_sw_displaytarget_from_handle(struct sw_winsys *winsys,
                                  const struct pipe_resource *templet,
                                  struct winsys_handle *whandle,
                                  unsigned *stride)
 {
-   assert(0);
-   return NULL;
+   if (whandle->type != GDI_SW_HANDLE_TYPE_USER_MEMORY || !whandle->handle)
+      return NULL;
+   return gdi_sw_displaytarget_create_common(templet->format, templet->width0,
+                                             templet->height0, 0, whandle->handle,
+                                             whandle->stride, stride);
 }
 
 

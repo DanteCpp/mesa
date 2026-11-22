@@ -238,14 +238,10 @@ softpipe_create_context(struct pipe_screen *screen,
       softpipe->cbuf_cache[i] = sp_create_tile_cache( &softpipe->pipe );
    softpipe->zsbuf_cache = sp_create_tile_cache( &softpipe->pipe );
 
-   /* Allocate texture caches */
-   for (sh = 0; sh < ARRAY_SIZE(softpipe->tex_cache); sh++) {
-      for (i = 0; i < ARRAY_SIZE(softpipe->tex_cache[0]); i++) {
-         softpipe->tex_cache[sh][i] = sp_create_tex_tile_cache(&softpipe->pipe);
-         if (!softpipe->tex_cache[sh][i])
-            goto fail;
-      }
-   }
+   /* Texture caches are created on first bind (softpipe_set_sampler_views): one per stage and slot up
+    * front was ~200 MB of committed memory per context (6 x 128 x 16 tiles), and processes with
+    * several D3D devices (Explorer) ran out of commit. */
+   (void)sh;
 
    softpipe->fs_machine = tgsi_exec_machine_create(MESA_SHADER_FRAGMENT);
 

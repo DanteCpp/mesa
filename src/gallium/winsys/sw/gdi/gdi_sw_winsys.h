@@ -6,6 +6,13 @@
 #include "util/compiler.h"
 #include "frontend/sw_winsys.h"
 
+/*
+ * resource_from_handle over memory the caller owns: winsys_handle.handle is the CPU
+ * pointer, winsys_handle.stride the row pitch (single level, single layer). Used by the
+ * D3D10 UMD for WDDM allocations it keeps locked.
+ */
+#define GDI_SW_HANDLE_TYPE_USER_MEMORY 0x6731
+
 void gdi_sw_display( struct sw_winsys *winsys,
                      struct sw_displaytarget *dt,
                      HDC hDC );
