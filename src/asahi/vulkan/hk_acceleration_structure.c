@@ -1953,7 +1953,7 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
       assert(valid);
       const uint64_t size = MAX2(UINT64_C(0x60000),
                                 ALIGN_POT((uint64_t)scs.end[12], 0x4000));
-      const bool cached = hk_g17p_cached_cmd_memory(&dev->dev);
+      const bool cached = hk_cached_cmd_memory();
       dev->gen1_rq_state = agx_bo_create(&dev->dev, size, 0x4000,
          AGX_BO_READONLY | (cached ? AGX_BO_WRITEBACK : 0),
          "Gen1 ray query user image");

@@ -550,11 +550,6 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
    }
    struct agx_submit_virt virt = {.ring_idx = ring_idx};
 
-   /* Complete the cache cleans of CPU-cached descriptor writes
-    * (hk_descriptor_set_publish()) before the GPU can read them. */
-   if (dev->dev.chip == AGX_CHIP_G17P && util_has_cache_ops())
-      util_post_flush_fence();
-
    if (dev->dev.is_virtio) {
       u_rwlock_rdlock(&dev->external_bos.lock);
       virt.extres_count = util_dynarray_num_elements(

@@ -39,8 +39,7 @@ hk_ioto_arena_clean(struct hk_cmd_buffer *cmd)
 {
    struct hk_ioto_arena *arena = &cmd->ioto;
 
-   if (arena->map && arena->cursor &&
-       hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev))
+   if (arena->map && arena->cursor && hk_cached_cmd_memory())
       util_flush_range_no_fence(arena->map, arena->cursor);
 }
 
@@ -50,11 +49,11 @@ hk_ioto_arena_grow(struct hk_cmd_buffer *cmd, size_t size, const char *label)
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_ioto_arena *arena = &cmd->ioto;
 
-   hk_ioto_arena_clean(cmd);
+   if (arena->map && arena->cursor && hk_cached_cmd_memory())
+      util_flush_range(arena->map, arena->cursor);
 
    /* See HK_CMD_SPAN_SIZE: one upload writes about 500 bytes of programs. */
-   if (!arena->map && size <= HK_CMD_SPAN_SIZE &&
-       hk_g17p_cached_cmd_memory(&dev->dev)) {
+   if (!arena->map && size <= HK_CMD_SPAN_SIZE && hk_cached_cmd_memory()) {
       struct agx_ptr ptr;
       if (hk_cmd_pool_alloc_span(hk_cmd_buffer_pool(cmd), HK_CMD_SLAB_IOTO,
                                  HK_CMD_SPAN_SIZE, HK_CMD_SPAN_SIZE, &ptr,
@@ -77,8 +76,7 @@ hk_ioto_arena_grow(struct hk_cmd_buffer *cmd, size_t size, const char *label)
    struct agx_bo *bo =
       agx_bo_create(&dev->dev, chunk, AGX_IOTO_PROGRAM_ALIGNMENT,
                     AGX_BO_EXEC | AGX_BO_LOW_VA |
-                       (hk_g17p_cached_cmd_memory(&dev->dev) ? AGX_BO_WRITEBACK
-                                                             : 0),
+                       (hk_cached_cmd_memory() ? AGX_BO_WRITEBACK : 0),
                     "G17P Ioto program arena");
    if (!bo)
       return false;
@@ -169,7 +167,7 @@ hk_cmd_publish_ioto_program(struct hk_cmd_buffer *cmd,
    arena->cursor = (uint32_t)offset + (uint32_t)length;
 
    /* Cached memory is cleaned with its chunk (hk_ioto_arena_clean()). */
-   if (!hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev))
+   if (!hk_cached_cmd_memory())
       agx_bo_assert_range(arena->bo, offset, length);
    arena->program_bytes += length;
    return reservation->va;

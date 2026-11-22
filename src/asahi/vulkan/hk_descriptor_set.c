@@ -106,7 +106,8 @@ write_accel_struct_desc(struct hk_descriptor_set *set,
 }
 
 /* Make a CPU write to descriptor-set memory visible to the GPU (see
- * hk_descriptor_pool::cpu_cached); the fence is queue submission's. */
+ * hk_descriptor_pool::cpu_cached); callers fence on the writing CPU before
+ * returning so visibility does not depend on which CPU later submits work. */
 static inline void
 hk_descriptor_set_publish(const struct hk_descriptor_set *set, void *data,
                           size_t size)
@@ -712,10 +713,11 @@ write_inline_uniform_data(struct hk_descriptor_set *set,
    write_desc(set, binding, offset, info->pData, info->dataSize);
 }
 
-static ATTRIBUTE_NOINLINE void
+static ATTRIBUTE_NOINLINE bool
 hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
                         const VkCopyDescriptorSet *pDescriptorCopies)
 {
+   bool flushed = false;
    for (uint32_t i = 0; i < descriptorCopyCount; i++) {
       const VkCopyDescriptorSet *copy = &pDescriptorCopies[i];
       VK_FROM_HANDLE(hk_descriptor_set, src, copy->srcSet);
@@ -746,6 +748,7 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
             else
                memcpy(dst_map, src_map, size);
             hk_descriptor_set_publish(dst, dst_map, size);
+            flushed |= dst->cpu_cached;
          }
       } else if (dst_binding_layout->stride > 0 && src_binding_layout->stride > 0) {
          for (uint32_t j = 0; j < copy->descriptorCount; j++) {
@@ -761,6 +764,7 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
 
             memcpy(dst_map, src_map, copy_size);
             hk_descriptor_set_publish(dst, dst_map, copy_size);
+            flushed |= dst->cpu_cached;
          }
       }
 
@@ -774,6 +778,7 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
                       copy->descriptorCount);
       }
    }
+   return flushed;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -782,9 +787,11 @@ hk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
                         uint32_t descriptorCopyCount,
                         const VkCopyDescriptorSet *pDescriptorCopies)
 {
+   bool needs_fence = false;
    for (uint32_t w = 0; w < descriptorWriteCount; w++) {
       const VkWriteDescriptorSet *write = &pDescriptorWrites[w];
       VK_FROM_HANDLE(hk_descriptor_set, set, write->dstSet);
+      needs_fence |= set->cpu_cached;
 
       switch (write->descriptorType) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -871,7 +878,11 @@ hk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
    }
 
    if (descriptorCopyCount)
-      hk_copy_descriptor_sets(descriptorCopyCount, pDescriptorCopies);
+      needs_fence |= hk_copy_descriptor_sets(descriptorCopyCount,
+                                             pDescriptorCopies);
+
+   if (needs_fence)
+      util_post_flush_fence();
 }
 
 /* Points a push descriptor set at layout for an update, and returns false,
@@ -1091,16 +1102,14 @@ hk_CreateDescriptorPool(VkDevice _device,
        * owner (a command slab, an upload pool, a geometry heap) left behind,
        * which is exactly the shape of a wild descriptor address.
        */
-      /* G17P: write descriptors through the CPU cache and clean what is
-       * written (hk_descriptor_set_publish()); write-combined stores of
-       * every descriptor and of the per-allocation zeroing above stalled
-       * the recording core. */
-      pool->cpu_cached = hk_g17p_cached_cmd_memory(&dev->dev);
+      /* Write descriptors through the CPU cache wherever cache maintenance is
+       * available and clean what is written (hk_descriptor_set_publish());
+       * write-combined stores of descriptors and per-allocation zeroing
+       * otherwise stall the recording core. */
+      pool->cpu_cached = hk_cached_cmd_memory();
       const enum agx_bo_flags pool_flags =
-         agx_chip_native_agx3(dev->dev.chip)
-            ? AGX_BO_ZERO_ON_REUSE |
-                 (pool->cpu_cached ? AGX_BO_WRITEBACK : 0)
-            : 0;
+         (agx_chip_native_agx3(dev->dev.chip) ? AGX_BO_ZERO_ON_REUSE : 0) |
+         (pool->cpu_cached ? AGX_BO_WRITEBACK : 0);
       pool->bo =
          agx_bo_create(&dev->dev, bo_size, 0, pool_flags, "Descriptor pool");
       if (!pool->bo) {
@@ -1280,6 +1289,8 @@ hk_AllocateDescriptorSets(VkDevice device,
       for (i = 0; i < pAllocateInfo->descriptorSetCount; i++) {
          pDescriptorSets[i] = VK_NULL_HANDLE;
       }
+   } else if (pool->cpu_cached && pAllocateInfo->descriptorSetCount > 0) {
+      util_post_flush_fence();
    }
    return result;
 }
@@ -1429,6 +1440,8 @@ hk_UpdateDescriptorSetWithTemplate(
                   descriptorUpdateTemplate);
 
    hk_descriptor_set_write_template(set, template, pData);
+   if (set->cpu_cached)
+      util_post_flush_fence();
 }
 
 bool

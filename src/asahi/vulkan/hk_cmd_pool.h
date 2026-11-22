@@ -72,13 +72,15 @@ struct agx_device;
 struct agx_ptr;
 struct hk_device;
 
-/* G17P command-buffer memory (main/USC pools, VDM slabs, Ioto arenas) is
- * CPU-cached; recording cleans what it wrote before submission
- * (hk_cmd_buffer_publish_cached_uploads()). */
+/* Command-buffer memory (main/USC pools, VDM slabs, Ioto arenas), descriptor
+ * pools, and the Gen1 ray-query image use CPU write-back mappings wherever
+ * userspace cache maintenance is available. Recording cleans command-buffer
+ * uploads together at EndCommandBuffer (hk_cmd_buffer_publish_cached_uploads());
+ * descriptor writes clean and fence before returning to the application. */
 static inline bool
-hk_g17p_cached_cmd_memory(const struct agx_device *dev)
+hk_cached_cmd_memory(void)
 {
-   return dev->chip == AGX_CHIP_G17P && util_has_cache_ops();
+   return util_has_cache_ops();
 }
 
 struct hk_cmd_pool;

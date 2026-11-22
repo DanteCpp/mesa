@@ -180,11 +180,10 @@ hk_descriptor_state_fini(struct hk_cmd_buffer *cmd,
    }
 }
 
-/* Writes the stream words of the patch sites. M5 command memory is mapped
- * uncached (hk_g17p_cached_cmd_memory() is G17P-only), so the words need no
- * cache maintenance, only to be stored whole (the GPU may read the stream
- * meanwhile when the alias count leaves 0) and made visible before the
- * submission or host signal that lets the GPU run them. */
+/* Writes the stream words of the patch sites. Each word is stored whole (the
+ * GPU may read the stream meanwhile when the alias count leaves 0), cleaned
+ * when command memory is CPU-cached, and made visible before the submission
+ * or host signal that lets the GPU run them. */
 void
 hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd)
 {
@@ -195,8 +194,11 @@ hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd)
       __atomic_store_n(site->word, site->value, __ATOMIC_RELAXED);
 
    __sync_synchronize();
-   if (util_has_cache_ops())
+   if (hk_cached_cmd_memory()) {
+      util_dynarray_foreach(&cmd->alias_sites, struct hk_alias_site, site)
+         util_flush_range_no_fence(site->word, sizeof(*site->word));
       util_post_flush_fence();
+   }
    p_atomic_set(&cmd->alias_patched, 1);
 }
 
@@ -559,7 +561,7 @@ hk_cmd_buffer_alloc_bo(struct hk_cmd_buffer *cmd,
                             : HK_CMD_SPAN_SIZE;
    VkResult result =
       !uploader->map && size <= span && list_is_empty(&pool->free_bos[type]) &&
-            hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev)
+            hk_cached_cmd_memory()
          ? hk_cmd_pool_alloc_bo_span(pool, type, span, bo_out)
          : hk_cmd_pool_alloc_bo(pool, type, bo_out);
    if (result != VK_SUCCESS)
@@ -1000,13 +1002,11 @@ hk_cmd_bo_clean_unlinked_streams(struct hk_cmd_buffer *cmd,
 }
 
 /* Clean everything recording wrote to CPU-cached command memory (see
- * hk_g17p_cached_cmd_memory()); hk_cmd_buffer_publish_root_uploads() and
- * queue submission fence the cleans. */
+ * hk_cached_cmd_memory()) and fence the cleans before submission. */
 static void
 hk_cmd_buffer_publish_cached_uploads(struct hk_cmd_buffer *cmd)
 {
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!hk_g17p_cached_cmd_memory(&dev->dev))
+   if (!hk_cached_cmd_memory())
       return;
 
    bool linked_stream = false;
