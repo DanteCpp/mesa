@@ -26,6 +26,7 @@
 #include "util/box.h"
 #include "util/u_sampler.h"
 #include "util/u_surface.h"
+#include "agx_bg_eot_key.h"
 #include "agx_state.h"
 #include "glsl_types.h"
 #include "nir.h"
@@ -537,13 +538,25 @@ agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
  * image. Keep that reverse copy restricted to the original WSI binding shape;
  * its later swap is the operation that supplies the direct resolve target.
  */
+/* G17P resolves multisampled colour tiles directly at EOT for every format
+ * whose tile representation averages cleanly in hardware (matching Borealis's
+ * hk_agx3_g17p_direct_color_resolve_supported()). Pure integer, sRGB (which
+ * requires linear averaging), 32-bit float, and raw-packed R11G11B10/RGB9E5
+ * tiles stay on the shader resolve path. */
 static bool
-agx_g17p_rgba8_resolve_format(enum pipe_format format)
+agx_g17p_direct_resolve_format(enum pipe_format format)
 {
-   return format == PIPE_FORMAT_R8G8B8A8_UNORM ||
-          format == PIPE_FORMAT_B8G8R8A8_UNORM ||
-          format == PIPE_FORMAT_R8G8B8X8_UNORM ||
-          format == PIPE_FORMAT_B8G8R8X8_UNORM;
+   if (util_format_is_srgb(format) || util_format_is_pure_integer(format) ||
+       format == PIPE_FORMAT_R11G11B10_FLOAT ||
+       format == PIPE_FORMAT_R9G9B9E5_FLOAT)
+      return false;
+
+   if (util_format_is_float(format) &&
+       util_format_get_component_bits(format, UTIL_FORMAT_COLORSPACE_RGB, 0) ==
+          32)
+      return false;
+
+   return agx_g17p_mrt_eot_selector(format) != 0;
 }
 
 bool
@@ -566,7 +579,7 @@ agx_g17p_direct_resolve_blit_shape(const struct pipe_blit_info *info,
    return (util_res_sample_count(msaa) == 2 ||
            util_res_sample_count(msaa) == 4) &&
           util_res_sample_count(single) == 1 && src->format == dst->format &&
-          agx_g17p_rgba8_resolve_format(src->format) &&
+          agx_g17p_direct_resolve_format(src->format) &&
           (source_multisampled || wsi_seed) &&
           (single->target == PIPE_TEXTURE_2D ||
            single->target == PIPE_TEXTURE_RECT) &&
@@ -603,7 +616,9 @@ agx_g17p_attach_direct_resolve(struct agx_context *ctx,
        batch->key.cbufs[0].texture != msaa ||
        batch->key.cbufs[0].level != 0 ||
        batch->key.cbufs[0].first_layer != 0 ||
-       batch->key.cbufs[0].last_layer != 0)
+       batch->key.cbufs[0].last_layer != 0 ||
+       (!batch->key.resolve &&
+        _mesa_set_search(batch->bo_list.set, agx_resource(single)->bo)))
       return false;
 
    batch->g17p_resolve_preserve |= preserve_source;
@@ -630,7 +645,7 @@ agx_g17p_staged_resolve_blit_shape(const struct pipe_blit_info *info)
           (src->target == PIPE_TEXTURE_2D ||
            src->target == PIPE_TEXTURE_RECT) &&
           src->last_level == 0 && src->array_size == 1 && src->depth0 == 1 &&
-          agx_g17p_rgba8_resolve_format(src->format) &&
+          agx_g17p_direct_resolve_format(src->format) &&
           info->src.level == 0 && info->src.box.z == 0 &&
           info->src.box.depth == 1 && info->src.format == src->format &&
           !(info->mask & ~PIPE_MASK_RGBA) && (info->mask & PIPE_MASK_RGBA) &&
@@ -696,6 +711,43 @@ agx_g17p_stencil_plane_blit_shape(const struct pipe_blit_info *info)
    return util_format_has_stencil(src) && util_format_has_stencil(dst) &&
           (!(info->mask & PIPE_MASK_Z) ||
            (util_format_has_depth(src) && util_format_has_depth(dst)));
+}
+
+bool
+agx_blit_overwrites_full_level(const struct pipe_blit_info *info)
+{
+   if (!info || !info->src.resource || !info->dst.resource ||
+       info->alpha_blend || info->scissor_enable ||
+       info->num_window_rectangles || info->render_condition_enable)
+      return false;
+
+   const struct pipe_resource *dst = info->dst.resource;
+   if (dst == info->src.resource && info->dst.level == info->src.level)
+      return false;
+
+   if (util_format_is_depth_or_stencil(dst->format) ||
+       (info->mask & PIPE_MASK_RGBA) != PIPE_MASK_RGBA)
+      return false;
+
+   int x0 = info->dst.box.x;
+   int w = info->dst.box.width;
+   if (w < 0) {
+      x0 += w;
+      w = -w;
+   }
+
+   int y0 = info->dst.box.y;
+   int h = info->dst.box.height;
+   if (h < 0) {
+      y0 += h;
+      h = -h;
+   }
+
+   const unsigned level = info->dst.level;
+   return x0 == 0 && y0 == 0 && info->dst.box.z == 0 &&
+          w == (int)u_minify(dst->width0, level) &&
+          h == (int)u_minify(dst->height0, level) &&
+          info->dst.box.depth == (int)util_num_layers(dst, level);
 }
 
 void
@@ -880,6 +932,12 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
 
    /* Handle self-blits */
    agx_flush_writer(ctx, agx_resource(info->dst.resource), "Blit");
+
+   /* Avoid reloading stale destination pixels when the blit unconditionally
+    * overwrites the entire destination level (e.g. glGenerateMipmap). */
+   if (agx_blit_overwrites_full_level(info))
+      BITSET_CLEAR(agx_resource(info->dst.resource)->data_valid,
+                   info->dst.level);
 
    agx_blitter_save(
       ctx, ctx->blitter,

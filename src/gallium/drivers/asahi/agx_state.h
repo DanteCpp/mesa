@@ -1645,6 +1645,8 @@ bool agx_g17p_direct_resolve_blit_shape(const struct pipe_blit_info *info,
 
 bool agx_g17p_staged_resolve_blit_shape(const struct pipe_blit_info *info);
 
+bool agx_blit_overwrites_full_level(const struct pipe_blit_info *info);
+
 bool agx_g17p_stencil_plane_blit_shape(const struct pipe_blit_info *info);
 
 bool agx_generate_mipmap_g17g(struct pipe_context *pctx,
@@ -1667,6 +1669,8 @@ void agx_copy_buffer_range(struct pipe_context *pctx, struct pipe_resource *dst,
 
 struct agx_encoder agx_encoder_allocate(struct agx_batch *batch,
                                         struct agx_device *dev);
+
+void agx_encoder_cleanup(struct agx_device *dev, struct agx_encoder *encoder);
 
 uint64_t agx_batch_get_g17p_vdm_alias(struct agx_batch *batch,
                                       struct agx_bo *bo, uint64_t address);

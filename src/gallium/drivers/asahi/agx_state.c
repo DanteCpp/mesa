@@ -10214,8 +10214,14 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
           batch->tilebuffer_layout.spilled[rt]) {
          key.op[rt] = AGX_BG_EOT_NONE;
       } else if (store) {
-         /* TODO: Suppress stores to discarded render targets */
-         key.op[rt] = AGX_EOT_STORE;
+         const bool can_discard_store =
+            (agx_chip_native_agx3(dev->chip) ||
+             agx_chip_command_stream_generation(dev->chip) ==
+                AGX_CS_GENERATION_AGX2) &&
+            !partial_render &&
+            !(batch->resolve & (PIPE_CLEAR_COLOR0 << rt)) &&
+            !(rt == 0 && batch->key.resolve);
+         key.op[rt] = can_discard_store ? AGX_BG_EOT_NONE : AGX_EOT_STORE;
       } else if (batch->tilebuffer_layout.spilled[rt] && partial_render) {
          /* Partial render programs exist only to store/load the tilebuffer to
           * main memory. When render targets are already spilled to main memory,
@@ -14669,10 +14675,19 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
  */
 static void
 agx_legalize_feedback_loop_surf(struct agx_context *ctx,
-                                struct agx_resource *rsrc,
+                                const struct agx_sampler_view *sv,
                                 struct pipe_surface *surf, unsigned bit)
 {
+   struct agx_resource *rsrc = sv->rsrc;
+
    if (agx_resource(surf->texture) != rsrc || !rsrc->layout.compressed)
+      return;
+
+   /* Sampling a disjoint mip level of the same texture (e.g. mipmap
+    * generation or hierarchical bloom) is not a feedback loop. */
+   if (sv->base.target != PIPE_BUFFER &&
+       (surf->level < sv->base.u.tex.first_level ||
+        surf->level > sv->base.u.tex.last_level))
       return;
 
    /* Decompress if we can and shadow if we can't. */
@@ -14750,18 +14765,17 @@ agx_legalize_feedback_loops(struct agx_context *ctx)
       unsigned nr_read = agx_nr_textures_read(ctx, stage);
 
       for (unsigned i = 0; i < nr_read; ++i) {
-         if (!ctx->stage[stage].textures[i])
+         const struct agx_sampler_view *sv = ctx->stage[stage].textures[i];
+         if (!sv)
             continue;
-
-         struct agx_resource *rsrc = ctx->stage[stage].textures[i]->rsrc;
 
          for (unsigned cb = 0; cb < ctx->framebuffer.nr_cbufs; ++cb) {
             agx_legalize_feedback_loop_surf(
-               ctx, rsrc, &ctx->framebuffer.cbufs[cb], PIPE_CLEAR_COLOR0 << i);
+               ctx, sv, &ctx->framebuffer.cbufs[cb], PIPE_CLEAR_COLOR0 << cb);
          }
 
          /* TODO: Separate stencil? */
-         agx_legalize_feedback_loop_surf(ctx, rsrc, &ctx->framebuffer.zsbuf,
+         agx_legalize_feedback_loop_surf(ctx, sv, &ctx->framebuffer.zsbuf,
                                          PIPE_CLEAR_DEPTH);
       }
    }

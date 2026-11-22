@@ -603,6 +603,39 @@ check_direct_resolve_shapes(void)
    src.format = dst.format = info.src.format = info.dst.format =
       PIPE_FORMAT_R8G8B8A8_UNORM;
 
+   src.format = dst.format = info.src.format = info.dst.format =
+      PIPE_FORMAT_R16G16B16A16_FLOAT;
+   if (!agx_g17p_direct_resolve_blit_shape(&info, true)) {
+      fprintf(stderr, "exact RGBA16F resolve shape was rejected\n");
+      return false;
+   }
+   src.format = dst.format = info.src.format = info.dst.format =
+      PIPE_FORMAT_R10G10B10A2_UNORM;
+   if (!agx_g17p_direct_resolve_blit_shape(&info, true)) {
+      fprintf(stderr, "exact RGB10A2 resolve shape was rejected\n");
+      return false;
+   }
+   src.format = dst.format = info.src.format = info.dst.format =
+      PIPE_FORMAT_R32_FLOAT;
+   if (agx_g17p_direct_resolve_blit_shape(&info, true)) {
+      fprintf(stderr, "R32F resolve shape was accepted\n");
+      return false;
+   }
+   src.format = dst.format = info.src.format = info.dst.format =
+      PIPE_FORMAT_R11G11B10_FLOAT;
+   if (agx_g17p_direct_resolve_blit_shape(&info, true)) {
+      fprintf(stderr, "R11G11B10F resolve shape was accepted\n");
+      return false;
+   }
+   src.format = dst.format = info.src.format = info.dst.format =
+      PIPE_FORMAT_R8G8B8A8_UINT;
+   if (agx_g17p_direct_resolve_blit_shape(&info, true)) {
+      fprintf(stderr, "pure integer resolve shape was accepted\n");
+      return false;
+   }
+   src.format = dst.format = info.src.format = info.dst.format =
+      PIPE_FORMAT_R8G8B8A8_UNORM;
+
    info.src.box.width = info.dst.box.width = 4;
    if (agx_g17p_direct_resolve_blit_shape(&info, true)) {
       fprintf(stderr, "partial offscreen resolve was accepted\n");
@@ -892,6 +925,21 @@ check_staged_resolve_shapes(void)
       PIPE_FORMAT_B8G8R8X8_UNORM;
    if (!agx_g17p_staged_resolve_blit_shape(&info)) {
       fprintf(stderr, "partial XRGB8 resolve staging shape was rejected\n");
+      return false;
+   }
+   src.format = dst.format = info.src.format = info.dst.format =
+      PIPE_FORMAT_R8G8B8A8_UNORM;
+
+   src.format = dst.format = info.src.format = info.dst.format =
+      PIPE_FORMAT_R16G16B16A16_FLOAT;
+   if (!agx_g17p_staged_resolve_blit_shape(&info)) {
+      fprintf(stderr, "partial RGBA16F resolve staging shape was rejected\n");
+      return false;
+   }
+   src.format = dst.format = info.src.format = info.dst.format =
+      PIPE_FORMAT_R32G32B32A32_FLOAT;
+   if (agx_g17p_staged_resolve_blit_shape(&info)) {
+      fprintf(stderr, "RGBA32F resolve staging shape was accepted\n");
       return false;
    }
    src.format = dst.format = info.src.format = info.dst.format =
@@ -1716,15 +1764,119 @@ main(void)
       agx_chip_command_stream_generation(dev->chip) == AGX_CS_GENERATION_AGX2;
    int status = 0;
 
-   /* AGX2 keeps blit-based texture transfers. Later generations use mapped
-    * transfers, which convert formats on the CPU. */
+   /* AGX2 and G17P use blit-based texture transfers; other AGX3 parts stay on
+    * mapped transfers. */
    const unsigned want_transfer_modes =
-      agx2 ? PIPE_TEXTURE_TRANSFER_BLIT : PIPE_TEXTURE_TRANSFER_DEFAULT;
+      (agx2 || dev->chip == AGX_CHIP_G17P) ? PIPE_TEXTURE_TRANSFER_BLIT
+                                           : PIPE_TEXTURE_TRANSFER_DEFAULT;
    if (screen->caps.texture_transfer_modes != want_transfer_modes) {
       fprintf(stderr, "texture transfer modes %#x on %s, expected %#x\n",
               screen->caps.texture_transfer_modes, agx_chip_name(dev->chip),
               want_transfer_modes);
       status = 1;
+   }
+
+   /* Verify full-level blit discard eligibility helper. */
+   {
+      struct pipe_resource blit_src = {
+         .target = PIPE_TEXTURE_2D,
+         .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+         .width0 = 64,
+         .height0 = 32,
+         .depth0 = 1,
+         .array_size = 1,
+         .last_level = 6,
+      };
+      struct pipe_blit_info binfo = {
+         .src = {.resource = &blit_src, .level = 0, .format = blit_src.format,
+                 .box = {.width = 64, .height = 32, .depth = 1}},
+         .dst = {.resource = &blit_src, .level = 1, .format = blit_src.format,
+                 .box = {.width = 32, .height = 16, .depth = 1}},
+         .mask = PIPE_MASK_RGBA,
+      };
+      if (!agx_blit_overwrites_full_level(&binfo)) {
+         fprintf(stderr, "full mip blit discard check rejected valid mip\n");
+         status = 1;
+      }
+      binfo.dst.box.y = 16;
+      binfo.dst.box.height = -16;
+      if (!agx_blit_overwrites_full_level(&binfo)) {
+         fprintf(stderr, "flipped full blit discard check rejected\n");
+         status = 1;
+      }
+      binfo.dst.box.y = 0;
+      binfo.dst.box.height = 15;
+      if (agx_blit_overwrites_full_level(&binfo)) {
+         fprintf(stderr, "partial blit discard check accepted\n");
+         status = 1;
+      }
+      binfo.dst.box.height = 16;
+      binfo.alpha_blend = true;
+      if (agx_blit_overwrites_full_level(&binfo)) {
+         fprintf(stderr, "blended blit discard check accepted\n");
+         status = 1;
+      }
+      binfo.alpha_blend = false;
+      binfo.dst.level = 0;
+      binfo.dst.box.width = 64;
+      binfo.dst.box.height = 32;
+      if (agx_blit_overwrites_full_level(&binfo)) {
+         fprintf(stderr, "same-level self-blit discard check accepted\n");
+         status = 1;
+      }
+   }
+
+   /* Full-extent compressed clear-only batch should take libagx_fast_clear on
+    * G17P without error, and large mipmapped 2D colour textures should allocate
+    * compressed while small mipmapped ones remain plain. */
+   if (dev->chip == AGX_CHIP_G17P) {
+      struct pipe_resource mip_big_templ = {
+         .target = PIPE_TEXTURE_2D,
+         .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+         .width0 = 512,
+         .height0 = 512,
+         .depth0 = 1,
+         .array_size = 1,
+         .last_level = 9,
+         .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
+      };
+      struct pipe_resource *mip_big =
+         screen->resource_create(screen, &mip_big_templ);
+      struct pipe_resource mip_small_templ = mip_big_templ;
+      mip_small_templ.width0 = 64;
+      mip_small_templ.height0 = 64;
+      mip_small_templ.last_level = 6;
+      struct pipe_resource *mip_small =
+         screen->resource_create(screen, &mip_small_templ);
+      if (!mip_big || !agx_resource(mip_big)->layout.compressed) {
+         fprintf(stderr, "large G17P mipmapped 2D texture was not compressed\n");
+         status = 1;
+      }
+      if (!mip_small || agx_resource(mip_small)->layout.compressed) {
+         fprintf(stderr, "small G17P mipmapped 2D texture was compressed\n");
+         status = 1;
+      }
+      if (mip_big) {
+         struct pipe_framebuffer_state full_fb = {
+            .width = 512,
+            .height = 512,
+            .layers = 1,
+            .samples = 1,
+            .nr_cbufs = 1,
+            .cbufs[0] = {
+               .texture = mip_big,
+               .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+               .first_layer = 0,
+               .last_layer = 0,
+               .level = 0,
+            },
+         };
+         pctx->set_framebuffer_state(pctx, &full_fb);
+         pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &colour, 0.0, 0);
+         pctx->flush(pctx, NULL, 0);
+      }
+      pipe_resource_reference(&mip_big, NULL);
+      pipe_resource_reference(&mip_small, NULL);
    }
 
    const bool vs_ok = ctx->vs != NULL && ctx->vs->bo != NULL;

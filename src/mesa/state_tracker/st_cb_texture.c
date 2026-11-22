@@ -1788,6 +1788,15 @@ try_pbo_upload_common(struct gl_context *ctx,
    unsigned width, height;
    pipe_surface_size(surface, &width, &height);
 
+   if (pipe->invalidate_resource &&
+       surface->texture->last_level == 0 &&
+       addr->xoffset == 0 && addr->yoffset == 0 &&
+       addr->width == width && addr->height == height &&
+       surface->first_layer == 0 &&
+       surface->last_layer + 1 == util_num_layers(surface->texture, 0)) {
+      pipe->invalidate_resource(pipe, surface->texture);
+   }
+
    /* Framebuffer_state */
    {
       struct pipe_framebuffer_state fb;

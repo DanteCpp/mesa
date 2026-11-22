@@ -458,22 +458,30 @@ agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
           !(templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DEPTH_STENCIL));
 }
 
-/* G17P compresses a private, single-level, single-layer, single-sample 2D
- * colour image of agx_g17p_compression_color_format(): written by the
- * compressed Gen9 2D PBE (end-of-tile stores, blits, staging uploads) and
- * read by the compressed texture descriptor, the packets Honeykrisp
- * compresses its own G17P colour images with. Nothing decompresses such an
- * image in place: its format never spills from the tilebuffer, and it is
- * neither shared nor scanned out, so a feedback loop or a shader-image
- * binding reallocates it uncompressed (agx_decompress()), as on AGX2.
+/* G17P compresses private, single-layer, single-sample 2D colour images of
+ * agx_g17p_compression_color_format(): written by the compressed Gen9 2D PBE
+ * (end-of-tile stores, blits, staging uploads) and read by the compressed
+ * texture descriptor, the packets Borealis compresses its own G17P colour
+ * images with. Mipmapped 2D colour textures are also compressed once large
+ * enough (matching Borealis's 128K-texel threshold) so mipchains and large
+ * textures get lossless bandwidth savings without penalizing small mipmaps.
+ * Nothing decompresses such an image in place: its format never spills from
+ * the tilebuffer, and it is neither shared nor scanned out, so a feedback
+ * loop or a shader-image binding reallocates it uncompressed
+ * (agx_decompress()), as on AGX2.
  */
 static bool
 agx_g17p_private_compression_allowed(const struct agx_device *dev,
                                      const struct pipe_resource *templ)
 {
+   const bool mip_allowed =
+      templ->last_level == 0 ||
+      (templ->last_level < 16 &&
+       (uint64_t)templ->width0 * templ->height0 >= (1u << 17));
+
    return dev->chip == AGX_CHIP_G17P && templ->target == PIPE_TEXTURE_2D &&
           templ->depth0 == 1 && templ->array_size <= 1 &&
-          templ->last_level == 0 && templ->nr_samples <= 1 &&
+          mip_allowed && templ->nr_samples <= 1 &&
           !(templ->bind &
             ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET)) &&
           agx_g17p_compression_color_format(templ->format);
@@ -2077,6 +2085,201 @@ agx_flush_render(struct agx_context *ctx, struct agx_batch *batch,
       batch->clear_depth, batch->clear_stencil, &batch->tilebuffer_layout);
 }
 
+static bool
+agx_fast_clear_surface_eligible(const struct agx_batch *batch,
+                                struct agx_resource *rsrc,
+                                unsigned level, unsigned first_layer,
+                                unsigned last_layer, enum pipe_format pack_fmt)
+{
+   if (!rsrc || rsrc->base.target == PIPE_BUFFER ||
+       rsrc->base.target == PIPE_TEXTURE_3D ||
+       !ail_is_level_logically_compressed(&rsrc->layout, level))
+      return false;
+
+   if (batch->key.width != u_minify(rsrc->base.width0, level) ||
+       batch->key.height != u_minify(rsrc->base.height0, level))
+      return false;
+
+   if (first_layer > last_layer ||
+       last_layer >= util_num_layers(&rsrc->base, level))
+      return false;
+
+   if (util_format_is_scaled(pack_fmt))
+      return false;
+
+   const unsigned blocksize_B = util_format_get_blocksize(pack_fmt);
+   if (!util_is_power_of_two_nonzero(blocksize_B) || blocksize_B > 16 ||
+       blocksize_B != util_format_get_blocksize(rsrc->layout.format))
+      return false;
+
+   if ((rsrc->layout.layer_stride_B % 16) != 0 ||
+       (rsrc->layout.compression_layer_stride_B % 16) != 0 ||
+       !util_is_power_of_two_nonzero(rsrc->layout.sample_count_sa) ||
+       !ail_metadata_tile(&rsrc->layout).height_el)
+      return false;
+
+   return ail_metadata_width_tl(&rsrc->layout, level) > 0 &&
+          ail_metadata_height_tl(&rsrc->layout, level) > 0;
+}
+
+static void
+agx_emit_fast_clear_surface(struct agx_batch *batch,
+                            struct agx_resource *rsrc, unsigned level,
+                            unsigned first_layer, unsigned last_layer,
+                            enum pipe_format pack_fmt, const void *clear_src)
+{
+   struct ail_layout *layout = &rsrc->layout;
+   uint32_t c[4] = {0};
+   util_format_pack_rgba(pack_fmt, c, clear_src, 1);
+
+   const unsigned blocksize_B = util_format_get_blocksize(pack_fmt);
+   uint8_t *bytes = (uint8_t *)c;
+   for (unsigned i = blocksize_B; i < 16; ++i)
+      bytes[i] = bytes[i % blocksize_B];
+
+   const uint64_t base_addr = agx_map_gpu(rsrc);
+   const uint64_t address =
+      base_addr + ail_get_layer_level_B(layout, first_layer, level);
+   const uint32_t layer_stride_uint4 = layout->layer_stride_B / 16;
+   const uint32_t meta_layer_stride_tl =
+      layout->compression_layer_stride_B / 8;
+   const uint64_t meta_addr =
+      base_addr + layout->metadata_offset_B +
+      (first_layer * layout->compression_layer_stride_B) +
+      layout->level_offsets_compressed_B[level];
+
+   const uint32_t word = (uint32_t)ail_tile_mode_solid(pack_fmt);
+   const struct agx_grid grid =
+      agx_3d(ail_metadata_width_tl(layout, level),
+             ail_metadata_height_tl(layout, level),
+             last_layer - first_layer + 1);
+   const struct ail_tile tilesize = layout->tilesize_el[level];
+
+   libagx_fast_clear(batch, grid, AGX_BARRIER_ALL, meta_addr, address,
+                     grid.count[0], grid.count[1], tilesize.width_el,
+                     tilesize.height_el, meta_layer_stride_tl,
+                     layer_stride_uint4,
+                     util_logbase2(ail_metadata_tile(layout).height_el),
+                     util_logbase2(blocksize_B),
+                     util_logbase2(layout->sample_count_sa), c[0], c[1], c[2],
+                     c[3], word);
+}
+
+/* Convert a clear-only batch targeting full compressed surfaces into a
+ * metadata-only libagx_fast_clear() compute dispatch, avoiding a full 3D
+ * VDM+ISP+PBE render pass. */
+static bool
+agx_try_fast_clear_batch(struct agx_context *ctx, struct agx_batch *batch)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+
+   if (!agx_chip_native_agx3(dev->chip) &&
+       agx_chip_command_stream_generation(dev->chip) != AGX_CS_GENERATION_AGX2)
+      return false;
+
+   if (batch->cdm.bo || !batch->vdm.bo || !batch->initialized ||
+       batch->draws || batch->draw || !batch->clear || batch->key.resolve ||
+       batch->feedback || batch->native_rejected || batch->timestamps.size ||
+       (batch->clear & batch->resolve) != batch->clear)
+      return false;
+
+   const uint32_t supported_mask =
+      PIPE_CLEAR_COLOR | PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL;
+   if (batch->clear & ~supported_mask)
+      return false;
+
+   for (unsigned rt = 0; rt < PIPE_MAX_COLOR_BUFS; ++rt) {
+      if (!(batch->clear & (PIPE_CLEAR_COLOR0 << rt)))
+         continue;
+
+      const struct pipe_surface *surf = &batch->key.cbufs[rt];
+      if (!surf->texture)
+         return false;
+
+      struct agx_resource *rsrc = agx_resource(surf->texture);
+      if (util_format_linear(surf->format) !=
+             util_format_linear(rsrc->layout.format) ||
+          !agx_fast_clear_surface_eligible(batch, rsrc, surf->level,
+                                           surf->first_layer, surf->last_layer,
+                                           surf->format))
+         return false;
+   }
+
+   if (batch->clear & PIPE_CLEAR_DEPTH) {
+      const struct pipe_surface *surf = &batch->key.zsbuf;
+      if (!surf->texture)
+         return false;
+
+      struct agx_resource *zres = agx_resource(surf->texture);
+      enum pipe_format zfmt = PIPE_FORMAT_NONE;
+      if (zres->layout.format == PIPE_FORMAT_Z32_FLOAT)
+         zfmt = PIPE_FORMAT_R32_FLOAT;
+      else if (zres->layout.format == PIPE_FORMAT_Z16_UNORM)
+         zfmt = PIPE_FORMAT_R16_UNORM;
+      else
+         return false;
+
+      if (!agx_fast_clear_surface_eligible(batch, zres, surf->level,
+                                           surf->first_layer, surf->last_layer,
+                                           zfmt))
+         return false;
+   }
+
+   if (batch->clear & PIPE_CLEAR_STENCIL) {
+      const struct pipe_surface *surf = &batch->key.zsbuf;
+      if (!surf->texture)
+         return false;
+
+      struct agx_resource *zres = agx_resource(surf->texture);
+      struct agx_resource *sres =
+         zres->separate_stencil ? zres->separate_stencil : zres;
+      if (sres->layout.format != PIPE_FORMAT_S8_UINT ||
+          !agx_fast_clear_surface_eligible(batch, sres, surf->level,
+                                           surf->first_layer, surf->last_layer,
+                                           PIPE_FORMAT_R8_UINT))
+         return false;
+   }
+
+   batch->cdm = agx_encoder_allocate(batch, dev);
+
+   for (unsigned rt = 0; rt < PIPE_MAX_COLOR_BUFS; ++rt) {
+      if (!(batch->clear & (PIPE_CLEAR_COLOR0 << rt)))
+         continue;
+
+      const struct pipe_surface *surf = &batch->key.cbufs[rt];
+      agx_emit_fast_clear_surface(batch, agx_resource(surf->texture),
+                                  surf->level, surf->first_layer,
+                                  surf->last_layer, surf->format,
+                                  &batch->clear_color[rt]);
+   }
+
+   if (batch->clear & PIPE_CLEAR_DEPTH) {
+      const struct pipe_surface *surf = &batch->key.zsbuf;
+      struct agx_resource *zres = agx_resource(surf->texture);
+      const enum pipe_format zfmt =
+         zres->layout.format == PIPE_FORMAT_Z32_FLOAT ? PIPE_FORMAT_R32_FLOAT
+                                                      : PIPE_FORMAT_R16_UNORM;
+      const float depth_f[4] = {(float)batch->clear_depth, 0.0f, 0.0f, 0.0f};
+      agx_emit_fast_clear_surface(batch, zres, surf->level, surf->first_layer,
+                                  surf->last_layer, zfmt, depth_f);
+   }
+
+   if (batch->clear & PIPE_CLEAR_STENCIL) {
+      const struct pipe_surface *surf = &batch->key.zsbuf;
+      struct agx_resource *zres = agx_resource(surf->texture);
+      struct agx_resource *sres =
+         zres->separate_stencil ? zres->separate_stencil : zres;
+      const uint32_t stencil_u[4] = {batch->clear_stencil & 0xff, 0, 0, 0};
+      agx_emit_fast_clear_surface(batch, sres, surf->level, surf->first_layer,
+                                  surf->last_layer, PIPE_FORMAT_R8_UINT,
+                                  stencil_u);
+   }
+
+   agx_encoder_cleanup(dev, &batch->vdm);
+   memset(&batch->vdm, 0, sizeof(batch->vdm));
+   return true;
+}
+
 void
 agx_flush_batch(struct agx_context *ctx, struct agx_batch *batch)
 {
@@ -2098,6 +2301,8 @@ agx_flush_batch(struct agx_context *ctx, struct agx_batch *batch)
       agx_batch_retire_faulted(ctx, batch);
       return;
    }
+
+   agx_try_fast_clear_batch(ctx, batch);
 
    if (batch->cdm.bo) {
       agx_flush_compute(ctx, batch, &compute);
@@ -2187,6 +2392,7 @@ agx_invalidate_resource(struct pipe_context *pctx,
                         struct pipe_resource *resource)
 {
    struct agx_context *ctx = agx_context(pctx);
+   struct agx_resource *rsrc = agx_resource(resource);
    struct agx_batch *batch = agx_get_batch(ctx);
 
    /* Handle the glInvalidateFramebuffer case */
@@ -2196,8 +2402,20 @@ agx_invalidate_resource(struct pipe_context *pctx,
    for (unsigned i = 0; i < batch->key.nr_cbufs; ++i) {
       const struct pipe_surface *surf = &batch->key.cbufs[i];
 
-      if (surf->texture == resource)
+      if (surf->texture == resource) {
          batch->resolve &= ~(PIPE_CLEAR_COLOR0 << i);
+         if (i == 0 && batch->key.resolve)
+            batch->g17p_resolve_preserve = false;
+      }
+   }
+
+   /* If no active batch is currently writing this texture, discard its valid
+    * levels so a subsequent full overwrite (such as a full-surface PBO upload)
+    * does not reload stale pixels from DRAM first. */
+   if (resource->target != PIPE_BUFFER) {
+      struct agx_batch *writer = agx_writer_get(ctx, rsrc->bo->handle);
+      if (!writer || !agx_batch_is_active(writer))
+         BITSET_ZERO(rsrc->data_valid);
    }
 }
 
@@ -2727,21 +2945,13 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
 
    caps->max_vertex_element_src_offset = 0xffff;
 
-   /* On AGX3, advertising blit-based transfers routes a format-mismatched
-    * glReadPixels through u_blitter.  In particular, the WSI-native
-    * B8G8R8A8_UNORM -> API R8G8B8A8_UNORM conversion silently returns zero on
-    * G17P even though the same drawable is byte-exact through a dma-buf CPU
-    * map after both CPU upload and GPU clear.  Keep using the ordinary mapped
-    * transfer path, which performs the format conversion on the CPU, until
-    * the AGX3 render-blitter pixel path is hardware-grounded.
-    *
-    * This is correctness-critical for every default EGL surface: the DRI
-    * pbuffer/window colour buffer is BGRA while GLES glReadPixels(GL_RGBA)
-    * requests RGBA.  AGX2 retains its established accelerated path.
-    */
+   /* AGX2 and G17P support blit-based texture transfers (PBO GPU uploads and
+    * blit-based format conversions). Other AGX3 parts stay on mapped transfers
+    * until their render-blitter pixel conversion path is verified. */
+   const enum agx_chip chip = agx_device(pscreen)->chip;
    caps->texture_transfer_modes =
-      agx_chip_command_stream_generation(agx_device(pscreen)->chip) ==
-            AGX_CS_GENERATION_AGX2
+      (agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_AGX2 ||
+       chip == AGX_CHIP_G17P)
          ? PIPE_TEXTURE_TRANSFER_BLIT
          : PIPE_TEXTURE_TRANSFER_DEFAULT;
 
