@@ -349,8 +349,14 @@ encode_gpu1(const struct agx3_isel_desc *d,
    const bool half_regs = d->cmp_16 && !d->cmp1_immediate;
    const bool ti = d->true_kind == AGX3_ISEL_IMMEDIATE;
    const bool fi = d->false_kind == AGX3_ISEL_IMMEDIATE;
-   if (half_regs && d->dest_16 && d->cond != AGX3_ISEL_ICOND_EQ &&
-       d->cond != AGX3_ISEL_ICOND_ULT)
+   /* Equality and unsigned less-than are the witnessed conditions for an
+    * immediate arm beside two half comparands. Register:register select
+    * operands take every condition instead: the iseli32 witnesses admit
+    * all of them on the same comparand fields, and the 16-bit-result form
+    * is the same instruction with f10=f54=f68=1 -- aurora-silicon/mesa#739,
+    * which GLSL abs(int16_t) reaches as imax(x, ineg x). */
+   if (half_regs && d->dest_16 && (ti || fi) &&
+       d->cond != AGX3_ISEL_ICOND_EQ && d->cond != AGX3_ISEL_ICOND_ULT)
       return false;
    if (half_regs && !d->dest_16 && (ti || fi) &&
        (d->cond != AGX3_ISEL_ICOND_EQ || (ti && fi)))
@@ -375,11 +381,14 @@ encode_gpu1(const struct agx3_isel_desc *d,
     *   (i < 1) ? 0 : 1       02010d80228106022080   sgt 0
     *   (i < j) ? 0 : 1       02011d03228007002081   slt, register comparand
     *
-    * A narrow comparand with a signed relation stays unwitnessed. */
+    * A narrow comparand with a signed relation stays unwitnessed for the
+    * immediate arms and the widened cmp1 form; it encodes only between two
+    * register halves selecting register halves, where f28/f43 sign-extend
+    * the comparands as the iseli32 signed forms already do. */
    if (d->dest_16 &&
        (d->cond != AGX3_ISEL_ICOND_ULT && d->cond != AGX3_ISEL_ICOND_UGT &&
         d->cond != AGX3_ISEL_ICOND_EQ) &&
-       (d->cmp_16 || d->cmp1_16))
+       (d->cmp1_16 || (d->cmp_16 && !(half_regs && !ti && !fi))))
       return false;
    for (unsigned i = 0; i < 4; ++i) {
       if (d->cache[i] && d->discard[i])

@@ -559,6 +559,29 @@ main(void)
    m5.cond = AGX3_ISEL_ICOND_ULT;
    CHECK(!agx3_isel_encode_g18g(AGX_ISA_ENCODING_AGX3C,&m5,out,&len));
 
+   /* mesa#739: two half register comparands selecting register halves.
+    * The iseli32 witnesses admit every relation on the same comparand and
+    * select-arm fields, so iseli16 admits them all; the immediate-arm
+    * forms of the same shape keep the witnessed EQ/ULT bound. */
+   const struct agx3_isel_desc hregs = {
+      .dest_16 = true, .cmp_16 = true,
+      .cmp0 = 0, .cmp1 = 1, .sel_true = 0, .sel_false = 1,
+   };
+   const unsigned hconds[] = {AGX3_ISEL_ICOND_ULT, AGX3_ISEL_ICOND_UGT,
+                              AGX3_ISEL_ICOND_EQ, AGX3_ISEL_ICOND_SLT,
+                              AGX3_ISEL_ICOND_SGT};
+   for (unsigned i = 0; i < sizeof(hconds)/sizeof(hconds[0]); ++i) {
+      const unsigned c = hconds[i];
+      m5 = hregs;
+      m5.cond = c;
+      CHECK(agx3_isel_encode_g18g(AGX_ISA_ENCODING_AGX3C,&m5,out,&len));
+      CHECK(len == 10);
+      m5.false_kind = AGX3_ISEL_IMMEDIATE;
+      m5.sel_false = 0;
+      CHECK((c == AGX3_ISEL_ICOND_EQ || c == AGX3_ISEL_ICOND_ULT) ==
+            agx3_isel_encode_g18g(AGX_ISA_ENCODING_AGX3C,&m5,out,&len));
+   }
+
    /* The same equality against 3, 4 and 255: Apple applegpu_g17g,
     * test/native/g17g/m5-libagx-reference.metal sel_heq*. libagx's GL query
     * copy selects on `k == 4`. */

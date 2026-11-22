@@ -6,6 +6,7 @@
 #include "agx_compile.h"
 #include "agx3_cf_core.h"
 #include "agx_compiler.h"
+#include "agx_debug.h"
 #include "nir_builder.h"
 #include "util/half_float.h"
 
@@ -2073,6 +2074,61 @@ check_f32_abs_zero_compare_select_compute(void)
    return valid;
 }
 
+/* aurora-silicon/mesa#739: the issue's minimal reproducer,
+ *
+ *   layout(local_size_x = 64) in;
+ *   buffer A { int16_t a[]; };
+ *   buffer R { int16_t r[]; };
+ *   void main() { uint i = gl_GlobalInvocationID.x; r[i] = abs(a[i]); }
+ *
+ * abs(int16_t) reaches the backend as imax(x, ineg x): a 16-bit icmpsel
+ * whose select operands are register halves on a signed relation.  The
+ * GPU1 packer admitted that shape only for equality and unsigned
+ * less-than, so vkCreateComputePipelines failed on G18G.  This check
+ * compiles the shader for G18G and fails if the packer still refuses. */
+static bool
+check_g18g_iabs16_regreg_icmpsel_compute(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "G18G int16 abs");
+   b.shader->info.workgroup_size[0] = 64;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   nir_def *input = nir_load_global(&b, 1, 16, nir_imm_int64(&b, 0x1000),
+                                    .align_mul = sizeof(int16_t));
+   nir_def *absolute = nir_iabs(&b, input);
+   nir_store_global(&b, absolute, nir_imm_int64(&b, 0x2000),
+                    .align_mul = sizeof(int16_t));
+   agx_preprocess_nir(b.shader);
+
+   struct agx_shader_key key = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.emit_agx3d = true;
+   key.dev.chip = AGX_CHIP_G18G;
+   struct agx_shader_part part = {0};
+   const bool compiled = agx_compile_shader_nir(b.shader, &key, &part);
+
+   /* A packer refusal takes the compile down the retry path instead of
+    * failing outright, and the issue's vkCreateComputePipelines still dies
+    * on it, so a refusal counts as a failure even when the retry encodes.
+    * agx_last_compile_refusal() names the first refusal of the compile and
+    * is not cleared by a recovered retry. */
+   const bool refused = agx_last_compile_refusal()[0] != '\0';
+   const bool valid = compiled && part.binary != NULL &&
+                      part.info.binary_size > 4 && part.info.main_size > 0 &&
+                      !refused;
+   if (!valid)
+      fprintf(stderr,
+              "G18G 16-bit register:register icmpsel: compiled=%u "
+              "refused=%u %s (mesa#739)\n", compiled, refused,
+              agx_last_compile_refusal());
+
+   free(part.binary);
+   ralloc_free(b.shader);
+   return valid;
+}
+
 static bool
 check_half_sqrt_compute(void)
 {
@@ -2513,6 +2569,13 @@ main(int argc, char **argv)
               valid ? "PASS" : "FAIL");
       return valid ? 0 : 1;
    }
+
+   if (argc == 2 && !strcmp(argv[1], "--g18g-iabs16-regreg-only")) {
+      const bool valid = check_g18g_iabs16_regreg_icmpsel_compute();
+      fprintf(stderr, "G18G int16 register:register icmpsel: %s\n",
+              valid ? "PASS" : "FAIL");
+      return valid ? 0 : 1;
+   }
    if (argc == 2 && !strcmp(argv[1], "--half-sqrt-only")) {
       const bool valid = check_half_sqrt_compute();
       fprintf(stderr, "G17P shaderFloat16 square root: %s\n",
@@ -2606,6 +2669,8 @@ main(int argc, char **argv)
    if (!check_half_isnan_isinf_compute())
       return 1;
    if (!check_f32_abs_zero_compare_select_compute())
+      return 1;
+   if (!check_g18g_iabs16_regreg_icmpsel_compute())
       return 1;
    if (!check_half_sqrt_compute())
       return 1;
