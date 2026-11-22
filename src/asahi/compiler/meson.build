@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 libasahi_agx_files = files(
+  'agx_bigstack.c',
   'agx_compile.c',
   'agx_nir_lower_cmat.c',
   'agx_dce.c',

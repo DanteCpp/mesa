@@ -679,6 +679,19 @@ hk_device_physical(struct hk_device *dev)
  * (hk_query_note_submit()), hk_get_timestamp() and the profiler's claims. */
 bool hk_own_timestamps(struct hk_device *dev);
 
+/* Query pool BO flags: the kernel requires bound timestamp buffers to carry
+ * AGX_BO_SHARED. When own_timestamps is true the kernel never binds the pool,
+ * so keeping it private lets v6 prove query writes never hit a primary and
+ * keeps the pool out of the v6 read list. */
+static inline enum agx_bo_flags
+hk_query_pool_bo_flags(bool timestamp, bool stamped, bool own_timestamps)
+{
+   enum agx_bo_flags flags = AGX_BO_WRITEBACK;
+   if ((timestamp || stamped) && !own_timestamps)
+      flags |= AGX_BO_SHARED;
+   return flags;
+}
+
 VkResult hk_device_init_meta(struct hk_device *dev);
 void hk_device_finish_meta(struct hk_device *dev);
 

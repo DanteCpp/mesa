@@ -1049,7 +1049,9 @@ stamp_carrier_launch(struct hk_cmd_buffer *cmd)
    struct agx_ptr scratch = hk_pool_alloc(cmd, 16, 16);
    if (!scratch.gpu)
       return;
+   hk_primary_private_begin(cmd, true);
    hk_g17p_meta_fill_addr(cmd, &cmd->current_cs.cs, scratch.gpu, 4, 0);
+   hk_primary_private_end(cmd);
 }
 
 void
@@ -1370,8 +1372,11 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       stamp_wait(cmd, gfx, dep);
 
       if (gfx->timestamp.end.handle) {
+         hk_primary_private_begin(
+            cmd, hk_primary_private_proof(req.bo, req.addr, sizeof(uint64_t)));
          libagx_copy_timestamp(cmd, agx_1d(1), AGX_BARRIER_ALL | AGX_POSTGFX,
                                req.addr, gfx->timestamp.end.addr);
+         hk_primary_private_end(cmd);
       } else {
          gfx->timestamp.end = req;
       }

@@ -858,6 +858,9 @@ struct hk_graphics_state {
    uint64_t xfb_query[4];
    /* Active VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT reports, per stream. */
    uint64_t prims_generated_query[4];
+   /* Backing BOs for active query pools (for v6 primary-write helper proofs). */
+   const struct agx_bo *pipeline_stats_bo;
+   const struct agx_bo *prims_generated_bo[4];
 
    struct hk_index_buffer_state index;
    enum agx_primitive topology;
@@ -1985,11 +1988,15 @@ hk_sync_xfer_begin(struct hk_cmd_buffer *cmd)
 
 /* As hk_sync_xfer_begin(), for a transfer whose writes stay inside the GPU
  * VA range [lo, hi). device_address says shaders may also reach the range
- * through a buffer device address. A nested transfer widens the range of the
- * outermost one. */
+ * through a buffer device address (for G17P transfer-to-graphics hazard
+ * tracking only). primary_ambiguous marks a sparse/aliased destination that
+ * v6 must refuse; primary_private marks a non-sparse transfer destination
+ * proven to live in a never-shared BO that can never be a WDDM primary. A
+ * nested transfer widens the range of the outermost one. */
 static inline void
 hk_sync_xfer_begin_dst(struct hk_cmd_buffer *cmd, uint64_t lo, uint64_t hi,
-                       bool device_address)
+                       bool device_address, bool primary_ambiguous,
+                       bool primary_private)
 {
    struct hk_sync_xfer_dst *dst = &cmd->sync.xfer_dst;
    if (cmd->sync.xfer_depth++ == 0) {
@@ -1998,11 +2005,21 @@ hk_sync_xfer_begin_dst(struct hk_cmd_buffer *cmd, uint64_t lo, uint64_t hi,
          .hi = hi,
          .valid = lo < hi,
          .device_address = device_address,
+         .primary_ambiguous = primary_ambiguous,
+         .primary_private = primary_private,
       };
-   } else if (dst->valid) {
-      dst->lo = MIN2(dst->lo, lo);
-      dst->hi = MAX2(dst->hi, hi);
+   } else {
       dst->device_address |= device_address;
+      dst->primary_ambiguous |= primary_ambiguous;
+      dst->primary_private &= primary_private;
+      if (dst->valid) {
+         if (lo < hi) {
+            dst->lo = MIN2(dst->lo, lo);
+            dst->hi = MAX2(dst->hi, hi);
+         } else {
+            dst->valid = false;
+         }
+      }
    }
 }
 
@@ -2031,13 +2048,24 @@ hk_primary_note_compute(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       agx_primary_write_note_private(&cs->primary_writes, !cmd->primary_private.unproven);
       return;
    }
-   if (!cmd->sync.xfer_depth || !d->valid || d->device_address || d->lo >= d->hi) {
+   if (!cmd->sync.xfer_depth || !d->valid || d->primary_ambiguous || d->lo >= d->hi) {
       agx_primary_write_refuse(&cs->primary_writes,
                                !cmd->sync.xfer_depth ? AGX_PRIMARY_WRITE_CAUSE_COMPUTE_NO_SCOPE
                                                      : AGX_PRIMARY_WRITE_CAUSE_TRANSFER_DST);
       return;
    }
+   if (d->primary_private)
+      return;
    agx_primary_write_add(&cs->primary_writes, d->lo, d->hi - d->lo);
+}
+
+/* A BO is private when it is mapped and neither shared nor shareable: such a
+ * BO can never be a WDDM primary. */
+static inline bool
+hk_primary_private_bo(const struct agx_bo *bo)
+{
+   return bo != NULL && bo->va != NULL && bo->size != 0 &&
+          (bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) == 0;
 }
 
 /* A helper write's destination is private when [address, address + size)
@@ -2046,9 +2074,17 @@ hk_primary_note_compute(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 static inline bool
 hk_primary_private_proof(const struct agx_bo *bo, uint64_t address, uint64_t size)
 {
-   return bo != NULL && bo->va != NULL && size != 0 && size <= bo->size &&
-          (bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) == 0 &&
+   return hk_primary_private_bo(bo) && size != 0 && size <= bo->size &&
           address >= bo->va->addr && address - bo->va->addr <= bo->size - size;
+}
+
+/* A query-statistic destination is private when disabled (0 or scratch page)
+ * or proven to lie within its never-shared query pool BO. */
+static inline bool
+hk_primary_stat_proof(const struct agx_bo *bo, uint64_t address)
+{
+   return !address || address == AGX_SCRATCH_PAGE_ADDRESS ||
+          hk_primary_private_proof(bo, address, sizeof(uint64_t));
 }
 
 static inline void

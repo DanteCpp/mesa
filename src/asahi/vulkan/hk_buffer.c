@@ -602,6 +602,9 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
          assert(buffer->vk.device_address == 0);
          buffer->vk.device_address =
             hk_device_memory_addr(mem) + pBindInfos[i].memoryOffset;
+         buffer->primary_private =
+            mem != NULL && mem->bo != NULL &&
+            (mem->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) == 0;
       }
 
       VK_FROM_HANDLE(hk_device, dev, device);

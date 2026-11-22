@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_shader.h"
+#include "asahi/compiler/agx_bigstack.h"
 #include "hk_buffer.h"
 #include "hk_frame_anatomy.h"
 #include "hk_agx3_ioto_program_core.h"
@@ -8200,12 +8201,59 @@ hk_m5_no_grid_record(const struct hk_device *dev, uint32_t shader_count,
 }
 
 static VkResult
+hk_compile_shaders_impl(struct vk_device *vk_dev, uint32_t shader_count,
+                        struct vk_shader_compile_info *infos,
+                        const struct vk_graphics_pipeline_state *state,
+                        const struct vk_features *features,
+                        const VkAllocationCallbacks *pAllocator,
+                        struct vk_shader **shaders_out);
+
+struct hk_compile_shaders_call {
+   struct vk_device *vk_dev;
+   uint32_t shader_count;
+   struct vk_shader_compile_info *infos;
+   const struct vk_graphics_pipeline_state *state;
+   const struct vk_features *features;
+   const VkAllocationCallbacks *pAllocator;
+   struct vk_shader **shaders_out;
+   VkResult ret;
+};
+
+static void
+hk_compile_shaders_call_fn(void *p)
+{
+   struct hk_compile_shaders_call *c = p;
+   c->ret = hk_compile_shaders_impl(c->vk_dev, c->shader_count, c->infos,
+                                    c->state, c->features, c->pAllocator,
+                                    c->shaders_out);
+}
+
+/* Linking and lowering (nir_opt_varyings: a 72 KiB frame) nest past a small
+ * host thread stack (DWM on Windows): run with enough stack
+ * (agx_bigstack.c). */
+static VkResult
 hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                    struct vk_shader_compile_info *infos,
                    const struct vk_graphics_pipeline_state *state,
                    const struct vk_features *features,
                    const VkAllocationCallbacks *pAllocator,
                    struct vk_shader **shaders_out)
+{
+   struct hk_compile_shaders_call c = {
+      vk_dev, shader_count, infos, state, features, pAllocator, shaders_out,
+      VK_SUCCESS,
+   };
+   agx_call_with_stack(hk_compile_shaders_call_fn, &c);
+   return c.ret;
+}
+
+static VkResult
+hk_compile_shaders_impl(struct vk_device *vk_dev, uint32_t shader_count,
+                        struct vk_shader_compile_info *infos,
+                        const struct vk_graphics_pipeline_state *state,
+                        const struct vk_features *features,
+                        const VkAllocationCallbacks *pAllocator,
+                        struct vk_shader **shaders_out)
 {
    struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
    nir_shader *shaders[shader_count];

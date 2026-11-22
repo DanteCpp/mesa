@@ -3001,8 +3001,12 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
          perf_debug(cmd, "CS invocation statistic");
          uint64_t grid = cmd->state.cs.descriptors.root.cs.group_count_addr;
 
+         hk_primary_private_begin(
+            cmd, hk_primary_private_proof(cmd->state.gfx.pipeline_stats_bo,
+                                          stat, sizeof(uint64_t)));
          libagx_increment_cs_invocations(cmd, agx_1d(1), AGX_BARRIER_ALL, grid,
                                          stat, agx_workgroup_threads(local_size));
+         hk_primary_private_end(cmd);
       }
    }
 

@@ -30,7 +30,24 @@ struct hk_buffer {
    uint32_t sparse_map_entries;
    /** Link in hk_device::sparse_buffers while sparse_map is set. */
    struct list_head sparse_link;
+
+   /** True when bound without a separate VA to a never-shared BO
+    * (neither AGX_BO_SHARED nor AGX_BO_SHAREABLE), so transfers into
+    * this buffer can never write a WDDM primary. */
+   bool primary_private;
 };
+
+/* Sparse buffers and buffers with their own VA (capture/replay) cannot be
+ * tracked as a single plain VA span under the v6 primary-write contract. */
+static inline bool
+hk_primary_buffer_ambiguous(const struct hk_buffer *buffer)
+{
+   return buffer->va != NULL ||
+          (buffer->vk.create_flags &
+           (VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
+            VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT |
+            VK_BUFFER_CREATE_SPARSE_ALIASED_BIT)) != 0;
+}
 
 /* VK_EXT_descriptor_buffer capture/replay data of a buffer */
 struct hk_buffer_capture {

@@ -5200,9 +5200,8 @@ hk_xfer_begin_image(struct hk_cmd_buffer *cmd, VkImage _image)
    VK_FROM_HANDLE(hk_image, image, _image);
    uint64_t lo, hi;
    hk_image_va_range(image, &lo, &hi);
-   hk_sync_xfer_begin_dst(cmd, lo, hi,
-         hk_cmd_buffer_device(cmd)->dev.primary_write_contract &&
-         hk_primary_image_ambiguous(image));
+   hk_sync_xfer_begin_dst(cmd, lo, hi, false,
+                          hk_primary_image_ambiguous(image), false);
 }
 
 static void
@@ -5211,12 +5210,21 @@ hk_xfer_begin_buffer(struct hk_cmd_buffer *cmd, VkBuffer _buffer,
 {
    VK_FROM_HANDLE(hk_buffer, buffer, _buffer);
    const uint64_t base = vk_buffer_address(&buffer->vk, 0);
+   uint64_t lo = 0, hi = 0;
+   if (lo_B < hi_B && lo_B < buffer->vk.size) {
+      const uint64_t end_B = MIN2(hi_B, buffer->vk.size);
+      if (end_B <= UINT64_MAX - base) {
+         lo = base + lo_B;
+         hi = base + end_B;
+      }
+   }
    /* A sparse buffer is also read through its shadow mapping. */
    const bool device_address =
       (buffer->vk.usage & VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT) ||
-      buffer->va;
-   hk_sync_xfer_begin_dst(cmd, base + lo_B, base + MIN2(hi_B, buffer->vk.size),
-                          device_address);
+      buffer->va != NULL;
+   const bool primary_ambiguous = hk_primary_buffer_ambiguous(buffer);
+   hk_sync_xfer_begin_dst(cmd, lo, hi, device_address, primary_ambiguous,
+                          !primary_ambiguous && buffer->primary_private);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -5266,8 +5274,14 @@ hk_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info)
     * class for every recorded dependency. */
    uint64_t lo = UINT64_MAX, hi = 0;
    for (uint32_t r = 0; r < info->regionCount; ++r) {
+      if (!info->pRegions[r].size)
+         continue;
       lo = MIN2(lo, info->pRegions[r].dstOffset);
-      hi = MAX2(hi, info->pRegions[r].dstOffset + info->pRegions[r].size);
+      const uint64_t end =
+         info->pRegions[r].size > UINT64_MAX - info->pRegions[r].dstOffset
+            ? UINT64_MAX
+            : info->pRegions[r].dstOffset + info->pRegions[r].size;
+      hi = MAX2(hi, end);
    }
    hk_xfer_begin_buffer(cmd, info->dstBuffer, lo, hi);
    hk_xfer_copybuffer2(commandBuffer, info);
@@ -5293,10 +5307,37 @@ hk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
                          const VkCopyImageToBufferInfo2 *pCopyImageToBufferInfo)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(hk_image, src_image, pCopyImageToBufferInfo->srcImage);
+   VK_FROM_HANDLE(hk_buffer, dst_buffer, pCopyImageToBufferInfo->dstBuffer);
 
    /* Transfer stage: the streams recorded here belong to the transfer
-    * class for every recorded dependency. */
-   hk_xfer_begin_buffer(cmd, pCopyImageToBufferInfo->dstBuffer, 0, UINT64_MAX);
+    * class for every recorded dependency. Compute tight byte bounds across
+    * pRegions (matching hk_meta_copy_image_to_buffer2), clamped to the
+    * destination buffer size, so slab-allocated buffers never blow the v6
+    * per-vector page cap. */
+   uint64_t lo = UINT64_MAX, hi = 0;
+   for (uint32_t r = 0; r < pCopyImageToBufferInfo->regionCount; ++r) {
+      const VkBufferImageCopy2 *region = &pCopyImageToBufferInfo->pRegions[r];
+      const VkFormat aspect_fmt = aspect_format(
+         src_image->vk.format, region->imageSubresource.aspectMask);
+      const enum pipe_format p_format = vk_format_to_pipe_format(aspect_fmt);
+      const uint32_t layers = vk_image_subresource_layer_count(
+         &src_image->vk, &region->imageSubresource);
+      uint64_t r_lo = 0, r_hi = 0;
+      if (agx_copy_image_to_buffer_bounds(
+             region->bufferOffset, region->bufferRowLength,
+             region->bufferImageHeight, region->imageExtent.width,
+             region->imageExtent.height, region->imageExtent.depth, layers,
+             util_format_get_blockwidth(p_format),
+             util_format_get_blockheight(p_format),
+             util_format_get_blockdepth(p_format),
+             util_format_get_blocksize(p_format), dst_buffer->vk.size,
+             &r_lo, &r_hi)) {
+         lo = MIN2(lo, r_lo);
+         hi = MAX2(hi, r_hi);
+      }
+   }
+   hk_xfer_begin_buffer(cmd, pCopyImageToBufferInfo->dstBuffer, lo, hi);
    hk_xfer_copyimagetobuffer2(commandBuffer, pCopyImageToBufferInfo);
    hk_sync_xfer_end(cmd);
 }
@@ -5355,7 +5396,9 @@ hk_CmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
-   hk_xfer_begin_buffer(cmd, dstBuffer, dstOffset, dstOffset + dstRange);
+   const uint64_t end =
+      dstRange > UINT64_MAX - dstOffset ? UINT64_MAX : dstOffset + dstRange;
+   hk_xfer_begin_buffer(cmd, dstBuffer, dstOffset, end);
    hk_xfer_updatebuffer(commandBuffer, dstBuffer, dstOffset, dstRange, pData);
    hk_sync_xfer_end(cmd);
    cmd->state.deferred_clear_hold = false;

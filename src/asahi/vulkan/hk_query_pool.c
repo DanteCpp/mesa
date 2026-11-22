@@ -241,21 +241,27 @@ hk_CmdWriteAccelerationStructuresPropertiesKHR(
       return;
    for (uint32_t i = 0; i < accelerationStructureCount; ++i) {
       VK_FROM_HANDLE(vk_acceleration_structure, as, pAccelerationStructures[i]);
+      const uint64_t report_addr = hk_query_report_addr(dev, pool, firstQuery + i);
+      hk_primary_private_begin(
+         cmd, hk_primary_private_proof(pool->bo, report_addr, sizeof(uint64_t)));
       if (dev->g17p_native_as) {
          uint64_t metadata = hk_gen1_as_metadata_addr(cmd, as);
-         if (!metadata)
+         if (!metadata) {
+            hk_primary_private_end(cmd);
             return;
+         }
          libagx_gen1_as_property(cmd, agx_1d(1), AGX_BARRIER_ALL,
             vk_acceleration_structure_get_va(as),
-            metadata, hk_query_report_addr(dev, pool, firstQuery + i),
+            metadata, report_addr,
             queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR ? 0 :
             queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR ? 1 :
             queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR ? 2 : 3);
       } else {
          libagx_agx3_as_property(cmd, agx_1d(1), AGX_BARRIER_ALL,
             ALIGN_POT(vk_acceleration_structure_get_va(as), UINT64_C(1024)),
-            hk_query_report_addr(dev, pool, firstQuery + i), kind);
+            report_addr, kind);
       }
+      hk_primary_private_end(cmd);
       if (vk_command_buffer_has_error(&cmd->vk))
          return;
       hk_queue_write_bo(cmd, pool->bo, hk_query_available_addr(pool, firstQuery + i), 1, false);
@@ -300,7 +306,9 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       bool pinned = cmd->sync.pin_cs;
       cmd->current_cs.cs = cs;
       cmd->sync.pin_cs = true;
+      hk_primary_private_begin(cmd, !cs->imm_writes_unproven);
       libagx_write_u32s(cmd, agx_1d(count), AGX_BARRIER_ALL, params);
+      hk_primary_private_end(cmd);
       cmd->current_cs.cs = saved;
       cmd->sync.pin_cs = pinned;
 
@@ -486,9 +494,13 @@ emit_zero_queries_g17p(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
       hk_cdm_cache_flush(dev, cs);
    }
 
+   const bool proven = hk_primary_private_bo(pool->bo) &&
+      (!pool->oq_queries || hk_primary_private_bo(dev->occlusion_queries.bo));
+   hk_primary_private_begin(cmd, proven);
    libagx_reset_query_struct(cmd, agx_1d(num_queries),
                              set_available ? AGX_BARRIER_ALL : AGX_BARRIER_NONE,
                              info);
+   hk_primary_private_end(cmd);
    hk_note_query_access(cmd);
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
@@ -517,9 +529,14 @@ emit_zero_queries_g17p(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    }
 
    if (publish_available) {
+      const uint64_t avail_addr = hk_query_available_addr(pool, first_index);
+      const uint64_t avail_size =
+         (uint64_t)num_queries * hk_query_available_size(pool);
+      hk_primary_private_begin(
+         cmd, hk_primary_private_proof(pool->bo, avail_addr, avail_size));
       hk_g17p_meta_fill_addr(cmd, &cmd->current_cs.cs,
-         hk_query_available_addr(pool, first_index),
-         (uint64_t)num_queries * hk_query_available_size(pool), 1);
+         avail_addr, avail_size, 1);
+      hk_primary_private_end(cmd);
    }
 }
 
@@ -549,7 +566,11 @@ emit_zero_queries(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
       .availability_shift = pool->avail_shift,
    };
 
+   const bool proven = hk_primary_private_bo(pool->bo) &&
+      (!pool->oq_queries || hk_primary_private_bo(dev->occlusion_queries.bo));
+   hk_primary_private_begin(cmd, proven);
    libagx_reset_query_struct(cmd, agx_1d(num_queries), AGX_BARRIER_ALL, info);
+   hk_primary_private_end(cmd);
    hk_note_query_access(cmd);
 }
 
@@ -656,10 +677,12 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
             bo_size += pool->query_stride * (size_t)pool->vk.query_count;
       }
 
-      /* The kernel requires that timestamp buffers are SHARED */
-      enum agx_bo_flags flags = AGX_BO_WRITEBACK;
-      if (timestamp || stamped)
-         flags |= AGX_BO_SHARED;
+      /* The kernel requires that bound timestamp buffers are SHARED.
+       * Where queries hold the device's own time (hk_own_timestamps()), the
+       * kernel never binds pool->bo, so keeping it private lets v6 prove
+       * query writes never hit a primary and keeps it out of the read list. */
+      enum agx_bo_flags flags =
+         hk_query_pool_bo_flags(timestamp, stamped, hk_own_timestamps(dev));
 
       pool->bo = agx_bo_create(&dev->dev, bo_size, 0, flags, "Query pool");
       if (!pool->bo || !agx_bo_map(pool->bo)) {
@@ -839,13 +862,18 @@ hk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
 
       util_dynarray_append(&cmd->soft_stamps, (uint64_t *)cell.cpu);
       const bool in_render = cmd->sync.in_pass && cmd->current_cs.gfx;
+      const uint64_t report_addr = hk_query_report_addr(dev, pool, query);
+      hk_primary_private_begin(
+         cmd, hk_primary_private_proof(pool->bo, report_addr, sizeof(uint64_t)));
       libagx_copy_timestamp(cmd, agx_1d(1),
                             in_render ? AGX_BARRIER_ALL | AGX_POSTGFX
                                       : AGX_BARRIER_ALL,
-                            hk_query_report_addr(dev, pool, query), cell.gpu);
+                            report_addr, cell.gpu);
+      hk_primary_private_end(cmd);
    } else {
       const struct agx_timestamp_req req = {
          .addr = hk_query_report_addr(dev, pool, query),
+         .bo = pool->bo,
          .handle = pool->handle,
          .offset_B = hk_query_offset(pool, query),
       };
@@ -998,6 +1026,7 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
        * report: in the pre-graphics helpers of each draw. */
       uint64_t addr = hk_query_report_addr(dev, pool, query);
       cmd->state.gfx.prims_generated_query[index] = end ? 0 : addr;
+      cmd->state.gfx.prims_generated_bo[index] = end ? NULL : pool->bo;
       /* As for the pipeline statistics written by the same helpers, publish
        * availability after the graphics work. */
       graphics = true;
@@ -1020,6 +1049,7 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
          end ? 0 : hk_query_report_addr(dev, pool, query);
       root->draw.pipeline_stats_flags =
          end ? 0 : pool->vk.pipeline_statistics;
+      cmd->state.gfx.pipeline_stats_bo = end ? NULL : pool->bo;
 
       /* IA/VS/clip counters may be written by the pre-graphics helper and FS
        * counters by the VDM workload itself, so any graphics statistic makes
@@ -1492,8 +1522,37 @@ hk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
    VK_FROM_HANDLE(hk_buffer, dst_buffer, dstBuffer);
 
+   const unsigned reports = hk_reports_per_query(pool);
+   const unsigned word_size = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
+   const uint64_t tuple_size = (uint64_t)word_size *
+      (reports + !!(flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT));
+   uint64_t lo = 0, hi = 0;
+   if (queryCount > 0 && tuple_size > 0 && dstOffset < dst_buffer->vk.size) {
+      const uint64_t avail = dst_buffer->vk.size - dstOffset;
+      uint64_t span = avail;
+      if (tuple_size <= avail) {
+         const uint64_t tail = avail - tuple_size;
+         if (queryCount == 1)
+            span = tuple_size;
+         else if (stride <= tail / (queryCount - 1))
+            span = (uint64_t)(queryCount - 1) * stride + tuple_size;
+      }
+      const uint64_t base = vk_buffer_address(&dst_buffer->vk, 0);
+      if (dstOffset <= UINT64_MAX - base && span <= UINT64_MAX - (base + dstOffset)) {
+         lo = base + dstOffset;
+         hi = lo + span;
+      }
+   }
+   const bool device_address =
+      (dst_buffer->vk.usage & VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT) ||
+      dst_buffer->va != NULL;
+   const bool primary_ambiguous = hk_primary_buffer_ambiguous(dst_buffer);
+
+   hk_sync_xfer_begin_dst(cmd, lo, hi, device_address, primary_ambiguous,
+                          !primary_ambiguous && dst_buffer->primary_private);
    cmd->sync.kind_override = HK_SYNC_ALL;
    hk_cmd_copy_query_pool_results(cmd, pool, firstQuery, queryCount,
                                   dst_buffer, dstOffset, stride, flags);
    cmd->sync.kind_override = 0;
+   hk_sync_xfer_end(cmd);
 }

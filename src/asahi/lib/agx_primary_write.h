@@ -104,3 +104,83 @@ agx_primary_write_cause_name(uint32_t cause)
    default: return "unknown";
    }
 }
+
+/* Tight byte range [*lo_out, *hi_out) written in a destination buffer by one
+ * VkBufferImageCopy2 region, clamped to buffer_size. Returns false when the
+ * region writes no bytes. Intermediate overflow saturates to buffer_size. */
+static inline bool
+agx_copy_image_to_buffer_bounds(uint64_t buffer_offset,
+                                uint32_t buffer_row_length,
+                                uint32_t buffer_image_height,
+                                uint32_t extent_width,
+                                uint32_t extent_height,
+                                uint32_t extent_depth,
+                                uint32_t layer_count,
+                                uint32_t block_w,
+                                uint32_t block_h,
+                                uint32_t block_d,
+                                uint32_t blocksize_B,
+                                uint64_t buffer_size,
+                                uint64_t *lo_out,
+                                uint64_t *hi_out)
+{
+   if (!extent_width || !extent_height || !extent_depth || !layer_count ||
+       !block_w || !block_h || !block_d || !blocksize_B ||
+       buffer_offset >= buffer_size)
+      return false;
+
+   const uint64_t bw = block_w;
+   const uint64_t bh = block_h;
+   const uint64_t bd = block_d;
+   const uint64_t bs = blocksize_B;
+   const uint64_t row_texels =
+      buffer_row_length > extent_width ? buffer_row_length : extent_width;
+   const uint64_t slice_texels =
+      buffer_image_height > extent_height ? buffer_image_height : extent_height;
+
+   const uint64_t width_blocks = ((uint64_t)extent_width + bw - 1u) / bw;
+   const uint64_t height_blocks = ((uint64_t)extent_height + bh - 1u) / bh;
+   const uint64_t depth_blocks = ((uint64_t)extent_depth + bd - 1u) / bd;
+   const uint64_t row_blocks = (row_texels + bw - 1u) / bw;
+   const uint64_t slice_rows = (slice_texels + bh - 1u) / bh;
+   const uint64_t slices =
+      depth_blocks > (uint64_t)layer_count ? depth_blocks : (uint64_t)layer_count;
+
+   const uint64_t max_span = buffer_size - buffer_offset;
+   uint64_t span = max_span;
+
+   if (width_blocks <= max_span / bs && row_blocks <= UINT64_MAX / bs) {
+      const uint64_t row_bytes = width_blocks * bs;
+      const uint64_t row_stride = row_blocks * bs;
+      bool overflow = false;
+      uint64_t total = row_bytes;
+
+      if (height_blocks > 1u) {
+         const uint64_t extra_rows = height_blocks - 1u;
+         if (row_stride > (max_span - total) / extra_rows)
+            overflow = true;
+         else
+            total += extra_rows * row_stride;
+      }
+
+      if (!overflow && slices > 1u) {
+         const uint64_t extra_slices = slices - 1u;
+         if (row_stride > UINT64_MAX / slice_rows) {
+            overflow = true;
+         } else {
+            const uint64_t slice_stride = slice_rows * row_stride;
+            if (slice_stride > (max_span - total) / extra_slices)
+               overflow = true;
+            else
+               total += extra_slices * slice_stride;
+         }
+      }
+
+      if (!overflow)
+         span = total;
+   }
+
+   *lo_out = buffer_offset;
+   *hi_out = buffer_offset + span;
+   return true;
+}

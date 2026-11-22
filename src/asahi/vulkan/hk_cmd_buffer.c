@@ -471,6 +471,8 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    cmd->geom_index_count = 0;
    cmd->geom_instance_count = 0;
    cmd->uses_heap = false;
+   cmd->primary_private.depth = 0;
+   cmd->primary_private.unproven = false;
    hk_sync_reset(cmd);
    if (cmd->m5_pushed_images)
       _mesa_set_clear(cmd->m5_pushed_images, NULL);
@@ -4300,9 +4302,11 @@ hk_apply_conditional_rendering(struct hk_cmd_buffer *cmd, uint64_t source,
       return 0;
    }
 
+   hk_primary_private_begin(cmd, true);
    libagx_conditional_render(cmd, agx_1d(1), barrier, output.gpu, source,
                              conditional->address, words,
                              conditional->inverted);
+   hk_primary_private_end(cmd);
    return vk_command_buffer_has_error(&cmd->vk) ? 0 : output.gpu;
 }
 
@@ -4402,9 +4406,9 @@ hk_primary_note_render(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    cs->primary_writes.observed = true;
    if (!set.complete)
       agx_primary_write_refuse(&cs->primary_writes, AGX_PRIMARY_WRITE_CAUSE_ATTACHMENT);
-   if (cs->m5_shader_writes_memory || cmd->state.gfx.shaders_write_memory)
+   if (cs->m5_shader_writes_memory)
       agx_primary_write_refuse(&cs->primary_writes, AGX_PRIMARY_WRITE_CAUSE_SHADER_WRITES);
-   if (cmd->state.gfx.xfb_enabled)
+   if (!cmd->in_meta && cmd->state.gfx.xfb_enabled)
       agx_primary_write_refuse(&cs->primary_writes, AGX_PRIMARY_WRITE_CAUSE_XFB);
    for (unsigned i = 0; i < set.count; i++)
       agx_primary_write_add(&cs->primary_writes, set.list[i].pointer, set.list[i].size);
@@ -4757,9 +4761,8 @@ clear_attachment_as_image(struct hk_cmd_buffer *cmd,
    if (primary) {
       uint64_t lo, hi;
       hk_image_va_range(image, &lo, &hi);
-      hk_sync_xfer_begin_dst(cmd, lo, hi,
-         hk_cmd_buffer_device(cmd)->dev.primary_write_contract &&
-         hk_primary_image_ambiguous(image));
+      hk_sync_xfer_begin_dst(cmd, lo, hi, false,
+                             hk_primary_image_ambiguous(image), false);
    }
    hk_clear_image(cmd, image, vk_format_to_pipe_format(format),
                   att->clear_colour, &range, false /* partially clear 3D */);
@@ -5072,9 +5075,8 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
       if (dev->dev.primary_write_contract) {
          uint64_t lo, hi;
          hk_image_va_range(e->image, &lo, &hi);
-         hk_sync_xfer_begin_dst(cmd, lo, hi,
-         hk_cmd_buffer_device(cmd)->dev.primary_write_contract &&
-         hk_primary_image_ambiguous(e->image));
+         hk_sync_xfer_begin_dst(cmd, lo, hi, false,
+                                hk_primary_image_ambiguous(e->image), false);
       } else {
          hk_sync_xfer_begin(cmd);
       }

@@ -87,9 +87,13 @@ hk_launch_tess_batched(struct hk_cmd_buffer *cmd, struct hk_shader *vs,
    /* Precompiled kernels record into the pre-graphics stream: stand each
     * stage's side stream in for it. Batched draws count nothing, so the
     * prefix sum has no counters to increment. */
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_cs *pre_gfx = cmd->current_cs.pre_gfx;
    batch->recording = true;
 
+   hk_primary_private_begin(
+      cmd, hk_primary_private_bo(dev->rodata.heap_bo) &&
+              hk_primary_private_bo(dev->heap));
    cmd->current_cs.pre_gfx = hk_tess_batch_stage(cmd, HK_TESS_STAGE_COUNT);
    libagx_tessellate(cmd, grid_tess, AGX_PREGFX, info.mode,
                      POLY_TESS_MODE_COUNT, state);
@@ -99,6 +103,7 @@ hk_launch_tess_batched(struct hk_cmd_buffer *cmd, struct hk_shader *vs,
    cmd->current_cs.pre_gfx = hk_tess_batch_stage(cmd, HK_TESS_STAGE_TESSELLATE);
    libagx_tessellate(cmd, grid_tess, AGX_PREGFX, info.mode,
                      POLY_TESS_MODE_WITH_COUNTS, state);
+   hk_primary_private_end(cmd);
 
    cmd->current_cs.pre_gfx = pre_gfx;
    batch->recording = false;

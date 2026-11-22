@@ -48,6 +48,7 @@
 
 #include "vulkan/vulkan_core.h"
 
+struct agx_bo;
 struct hk_cmd_buffer;
 struct hk_cs;
 struct hk_device;
@@ -134,6 +135,7 @@ struct hk_sync_dep {
  */
 struct agx_timestamp_req {
    uint64_t addr;
+   const struct agx_bo *bo;
    uint32_t handle;
    uint32_t offset_B;
 };
@@ -222,11 +224,16 @@ struct hk_sync_xfer_write {
    struct hk_cs *cs;
 };
 
-/* The destination of the transfer command being recorded. */
+/* The destination of the transfer command being recorded.
+ * device_address is for G17P transfer-to-graphics hazard tracking only
+ * (hk_sync.c); primary_ambiguous and primary_private are for the v6
+ * primary-write contract only (hk_primary_note_compute). */
 struct hk_sync_xfer_dst {
    uint64_t lo, hi;
    bool valid;
    bool device_address;
+   bool primary_ambiguous;
+   bool primary_private;
 };
 
 /* Per-stream state, embedded in hk_cs. */

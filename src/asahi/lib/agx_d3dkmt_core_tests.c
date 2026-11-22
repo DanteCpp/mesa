@@ -1229,6 +1229,74 @@ test_primary_write_private_and_causes(void)
    CHECK(strcmp(agx_primary_write_cause_name(1u << 31), "unknown") == 0);
 }
 
+/* Tight destination byte bounds for hk_CmdCopyImageToBuffer2: a small copy
+ * into a large DXVK slab must cover only the written region, never the full
+ * slab (which would blow the v6 16,384-page validator cap). */
+static void
+test_copy_image_to_buffer_bounds(void)
+{
+   const uint64_t slab = UINT64_C(256) << 20; /* 256 MiB DXVK slab */
+   uint64_t lo = 0, hi = 0;
+
+   /* Tightly packed 256x256 RGBA8 at offset 1 MiB inside a 256 MiB slab. */
+   CHECK(agx_copy_image_to_buffer_bounds(
+      UINT64_C(1) << 20, 0, 0, 256, 256, 1, 1, 1, 1, 1, 4, slab, &lo, &hi));
+   CHECK_EQ(lo, UINT64_C(1) << 20);
+   CHECK_EQ(hi, (UINT64_C(1) << 20) + 256u * 256u * 4u);
+
+   /* Padded row length (128) and image height (64) across 3 layers of a
+    * 100x50 RGBA8 image: last row and last layer do not require trailing pad. */
+   CHECK(agx_copy_image_to_buffer_bounds(
+      4096, 128, 64, 100, 50, 1, 3, 1, 1, 1, 4, slab, &lo, &hi));
+   CHECK_EQ(lo, 4096u);
+   CHECK_EQ(hi, 4096u + 2u * (64u * 128u * 4u) + 49u * (128u * 4u) + 100u * 4u);
+
+   /* 3D image (depth = 4, layer_count = 1) with 4x4 BC7 (16 B/block) and
+    * non-block-aligned 2x2 mip. */
+   CHECK(agx_copy_image_to_buffer_bounds(
+      512, 8, 8, 2, 2, 4, 1, 4, 4, 1, 16, slab, &lo, &hi));
+   CHECK_EQ(lo, 512u);
+   /* row_stride = 2*16 = 32, slice_stride = 2*32 = 64, 3 extra slices + 16 B. */
+   CHECK_EQ(hi, 512u + 3u * 64u + 16u);
+
+   /* Single-aspect stencil (1 B/texel) and 3-byte RGB. */
+   CHECK(agx_copy_image_to_buffer_bounds(
+      16, 0, 0, 17, 3, 1, 1, 1, 1, 1, 1, slab, &lo, &hi));
+   CHECK_EQ(lo, 16u);
+   CHECK_EQ(hi, 16u + 51u);
+   CHECK(agx_copy_image_to_buffer_bounds(
+      0, 0, 0, 10, 5, 1, 1, 1, 1, 1, 3, slab, &lo, &hi));
+   CHECK_EQ(lo, 0u);
+   CHECK_EQ(hi, 150u);
+
+   /* Overflowing stride/extent clamps cleanly to buffer_size. */
+   CHECK(agx_copy_image_to_buffer_bounds(
+      1024, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, 1,
+      1, 1, 1, 16, slab, &lo, &hi));
+   CHECK_EQ(lo, 1024u);
+   CHECK_EQ(hi, slab);
+
+   /* Region exceeding buffer_size clamps hi to buffer_size. */
+   CHECK(agx_copy_image_to_buffer_bounds(
+      slab - 64, 0, 0, 64, 64, 1, 1, 1, 1, 1, 4, slab, &lo, &hi));
+   CHECK_EQ(lo, slab - 64);
+   CHECK_EQ(hi, slab);
+
+   /* Empty regions or offset at/past end return false. */
+   CHECK(!agx_copy_image_to_buffer_bounds(
+      0, 0, 0, 0, 16, 1, 1, 1, 1, 1, 4, slab, &lo, &hi));
+   CHECK(!agx_copy_image_to_buffer_bounds(
+      0, 0, 0, 16, 0, 1, 1, 1, 1, 1, 4, slab, &lo, &hi));
+   CHECK(!agx_copy_image_to_buffer_bounds(
+      0, 0, 0, 16, 16, 0, 1, 1, 1, 1, 4, slab, &lo, &hi));
+   CHECK(!agx_copy_image_to_buffer_bounds(
+      0, 0, 0, 16, 16, 1, 0, 1, 1, 1, 4, slab, &lo, &hi));
+   CHECK(!agx_copy_image_to_buffer_bounds(
+      slab, 0, 0, 16, 16, 1, 1, 1, 1, 1, 4, slab, &lo, &hi));
+   CHECK(!agx_copy_image_to_buffer_bounds(
+      0, 0, 0, 16, 16, 1, 1, 1, 1, 1, 4, 0, &lo, &hi));
+}
+
 static void
 test_contract_blobs_we_emit(void)
 {
@@ -1685,6 +1753,7 @@ main(void)
    test_read_set_selection_by_contract();
    test_v6_blob_without_reads();
    test_primary_write_private_and_causes();
+   test_copy_image_to_buffer_bounds();
    test_contract_blobs_we_emit();
    test_import_size_is_kmd_bounded();
    test_vm_status_refused_then_signalled();

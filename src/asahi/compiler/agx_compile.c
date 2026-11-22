@@ -6,6 +6,7 @@
  */
 
 #include "agx_compile.h"
+#include "agx_bigstack.h"
 #include "c11/threads.h"
 #include "asahi/clc/asahi_clc.h"
 #include "asahi/isa/disasm.h"
@@ -15909,9 +15910,38 @@ cse_shared_reads_in_phases(nir_shader *nir)
    return any;
 }
 
+static bool
+agx_compile_shader_nir_impl(nir_shader *nir, struct agx_shader_key *key,
+                            struct agx_shader_part *out);
+
+struct agx_compile_call {
+   nir_shader *nir;
+   struct agx_shader_key *key;
+   struct agx_shader_part *out;
+   bool ret;
+};
+
+static void
+agx_compile_call_fn(void *p)
+{
+   struct agx_compile_call *c = p;
+   c->ret = agx_compile_shader_nir_impl(c->nir, c->key, c->out);
+}
+
+/* The compiler's frames nest past a small host thread stack (DWM on
+ * Windows): run it with enough stack (agx_bigstack.c). */
 bool
 agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                        struct agx_shader_part *out)
+{
+   struct agx_compile_call c = {nir, key, out, false};
+   agx_call_with_stack(agx_compile_call_fn, &c);
+   return c.ret;
+}
+
+static bool
+agx_compile_shader_nir_impl(nir_shader *nir, struct agx_shader_key *key,
+                            struct agx_shader_part *out)
 {
    /* Specialization or shader linking may gather info again after
     * preprocessing, clearing the operation-derived helper flags. Execution
