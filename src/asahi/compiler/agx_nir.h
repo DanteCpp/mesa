@@ -368,3 +368,5 @@ bool agx_nir_lower_texture_early_with_2d_robustness(struct nir_shader *s,
                                                     bool lower_2d_robustness);
 
 bool agx_nir_uniform_unit_global_id(struct nir_shader *nir);
+bool agx_nir_opt_uniform_stride_chains(struct nir_shader *shader,
+                                       bool no_textures);
