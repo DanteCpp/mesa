@@ -1087,7 +1087,11 @@ agx_lower_uniform_sources(agx_context *ctx)
                   materialized_to[materialized++] = split->dest[idx.value & 1];
                }
             } else {
-               agx_index copy = agx_mov(&b, idx);
+               agx_index copy = copy_g18g_wide_base
+                  ? agx_vec_temp(ctx, idx.size, agx_channels(idx))
+                  : agx_mov(&b, idx);
+               if (copy_g18g_wide_base)
+                  agx_mov_to(&b, copy, idx);
                agx_replace_src(I, s, copy);
                if (materialized < ARRAY_SIZE(materialized_from)) {
                   materialized_from[materialized] = idx;

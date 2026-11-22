@@ -42,6 +42,17 @@ load_base_is_uniform(agx_context *ctx)
    return uniform;
 }
 
+bool
+copied_base_keeps_shape(agx_context *ctx, enum agx_size size, unsigned channels)
+{
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op != AGX_OPCODE_DEVICE_LOAD)
+         continue;
+      return I->src[0].size == size && agx_channels(I->src[0]) == channels;
+   }
+   return false;
+}
+
 } // namespace
 
 /* Subgroups 4 and up read 0 from a uniform-base device load. */
@@ -51,6 +62,7 @@ TEST(G18GUniformDeviceBase, WideWorkgroupCopiesTheBase)
    agx_context *ctx = shader(mem, 256, true);
    agx_lower_uniform_sources(ctx);
    EXPECT_FALSE(load_base_is_uniform(ctx));
+   EXPECT_TRUE(copied_base_keeps_shape(ctx, AGX_SIZE_64, 1));
    ralloc_free(mem);
 }
 
