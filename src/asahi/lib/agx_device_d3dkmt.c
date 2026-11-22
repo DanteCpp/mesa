@@ -1281,6 +1281,13 @@ d3dkmt_bo_bind(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
          goto out;
       }
       range = ALIGN_POT(range, granularity);
+      if ((ops[i].flags & (DRM_ASAHI_BIND_SINGLE_PAGE | DRM_ASAHI_BIND_WRITE)) ==
+          (DRM_ASAHI_BIND_SINGLE_PAGE | DRM_ASAHI_BIND_WRITE)) {
+         d3dkmt_log_flushed(
+            "d3dkmt_bo_bind WARN writable SINGLE_PAGE: i=%u addr=0x%llx range=0x%llx handle=0x%08x flags=0x%x\n",
+            i, (unsigned long long)ops[i].addr, (unsigned long long)range,
+            (unsigned)ops[i].handle, ops[i].flags);
+      }
       binds[i] = (struct agx_d3dkmt_bind){
          .flags = ops[i].flags,
          .kmt_handle = ops[i].handle,

@@ -13302,6 +13302,8 @@ hk_dispatch_task_kernel(struct hk_cmd_buffer *cmd, struct hk_shader *task,
       : agx_3d(cpu_grid[0] * wg[0], cpu_grid[1] * wg[1], cpu_grid[2] * wg[2]);
    hk_dispatch_with_local_size(cmd, ccs, task, task_grid,
                                agx_workgroup(wg[0], wg[1], wg[2]));
+   while (ccs->m5_successor)
+      ccs = ccs->m5_successor;
 
    /* The launch ends in a weak ordering record, which doesn't make the
     * entries visible to the mesh draws that read them; strengthen it into a

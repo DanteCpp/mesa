@@ -1659,9 +1659,10 @@ hk_m5_compute_resources(struct hk_cs *cs, uint32_t scratch_B,
 static struct hk_cs *
 hk_m5_dispatch_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
-   while (cs->m5_dispatch_sealed && cs->m5_successor)
+   while ((cs->m5_dispatch_sealed || cs->current != cs->start) &&
+          cs->m5_successor)
       cs = cs->m5_successor;
-   if (!cs->m5_dispatch_sealed)
+   if (!cs->m5_dispatch_sealed && cs->current == cs->start)
       return cs;
 
    struct hk_cs **slots[] = {
@@ -1677,6 +1678,13 @@ hk_m5_dispatch_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       struct hk_cs *next = hk_cmd_buffer_get_cs_general(cmd, slots[i], true);
       if (!next)
          return NULL;
+      /* When a deferred post-graphics stream is pinned in place
+       * (hk_dispatch_imm_writes()), keep the rotated dispatch immediately
+       * after the leading-barrier stream so later query copies stay ordered. */
+      if (cmd->sync.pin_cs) {
+         list_del(&next->node);
+         list_add(&next->node, &cs->node);
+      }
       /* In one stream the dispatches ran in stream order; keep that order
        * across the two commands (cdm_barrier). */
       hk_sync_stream_follow(next, cs);

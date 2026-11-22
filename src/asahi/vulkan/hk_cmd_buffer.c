@@ -939,6 +939,9 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
       if (cs->type == HK_CS_CDM && last && last->type == HK_CS_CDM && !g18 &&
           !last->g18_dispatch_sealed && !cs->g18_dispatch_sealed &&
           !last->m5_dispatch_sealed && !cs->m5_dispatch_sealed &&
+          (!agx_chip_g17_m5(dev->dev.chip) ||
+           ((size_t)((uint8_t *)last->current - (uint8_t *)last->start) +
+            (size_t)((uint8_t *)cs->current - (uint8_t *)cs->start)) <= 44u) &&
           !last->timestamp.end.handle &&
           !(last->timestamp.start.handle && cs->g17p_timestamp_query) &&
           !(last->timestamp.start.handle && cs->timestamp.start.handle) &&
@@ -1115,6 +1118,19 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
                                      cs->current == cs->memory_flush_end;
          }
          cs->current = hk_cmd_buffer_emit_cdm_terminate(cmd, cs->current);
+#ifdef _WIN32
+         if (agx_chip_g17_m5(dev->dev.chip)) {
+            const size_t stream_bytes =
+               (size_t)((uint8_t *)cs->current - (uint8_t *)cs->start);
+            if (stream_bytes > 48u) {
+               fprintf(stderr,
+                       "agxw-m5: oversized CDM stream len=%zu cmds=%u flushes=%u sealed=%d\n",
+                       stream_bytes, cs->stats.cmds, cs->stats.flushes,
+                       cs->m5_dispatch_sealed ? 1 : 0);
+               fflush(stderr);
+            }
+         }
+#endif
       }
    }
 

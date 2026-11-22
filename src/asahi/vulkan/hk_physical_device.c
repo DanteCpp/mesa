@@ -1092,6 +1092,23 @@ hk_get_device_features(
       features->computeDerivativeGroupLinear = true;
    }
 
+#ifdef _WIN32
+   /* The Windows WDDM KMD strictly forbids writable AGXW_VAPROT_SINGLE_PAGE
+    * fills (AGXW_UPDATE_DETAIL_SP_WRITABLE), which sparse image creation
+    * (hk_bind_scratch()) and vkQueueBindSparse unbinds require. Keeping sparse
+    * features off prevents DXVK from advertising D3D11 tiled resources. */
+   features->shaderResourceResidency = false;
+   features->sparseBinding = false;
+   features->sparseResidencyAliased = false;
+   features->sparseResidencyImage2D = false;
+   features->sparseResidencyImage3D = false;
+   features->sparseResidencyBuffer = false;
+   features->sparseResidency2Samples = false;
+   features->sparseResidency4Samples = false;
+   features->sparseResidency8Samples = false;
+   features->sparseResidency16Samples = false;
+#endif
+
    /* A multiview promise for a stage this device does not expose is
     * meaningless, so keep the pair consistent however the stage bits above
     * resolved. */
@@ -1788,6 +1805,11 @@ hk_get_device_properties(const struct agx_device *dev,
     * hk_sparse_buffer_unmapped(). */
    if (agx_chip_g17_m5(dev->chip))
       properties->sparseResidencyNonResidentStrict = agx_has_soft_fault(dev);
+#ifdef _WIN32
+   properties->sparseResidencyNonResidentStrict = false;
+   properties->sparseResidencyStandard2DBlockShape = false;
+   properties->sparseAddressSpaceSize = 0;
+#endif
 
    /* G17P maps unbound pages to a zeroed fill page, so they read zero, but
     * the page is writable: a store or copy into an unbound page is read back
@@ -2397,18 +2419,9 @@ hk_physical_device_init_common(struct hk_instance *instance,
    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
 
    VkQueueFlags queue_flags =
-      VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT |
-      VK_QUEUE_SPARSE_BINDING_BIT;
-   if (agx_native_graphics(&pdev->dev)) {
-      /* Graphics, compute and transfers use the native HAL200 queue path.
-       * Sparse binding rides the shared per-page VM_BIND path; advertise it
-       * only when the same opt-in that turns on the sparse features above is
-       * set, so the queue family and the device features stay consistent. */
-      queue_flags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT |
-                    VK_QUEUE_TRANSFER_BIT;
-      if (pdev->vk.supported_features.sparseBinding)
-         queue_flags |= VK_QUEUE_SPARSE_BINDING_BIT;
-   }
+      VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+   if (pdev->vk.supported_features.sparseBinding)
+      queue_flags |= VK_QUEUE_SPARSE_BINDING_BIT;
 
    uint32_t queue_count = 1;
    /* Under virtio the simple-ioctl path forwards the request struct, not the
