@@ -1407,6 +1407,17 @@ d3dkmt_bo_bind(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
    if (ret != 0)
       agx_d3dkmt_mark_device_lost(ws, NULL);
 
+   if (ws->v6_log && count == 1 && ops[0].range >= (16u << 20)) {
+      static uint32_t large_bind_events;
+      if (__atomic_fetch_add(&large_bind_events, 1, __ATOMIC_RELAXED) < 128)
+         d3dkmt_log_flushed("agxw-v6: bind ctx=0x%x flags=0x%x allocation=0x%x "
+                            "va=0x%llx len=0x%llx fence=%llu result=%d\n",
+                            (unsigned)ws->va_context, ops[0].flags, ops[0].handle,
+                            (unsigned long long)ops[0].addr,
+                            (unsigned long long)ops[0].range,
+                            (unsigned long long)completion_value, ret);
+   }
+
 out:
    if (binds != stack_binds)
       free(binds);

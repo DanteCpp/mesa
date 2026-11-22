@@ -164,8 +164,7 @@ agx_bo_free(struct agx_device *dev, struct agx_bo *bo)
       }
    }
 
-   /* Free the VA. No need to unmap the BO or unbind the VA, as the kernel will
-    * take care of that when we close it.
+   /* Native DRM drops the mapping on GEM close.
     *
     * Under virtio the host closes the GEM handle, and with it the mapping,
     * only when it gets to the resource unref. Another thread can recycle the
@@ -174,7 +173,15 @@ agx_bo_free(struct agx_device *dev, struct agx_bo *bo)
     * vdrm_bo_create() flushes this ahead of any blob that reuses the VA. Keep
     * (leak) the VA if the unbind cannot be queued.
     */
-   if (!dev->is_virtio || !bo->va ||
+   bool unbind_before_reuse = dev->is_virtio;
+#ifdef _WIN32
+   /* A D3DKMT allocation can be owned by the outer runtime. Closing our
+    * wrapper may leave that allocation live, and a delayed VidMm unmap must
+    * never land on a later user of this VA. bo_bind waits for the WDDM VA
+    * update fence before returning success. */
+   unbind_before_reuse |= dev->ops.simple_ioctl == agx_device_d3dkmt_ops.simple_ioctl;
+#endif
+   if (!unbind_before_reuse || !bo->va ||
        !agx_bo_bind(dev, NULL, bo->va->addr, bo->size, 0,
                     DRM_ASAHI_BIND_UNBIND))
       agx_va_free(dev, bo->va, false);
