@@ -457,6 +457,11 @@ d3dkmt_create_allocation(struct agx_d3dkmt_winsys *ws, uint64_t size,
 
    agx_kmt_status st = ws->fns.CreateAllocation2(&create);
    if (!AGX_KMT_SUCCESS(st)) {
+      d3dkmt_log_flushed(
+         "D3DKMTCreateAllocation2 fail: st=0x%08x size=0x%llx bo_flags=0x%x "
+         "priv_flags=0x%x ext=%d create_flags=0x%x\n",
+         (unsigned)st, (unsigned long long)size, (unsigned)flags,
+         (unsigned)priv.flags, (int)external_type, (unsigned)create.Flags);
       agx_d3dkmt_fail(st);
       return false;
    }
@@ -468,12 +473,34 @@ d3dkmt_create_allocation(struct agx_d3dkmt_winsys *ws, uint64_t size,
       .external_type = external_type,
    };
 
-   const bool expected_resource =
+   bool expected_resource =
       external_type != AGX_D3DKMT_EXTERNAL_MEMORY_NONE;
-   const bool expected_global =
+   bool expected_global =
       external_type == AGX_D3DKMT_EXTERNAL_MEMORY_OPAQUE_WIN32_KMT;
+   /* Bridge-mode export degrade (degraded-create tolerance): an exportable
+    * create with NO Triton resource handoff pending is converted by the
+    * bridge into a plain VM-private allocation rather than refused
+    * (0.1.339: 475x REFUSED no-handoff was every compositor allocation
+    * failure). The record is then legitimately resourceless; accept it and
+    * drop the external type so a later export attempt fails cleanly at
+    * bo_export (record.resource == 0) instead of here. Non-bridge builds
+    * keep the strict shape check. */
+   if (agxw_bridge_is_sentinel(ws->device) && expected_resource &&
+       record->allocation != 0 && record->resource == 0 &&
+       record->global_share == 0) {
+      record->external_type = AGX_D3DKMT_EXTERNAL_MEMORY_NONE;
+      expected_resource = false;
+      expected_global = false;
+   }
    if (record->allocation == 0 || (!!record->resource != expected_resource) ||
        (!!record->global_share != expected_global)) {
+      d3dkmt_log_flushed(
+         "D3DKMTCreateAllocation2 shape fail: size=0x%llx ext=%d alloc=0x%08x "
+         "res=0x%08x(want=%d) global=0x%08x(want=%d) dev=0x%08x\n",
+         (unsigned long long)size, (int)external_type,
+         (unsigned)record->allocation, (unsigned)record->resource,
+         expected_resource ? 1 : 0, (unsigned)record->global_share,
+         expected_global ? 1 : 0, (unsigned)ws->device);
       errno = EIO;
       d3dkmt_destroy_record(ws, record);
       memset(record, 0, sizeof(*record));
@@ -510,6 +537,22 @@ d3dkmt_adopt_allocation(
    bo = agx_lookup_bo(dev, handle);
    dev->max_handle = MAX2(dev->max_handle, handle);
    simple_mtx_unlock(&dev->bo_map_lock);
+
+   /* util_sparse_array_get grows its node tree on demand and returns NULL on
+    * allocation failure; release builds compile the zero-slot assert out, so
+    * without this guard the field writes below would be the process's first
+    * dereference of NULL (adopt-null-bo hardening). Fail cleanly instead. */
+   if (bo == NULL) {
+      simple_mtx_lock(&ws->lock);
+      struct agx_d3dkmt_allocation_record released;
+      bool found =
+         agx_d3dkmt_pool_release_record(&ws->pool, handle, &released);
+      simple_mtx_unlock(&ws->lock);
+      if (found)
+         d3dkmt_destroy_record(ws, &released);
+      d3dkmt_log_flushed("d3dkmt_adopt_allocation: BO map slot unavailable\n");
+      return NULL;
+   }
 
    assert(!memcmp(bo, &((struct agx_bo){}), sizeof(*bo)));
    bo->dev = dev;
@@ -1202,6 +1245,10 @@ d3dkmt_bo_bind(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
           (ops[i].offset & (granularity - 1)) != 0 || range == 0 ||
           range > UINT64_MAX - (granularity - 1)) {
          simple_mtx_unlock(&ws->lock);
+         d3dkmt_log_flushed(
+            "d3dkmt_bo_bind align fail: i=%u addr=0x%llx offset=0x%llx range=0x%llx\n",
+            i, (unsigned long long)ops[i].addr,
+            (unsigned long long)ops[i].offset, (unsigned long long)range);
          errno = EINVAL;
          goto out;
       }
@@ -1225,6 +1272,11 @@ d3dkmt_bo_bind(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
 
    if (agx_d3dkmt_translate_binds(binds, count, &bind_policy, NULL, 0,
                                   &nops) != AGX_D3DKMT_OK) {
+      d3dkmt_log_flushed(
+         "d3dkmt_bo_bind translate fail: count=%u addr0=0x%llx range0=0x%llx flags0=0x%x kmt0=0x%08x\n",
+         count, (unsigned long long)binds[0].addr,
+         (unsigned long long)binds[0].range, binds[0].flags,
+         (unsigned)binds[0].kmt_handle);
       errno = EINVAL;
       goto out;
    }

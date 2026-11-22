@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 #ifndef _WIN32
 #include <sys/mman.h>
@@ -788,6 +789,19 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
                          mem->bo->size, 0, DRM_ASAHI_BIND_READ);
    if (ret) {
       /* The bind fails once the VM carries a sticky error. */
+#ifdef _WIN32
+      fprintf(stderr,
+              "hk_AllocateMemory ro-bind fail: size=%llu aligned=%llu va=0x%llx "
+              "bo_size=%zu type=%u rt=%d handle_types=0x%x errno=%d\n",
+              (unsigned long long)pAllocateInfo->allocationSize,
+              (unsigned long long)aligned_size,
+              (unsigned long long)(mem->bo && mem->bo->va ? mem->bo->va->addr : 0),
+              mem->bo ? mem->bo->size : (size_t)0,
+              pAllocateInfo->memoryTypeIndex,
+              aurora_runtime_resource ? 1 : 0,
+              (unsigned)handle_types, errno);
+      fflush(stderr);
+#endif
       hk_memory_release_replay_va(dev, mem);
       agx_bo_unreference(&dev->dev, mem->bo);
       mem->bo = NULL;
@@ -853,6 +867,17 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    return VK_SUCCESS;
 
 fail_alloc:
+#ifdef _WIN32
+   fprintf(stderr,
+           "hk_AllocateMemory fail_alloc: result=%d size=%llu aligned=%llu "
+           "type=%u heap_used=%llu/%llu rt=%d handle_types=0x%x errno=%d\n",
+           (int)result, (unsigned long long)pAllocateInfo->allocationSize,
+           (unsigned long long)aligned_size, pAllocateInfo->memoryTypeIndex,
+           (unsigned long long)p_atomic_read(heap->used),
+           (unsigned long long)heap->size,
+           aurora_runtime_resource ? 1 : 0, (unsigned)handle_types, errno);
+   fflush(stderr);
+#endif
    vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
    return result;
 }
