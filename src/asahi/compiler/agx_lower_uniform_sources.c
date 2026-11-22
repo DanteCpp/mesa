@@ -1041,11 +1041,14 @@ agx_lower_uniform_sources(agx_context *ctx)
          const bool copy_g18g_half_export =
             agx_is_g18g(&ctx->key->dev) && I->op == AGX_OPCODE_EXPORT &&
             I->src[s].size == AGX_SIZE_16;
+         const bool copy_g18g_wide_base =
+            agx_g18g_copy_uniform_memory_base(ctx, I->op, s);
          if (I->src[s].type == AGX_INDEX_UNIFORM && !select_uniform_flag &&
              !select_uniform_comparand && !select_uniform_alternative &&
              (s == first_uniform ||
               copy_minmax || copy_float_uniforms || copy_float_modifier ||
               copy_compare_uniform || copy_tex || copy_g18g_half_export ||
+              copy_g18g_wide_base ||
               !(native_integer || native_m5_float || uniform_imm_compare ||
                 (s < 3 && keep_m5_float_uniform[s]) ||
                 (s < 4 && keep_isel_uniform[s]) ||

@@ -768,6 +768,37 @@ typedef struct {
    void *ra_abort;
 } agx_context;
 
+/* G18G runs a uniform-base device memory op only for the first 128 lanes.
+ * Subgroups 4 and up in a larger workgroup read 0 (aurora-silicon/mesa#737).
+ * Return false when a device load, store or atomic base must be a GPR. */
+static inline bool
+agx_g18g_uniform_device_base_ok(const agx_context *ctx)
+{
+   if (!ctx || !ctx->key || !agx_is_g18g(&ctx->key->dev))
+      return true;
+   if (ctx->stage != MESA_SHADER_COMPUTE || !ctx->nir)
+      return true;
+   if (ctx->nir->info.workgroup_size_variable)
+      return false;
+   const unsigned threads =
+      (unsigned)ctx->nir->info.workgroup_size[0] *
+      ctx->nir->info.workgroup_size[1] *
+      ctx->nir->info.workgroup_size[2];
+   return threads <= 128;
+}
+
+static inline bool
+agx_g18g_copy_uniform_memory_base(const agx_context *ctx, enum agx_opcode op,
+                                  unsigned src_index)
+{
+   if (agx_g18g_uniform_device_base_ok(ctx))
+      return false;
+   return (op == AGX_OPCODE_DEVICE_LOAD && src_index == 0) ||
+          ((op == AGX_OPCODE_DEVICE_STORE || op == AGX_OPCODE_ATOMIC) &&
+           src_index == 1);
+}
+
+
 static inline void
 agx_remove_instruction(agx_instr *ins)
 {
