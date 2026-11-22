@@ -2444,8 +2444,9 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
  * timestamps, events, indirect or internal launches stay separate, and so do
  * streams with global atomics where another kernel queue could run beside the
  * packet (hk_pack_atomics_allowed()). A packet stays within the launch,
- * thread and static work bounds of hk_pack.h and holds at most one stream
- * with a looping program, so at ALU rate it runs about as long as its longest
+ * thread and static work bounds of hk_pack.h (which weight compile-time-
+ * bounded loops by their iteration bound) and holds at most one stream with
+ * an unbounded loop, so at ALU rate it runs about as long as its longest
  * member could alone (hk_pack.h says how far that holds for memory-bound
  * programs); it carries no more compute attachments than the kernel takes for
  * one command. A run past a bound starts a new packet.
@@ -2495,41 +2496,32 @@ hk_pack_attachment_limit(const struct hk_device *dev)
 /* Streams with global atomics are packed only where no other kernel queue
  * of the device can run beside the packet. On M5, two kernel queues
  * running packed atomic chains on the same memory lost contributions (root
- * cause unknown), so such streams stay separate commands unless
- * ASAHI_M5_PACK_ATOMICS=1 (or HK_PACK_ATOMICS=1) and the device has a
- * single kernel queue, which runs its commands in order. A second kernel
- * queue created while a packet runs is not covered; unpacked atomic work
- * has the same exposure. The G16 kernel puts every compute command of a VM
- * on its one firmware compute queue and never runs one beside another VM's:
- * several commands of one VM may be in flight there, but the firmware runs
- * them one after another, never beside a packet. G16G packs them unless
- * HK_PACK_ATOMICS=0. That is a property of the G16 kernel, the only one for
- * G16G, which no uAPI feature reports yet; the chip stands for it until one
- * does (hk_pack_atomics_choice()). */
+ * cause unknown), so packing is allowed by default only when the device has
+ * a single kernel queue (which runs its commands in order) and disabled
+ * whenever multiple kernel queues exist or HK_PACK_ATOMICS=0. On M5 Max
+ * (G17C) the compute kicker (hk_compute_kick.c) keeps its own kick queues
+ * outside dev->vk.queues and submits to them while a long compute command is
+ * running, so active kick queues are counted as additional kernel queues in
+ * hk_pack_atomics_allowed() and keep global-atomic streams unpacked while
+ * the kicker is enabled. A second kernel queue created while a packet runs
+ * is not covered; unpacked atomic work has the same exposure. The G16 kernel
+ * puts every compute command of a VM on its one firmware compute queue and
+ * never runs one beside another VM's: several commands of one VM may be in
+ * flight there, but the firmware runs them one after another, never beside a
+ * packet. G16G packs them unless HK_PACK_ATOMICS=0. That is a property of
+ * the G16 kernel, the only one for G16G, which no uAPI feature reports yet;
+ * the chip stands for it until one does (hk_pack_atomics_choice()). */
 DEBUG_GET_ONCE_OPTION(hk_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
 DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
 
 static bool
-hk_pack_atomics_allowed(struct hk_device *dev, const struct hk_queue *queue)
+hk_pack_atomics_for_queue(struct hk_device *dev, const struct hk_queue *queue)
 {
    const char *opt = debug_get_option_hk_pack_atomics_opt();
    if (!opt)
       opt = debug_get_option_m5_pack_atomics_opt();
 
-   if (dev->dev.chip == AGX_CHIP_G16G)
-      return hk_pack_atomics_choice(true, opt, queue->sib.count);
-   if (!hk_pack_atomics_choice(false, opt, queue->sib.count))
-      return false;
-
-   vk_foreach_queue(iter, &dev->vk) {
-      if (vk_queue_is_emulated(iter))
-         continue;
-      const struct hk_queue *other = container_of(iter, struct hk_queue, vk);
-      if (other != queue && other->drm.id != UINT32_MAX)
-         return false;
-   }
-   const struct hk_queue *as = dev->host_as.queue;
-   return !as || as == queue || as->drm.id == UINT32_MAX;
+   return hk_pack_atomics_allowed(dev, queue, opt);
 }
 
 /* A submission-owned replacement for a run of command buffers. The
@@ -2598,7 +2590,7 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
 
    const bool visible_completion =
       hk_pack_boundary(dev) == HK_PACK_BOUNDARY_VISIBLE_COMPLETION;
-   const bool atomics = hk_pack_atomics_allowed(dev, queue);
+   const bool atomics = hk_pack_atomics_for_queue(dev, queue);
    const struct hk_pack_limits limits = {
       .max_attachments = hk_pack_attachment_limit(dev),
       .overhead =

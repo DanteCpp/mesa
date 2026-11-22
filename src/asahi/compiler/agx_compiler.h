@@ -588,6 +588,11 @@ typedef struct agx_block {
     */
    bool loop_header;
 
+   /* Upper bound on how many times this block can execute per invocation:
+    * the product of enclosing compile-time-bounded loops' iteration bounds
+    * (max_trip_count + 1), saturating at UINT64_MAX. Outside loops it is 1. */
+   uint64_t exec_bound;
+
    /* Offsets of the block in the emitted binary.  On AGX3, loop_exit_offset
     * names the first CNDEND after a loop backedge, before any enclosing-scope
     * CNDENDs that happen to share the block. */
@@ -716,6 +721,10 @@ typedef struct {
    /* Stats for shader-db */
    unsigned loop_count;
    unsigned max_reg;
+
+   /* Running product of enclosing compile-time-bounded loops' iteration bounds
+    * during NIR-to-AIR emission (1 outside loops, saturating at UINT64_MAX). */
+   uint64_t loop_trip_scale;
 
    /* Half of the AGX3 compiler staging footprint. Unlike max_reg, this
     * describes the separate file consumed by UVSW and texture inputs. */

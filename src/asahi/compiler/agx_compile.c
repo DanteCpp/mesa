@@ -9300,6 +9300,7 @@ agx_create_block(agx_context *ctx)
    /* This is conservative, TODO: divergence analysis */
    blk->divergent = ctx->total_nesting > 0;
    blk->cf_divergent = ctx->divergent_nesting > 0;
+   blk->exec_bound = MAX2(ctx->loop_trip_scale, 1u);
 
    util_dynarray_init(&blk->predecessors, blk);
 
@@ -9392,16 +9393,33 @@ emit_loop(agx_context *ctx, nir_loop *nloop)
    assert(!nir_loop_has_continue_construct(nloop));
    /* We only track nesting within the innermost loop, so push and reset */
    unsigned pushed_nesting = ctx->loop_nesting;
+   uint64_t pushed_trip_scale = ctx->loop_trip_scale;
    const bool divergent = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX2 ||
                           nir_loop_is_divergent(nloop);
    ctx->loop_nesting = 0;
    ctx->total_nesting++;
    ctx->divergent_nesting += divergent;
-   ctx->out->has_loops = true;
 
    agx_block *popped_break = ctx->break_block;
 
+   /* break_block runs after the loop exits, at the enclosing loop scale. */
    ctx->break_block = agx_create_block(ctx);
+
+   if (!ctx->is_preamble && nloop->info && !nloop->info->complex_loop &&
+       nloop->info->limiting_terminator) {
+      /* NIR's max_trip_count counts back-edge iterations before the limiting
+       * terminator exits, so the loop header and body execute at most
+       * max_trip_count + 1 times per entry (e.g. a rotated bottom-tested
+       * N-iteration loop has max_trip_count == N - 1 and runs N times; a
+       * top-tested N-iteration loop runs its header at most N + 1 times). */
+      const uint64_t trips = (uint64_t)nloop->info->max_trip_count + 1;
+      if (__builtin_mul_overflow(ctx->loop_trip_scale, trips,
+                                 &ctx->loop_trip_scale))
+         ctx->loop_trip_scale = UINT64_MAX;
+   } else {
+      ctx->out->has_loops = true;
+   }
+
    agx_block *loop_header = agx_create_block(ctx);
 
    /* AGX3 loops always open two architectural exec-mask levels before their
@@ -9445,6 +9463,7 @@ emit_loop(agx_context *ctx, nir_loop *nloop)
 
    /* Restore loop nesting (we might be inside an if inside an outer loop) */
    ctx->loop_nesting = pushed_nesting;
+   ctx->loop_trip_scale = pushed_trip_scale;
    ctx->total_nesting--;
    ctx->divergent_nesting -= divergent;
 }
@@ -9515,8 +9534,26 @@ agx_set_st_vary_final(agx_context *ctx)
    agx_no_varyings(&_b);
 }
 
+static bool
+agx_nir_cf_list_has_loop(const struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_loop)
+         return true;
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (agx_nir_cf_list_has_loop(&nif->then_list) ||
+             agx_nir_cf_list_has_loop(&nif->else_list))
+            return true;
+      }
+   }
+
+   return false;
+}
+
 static void
-agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats)
+agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats,
+               uint64_t *pack_instrs_out)
 {
    struct agx_cycle_estimate cycles = agx_estimate_cycles(ctx);
    uint32_t old_preamble_inst = stats->preamble_inst;
@@ -9534,15 +9571,31 @@ agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats)
       .preamble_inst = old_preamble_inst,
    };
 
-   /* Count instructions */
-   agx_foreach_instr_global(ctx, I) {
-      stats->instrs++;
+   uint64_t pack_instrs = 0;
 
-      if (I->op == AGX_OPCODE_STACK_STORE)
-         stats->spills++;
-      else if (I->op == AGX_OPCODE_STACK_LOAD)
-         stats->fills++;
+   /* Count instructions and bounded-loop dynamic instruction work. */
+   agx_foreach_block(ctx, block) {
+      uint64_t block_instrs = 0;
+      agx_foreach_instr_in_block(block, I) {
+         stats->instrs++;
+         block_instrs++;
+
+         if (I->op == AGX_OPCODE_STACK_STORE)
+            stats->spills++;
+         else if (I->op == AGX_OPCODE_STACK_LOAD)
+            stats->fills++;
+      }
+
+      const uint64_t bound = MAX2(block->exec_bound, 1u);
+      uint64_t weighted;
+      if (__builtin_mul_overflow(block_instrs, bound, &weighted))
+         weighted = UINT64_MAX;
+      pack_instrs = weighted > UINT64_MAX - pack_instrs
+                       ? UINT64_MAX : pack_instrs + weighted;
    }
+
+   if (pack_instrs_out)
+      *pack_instrs_out = pack_instrs;
 }
 
 static bool
@@ -12925,6 +12978,10 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    }
 
    ctx->alloc = impl->ssa_alloc;
+   ctx->loop_trip_scale = 1;
+   if (!ctx->is_preamble && agx_nir_cf_list_has_loop(&impl->body))
+      nir_metadata_require(impl, nir_metadata_loop_analysis, nir_var_all,
+                           false);
    /* AGX3 uniform control-flow hints need divergence metadata for this final
     * IR. AGX2 keeps upstream's conservative hints. */
    if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2)
@@ -13526,7 +13583,8 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
       ctx->out->stats.preamble_inst = instrs;
    } else {
-      agx_calc_stats(ctx, binary->size, &ctx->out->stats);
+      agx_calc_stats(ctx, binary->size, &ctx->out->stats,
+                     &ctx->out->pack_instrs);
    }
 
    /*

@@ -183,10 +183,17 @@ struct agx_shader_info {
     * device-address atomics). Submit packing keeps such programs apart where
     * another kernel queue could run beside them (hk_queue.c). */
    bool uses_global_atomics;
-   /* The program (main or preamble) contains a loop, so its run time is not
-    * bounded by its static instruction count. Submit packing keeps at most
-    * one such stream per packed command (hk_pack.c). */
+   /* The program contains a loop whose iteration count could not be bounded at
+    * compile time (or a preamble loop), so its run time is not bounded by
+    * pack_instrs. Submit packing keeps at most one such stream per packed
+    * command (hk_pack.c). */
    bool has_loops;
+   /* Upper bound on dynamic native instructions per invocation of the main
+    * shader for submit packing (hk_cmd_dispatch.c): each block's emitted
+    * instruction count multiplied by the product of enclosing compile-time-
+    * bounded loops' iteration bounds (max_trip_count + 1), saturating at
+    * UINT64_MAX. Equals stats.instrs when the shader has no loops. */
+   uint64_t pack_instrs;
    /* Native constant-program live-ins. External G17P launch needs the
     * uniform-input prelude when a uniform half is read before definition. */
    bool agx3_preamble_uniform_inputs;

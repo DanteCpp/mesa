@@ -5,6 +5,7 @@
 
 #include "hk_pack.h"
 
+#include <limits.h>
 #include <string.h>
 #include <strings.h>
 
@@ -13,6 +14,7 @@
 #include "util/macros.h"
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
+#include "hk_queue.h"
 
 /*
  * Selected by the stream format and the kernel, never by which parts were
@@ -77,7 +79,41 @@ hk_pack_atomics_choice(bool serial_kernel, const char *opt, unsigned queues)
 {
    if (serial_kernel)
       return opt ? hk_pack_parse_bool(opt, true) : true;
-   return opt && hk_pack_parse_bool(opt, false) && queues <= 1;
+   if (queues > 1)
+      return false;
+   return opt ? hk_pack_parse_bool(opt, true) : true;
+}
+
+bool
+hk_pack_atomics_allowed(const struct hk_device *dev,
+                        const struct hk_queue *queue, const char *opt)
+{
+   if (dev->dev.chip == AGX_CHIP_G16G)
+      return hk_pack_atomics_choice(true, opt, queue->sib.count);
+
+   unsigned queues = MAX2(queue->sib.count, 1u);
+   /* The G17C compute kicker (hk_compute_kick.c) keeps its own per-priority
+    * kick queues outside dev->vk.queues and creates their kernel queues lazily
+    * on the first kick while a long compute command is running. Count any
+    * active kick queue as another kernel queue so packed global-atomic chains
+    * do not run beside a kick queue. */
+   if (dev->compute_kick_queues || queue->kick.watched) {
+      const unsigned kick = MAX2(dev->compute_kick_queues, 1u);
+      queues = kick > UINT_MAX - queues ? UINT_MAX : queues + kick;
+   }
+
+   if (!hk_pack_atomics_choice(false, opt, queues))
+      return false;
+
+   vk_foreach_queue(iter, &dev->vk) {
+      if (vk_queue_is_emulated(iter))
+         continue;
+      const struct hk_queue *other = container_of(iter, struct hk_queue, vk);
+      if (other != queue && other->drm.id != UINT32_MAX)
+         return false;
+   }
+   const struct hk_queue *as = dev->host_as.queue;
+   return !as || as == queue || as->drm.id == UINT32_MAX;
 }
 
 const struct hk_cs *

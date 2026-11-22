@@ -2975,12 +2975,14 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
       cs->sib_threads = threads > UINT64_MAX - cs->sib_threads
                            ? UINT64_MAX : cs->sib_threads + threads;
 
-      /* What submit packing bounds a packet with (hk_pack_plan()). Static
-       * instruction counts bound a program without loops; pack_loops marks
-       * the others, at most one of which a packet holds. */
+      /* What submit packing bounds a packet with (hk_pack_plan()).
+       * pack_instrs weights compile-time-bounded loops by their iteration
+       * bound; pack_loops marks programs with an unbounded loop, at most one
+       * of which a packet holds. */
+      const uint64_t instrs =
+         MAX2(s->b.info.pack_instrs, (uint64_t)s->b.info.stats.instrs);
       uint64_t work;
-      if (__builtin_mul_overflow(threads, (uint64_t)s->b.info.stats.instrs,
-                                 &work))
+      if (__builtin_mul_overflow(threads, instrs, &work))
          work = UINT64_MAX;
       cs->pack_threads = threads > UINT64_MAX - cs->pack_threads
                             ? UINT64_MAX : cs->pack_threads + threads;

@@ -1176,15 +1176,18 @@ struct hk_cs {
 
    /* Submit packing (hk_pack_runs()): how many of the stream's launches are
     * direct application dispatches, their threads, and the sum over them of
-    * threads times static native instructions. These bound the work one
-    * packed command may hold. The sums saturate at UINT64_MAX. */
+    * threads times bounded dynamic native instructions (pack_instrs, where
+    * compile-time-bounded loops are weighted by their iteration bound). These
+    * bound the work one packed command may hold. The sums saturate at
+    * UINT64_MAX. */
    uint32_t pack_dispatches;
    uint64_t pack_threads;
    uint64_t pack_static_work;
    /* A dispatch in this stream runs a program with global atomics. */
    bool uses_global_atomics;
-   /* A dispatch in this stream runs a program with a loop: pack_static_work
-    * does not bound its run time. */
+   /* A dispatch in this stream runs a program with a loop whose trip count
+    * could not be bounded at compile time: pack_static_work does not bound
+    * its run time. */
    bool pack_loops;
    /* The stream calls another stream through a link with return; its bytes
     * must stay where they were recorded. */

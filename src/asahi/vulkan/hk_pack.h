@@ -14,6 +14,7 @@
 struct hk_cmd_buffer;
 struct hk_cs;
 struct hk_device;
+struct hk_queue;
 struct hk_sync_queue;
 
 /* Submit packing (hk_queue.c, hk_pack_runs()): a run of consecutive command
@@ -23,11 +24,14 @@ struct hk_sync_queue;
  *
  * A packet covers at most HK_PACK_MAX_DISPATCHES launches and the thread
  * and static work bounds; the measured 165-, 200- and 242-dispatch image and
- * compute graphs fit. A program with loops runs for longer than its static
- * work says, so a packet holds at most one stream with a looping program.
- * The static work bound is 2^35 thread-instructions, about 18 ms at the M4's
- * ALU issue rate; memory-bound programs run slower per instruction, so for
- * them the bound limits a packet's length only roughly.
+ * compute graphs fit. Compile-time-bounded loops are weighted by NIR loop
+ * analysis's iteration bound (max_trip_count + 1) inside pack_static_work, so
+ * they pack within HK_PACK_MAX_STATIC_WORK; a program with an unbounded loop
+ * runs for longer than pack_static_work says, so a packet holds at most one
+ * stream with an unbounded loop. The static work bound is 2^35
+ * thread-instructions, about 18 ms at the M4's ALU issue rate; memory-bound
+ * programs run slower per instruction, so for them the bound limits a
+ * packet's length only roughly.
  */
 #define HK_PACK_MAX_DISPATCHES 256u
 #define HK_PACK_MAX_THREADS (UINT64_C(1) << 28)
@@ -95,14 +99,20 @@ enum hk_pack_boundary hk_pack_boundary(const struct hk_device *dev);
 bool hk_pack_admits_strong_tail(enum hk_pack_boundary boundary);
 
 /* Whether streams with global atomics may be packed, before the check of the
- * device's other kernel queues: with `serial_kernel` (G16G, whose kernel
- * runs a VM's compute commands one after another on one firmware queue) by
- * default and unless HK_PACK_ATOMICS (`opt`) says no; otherwise only when
- * `opt` says yes and the queue has a single kernel queue (`queues`). `opt`
- * takes debug_parse_bool_option()'s values plus "on" and "off"; any other
- * value keeps the default. */
+ * device's other kernel queues: by default when either `serial_kernel` holds
+ * (G16G, whose kernel runs a VM's compute commands one after another on one
+ * firmware queue) or the queue has at most one kernel queue (`queues <= 1`),
+ * unless HK_PACK_ATOMICS (`opt`) explicitly disables it; never when
+ * `!serial_kernel && queues > 1`. `opt` takes debug_parse_bool_option()'s
+ * values plus "on" and "off"; any other value keeps the default. */
 bool hk_pack_atomics_choice(bool serial_kernel, const char *opt,
                             unsigned queues);
+
+/* Full global-atomics packing policy for a submission to `queue` on `dev`,
+ * counting sibling queues, other live device queues, host-AS queues, and
+ * active compute kick queues (hk_compute_kick.c). */
+bool hk_pack_atomics_allowed(const struct hk_device *dev,
+                             const struct hk_queue *queue, const char *opt);
 
 /* The single compute stream of `cmd` that a packet may copy, or NULL. */
 const struct hk_cs *hk_pack_run_member(const struct hk_device *dev,

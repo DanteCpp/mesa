@@ -9,7 +9,8 @@
  * with a CPU model of the same operations. Run it once with
  * HK_PACK_CDM_SUBMIT=0 and once with =1 (HK_PACK_CDM_TRACE=1 prints what was
  * packed) to cover both paths. Plain dispatches run a program without loops,
- * heavy ones a looping program, which a packet holds at most one of.
+ * heavy ones a program with an unbounded runtime loop (whose trip count the
+ * compiler cannot bound), which a packet holds at most one of.
  *
  * The driver's packing trace (HK_PACK_CDM_TRACE, turned on here) passes
  * through to stderr as it is written, and each case reports how many command

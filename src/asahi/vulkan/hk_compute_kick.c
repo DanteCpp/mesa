@@ -427,6 +427,7 @@ hk_compute_kick_init(struct hk_device *dev, unsigned period_ms)
          k->watch[k->watch_count++] = container_of(iter, struct hk_queue, vk);
    }
 
+   unsigned kick_queues = 0;
    for (unsigned i = 0; i < k->watch_count; i++) {
       struct hk_queue *queue = k->watch[i];
       const unsigned class = queue->drm.virt_ring_idx - 1;
@@ -434,13 +435,17 @@ hk_compute_kick_init(struct hk_device *dev, unsigned period_ms)
          continue;
 
       struct hk_kick_class *c = &k->class[class];
-      if (!c->queue && !c->failed &&
-          hk_queue_init_kick(dev, class, &c->queue) != VK_SUCCESS)
-         c->failed = true;
+      if (!c->queue && !c->failed) {
+         if (hk_queue_init_kick(dev, class, &c->queue) == VK_SUCCESS)
+            kick_queues++;
+         else
+            c->failed = true;
+      }
       queue->kick.watched = c->queue != NULL;
    }
 
    dev->compute_kick = k;
+   dev->compute_kick_queues = kick_queues;
 }
 
 void
@@ -491,6 +496,8 @@ hk_compute_kick_stop(struct hk_device *dev)
       if (c->done)
          t->DestroySemaphore(d, c->done, NULL);
    }
+
+   dev->compute_kick_queues = 0;
 
    if (k->buffer)
       t->DestroyBuffer(d, k->buffer, NULL);

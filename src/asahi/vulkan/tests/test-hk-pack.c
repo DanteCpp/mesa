@@ -326,6 +326,16 @@ looping(void)
    return c;
 }
 
+static struct hk_cmd_buffer *
+bounded_work(unsigned dispatches, uint64_t work)
+{
+   struct hk_cmd_buffer *c = plain(dispatches);
+   struct hk_cs *s = list_first_entry(&c->control_streams, struct hk_cs, node);
+   s->pack_static_work = work;
+   s->pack_loops = false;
+   return c;
+}
+
 /* A member waiting for render work: a GFX -> COMPUTE barrier before it. */
 static struct hk_cmd_buffer *
 after_render(void)
@@ -349,13 +359,39 @@ test_plan(void)
 
    struct hk_cmd_buffer *loops2[] = {looping(), looping()};
    plan(loops2, 2, runs, &count);
-   T("two looping members stay apart", count == 0);
+   T("two unbounded-loop members stay apart", count == 0);
 
    struct hk_cmd_buffer *loops_mixed[] = {plain(1), looping(), looping(),
                                           plain(1)};
    plan(loops_mixed, 4, runs, &count);
-   T("a packet holds at most one looping member",
+   T("a packet holds at most one unbounded-loop member",
      runs_are(runs, count, 2, (unsigned[]){0, 2}, (unsigned[]){2, 2}));
+
+   const uint64_t quarter_work = HK_PACK_MAX_STATIC_WORK / 4;
+   struct hk_cmd_buffer *bounded_exact[] = {
+      bounded_work(1, quarter_work),
+      bounded_work(1, quarter_work),
+      bounded_work(1, quarter_work),
+      bounded_work(1, HK_PACK_MAX_STATIC_WORK - 3 * quarter_work),
+   };
+   plan(bounded_exact, 4, runs, &count);
+   T("bounded-loop members within HK_PACK_MAX_STATIC_WORK pack together",
+     runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){4}));
+
+   struct hk_cmd_buffer *bounded_over[] = {
+      bounded_work(1, HK_PACK_MAX_STATIC_WORK / 2),
+      bounded_work(1, HK_PACK_MAX_STATIC_WORK - HK_PACK_MAX_STATIC_WORK / 2 + 1),
+   };
+   plan(bounded_over, 2, runs, &count);
+   T("bounded-loop work exceeding HK_PACK_MAX_STATIC_WORK splits", count == 0);
+
+   struct hk_cmd_buffer *bounded_sat[] = {
+      plain(1),
+      bounded_work(1, UINT64_MAX),
+      plain(1),
+   };
+   plan(bounded_sat, 3, runs, &count);
+   T("saturated bounded-loop work stays unpacked", count == 0);
 
    struct hk_cmd_buffer *later_render[] = {plain(1), after_render()};
    plan_on(later_render, 2, HK_SYNC_GFX, false, runs, &count);
@@ -558,8 +594,10 @@ test_boundary(void)
 }
 
 /* HK_PACK_ATOMICS: on by default where the kernel runs a VM's compute
- * commands one after another (G16G), opt-in elsewhere with one kernel queue;
- * an unparsable value keeps the default. */
+ * commands one after another (G16G) or when the device has at most one
+ * kernel compute queue (`queues <= 1`); disabled when multiple kernel
+ * queues exist (`queues > 1`), even with HK_PACK_ATOMICS=1; an unparsable
+ * value keeps the default. */
 static void
 test_atomics_choice(void)
 {
@@ -572,15 +610,90 @@ test_atomics_choice(void)
    T("G16G: HK_PACK_ATOMICS=off keeps them apart",
      !hk_pack_atomics_choice(true, "off", 1) &&
         !hk_pack_atomics_choice(true, "OFF", 1));
-   T("M5: atomics apart by default", !hk_pack_atomics_choice(false, NULL, 1));
+   T("M5: single kernel queue packs atomics by default",
+     hk_pack_atomics_choice(false, NULL, 1) &&
+        hk_pack_atomics_choice(false, NULL, 0));
+   T("M5: HK_PACK_ATOMICS=0 disables single-queue atomics packing",
+     !hk_pack_atomics_choice(false, "0", 1));
+   T("M5: HK_PACK_ATOMICS=off disables single-queue atomics packing",
+     !hk_pack_atomics_choice(false, "off", 1) &&
+        !hk_pack_atomics_choice(false, "OFF", 1));
    T("M5: HK_PACK_ATOMICS=1 with one kernel queue",
      hk_pack_atomics_choice(false, "1", 1));
-   T("M5: HK_PACK_ATOMICS=1 with two kernel queues",
+   T("M5: two kernel queues keep atomics apart by default",
+     !hk_pack_atomics_choice(false, NULL, 2));
+   T("M5: HK_PACK_ATOMICS=1 with two kernel queues stays apart",
      !hk_pack_atomics_choice(false, "1", 2));
-   T("M5: an unparsable value keeps the default",
-     !hk_pack_atomics_choice(false, "maybe", 1));
+   T("M5: HK_PACK_ATOMICS=on with two kernel queues stays apart",
+     !hk_pack_atomics_choice(false, "on", 2));
+   T("M5: an unparsable value keeps single-queue default",
+     hk_pack_atomics_choice(false, "maybe", 1));
    T("M5: HK_PACK_ATOMICS=on with one kernel queue",
      hk_pack_atomics_choice(false, "on", 1));
+}
+
+/* hk_pack_atomics_allowed(): device-level kernel queue check, including
+ * sibling queues, other live vk_queues, host-AS queue, and G17C compute kick
+ * queues (which are not in dev->vk.queues). */
+static void
+test_atomics_allowed(void)
+{
+   struct hk_device *dev =
+      dev_with(AGX_CHIP_G17C, DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION);
+   list_inithead(&dev->vk.queues);
+
+   struct hk_queue *q1 = new_queue(false);
+   q1->sib.count = 1;
+   q1->drm.id = 1;
+   list_addtail(&q1->vk.link, &dev->vk.queues);
+
+   T("M5: single vk_queue without kicker packs atomics by default",
+     hk_pack_atomics_allowed(dev, q1, NULL));
+   T("M5: single vk_queue honors HK_PACK_ATOMICS=0",
+     !hk_pack_atomics_allowed(dev, q1, "0"));
+
+   dev->compute_kick_queues = 1;
+   T("G17C: active compute kick queue disables atomics packing with 1 vk_queue",
+     !hk_pack_atomics_allowed(dev, q1, NULL) &&
+        !hk_pack_atomics_allowed(dev, q1, "1"));
+   dev->compute_kick_queues = 0;
+
+   q1->kick.watched = true;
+   T("G17C: watched kick queue disables atomics packing with 1 vk_queue",
+     !hk_pack_atomics_allowed(dev, q1, NULL) &&
+        !hk_pack_atomics_allowed(dev, q1, "on"));
+   q1->kick.watched = false;
+
+   q1->sib.count = 2;
+   T("M5: sibling kernel queues disable atomics packing",
+     !hk_pack_atomics_allowed(dev, q1, NULL) &&
+        !hk_pack_atomics_allowed(dev, q1, "1"));
+   q1->sib.count = 1;
+
+   struct hk_queue *q2 = new_queue(false);
+   q2->sib.count = 1;
+   q2->drm.id = UINT32_MAX;
+   list_addtail(&q2->vk.link, &dev->vk.queues);
+   T("M5: uninitialized second vk_queue does not disable atomics packing",
+     hk_pack_atomics_allowed(dev, q1, NULL));
+   q2->drm.id = 2;
+   T("M5: second live vk_queue disables atomics packing",
+     !hk_pack_atomics_allowed(dev, q1, NULL) &&
+        !hk_pack_atomics_allowed(dev, q1, "1"));
+   list_del(&q2->vk.link);
+
+   struct hk_queue *as_q = new_queue(false);
+   as_q->drm.id = 3;
+   dev->host_as.queue = as_q;
+   T("M5: live host_as queue disables atomics packing",
+     !hk_pack_atomics_allowed(dev, q1, NULL));
+   dev->host_as.queue = NULL;
+
+   dev->dev.chip = AGX_CHIP_G16G;
+   dev->compute_kick_queues = 1;
+   T("G16G: serial kernel still packs atomics by default",
+     hk_pack_atomics_allowed(dev, q1, NULL) &&
+        !hk_pack_atomics_allowed(dev, q1, "off"));
 }
 
 /* hk_sync_forget_stream() leaves a command buffer's latest render of a kind
@@ -1254,6 +1367,7 @@ main(void)
       return EXIT_FAILURE;
    test_boundary();
    test_atomics_choice();
+   test_atomics_allowed();
    test_rejections();
    test_m5_tails();
    test_plan();
