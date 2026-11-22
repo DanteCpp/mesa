@@ -1259,14 +1259,25 @@ ilp_single_tile_blend(const agx_context *ctx, const agx_block *block)
  * into the next step even when the estimate does not grow; so does a program
  * in the last step, where crossing the top spills.
  */
+/* AGX3C (non-G18G) has an empirical occupancy cliff above 64 half-registers,
+ * below AGX2's 104-half top step. */
+static inline int
+agx_m5_occupancy_step_top(int halves)
+{
+   if (halves <= 64)
+      return 64;
+   return agx_occupancy_for_register_count(halves).max_registers;
+}
+
 int
 agx_ilp_m5_device_load_cap(int program_peak)
 {
    if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN > AGX_ILP_M5_MAX_HALVES)
       return 0;
 
-   const int step_top =
-      agx_occupancy_for_register_count(program_peak).max_registers;
+   const int step_top = agx_m5_occupancy_step_top(program_peak);
+   if (step_top == 64)
+      return program_peak <= 61 ? 61 : 0;
    if (program_peak + AGX_ILP_M5_LOAD_HEADROOM > step_top ||
        step_top >= AGX_ILP_M5_MAX_HALVES)
       return 0;
@@ -1433,9 +1444,13 @@ agx_ilp_schedule(agx_context *ctx)
                              ilp_block_peak(ctx, block, size16, memctx));
       /* Keep a margin for register-allocation alignment. */
       if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN <= AGX_ILP_M5_MAX_HALVES) {
-         m5_occupancy_cap = agx_occupancy_for_register_count(
-            program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN).max_registers -
-            AGX_ILP_M5_OCCUPANCY_MARGIN;
+         if (m5_compute && !ctx->key->dev.emit_agx3d && program_peak <= 61) {
+            m5_occupancy_cap = 61;
+         } else {
+            m5_occupancy_cap = agx_occupancy_for_register_count(
+               program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN).max_registers -
+               AGX_ILP_M5_OCCUPANCY_MARGIN;
+         }
          m5_load_cap = agx_ilp_m5_device_load_cap(program_peak);
       }
    }
@@ -1495,13 +1510,14 @@ agx_ilp_schedule(agx_context *ctx)
                                          false, true, true, &dag_state))
                      break;
                }
-            } else {
+            } else if (!loads || copy || loop_samples ||
+                       ilp_block_samples(ctx, block) > 0) {
                ilp_schedule_block(ctx, block, memctx, native_uniforms,
                                   alu_latency, 16 * alu_latency, growth, 0,
                                   false, true, AGX_ILP_FS_SAMPLE_HALVES,
                                   copy ? AGX_ILP_M5_COPY_SAMPLES
                                        : AGX_ILP_FS_HOIST_SAMPLES,
-                                  copy, loads > 0, false, &dag_state);
+                                  copy, false, false, &dag_state);
             }
          }
          continue;

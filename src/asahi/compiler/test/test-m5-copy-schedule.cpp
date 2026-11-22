@@ -315,12 +315,17 @@ TEST(M5CopySchedule, ComputeDeviceLoadsStayInsideTheOccupancyStep)
    ralloc_free(s.mem);
 }
 
-/* The headroom rule at its edges: at least 16 halves free below the top of
- * the step enables the windows, the step lookup includes its top, and the
- * last step (256 halves) keeps the issue-order schedule. */
+/* The headroom rule at its edges: AGX3C's 64-half top occupancy step caps at
+ * 61 halves, above 64 at least 16 halves free below the top of the step
+ * enables the windows, the step lookup includes its top, and the last step
+ * (256 halves) keeps the issue-order schedule. */
 TEST(M5CopySchedule, DeviceLoadCapBoundaries)
 {
-   EXPECT_EQ(agx_ilp_m5_device_load_cap(0), 96);
+   EXPECT_EQ(agx_ilp_m5_device_load_cap(0), 61);
+   EXPECT_EQ(agx_ilp_m5_device_load_cap(61), 61); /* AGX3C 64-half top step */
+   EXPECT_EQ(agx_ilp_m5_device_load_cap(62), 0);
+   EXPECT_EQ(agx_ilp_m5_device_load_cap(64), 0);
+   EXPECT_EQ(agx_ilp_m5_device_load_cap(65), 96); /* 16 free below 104 */
    EXPECT_EQ(agx_ilp_m5_device_load_cap(88), 96); /* 16 free below 104 */
    EXPECT_EQ(agx_ilp_m5_device_load_cap(89), 0);  /* 15 free */
    EXPECT_EQ(agx_ilp_m5_device_load_cap(104), 0); /* the top of its step */
@@ -333,36 +338,44 @@ TEST(M5CopySchedule, DeviceLoadCapBoundaries)
    EXPECT_EQ(agx_ilp_m5_device_load_cap(256), 0);
 }
 
-/* With more values held across vec4 loads, four in flight stop fitting and
- * the schedule takes two, then one: the count only falls, and every window
- * is used. */
+/* Within each occupancy step (the 64-half top step and the 104-half step),
+ * adding live values reduces the in-flight window monotonically (4 -> 2 -> 1),
+ * and every window is used. */
 TEST(M5CopySchedule, ComputeDeviceLoadWindowsFallBack)
 {
-   unsigned last = ~0u;
-   bool seen[5] = {false};
-   for (unsigned live = 0; live <= 50; ++live) {
-      SCOPED_TRACE(live);
-      copy_shader s;
-      copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
-      emit_wide_load_uses(&s, 8, 4, live);
-      agx_ilp_schedule(s.b->shader);
-      const unsigned in_flight = max_device_loads_in_flight(s.body);
-      EXPECT_TRUE(in_flight == 4 || in_flight == 2 || in_flight == 1);
-      EXPECT_LE(in_flight, last);
-      if (in_flight <= 4)
-         seen[in_flight] = true;
-      last = in_flight;
-      ralloc_free(s.mem);
+   const struct {
+      unsigned lo, hi;
+   } steps[] = {
+      {0, 25},   /* 64-half occupancy step (peak <= 64) */
+      {26, 50},  /* 104-half occupancy step (peak > 64) */
+   };
+   for (const auto &step : steps) {
+      unsigned last = ~0u;
+      bool seen[5] = {false};
+      for (unsigned live = step.lo; live <= step.hi; ++live) {
+         SCOPED_TRACE(live);
+         copy_shader s;
+         copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+         emit_wide_load_uses(&s, 8, 4, live);
+         agx_ilp_schedule(s.b->shader);
+         const unsigned in_flight = max_device_loads_in_flight(s.body);
+         EXPECT_TRUE(in_flight == 4 || in_flight == 2 || in_flight == 1);
+         EXPECT_LE(in_flight, last);
+         if (in_flight <= 4)
+            seen[in_flight] = true;
+         last = in_flight;
+         ralloc_free(s.mem);
+      }
+      EXPECT_TRUE(seen[4]);
+      EXPECT_TRUE(seen[2]);
+      EXPECT_TRUE(seen[1]);
    }
-   EXPECT_TRUE(seen[4]);
-   EXPECT_TRUE(seen[2]);
-   EXPECT_TRUE(seen[1]);
 }
 
 /* The program's peak decides, whichever block sets it: a light load block
- * after a block holding many values keeps the previous schedule, which hoists
- * all of its loads ahead of their uses, while the same load block alone takes
- * the in-flight windows. */
+ * after a block holding many values gets load_cap == 0 and keeps the
+ * issue-order schedule instead of falling through to unbounded device-load
+ * hoisting, while the same load block alone takes the in-flight windows. */
 TEST(M5CopySchedule, ComputeDeviceLoadsFollowTheProgramPeak)
 {
    for (bool heavy : {false, true}) {
@@ -386,9 +399,79 @@ TEST(M5CopySchedule, ComputeDeviceLoadsFollowTheProgramPeak)
       agx_ilp_schedule(b->shader);
       const unsigned in_flight = max_device_loads_in_flight(loads);
       if (heavy)
-         EXPECT_EQ(in_flight, 16u);
+         EXPECT_EQ(in_flight, 1u);
       else
          EXPECT_LE(in_flight, 4u);
       ralloc_free(s.mem);
+   }
+}
+
+/* On AGX3C (non-G18G, non-preamble), register allocation caps max_regs at 64
+ * halves whenever aligned demand fits in 64 halves so unrelated short-lived
+ * allocations do not cross the 64-half occupancy cliff, while G18G and AGX3B
+ * keep the 104-half step. */
+TEST(M5CopySchedule, Agx3cRegisterAllocatorRespects64HalfOccupancyCap)
+{
+   struct variant {
+      const char *name;
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+      bool emit_agx3d;
+      bool expect_capped_64;
+   };
+
+   const variant cases[] = {
+      {"agx3c", AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, true},
+      {"g18g", AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, true, false},
+      {"agx3b", AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, false},
+   };
+
+   for (const variant &c : cases) {
+      SCOPED_TRACE(c.name);
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = c.enc;
+      key.dev.chip = c.chip;
+      key.dev.emit_agx3d = c.emit_agx3d;
+
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_info info = {};
+      b->shader->key = &key;
+      b->shader->out = &info;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->nir = rzalloc(mem, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+      b->shader->nir->info.workgroup_size[0] = 32;
+      b->shader->nir->info.workgroup_size[1] = 1;
+      b->shader->nir->info.workgroup_size[2] = 1;
+
+      /* Preload 30 32-bit values filling halves 0..59, consume four non-adjacent
+       * ones so peak demand stays <= 64 halves (52 live + 8 for the vec4 = 60)
+       * with no contiguous 8-half hole below half 60, then allocate a vec4.
+       * With max_regs = 104 (G18G/AGX3B), RA places the vec4 at half 64 without
+       * shuffling; with max_regs = 64 (AGX3C), RA repacks within halves 0..63. */
+      agx_index live[30];
+      for (unsigned i = 0; i < ARRAY_SIZE(live); ++i)
+         live[i] = agx_preload(b, agx_register(2 * i, AGX_SIZE_32));
+      agx_index acc = agx_iadd(b, live[1], live[5], 0);
+      acc = agx_iadd(b, acc, live[11], 0);
+      acc = agx_iadd(b, acc, live[17], 0);
+      agx_index v4 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_device_load_to(b, v4, agx_uniform(0, AGX_SIZE_64), agx_immediate(0),
+                         AGX_FORMAT_I32, BITFIELD_MASK(4), 0, false);
+      agx_unit_test(b, v4);
+      for (unsigned i = 0; i < ARRAY_SIZE(live); ++i) {
+         if (i != 1 && i != 5 && i != 11 && i != 17)
+            acc = agx_iadd(b, acc, live[i], 0);
+      }
+      agx_unit_test(b, acc);
+
+      agx_ra(b->shader);
+      ASSERT_FALSE(b->shader->ra_failed);
+      if (c.expect_capped_64)
+         EXPECT_LE(b->shader->max_reg, 64u);
+      else
+         EXPECT_GT(b->shader->max_reg, 64u);
+      ralloc_free(mem);
    }
 }

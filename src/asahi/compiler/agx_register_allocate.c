@@ -3720,8 +3720,14 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
    /* Round up the demand to the maximum number of registers we can use without
     * affecting occupancy. This reduces live range splitting.
+    * On AGX3C (non-G18G), occupancy steps down above 64 half-registers, so
+    * keep shaders whose aligned demand fits in 64 halves within 64.
     */
-   unsigned max_regs = agx_occupancy_for_register_count(demand).max_registers;
+   unsigned max_regs =
+      (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !agx_is_g18g(&ctx->key->dev) && !ctx->is_preamble && demand <= 64)
+         ? 64
+         : agx_occupancy_for_register_count(demand).max_registers;
    if (ctx->key->is_helper || force_spilling)
       max_regs = max_possible_regs;
 
