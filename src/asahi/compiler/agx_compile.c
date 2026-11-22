@@ -5248,7 +5248,7 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
       bool has_full_gpr = false, src_modifier = false;
       unsigned half_uniforms = 0;
       bool all_scalar_regs =
-         ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         agx_isa_is_agx3(ctx->key->dev.encoding) && !g18g &&
          I->nr_dests == 1 && !I->dest[0].memory &&
          I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1;
       agx_foreach_src(I, s) {
@@ -5276,11 +5276,11 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
              agx_channels(I->dest[0]) == 1 && has_full_gpr &&
              half_uniforms == 1 && I->src[s].type == AGX_INDEX_UNIFORM)
             continue;
-         /* AGX3B encodes unmodified all-scalar-register F32 FFMA with
-          * per-operand width bits directly (agx3_falu_fma_mod_runtime),
-          * avoiding redundant f16->f32 widening moves. Leave AGX3C untouched. */
-         if (native_half_gpr && (I->src[s].type == AGX_INDEX_NORMAL ||
-                                 I->src[s].type == AGX_INDEX_REGISTER))
+         /* AGX3B and AGX3C (non-G18G) encode unmodified all-scalar-register
+          * F32 FFMA with per-operand width bits directly
+          * (agx3_falu_fma_mod_runtime), avoiding redundant f16->f32 widening
+          * moves for both SSA and precoloured half GPRs. */
+         if (native_half_gpr)
             continue;
 
          agx_index widened = agx_temp(ctx, AGX_SIZE_32);

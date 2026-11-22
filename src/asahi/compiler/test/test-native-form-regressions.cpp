@@ -7273,7 +7273,7 @@ TEST(NativeForms, Agx3bMatmad8x8EnforcesRegisterBounds)
 }
 
 /*
- * Unmodified all-scalar-register F32 FFMA on AGX3B (non-G18G) preserves
+ * Unmodified all-scalar-register F32 FFMA on AGX3B/AGX3C (non-G18G) preserves
  * f16 GPR sources (both SSA normal and precoloured register indices) across
  * all operand slots and packs them via agx3_falu_fma_mod_runtime(). Modified,
  * uniform-mixed, and G18G forms keep explicit f16->f32 widening.
@@ -7308,8 +7308,8 @@ TEST(NativeForms, Agx3bFfmaKeepsUnmodifiedHalfGprNative)
        true, false, false},
       {"agx3b_uniform_mixed_widened", AGX_ISA_ENCODING_AGX3B, false, false, 1u,
        false, false, true, false},
-      {"agx3c_src0_widened", AGX_ISA_ENCODING_AGX3C, false, false, 1u, false,
-       false, false, false},
+      {"agx3c_src0_native", AGX_ISA_ENCODING_AGX3C, false, false, 1u, false,
+       false, false, true},
       {"g18g_src0_widened", AGX_ISA_ENCODING_AGX3C, true, false, 1u, false,
        false, false, false},
    };
@@ -7430,4 +7430,111 @@ TEST(NativeForms, Agx3bFfmaKeepsUnmodifiedHalfGprNative)
       util_dynarray_fini(&binary);
       ralloc_free(mem);
    }
+}
+
+/* Unmodified all-scalar-register F32 FFMA on AGX3C (non-G18G) keeps f16 GPR
+ * sources (both SSA and precoloured registers) native instead of inserting a
+ * widening move, while modified, G18G, and uniform-mixed cases still widen
+ * safely. */
+TEST(NativeForms, Agx3cFfmaKeepsUnmodifiedHalfGprNative)
+{
+   struct variant {
+      const char *name;
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+      bool emit_agx3d;
+      bool precoloured_half;
+      bool neg_src1;
+      bool uniform_src1;
+      bool expect_native_f16;
+   };
+
+   const variant cases[] = {
+      {"agx3c_unmodified_gpr", AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false,
+       false, false, false, true},
+      {"agx3c_precoloured_gpr", AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false,
+       true, false, false, true},
+      {"agx3c_modified_gpr", AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false,
+       false, true, false, false},
+      {"agx3c_uniform_mixed", AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false,
+       false, false, true, false},
+      {"g18g_unmodified_gpr", AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, true,
+       false, false, false, false},
+      {"agx3b_unmodified_gpr", AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false,
+       false, false, false, true},
+   };
+
+   for (const variant &c : cases) {
+      SCOPED_TRACE(c.name);
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = c.enc;
+      key.dev.chip = c.chip;
+      key.dev.emit_agx3d = c.emit_agx3d;
+
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->cursor = agx_after_block(agx_start_block(b->shader));
+
+      agx_index h = c.precoloured_half
+                       ? agx_register(0, AGX_SIZE_16)
+                       : agx_preload(b, agx_register(0, AGX_SIZE_16));
+      agx_index a = c.uniform_src1 ? agx_uniform(0, AGX_SIZE_32)
+                                   : agx_preload(b, agx_register(2, AGX_SIZE_32));
+      if (c.neg_src1)
+         a = agx_neg(a);
+      agx_index acc = agx_preload(b, agx_register(4, AGX_SIZE_32));
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *fma = agx_ffma_to(b, out, h, a, acc);
+      agx_unit_test(b, out);
+
+      agx_lower_agx3_fma_sources(b->shader);
+
+      unsigned fadds = 0;
+      agx_foreach_instr_global(b->shader, I)
+         fadds += I->op == AGX_OPCODE_FADD;
+
+      if (c.expect_native_f16) {
+         EXPECT_EQ(fma->src[0].size, AGX_SIZE_16);
+         EXPECT_EQ(fadds, 0u);
+      } else {
+         EXPECT_EQ(fma->src[0].size, AGX_SIZE_32);
+         EXPECT_EQ(fadds, 1u);
+      }
+      ralloc_free(mem);
+   }
+
+   /* Verify an end-to-end AGX3C compute shader with f16->f32 FFMA compiles and
+    * packs cleanly. */
+   nir_builder nb = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "agx3c mixed f16 ffma");
+   nb.shader->info.workgroup_size[0] = 32;
+   nb.shader->info.workgroup_size[1] = 1;
+   nb.shader->info.workgroup_size[2] = 1;
+   nir_def *base = nir_load_preamble(&nb, 1, 64, .base = 0);
+   nir_def *id = nir_u2u64(&nb, nir_load_local_invocation_index(&nb));
+   nir_def *h = nir_load_global(&nb, 1, 16, nir_iadd(&nb, base, nir_ishl_imm(&nb, id, 1)),
+                                .align_mul = 2);
+   nir_def *w = nir_load_global(&nb, 1, 32,
+                                nir_iadd_imm(&nb, nir_iadd(&nb, base, nir_ishl_imm(&nb, id, 2)), 256),
+                                .align_mul = 4);
+   nir_def *acc = nir_load_global(&nb, 1, 32,
+                                  nir_iadd_imm(&nb, nir_iadd(&nb, base, nir_ishl_imm(&nb, id, 2)), 512),
+                                  .align_mul = 4);
+   nir_def *res = nir_ffma(&nb, nir_f2f32(&nb, h), w, acc);
+   nir_store_global(&nb, res,
+                    nir_iadd_imm(&nb, nir_iadd(&nb, base, nir_ishl_imm(&nb, id, 2)), 768),
+                    .align_mul = 4);
+   agx_preprocess_nir_native(nb.shader, AGX_CHIP_G17S);
+
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   key.no_preamble = true;
+   key.reserved_preamble = 8;
+   agx_shader_part part = {};
+   EXPECT_TRUE(agx_compile_shader_nir(nb.shader, &key, &part));
+   EXPECT_GT(part.info.binary_size, 0u);
+   free(part.binary);
+   ralloc_free(nb.shader);
 }

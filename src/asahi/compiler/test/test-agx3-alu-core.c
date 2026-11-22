@@ -6535,6 +6535,12 @@ static void test_threejs_width_kind_modifier_axes(void)
       assert(agx3_falu_fma_mod_runtime(enc, 0, 0, 8, 4, &g, &frt, bytes,
                                        &len));
       exact(bytes, len, "09081e01810402c0");
+
+      struct agx3_falu_mods h = {0};
+      h.src0_16 = true;
+      assert(agx3_falu_fma_mod_runtime(enc, 0, 8, 0, 4, &h, &frt, bytes,
+                                       &len));
+      exact(bytes, len, "09011e08810402c0");
    }
 
    /* fsel: an absolute comparator against a minifloat IMMEDIATE. Against the
