@@ -462,8 +462,27 @@ agx_pressure_schedule(agx_context *ctx)
  * forward cap on the halves its own definitions hold. */
 #define AGX_ILP_FS_SAMPLE_SLACK 16
 #define AGX_ILP_FS_SAMPLE_HALVES 88
+/* Measured AGX3B Dynamic Caching tuning cap (halves) for low-pressure
+ * multi-tap fragment sample hoisting. AGX3B has no static register-file split
+ * (register storage shares on-chip SRAM with L1 cache); sweeping 48/64/88
+ * halves on G17P render.postfx, render.shadow, render.deferred and a
+ * 10,982-shader corpus selected 48 halves: it preserves the full render.postfx
+ * gain (5-tap bloom downsample at 39 GPRs) while keeping 9-tap shadow PCF at
+ * 63 GPRs (0% regression vs +3.7-4.1% slower at 64/88) and avoiding d16
+ * high-register packer refusals observed at 88 halves. */
+#define AGX_ILP_AGX3B_FS_SAMPLE_HALVES 48
 /* Samples a fragment block may issue ahead of the first unissued one. */
 #define AGX_ILP_FS_HOIST_SAMPLES 6
+
+/* Register allocation rounds vector widths up to a power of two halves
+ * (agx_register_allocate.c), so e.g. a 3-word coordinate collect occupies an
+ * aligned 8-half slot rather than 6 halves. */
+static inline unsigned
+ilp_ra_size_16(agx_index idx)
+{
+   const unsigned sz = agx_index_size_16(idx);
+   return sz ? util_next_power_of_two(sz) : 0;
+}
 
 /* A sample for the sample-issue schedule. M5 encodes a storage-image read as
  * the same native SMP as a texture fetch (Apple's texture.read), so it has
@@ -773,7 +792,8 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                    bool place_exit_compare, bool order_edges_free,
                    signed fwd_cap, unsigned hoist_samples,
                    bool hoist_past_writes, bool hoist_loads,
-                   bool loads_in_flight, struct sched_dag_state *dag_state)
+                   bool loads_in_flight, bool ra_sample_cost,
+                   struct sched_dag_state *dag_state)
 {
    struct util_dynarray all;
    util_dynarray_init(&all, memctx);
@@ -855,9 +875,21 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
     * counted, so the cap applies to what this block adds. While the cap is
     * reached, prefer instructions that define nothing (stores) and then the
     * smallest definitions; the final check below still measures the result
-    * exactly. */
+    * exactly.
+    *
+    * When ra_sample_cost is set, charge the power-of-two aligned register
+    * width that RA allocates (so 3-word coordinate collects cost 8 halves,
+    * not 6) and keep a sample destination's aligned 8-half bucket charged
+    * across its single-use split until the last live split component dies:
+    * RA coalesces split outputs in-place inside the sample's aligned 4-reg
+    * slot, so a 1-channel sample (shadow, depth, AO) still blocks that slot
+    * until its consumer drains it. */
    unsigned *uses_left = NULL;
    bool *dies = NULL;
+   int *src_split = NULL;
+   int *dest_split = NULL;
+   uint8_t *slot_size = NULL;
+   uint8_t *slot_live_outs = NULL;
    signed live = 0;
    if (fwd_cap > 0) {
       uses_left = rzalloc_array(memctx, unsigned, ctx->alloc);
@@ -879,6 +911,49 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
             continue;
          agx_foreach_ssa_src(I, si)
             dies[I->src[si].value] = false;
+      }
+      if (ra_sample_cost) {
+         bool *is_sample_def = rzalloc_array(memctx, bool, MAX2(ctx->alloc, 1));
+         src_split = ralloc_array(memctx, int, MAX2(ctx->alloc, 1));
+         dest_split = ralloc_array(memctx, int, MAX2(ctx->alloc, 1));
+         slot_size = rzalloc_array(memctx, uint8_t, n);
+         slot_live_outs = rzalloc_array(memctx, uint8_t, n);
+         if (!is_sample_def || !src_split || !dest_split || !slot_size ||
+             !slot_live_outs)
+            return false;
+         for (unsigned v = 0; v < ctx->alloc; ++v) {
+            src_split[v] = -1;
+            dest_split[v] = -1;
+         }
+         for (unsigned i = 0; i < n; ++i) {
+            const agx_instr *I = nodes[i]->instr;
+            if (!ilp_is_sample(ctx, I))
+               continue;
+            agx_foreach_ssa_dest(I, d) {
+               if (ilp_ra_size_16(I->dest[d]) > 2)
+                  is_sample_def[I->dest[d].value] = true;
+            }
+         }
+         unsigned nr_slots = 0;
+         for (unsigned i = 0; i < n; ++i) {
+            const agx_instr *I = nodes[i]->instr;
+            if (I->op != AGX_OPCODE_SPLIT ||
+                I->src[0].type != AGX_INDEX_NORMAL)
+               continue;
+            const unsigned sv = I->src[0].value;
+            if (!is_sample_def[sv] || !dies[sv] || uses_left[sv] != 1)
+               continue;
+            const unsigned k = nr_slots++;
+            src_split[sv] = k;
+            slot_size[k] = ilp_ra_size_16(I->src[0]);
+            agx_foreach_ssa_dest(I, d) {
+               const unsigned dv = I->dest[d].value;
+               if (uses_left[dv] > 0 || !dies[dv]) {
+                  dest_split[dv] = k;
+                  slot_live_outs[k]++;
+               }
+            }
+         }
       }
    }
 
@@ -909,6 +984,34 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    unsigned cycle = 0;
    bool changed = false;
    for (unsigned step = 0; step < n; ++step) {
+      const unsigned window =
+         hoist_samples ? (hoist_past_writes ? issued_writes
+                          : in_flight       ? consumed_loads
+                                            : issued_samples) +
+                            hoist_samples
+                       : 0;
+      /* When ra_sample_cost is set and a ready instruction feeding sample k
+       * exceeds fwd_cap, do not hoist dependencies (such as coordinate
+       * collects) of later samples > k ahead of draining consumers of
+       * already-issued samples. */
+      unsigned hoist_limit = ~0u;
+      if (ra_sample_cost && hoist_samples && fwd_cap > 0) {
+         for (unsigned i = 0; i < n; ++i) {
+            if (done[i] || ndeps[i] || first_sample[i] >= window)
+               continue;
+            const agx_instr *I = nodes[i]->instr;
+            if (I->op == AGX_OPCODE_SPLIT &&
+                I->src[0].type == AGX_INDEX_NORMAL &&
+                src_split[I->src[0].value] >= 0)
+               continue;
+            signed g = 0;
+            agx_foreach_ssa_dest(I, d)
+               g += ilp_ra_size_16(I->dest[d]);
+            if (g > 0 && live + g > fwd_cap)
+               hoist_limit = MIN2(hoist_limit, first_sample[i]);
+         }
+      }
+
       int best = -1;
       unsigned best_t = 0;
       signed best_grow = 0;
@@ -919,8 +1022,15 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
          const unsigned t = MAX2(ready[i], cycle);
          signed grow = 0;
          if (fwd_cap > 0) {
-            agx_foreach_ssa_dest(nodes[i]->instr, d)
-               grow += agx_index_size_16(nodes[i]->instr->dest[d]);
+            const agx_instr *I = nodes[i]->instr;
+            if (!(ra_sample_cost && I->op == AGX_OPCODE_SPLIT &&
+                  I->src[0].type == AGX_INDEX_NORMAL &&
+                  src_split[I->src[0].value] >= 0)) {
+               agx_foreach_ssa_dest(I, d) {
+                  grow += ra_sample_cost ? ilp_ra_size_16(I->dest[d])
+                                         : agx_index_size_16(I->dest[d]);
+               }
+            }
          }
          const bool fits = fwd_cap <= 0 || grow == 0 || live + grow <= fwd_cap;
          bool better;
@@ -931,13 +1041,10 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
          else if (!fits && grow != best_grow)
             better = grow < best_grow;
          else if (hoist_samples) {
-            const unsigned window =
-               (hoist_past_writes ? issued_writes
-                : in_flight       ? consumed_loads
-                                  : issued_samples) +
-               hoist_samples;
-            const bool hoist_i = first_sample[i] < window;
-            const bool hoist_b = first_sample[best] < window;
+            const bool hoist_i =
+               first_sample[i] < window && first_sample[i] <= hoist_limit;
+            const bool hoist_b =
+               first_sample[best] < window && first_sample[best] <= hoist_limit;
             better = hoist_i != hoist_b ? hoist_i : i < (unsigned)best;
          } else
             better = t < best_t || (t == best_t && height[i] > height[best]);
@@ -956,13 +1063,31 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
          live += best_grow;
          agx_foreach_ssa_src(B, si) {
             const unsigned v = B->src[si].value;
-            if (--uses_left[v] == 0 && dies[v])
-               live -= agx_index_size_16(B->src[si]);
+            if (--uses_left[v] == 0 && dies[v]) {
+               if (ra_sample_cost && src_split[v] >= 0) {
+                  const int k = src_split[v];
+                  if (slot_live_outs[k] == 0)
+                     live -= slot_size[k];
+               } else if (ra_sample_cost && dest_split[v] >= 0) {
+                  const int k = dest_split[v];
+                  if (--slot_live_outs[k] == 0)
+                     live -= slot_size[k];
+               } else {
+                  live -= ra_sample_cost ? ilp_ra_size_16(B->src[si])
+                                         : agx_index_size_16(B->src[si]);
+               }
+            }
          }
          agx_foreach_ssa_dest(B, d) {
             const unsigned v = B->dest[d].value;
-            if (uses_left[v] == 0 && dies[v])
-               live -= agx_index_size_16(B->dest[d]);
+            if (uses_left[v] == 0 && dies[v] &&
+                !(ra_sample_cost && dest_split[v] >= 0) &&
+                !(ra_sample_cost && B->op == AGX_OPCODE_SPLIT &&
+                  B->src[0].type == AGX_INDEX_NORMAL &&
+                  src_split[B->src[0].value] >= 0)) {
+               live -= ra_sample_cost ? ilp_ra_size_16(B->dest[d])
+                                      : agx_index_size_16(B->dest[d]);
+            }
          }
       }
 
@@ -1295,6 +1420,37 @@ ilp_block_peak(agx_context *ctx, agx_block *block, const uint8_t *size16,
    return out + peak;
 }
 
+/* Measured AGX3B per-block fragment sample hoisting budget (tuned on G17P).
+ * Keeping low-pressure multi-tap blocks inside AGX_ILP_AGX3B_FS_SAMPLE_HALVES
+ * (48 halves, using aligned RA vector widths and keeping sample destination
+ * slots charged across split until their last live channel dies) lets 5-tap
+ * bloom downsamples hoist all taps in flight without regressing 9-tap PCF
+ * (measured on G17P: 9-tap shadow PCF at g79/g95 with 64/88-half caps is
+ * 3.7-4.1% slower than at g63 with a 48-half cap). Blocks with peak >= 32
+ * halves keep AGX_ILP_FS_SAMPLE_SLACK. */
+static bool
+ilp_agx3b_fragment_sample_budget(agx_context *ctx, agx_block *block,
+                                 uint8_t **size16_out, void *memctx,
+                                 signed *slack_out, signed *fwd_cap_out)
+{
+   if (!*size16_out) {
+      *size16_out = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
+      if (!*size16_out)
+         return false;
+      agx_foreach_instr_global(ctx, I) {
+         agx_foreach_ssa_dest(I, d)
+            (*size16_out)[I->dest[d].value] = agx_index_size_16(I->dest[d]);
+      }
+   }
+   const signed peak = ilp_block_peak(ctx, block, *size16_out, memctx);
+   if (peak + AGX_ILP_FS_SAMPLE_SLACK < AGX_ILP_AGX3B_FS_SAMPLE_HALVES) {
+      *slack_out = AGX_ILP_AGX3B_FS_SAMPLE_HALVES - peak;
+      *fwd_cap_out = AGX_ILP_AGX3B_FS_SAMPLE_HALVES;
+      return true;
+   }
+   return false;
+}
+
 void
 agx_ilp_schedule(agx_context *ctx)
 {
@@ -1492,7 +1648,7 @@ agx_ilp_schedule(agx_context *ctx)
                                          alu_latency, 16 * alu_latency,
                                          load_growth, 0, false, true,
                                          AGX_ILP_FS_SAMPLE_HALVES, windows[w],
-                                         false, true, true, &dag_state))
+                                         false, true, true, false, &dag_state))
                      break;
                }
             } else {
@@ -1501,7 +1657,7 @@ agx_ilp_schedule(agx_context *ctx)
                                   false, true, AGX_ILP_FS_SAMPLE_HALVES,
                                   copy ? AGX_ILP_M5_COPY_SAMPLES
                                        : AGX_ILP_FS_HOIST_SAMPLES,
-                                  copy, loads > 0, false, &dag_state);
+                                  copy, loads > 0, false, false, &dag_state);
             }
          }
          continue;
@@ -1524,12 +1680,12 @@ agx_ilp_schedule(agx_context *ctx)
           !m5_ordered_memory) {
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, AGX_ILP_SLACK, 0, true, false, 0, 0, false,
-                            false, false, &dag_state);
+                            false, false, false, &dag_state);
       } else if (!in_loop[block->index] && ilp_single_tile_blend(ctx, block)) {
          /* Hardware-qualified color-only budget; leave loop pressure alone. */
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, 8, 0, true, false, 0, 0, false,
-                            false, false, &dag_state);
+                            false, false, false, &dag_state);
       } else if (!in_loop[block->index] && !ctx->is_preamble &&
                  ctx->stage == MESA_SHADER_FRAGMENT &&
                  ilp_block_samples(ctx, block) >= AGX_ILP_FS_MIN_SAMPLES) {
@@ -1539,15 +1695,20 @@ agx_ilp_schedule(agx_context *ctx)
           * and consume the results afterwards: move each sample and what it
           * depends on up, and keep the pressure order for everything else. */
          signed slack = AGX_ILP_FS_SAMPLE_SLACK;
+         signed fwd_cap = AGX_ILP_FS_SAMPLE_HALVES;
+         bool ra_sample_cost = false;
          if (m5_fragment) {
             const signed peak = ilp_block_peak(ctx, block, size16, memctx);
             slack = MAX2(slack, m5_occupancy_cap - peak);
+         } else if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
+            ra_sample_cost = ilp_agx3b_fragment_sample_budget(
+               ctx, block, &size16, memctx, &slack, &fwd_cap);
          }
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             16 * alu_latency, slack, 0, false,
-                            true, AGX_ILP_FS_SAMPLE_HALVES,
+                            true, fwd_cap,
                             AGX_ILP_FS_HOIST_SAMPLES, false, false, false,
-                            &dag_state);
+                            ra_sample_cost, &dag_state);
       } else if (!in_loop[block->index] && ctx->is_preamble) {
          /* A constant program's device loads are mostly independent, but the
           * pressure schedule places each right before its uniform store, so
@@ -1561,7 +1722,7 @@ agx_ilp_schedule(agx_context *ctx)
                             16 * alu_latency, AGX_ILP_SLACK,
                             AGX_ILP_CPROG_HALVES, false, true,
                             AGX_ILP_CPROG_HALVES - 16, 0, false, false, false,
-                            &dag_state);
+                            false, &dag_state);
       }
    }
 

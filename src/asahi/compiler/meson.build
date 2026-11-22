@@ -741,6 +741,7 @@ if with_tests
          'test/test-agx3-sr.cpp',
          'test/test-agx3-scs.cpp',
          'test/test-agx3-register-copy.cpp',
+         'test/test-agx3b-fragment-sample-schedule.cpp',
          'test/test-agx3-uniform-alu.cpp',
          'test/test-position-order.cpp',
          'test/test-clip-m1-1.cpp',
