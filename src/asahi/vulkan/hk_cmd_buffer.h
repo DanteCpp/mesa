@@ -322,6 +322,7 @@ enum hk_root_reads {
     * constant data. */
    HK_ROOT_READS_VERTEX_INPUT = BITFIELD_BIT(1),
    HK_ROOT_READS_DYNAMIC_BUFFERS = BITFIELD_BIT(2),
+   HK_ROOT_READS_PUSH = BITFIELD_BIT(3),
 };
 
 /* Every root byte a draw may republish without the fragment stage observing
@@ -335,6 +336,7 @@ enum hk_root_reads {
    X(draw.vs_constant_data_addr, draw.fs_constant_data_addr,                   \
      HK_ROOT_READS_VERTEX_INPUT)                                               \
    X(draw.attrib_base, push, HK_ROOT_READS_VERTEX_INPUT)                       \
+   X(push, dynamic_buffers, HK_ROOT_READS_PUSH)                                \
    X(dynamic_buffers, set_dynamic_buffer_start, HK_ROOT_READS_DYNAMIC_BUFFERS)
 
 /* The HK_ROOT_READS_* classes a read of root bytes [start_B, end_B) falls
@@ -349,6 +351,114 @@ hk_root_reads_of(uint64_t start_B, uint64_t end_B)
       reads |= (class);
    HK_ROOT_FRAGMENT_HIDDEN_SPANS(HK_ROOT_CLASSIFY)
 #undef HK_ROOT_CLASSIFY
+   return reads;
+}
+
+/* Constant byte offset from a load_root_agx pointer.  Runs before NIR opts:
+ * lowering adds, scales and widens immediates without folding them. */
+static inline bool
+hk_nir_constant_offset(nir_scalar s, unsigned depth, uint64_t *value)
+{
+   s = nir_scalar_chase_movs(s);
+   if (nir_scalar_is_const(s)) {
+      *value = nir_scalar_as_uint(s);
+      return true;
+   }
+   if (!depth || !nir_scalar_is_alu(s))
+      return false;
+
+   const nir_op op = nir_scalar_alu_op(s);
+   uint64_t a, b = 0;
+   if (!hk_nir_constant_offset(nir_scalar_chase_alu_src(s, 0), depth - 1, &a))
+      return false;
+   if (nir_op_infos[op].num_inputs == 2 &&
+       !hk_nir_constant_offset(nir_scalar_chase_alu_src(s, 1), depth - 1, &b))
+      return false;
+
+   switch (op) {
+   case nir_op_u2u32:
+   case nir_op_u2u64:
+      *value = a;
+      break;
+   case nir_op_iadd:
+      *value = a + b;
+      break;
+   case nir_op_imul:
+   case nir_op_amul:
+      *value = a * b;
+      break;
+   case nir_op_ishl:
+      *value = a << (b & (s.def->bit_size - 1));
+      break;
+   default:
+      return false;
+   }
+   *value &= BITFIELD64_MASK(s.def->bit_size);
+   return true;
+}
+
+/* The HK_ROOT_READS_* classes of the root bytes one use of load_root_agx can
+ * read: an immediate offset loaded as is falls in the classes of its bytes,
+ * anything else could read any byte. */
+static inline uint8_t
+hk_nir_root_use_reads(nir_src *use)
+{
+   const uint8_t any = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
+                       HK_ROOT_READS_DYNAMIC_BUFFERS | HK_ROOT_READS_PUSH;
+   if (nir_src_is_if(use) ||
+       nir_src_use_instr(use)->type != nir_instr_type_alu)
+      return any;
+
+   nir_alu_instr *add = nir_instr_as_alu(nir_src_use_instr(use));
+   if (add->op != nir_op_iadd)
+      return any;
+
+   const unsigned other = use == &add->src[0].src ? 1 : 0;
+   uint64_t offset;
+   if (!hk_nir_constant_offset(nir_get_scalar(add->src[other].src.ssa,
+                                              add->src[other].swizzle[0]),
+                               8, &offset))
+      return any;
+
+   uint8_t reads = 0;
+   nir_foreach_use_including_if(load_use, &add->def) {
+      if (nir_src_is_if(load_use) ||
+          nir_src_use_instr(load_use)->type != nir_instr_type_intrinsic)
+         return any;
+
+      nir_intrinsic_instr *load =
+         nir_instr_as_intrinsic(nir_src_use_instr(load_use));
+      if ((load->intrinsic != nir_intrinsic_load_global_constant &&
+           load->intrinsic != nir_intrinsic_load_global) ||
+          load_use != &load->src[0])
+         return any;
+
+      reads |= hk_root_reads_of(
+         offset, offset + load->def.num_components * load->def.bit_size / 8);
+   }
+   return reads;
+}
+
+/* hk_shader_info::agx3_root_reads, gathered where hk_nir_uses_root() is. */
+static inline uint8_t
+hk_nir_root_reads(const nir_shader *nir)
+{
+   uint8_t reads = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic ||
+                nir_instr_as_intrinsic(instr)->intrinsic !=
+                   nir_intrinsic_load_root_agx)
+               continue;
+
+            nir_foreach_use_including_if(use,
+                                         &nir_instr_as_intrinsic(instr)->def)
+               reads |= hk_nir_root_use_reads(use);
+         }
+      }
+   }
+
    return reads;
 }
 
@@ -421,6 +531,10 @@ static_assert(hk_root_descriptor_offset(push) ==
                     sizeof(((struct hk_root_descriptor_table *)0)
                               ->draw.attrib_base),
               "attrib_base ends the graphics arm");
+static_assert(hk_root_descriptor_offset(dynamic_buffers) ==
+                 hk_root_descriptor_offset(push) +
+                    sizeof(((struct hk_root_descriptor_table *)0)->push),
+              "push constants are followed directly by dynamic buffers");
 static_assert(hk_root_descriptor_offset(set_dynamic_buffer_start) ==
                  hk_root_descriptor_offset(dynamic_buffers) +
                     sizeof(((struct hk_root_descriptor_table *)0)
@@ -1002,7 +1116,7 @@ hk_m5_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
                            bool use_memo, bool use_shadow)
 {
    const uint8_t hidden = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
-                          HK_ROOT_READS_DYNAMIC_BUFFERS;
+                          HK_ROOT_READS_DYNAMIC_BUFFERS | HK_ROOT_READS_PUSH;
 
    const bool shadow = use_shadow &&
                        gfx->root_fragment_snapshot_cpu == gfx->root_cpu &&

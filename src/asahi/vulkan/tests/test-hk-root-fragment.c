@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "hk_cmd_buffer.h"
+#include "nir_builder.h"
 
 static uint64_t checks;
 #define CHECK(condition)                                                       \
@@ -20,7 +21,7 @@ static uint64_t
 fresh_select(struct hk_graphics_state *gfx, uint8_t reads)
 {
    const uint8_t hidden = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
-                          HK_ROOT_READS_DYNAMIC_BUFFERS;
+                          HK_ROOT_READS_DYNAMIC_BUFFERS | HK_ROOT_READS_PUSH;
    if (gfx->fs_root && gfx->fs_root != gfx->root && gfx->root_cpu &&
        !(reads & hidden) &&
        hk_root_matches_for_fragment(gfx->fs_root_cpu, gfx->root_cpu))
@@ -73,9 +74,108 @@ publish(struct hk_graphics_state *fresh, struct hk_graphics_state *cached,
    }
 }
 
+static void
+test_nir_root_use_reads(void)
+{
+   static const nir_shader_compiler_options opts = {0};
+   const uint8_t any = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
+                       HK_ROOT_READS_DYNAMIC_BUFFERS | HK_ROOT_READS_PUSH;
+
+   /* Constant-offset push-constant load -> HK_ROOT_READS_PUSH only. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                     &opts, "push_const");
+      nir_def *root = nir_load_root_agx(&b);
+      nir_def *addr =
+         nir_iadd_imm(&b, root, hk_root_descriptor_offset(push) + 4);
+      nir_load_global_constant(&b, 1, 32, addr);
+
+      uint8_t use_reads = 0;
+      nir_foreach_use_including_if(use, root)
+         use_reads |= hk_nir_root_use_reads(use);
+      CHECK(use_reads == HK_ROOT_READS_PUSH);
+      CHECK(hk_nir_root_reads(b.shader) == HK_ROOT_READS_PUSH);
+      ralloc_free(b.shader);
+   }
+
+   /* Unfolded constant push-constant expression (as emitted before opts). */
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                     &opts, "push_unfolded");
+      nir_def *root = nir_load_root_agx(&b);
+      nir_def *off32 =
+         nir_iadd(&b, nir_imm_int(&b, hk_root_descriptor_offset(push)),
+                  nir_ishl_imm(&b, nir_imm_int(&b, 3), 2));
+      nir_def *addr = nir_iadd(&b, root, nir_u2u64(&b, off32));
+      nir_load_global(&b, 1, 32, addr);
+
+      CHECK(hk_nir_root_reads(b.shader) == HK_ROOT_READS_PUSH);
+      ralloc_free(b.shader);
+   }
+
+   /* Constant-offset descriptor-set load -> visible span (reads == 0). */
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                     &opts, "sets_const");
+      nir_def *root = nir_load_root_agx(&b);
+      nir_def *addr = nir_iadd_imm(&b, root, hk_root_descriptor_offset(sets));
+      nir_load_global_constant(&b, 1, 64, addr);
+
+      CHECK(hk_nir_root_reads(b.shader) == 0);
+      ralloc_free(b.shader);
+   }
+
+   /* Constant load straddling push and dynamic_buffers -> both classes. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                     &opts, "push_straddle");
+      nir_def *root = nir_load_root_agx(&b);
+      nir_def *addr = nir_iadd_imm(
+         &b, root, hk_root_descriptor_offset(dynamic_buffers) - 4);
+      nir_load_global_constant(&b, 2, 32, addr);
+
+      CHECK(hk_nir_root_reads(b.shader) ==
+            (HK_ROOT_READS_PUSH | HK_ROOT_READS_DYNAMIC_BUFFERS));
+      ralloc_free(b.shader);
+   }
+
+   /* Dynamically indexed push load -> conservative fallback to every class. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                     &opts, "push_dynamic");
+      nir_def *root = nir_load_root_agx(&b);
+      nir_def *dyn_idx = nir_load_primitive_id(&b);
+      nir_def *off32 =
+         nir_iadd_imm(&b, nir_ishl_imm(&b, dyn_idx, 2),
+                      hk_root_descriptor_offset(push));
+      nir_def *addr = nir_iadd(&b, root, nir_u2u64(&b, off32));
+      nir_load_global_constant(&b, 1, 32, addr);
+
+      uint8_t use_reads = 0;
+      nir_foreach_use_including_if(use, root)
+         use_reads |= hk_nir_root_use_reads(use);
+      CHECK(use_reads == any);
+      CHECK(hk_nir_root_reads(b.shader) == any);
+      ralloc_free(b.shader);
+   }
+
+   /* Direct non-iadd load from load_root_agx -> conservative fallback. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                     &opts, "root_direct");
+      nir_def *root = nir_load_root_agx(&b);
+      nir_load_global_constant(&b, 1, 64, root);
+
+      CHECK(hk_nir_root_reads(b.shader) == any);
+      ralloc_free(b.shader);
+   }
+}
+
 int
 main(void)
 {
+   test_nir_root_use_reads();
+
    struct hk_graphics_state *fresh = calloc(1, sizeof(*fresh));
    struct hk_graphics_state *cached = calloc(1, sizeof(*cached));
    struct hk_root_descriptor_table source, gpu[35];
@@ -96,7 +196,7 @@ main(void)
                cached->fs_root_fragment_snapshot_cpu;
             ((uint8_t *)&source)[byte] ^= 0x5a;
             publish(fresh, cached, &gpu[1], &source, end, 0x2000, shadow);
-            for (unsigned reads = 0; reads < 8; ++reads) {
+            for (unsigned reads = 0; reads < 16; ++reads) {
                /* Each mask must decide between the old and current roots.
                 * A previous hidden-read selection must not pre-adopt it. */
                fresh->fs_root = cached->fs_root = 0x1000;
@@ -109,6 +209,21 @@ main(void)
             }
          }
       }
+
+      /* Push-constant-only updates reuse fs_root when the fragment shader
+       * does not read push constants, and republish when it does. */
+      memset(fresh, 0, sizeof(*fresh));
+      memset(cached, 0, sizeof(*cached));
+      memset(&source, 0, sizeof(source));
+      publish(fresh, cached, &gpu[0], &source, 0, 0x1000, shadow);
+      select_and_check(fresh, cached, 0, memo, shadow);
+      source.push[0] = 0x42;
+      publish(fresh, cached, &gpu[1], &source, 0, 0x2000, shadow);
+      CHECK(hk_m5_fragment_root_select(cached, 0, memo, shadow) == 0x1000);
+      CHECK(fresh_select(fresh, 0) == 0x1000);
+      CHECK(hk_m5_fragment_root_select(cached, HK_ROOT_READS_PUSH, memo,
+                                       shadow) == 0x2000);
+      CHECK(fresh_select(fresh, HK_ROOT_READS_PUSH) == 0x2000);
 
       /* Every publication-time global and the complete tail are visible. */
       memset(fresh, 0, sizeof(*fresh));
@@ -135,14 +250,14 @@ main(void)
       publish(fresh, cached, &gpu[1], &source, 0, 0x2000, shadow);
       memset(&source, 0x6d, sizeof(source));
       select_and_check(fresh, cached, 0, memo, shadow);
-      select_and_check(fresh, cached, 7, memo, shadow);
+      select_and_check(fresh, cached, 15, memo, shadow);
 
       /* Failed publication retains the old CPU copy while its GPU VA is 0. */
-      source.push[0] ^= 1;
+      source.sets[0] ^= 1;
       publish(fresh, cached, &gpu[2], &source, 64, 0x3000, shadow);
       fresh->root = cached->root = 0;
       select_and_check(fresh, cached, 0, memo, shadow);
-      select_and_check(fresh, cached, 7, memo, shadow);
+      select_and_check(fresh, cached, 15, memo, shadow);
       cached->root_fragment_snapshot_cpu = NULL;
       select_and_check(fresh, cached, 0, memo, shadow);
 
@@ -152,7 +267,7 @@ main(void)
       memset(&source, 0, sizeof(source));
       publish(fresh, cached, &gpu[0], &source, 0, 0x1000, shadow);
       select_and_check(fresh, cached, 0, memo, shadow);
-      source.push[0] = 1;
+      source.sets[0] = 1;
       publish(fresh, cached, &gpu[1], &source, 0, 0x2000, shadow);
       cached->root_fragment_snapshot_cpu = NULL;
       select_and_check(fresh, cached, 0, memo, shadow);

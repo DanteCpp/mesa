@@ -3820,6 +3820,9 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
        * earlier compact publication in this recording with the same inputs
        * was already admitted. */
       struct hk_graphics_state *agfx = &cmd->state.gfx;
+      const uint64_t root = stage && !s->info.agx3_gen1_fragment_rq
+                               ? hk_m5_fragment_root(cmd, s)
+                               : agfx->root;
       const struct hk_shader *hw_vs =
          agfx->shaders[MESA_SHADER_VERTEX] ? hk_bound_hw_vs(agfx) : NULL;
       const uint8_t flags = hk_g17p_launch_flags(cmd, s);
@@ -3827,7 +3830,7 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       if (!s->info.agx3_gen1_fragment_rq &&
           hk_g17p_launch_matches(cmd, launch, s, linked, flags, hw_vs)) {
          const uint64_t published =
-            hk_g17p_launch_replay(cmd, launch, linked, cached, agfx->root);
+            hk_g17p_launch_replay(cmd, launch, linked, cached, root);
          if (published)
             return published;
          if (vk_command_buffer_has_error(&cmd->vk))
@@ -3872,14 +3875,14 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
          loader_ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
       uint8_t sources[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
       size_t loader_range_count = 0;
-      if (hk_g17p_graphics_uniform_ranges(cmd, s, linked, agfx->root,
+      if (hk_g17p_graphics_uniform_ranges(cmd, s, linked, root,
                                           loader_ranges, &loader_range_count,
                                           sources)) {
          const uint64_t published = hk_g17p_publish_gfx_loader(
             cmd, s, linked, cached, loader_ranges, loader_range_count);
          if (published) {
             hk_g17p_launch_record(cmd, launch, s, linked, cached->loader,
-                                  flags, hw_vs, agfx->root, loader_ranges,
+                                  flags, hw_vs, root, loader_ranges,
                                   loader_range_count, sources);
             return published;
          }

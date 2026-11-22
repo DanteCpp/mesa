@@ -8477,6 +8477,18 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
        gfx->g17p_bind_tail_memo.fs == fs &&
        gfx->g17p_bind_tail_memo.hw_vs == hk_bound_hw_vs(gfx) &&
        hk_g17p_bind_tail_state_matches(cmd, prepared)) {
+      if (gfx->g17p_bind_tail_memo.fs_fields.stage_program ==
+          fragment_program) {
+         prepared->dynamic_generation = dyn->generation;
+         prepared->descriptor_generation = gfx->descriptors.generation;
+         prepared->vertex_buffer_generation = gfx->root_vertex_buffer_generation;
+         prepared->root = gfx->root;
+         prepared->fragment_shader = fs;
+         prepared->fragment_dma_set_base = hk_g17p_dma_set_base(cmd, fs);
+         prepared->valid = true;
+         return true;
+      }
+
       struct agx_ppp_hal200_fragment_fields memo_fs_fields =
          gfx->g17p_bind_tail_memo.fs_fields;
       memo_fs_fields.stage_program = fragment_program;
@@ -8507,6 +8519,7 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
          value += delta;
          memcpy(offset, &value, sizeof(value));
       }
+      gfx->g17p_bind_tail_memo.fs_fields.stage_program = fragment_program;
       gfx->g17p_bind_tail_memo.state_cpu = memo_state.cpu;
       gfx->g17p_bind_tail_memo.state_compact = (uint32_t)memo_state.gpu;
 

@@ -88,7 +88,7 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    /* Capture from the CPU source after every publication-time augmentation.
     * Reading the GPU-mapped root back here would pay uncached load latency. */
    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS &&
-       agx_chip_g17_m5(dev->dev.chip)) {
+       agx_chip_native_or_m5(dev->dev.chip)) {
       struct hk_graphics_state *gfx = &cmd->state.gfx;
       hk_root_fragment_snapshot_publish(gfx, root_ptr.cpu, root);
    }
