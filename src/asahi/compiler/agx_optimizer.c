@@ -962,7 +962,9 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
 
       /* Preserve an aligned 64-bit device-load base assembled from
        * adjacent uniform words. The native form reads those same words. */
-      if (ctx->key && I->op == AGX_OPCODE_DEVICE_LOAD && s == 0 &&
+      if (ctx->key &&
+          ((I->op == AGX_OPCODE_DEVICE_LOAD && s == 0) ||
+           (I->op == AGX_OPCODE_DEVICE_STORE && s == 1)) &&
           src.size == AGX_SIZE_64 && agx_channels(src) == 1 &&
           !src.abs && !src.neg && !src.memory &&
           def->op == AGX_OPCODE_COLLECT && def->nr_srcs == 2 &&
@@ -971,26 +973,22 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
           !def->saturate) {
          const agx_index lo = def->src[0], hi = def->src[1];
          const bool m5_uniform_base =
-            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+            I->op == AGX_OPCODE_DEVICE_LOAD;
 
-         /* On AGX3B a scalar W8 load and four packed W8 components both
-          * return one physical word, and the LDDEV encoding reads an aligned
-          * base directly from the low uniform file. Both are properties of
-          * the encoding, so this holds on every AGX3B part. */
-         const bool agx3b_w8_uniform_base =
+         /* On AGX3B, LDDEV and STDEV both encode an aligned 64-bit base
+          * directly from the low uniform file across all widths and masks. */
+         const bool agx3b_uniform_base =
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+            !ctx->key->dev.emit_agx3d &&
             ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
             ctx->nir && !ctx->nir->info.internal && !ctx->key->secondary &&
-            I->format == AGX_FORMAT_I8 && !I->coherent &&
-            I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
-            agx_channels(I->dest[0]) == 1 &&
-            ((!I->memory_is_packed && I->mask == 0x1) ||
-             (I->memory_is_packed && I->mask == 0xf)) &&
+            !I->coherent &&
             !src.kill && !src.cache && !src.discard &&
             !lo.kill && !lo.cache && !lo.discard &&
             !hi.kill && !hi.cache && !hi.discard;
 
-         if ((m5_uniform_base || agx3b_w8_uniform_base) &&
+         if ((m5_uniform_base || agx3b_uniform_base) &&
              lo.type == AGX_INDEX_UNIFORM && hi.type == AGX_INDEX_UNIFORM &&
              lo.size == AGX_SIZE_32 && hi.size == AGX_SIZE_32 &&
              agx_channels(lo) == 1 && agx_channels(hi) == 1 &&
