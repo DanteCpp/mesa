@@ -45,6 +45,7 @@
 #endif
 #ifdef _WIN32
 #include "agx_device_d3dkmt.h"
+#include "win/agx_device_g18.h"
 #include <windows.h> /* HANDLE / CloseHandle, agx_close_device() */
 #endif
 #include "util/blob.h"
@@ -174,6 +175,19 @@ agx_bo_free(struct agx_device *dev, struct agx_bo *bo)
     * vdrm_bo_create() flushes this ahead of any blob that reuses the VA. Keep
     * (leak) the VA if the unbind cannot be queued.
     */
+   struct agx_va *host_ptr_va = NULL;
+   size_t host_ptr_size = 0;
+#ifdef _WIN32
+   /* A G18 render-node import of pages this process maps is closed first and
+    * unbound right after (below): the GPU must not keep the pages once the
+    * memory object goes (the caller unlocks and frees the allocation behind
+    * them), and the node, which may hold a newer import of the same pages,
+    * gives the leaves back to the closed one. */
+   if ((bo->flags & AGX_BO_HOST_PTR) && bo->va && agx_device_is_g18(dev)) {
+      host_ptr_va = bo->va;
+      host_ptr_size = bo->size;
+   } else
+#endif
    if (!dev->is_virtio || !bo->va ||
        !agx_bo_bind(dev, NULL, bo->va->addr, bo->size, 0,
                     DRM_ASAHI_BIND_UNBIND))
@@ -191,6 +205,12 @@ agx_bo_free(struct agx_device *dev, struct agx_bo *bo)
    __sync_synchronize();
 
    dev->ops.bo_free(dev, handle);
+
+   /* Keep (leak) the VA if the unbind fails. */
+   if (host_ptr_va &&
+       !agx_bo_bind(dev, NULL, host_ptr_va->addr, host_ptr_size, 0,
+                    DRM_ASAHI_BIND_UNBIND))
+      agx_va_free(dev, host_ptr_va, false);
 }
 
 /*
@@ -951,12 +971,17 @@ agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo)
  * publishes DRM_ASAHI_FEATURE_USERPTR or _GEM_RESIDENCY
  * (agx_d3dkmt_published_features), so agx_has_userptr() and
  * agx_has_residency_control() are false and hk never reaches these. They
- * answer as the DRM helpers do on a kernel without the feature.
+ * answer as the DRM helpers do on a kernel without the feature. The G18
+ * render node imports host memory with its own GEM_USERPTR.
  */
 struct agx_bo *
 agx_bo_import_host_ptr(struct agx_device *dev, void *ptr, size_t size,
                        enum agx_host_ptr_access access)
 {
+#ifdef _WIN32
+   if (agx_device_is_g18(dev) && agx_has_userptr(dev))
+      return agx_g18_bo_import_host_ptr(dev, ptr, size, access);
+#endif
    (void)dev, (void)ptr, (void)size, (void)access;
    errno = EOPNOTSUPP;
    return NULL;
@@ -1295,8 +1320,9 @@ agx_open_device(void *memctx, struct agx_device *dev)
    reservation += LIBAGX_PRINTF_BUFFER_SIZE;
 
 #ifdef _WIN32
-   /* VidMm reserves and maps GPU VA in 64 KiB units. */
-   dev->guard_size = 0x10000;
+   /* VidMm reserves and maps GPU VA in 64 KiB units. The G18 render node maps
+    * 16 KiB pages, as the DRM kernel does. */
+   dev->guard_size = agx_device_is_g18(dev) ? AIL_PAGESIZE : 0x10000;
 #else
    dev->guard_size = AIL_PAGESIZE;
 #endif
@@ -1471,7 +1497,8 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * 4 KiB/64 KiB choice is made at this table granularity, so isolate the
     * fixed zero/scratch mappings from both long-lived render heaps. */
    const uint64_t uat_leaf_span = UINT64_C(0x02000000);
-   if ((AGX_ZERO_PAGE_ADDRESS & (uat_leaf_span - 1)) != 0 ||
+   if (!agx_device_is_g18(dev) &&
+       ((AGX_ZERO_PAGE_ADDRESS & (uat_leaf_span - 1)) != 0 ||
        (dev->shader_base & (uat_leaf_span - 1)) != 0 ||
        (user_start & (uat_leaf_span - 1)) != 0 ||
        (AGX_ZERO_PAGE_ADDRESS / uat_leaf_span) ==
@@ -1479,7 +1506,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
        (AGX_ZERO_PAGE_ADDRESS / uat_leaf_span) ==
           (user_start / uat_leaf_span) ||
        (dev->shader_base / uat_leaf_span) ==
-          (user_start / uat_leaf_span)) {
+          (user_start / uat_leaf_span))) {
       fprintf(stderr, "D3DKMT VA heaps do not occupy distinct UAT leaves\n");
       goto fail;
    }
@@ -1853,7 +1880,10 @@ agx_close_device(struct agx_device *dev)
     * keeps an NT HANDLE there.  Release both at this one ownership boundary
     * so a successful Vulkan teardown cannot leak either. */
 #ifdef _WIN32
-   if (dev->ops.simple_ioctl == agx_device_d3dkmt_ops.simple_ioctl)
+   /* The G18 render node keeps a transport pseudo-fd in fd instead. */
+   if (agx_device_is_g18(dev))
+      agx_g18_close_fd(dev->fd);
+   else if (dev->ops.simple_ioctl == agx_device_d3dkmt_ops.simple_ioctl)
       agx_d3dkmt_close_device(dev);
    else
       CloseHandle((HANDLE)dev->hdev);

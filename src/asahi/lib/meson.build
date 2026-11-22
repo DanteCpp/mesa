@@ -123,7 +123,24 @@ libasahi_lib_files = files(
 asahi_win_agxkmd = false
 asahi_win_d3dkmt = false
 libasahi_lib_inc_win = []
+
+# The G18 render-node transport (DeviceIoControl on the g18win render node,
+# ABI in win/g18_uapi.h) and the in-process stub node with its G18R recorder.
+# The tests below build it on any host.
+asahi_win_kmd_files = files(
+  'win/agx_win_g18r.c',
+  'win/agx_win_g18r.h',
+  'win/agx_win_kmd.c',
+  'win/agx_win_kmd.h',
+  'win/agx_win_kmd_stub.c',
+  'win/g18_uapi.h',
+)
+
 if host_machine.system() == 'windows'
+  libasahi_lib_files += files(
+    'win/agx_device_g18.c',
+    'win/agx_device_g18.h',
+  ) + asahi_win_kmd_files
   kmd_uapi_core_dir = meson.get_external_property('ntagx_kmd_uapi_core', '')
   wddm_contract_dir = meson.get_external_property('ntagx_wddm_contract_core',
                                                   '')
@@ -332,6 +349,15 @@ libasahi_lib = static_library(
 )
 
 if with_tests
+  # G18 transport framing against the stub render node; runs on any host.
+  test('asahi-win-kmd-stub',
+    executable('asahi-win-kmd-stub',
+      ['tests/test-win-kmd-stub.c', asahi_win_kmd_files],
+      include_directories : [inc_include, inc_asahi],
+    ),
+    suite : ['asahi'],
+  )
+
   foreach rt_test : ['rt-bvh', 'scs-layout']
     test('asahi-' + rt_test,
       executable('asahi-' + rt_test,
