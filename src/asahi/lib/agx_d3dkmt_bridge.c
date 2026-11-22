@@ -827,6 +827,18 @@ impl_create_allocation2(unsigned s, struct agx_kmt_createallocation *a)
          degraded ? 1u : 0u, donor_handoff ? 1u : 0u,
          (unsigned long long)handoff_allocation_size,
          bad_output ? 1u : 0u);
+   if (failed) {
+      fprintf(stderr,
+              "agx_bridge CreateAllocation2 fail: slot=%u st=0x%08x bytes=0x%llx "
+              "flags0=0x%x create_flags=0x%x handoff=%u hrt=%p degraded=%u "
+              "halloc0=0x%x hkmres=0x%x bad_out=%u\n",
+              s, (unsigned)st, (unsigned long long)valid_bytes, first_flags,
+              (unsigned)a->Flags, resource_handoff ? 1u : 0u,
+              resource_handoff ? handoff.hRTResource : NULL,
+              degraded ? 1u : 0u, (unsigned)first_handle,
+              (unsigned)c.hKMResource, bad_output ? 1u : 0u);
+      fflush(stderr);
+   }
    return st;
 }
 
