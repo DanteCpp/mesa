@@ -214,6 +214,9 @@ update_velems(Device *pDevice)
 static void
 ResolveState(Device *pDevice)
 {
+   RotDiagDraw(pDevice, pDevice->fb.nr_cbufs ? pDevice->fb.cbufs[0].texture: NULL);
+   if (pDevice->cfTarget)
+      CfDamageDraw(pDevice);
    if (pDevice->proxiedHead)
       WddmSyncShared(pDevice);
    if (UmdTraceAll())

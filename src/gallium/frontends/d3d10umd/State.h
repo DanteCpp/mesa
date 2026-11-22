@@ -73,6 +73,17 @@ struct Shader
 
 struct Query;
 struct ElementLayout;
+struct Resource;
+
+/* R8: a view (RTV, DSV, SRV) on a resource handle. RotateResourceIdentities moves each handle's storage, and the
+ * views created on that handle follow it (D3D semantics: a view names the handle, not the storage). */
+enum ViewKind { VIEW_RTV = 1, VIEW_DSV, VIEW_SRV };
+struct ViewLink
+{
+   struct ViewLink *next, *prev;
+   struct Resource *res;
+   int kind;
+};
 
 struct Device
 {
@@ -160,7 +171,22 @@ struct Device
    struct Resource *sharedHead;      /* G6 r7: shared resources over their allocation (no copy out): bumped at flush */
    int flushDefer;                   /* -1 not decided; C:\\g6u\\flushdefer.off */
 
-   struct pipe_resource *rotTemp;    /* R7: RotateResourceIdentities' temporary, kept (a create is a GEM_CREATE + VM_BIND) */
+   struct Resource *rotSet[4];       /* R8 diagnostics: the last rotated handles (trace only) */
+   UINT rotN, rotCalls, rotDiag;
+   UINT rotDraws[6];                 /* per present: draws/clears into rotated handle 0..3's storage, 4 none bound, 5 other */
+   struct pipe_resource *rotTemp;
+   /* R8: copy-forward of a copy-model swap chain (DWM's NO_SCANOUT primaries): what was drawn into the chain's back
+    * buffer per frame (bounding boxes, x0 y0 x1 y1; empty when x1 <= x0), so that after a rotation the new back
+    * buffer is brought up to the latest frame by copying only the regions drawn in the frames it missed */
+   struct pipe_resource *cfTarget;
+   struct Resource *cfSet[4];
+   UINT cfSetN;
+   int cfCur[4];
+   int cfHist[4][4];
+   UINT cfHistN;                     /* valid history entries (0: unknown, copy everything) */
+   UINT64 cfFrames, cfPixels, cfFull;
+   bool rsScissor;                   /* bound rasterizer state has the scissor test on */
+   int scissor0[4];                  /* scissor rect 0 (x0 y0 x1 y1) */    /* R7: RotateResourceIdentities' temporary, kept (a create is a GEM_CREATE + VM_BIND) */
 
    D3DDDI_DEVICECALLBACKS KTCallbacks;
    D3D10DDI_CORELAYER_DEVICECALLBACKS UMCallbacks;
@@ -248,6 +274,8 @@ struct Resource
     * opened; the writer bumps its generation after each CPU copy-out (the reader skips unchanged ones) */
    UINT64 shareKey;
    struct Resource *sharedNext;  /* G6 r7: the device's shared resources it renders into directly (zc.sim) */
+   bool copyModel;            /* R8: a primary DXGI presents by copy (NO_SCANOUT set by this UMD): its swap chain's
+                               * back buffer must hold the latest frame (DWM draws only what changed) */
    /* G6 r7 (A): pipelined proxy: the KMD BLTs the shared surface into a staging allocation (zero copy), the GPU
     * copies staging -> resource in the frame that samples it. pqSync: 4 KiB the BLT's status FILL lands in */
    struct Resource *pqStage[2];
@@ -265,7 +293,20 @@ struct Resource
    struct pipe_resource *resource;
    struct pipe_transfer **transfers;
    struct pipe_stream_output_target *so_target;
+   /* R8: views created on this handle (they follow the handle through RotateResourceIdentities) */
+   struct ViewLink *views;
 };
+
+
+/* R8: view tracking (DxgiFns.cpp) */
+void ViewTrack(struct ViewLink *l, Resource *pResource, int kind);
+void ViewUntrack(struct ViewLink *l);
+void ViewsDetach(Resource *pResource);
+void RotDiag(struct Device *pDev, const char *what, int slot, Resource *a, Resource *b);
+void RotDiagDraw(struct Device *pDev, struct pipe_resource *target);
+void CfDamage(struct Device *pDev, struct pipe_resource *tex, int x0, int y0, int x1, int y1);
+void CfDamageDraw(struct Device *pDev);
+void RotForget(struct Device *pDev, Resource *pResource);
 
 
 static inline Resource *
@@ -313,6 +354,7 @@ struct RenderTargetView
 {
    struct pipe_surface surface;
    D3D10DDI_HRTRENDERTARGETVIEW hRTRenderTargetView;
+   struct ViewLink link;
 };
 
 
@@ -335,6 +377,7 @@ struct DepthStencilView
 {
    struct pipe_surface surface;
    D3D10DDI_HRTDEPTHSTENCILVIEW hRTDepthStencilView;
+   struct ViewLink link;
 };
 
 
@@ -398,6 +441,7 @@ CastPipeDepthStencilState(D3D10DDI_HDEPTHSTENCILSTATE hDepthStencilState)
 struct RasterizerState
 {
    void *handle;
+   bool scissor;
 };
 
 
@@ -467,6 +511,8 @@ CastPipeSamplerState(D3D10DDI_HSAMPLER hSampler)
 struct ShaderResourceView
 {
    struct pipe_sampler_view *handle;
+   struct ViewLink link;
+   struct pipe_sampler_view tmpl;    /* R8: the creation template (texture NULL), to make it anew on rotated storage */
 };
 
 

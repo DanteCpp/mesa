@@ -18,6 +18,7 @@ bool WddmCreateResource(Device *pDevice, const D3D10DDIARG_CREATERESOURCE *pCrea
 void WddmOpenResource(D3D10DDI_HDEVICE hDevice, const D3D10DDIARG_OPENRESOURCE *pOpen,
                       D3D10DDI_HRESOURCE hResource, D3D10DDI_HRTRESOURCE hRTResource);
 void WddmDestroyResource(Device *pDevice, Resource *pResource);
+bool WddmRotateStorage(Device *pDevice, Resource *const *r, UINT n);
 HRESULT WddmPresent(Device *pDevice, DXGI_DDI_ARG_PRESENT *pPresentData);
 bool WddmUmdFlip(Device *pDevice, Resource *pSrc, UINT flags = 0, UINT64 tag = 0);
 UINT64 WddmPerfNow(void);

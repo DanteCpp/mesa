@@ -86,6 +86,7 @@ CreateRenderTargetView(
 
    struct pipe_resource *resource = CastPipeResource(pCreateRenderTargetView->hDrvResource);
    RenderTargetView *pRTView = CastRenderTargetView(hRenderTargetView);
+   pRTView->link.res = NULL;
 
    struct pipe_surface desc;
 
@@ -131,6 +132,7 @@ CreateRenderTargetView(
    }
 
    pRTView->surface = desc;
+   ViewTrack(&pRTView->link, CastResource(pCreateRenderTargetView->hDrvResource), VIEW_RTV);
 }
 
 
@@ -154,6 +156,7 @@ DestroyRenderTargetView(D3D10DDI_HDEVICE hDevice,                       // IN
 
    RenderTargetView *pRTView = CastRenderTargetView(hRenderTargetView);
 
+   ViewUntrack(&pRTView->link);
    pipe_resource_reference(&pRTView->surface.texture, NULL);
 }
 
@@ -178,6 +181,9 @@ ClearRenderTargetView(D3D10DDI_HDEVICE hDevice,                      // IN
 
    struct pipe_context *pipe = CastPipeContext(hDevice);
    struct pipe_surface *surface = CastPipeRenderTargetView(hRenderTargetView);
+   RotDiagDraw(CastDevice(hDevice), surface ? surface->texture : NULL);
+   if (surface)
+      CfDamage(CastDevice(hDevice), surface->texture, 0, 0, 1 << 30, 1 << 30);
    union pipe_color_union clear_color;
    if (CastDevice(hDevice)->shadowHead && surface)
       WddmMarkDirty(CastDevice(hDevice), surface->texture);
@@ -286,6 +292,7 @@ CreateDepthStencilView(
 
    struct pipe_resource *resource = CastPipeResource(pCreateDepthStencilView->hDrvResource);
    DepthStencilView *pDSView = CastDepthStencilView(hDepthStencilView);
+   pDSView->link.res = NULL;
 
    struct pipe_surface desc;
 
@@ -321,6 +328,7 @@ CreateDepthStencilView(
    }
 
    pDSView->surface = desc;
+   ViewTrack(&pDSView->link, CastResource(pCreateDepthStencilView->hDrvResource), VIEW_DSV);
 }
 
 
@@ -344,6 +352,7 @@ DestroyDepthStencilView(D3D10DDI_HDEVICE hDevice,                       // IN
 
    DepthStencilView *pDSView = CastDepthStencilView(hDepthStencilView);
 
+   ViewUntrack(&pDSView->link);
    pipe_resource_reference(&pDSView->surface.texture, NULL);
 }
 
@@ -756,6 +765,8 @@ SetRenderTargets(D3D10DDI_HDEVICE hDevice,                              // IN
    pDevice->fb.nr_cbufs = 0;
    for (unsigned i = 0; i < RTargets; ++i) {
       struct pipe_surface *psurf = CastPipeRenderTargetView(phRenderTargetView[i]);
+      if (psurf)
+         RotDiag(pDevice, "SetRenderTargets", i, CastRenderTargetView(phRenderTargetView[i])->link.res, NULL);
       pipe_resource_reference(&pDevice->fb.cbufs[i].texture,
                               psurf && psurf->texture ? psurf->texture : NULL);
       if (psurf && psurf->texture) {

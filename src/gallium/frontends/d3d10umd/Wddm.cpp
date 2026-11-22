@@ -1133,6 +1133,7 @@ retry:
          pResource->allocationPitch = pitch;
          pResource->shadowed = true;
          pResource->isPrimary = true;
+         pResource->copyModel = noscanout != 0;
          pResource->ownsAllocation = true;
          pResource->shadowNext = pDevice->shadowHead;
          pDevice->shadowHead = pResource;
@@ -1321,6 +1322,103 @@ WddmDestroyResource(Device *pDevice, Resource *pResource)
    }
    pResource->hAllocation = 0;
    pResource->pAllocationData = NULL;
+}
+
+
+/* R8: RotateResourceIdentities without copies. Handle i takes the storage handle i+1 had (handle n-1 the storage
+ * handle 0 had): the pipe resource and everything that belongs to it move together, i.e. the KMD allocation
+ * (hAllocation, its lock pData, pitch, ownership), a zero-copy texture's import of that allocation (the texture IS
+ * the locked segment-1 allocation, so the pair cannot be split), the shadow/dirty/scan-sourced state, the share key
+ * and proxy state of a shared allocation, and open maps. Device lists (shadowed, shared, proxied) hold the resource
+ * structs: membership follows the storage. What stays with the handle: its description and its views (the caller
+ * moves the views). The KMD's scan-out slot registry only holds the device's own scan-out buffers (zcScan), which
+ * are never runtime resources, so it stays as it is; flips name allocations, which move with their storage.
+ * False: not rotatable here (the caller copies). */
+static bool
+InList(Resource *head, Resource *Resource::*next, Resource *r)
+{
+   for (Resource *p = head; p; p = p->*next)
+      if (p == r)
+         return true;
+   return false;
+}
+
+static void
+ListRemove(Resource **head, Resource *Resource::*next, Resource *r)
+{
+   for (Resource **pp = head; *pp; pp = &((*pp)->*next))
+      if (*pp == r) {
+         *pp = r->*next;
+         r->*next = NULL;
+         return;
+      }
+}
+
+bool
+WddmRotateStorage(Device *pDevice, Resource *const *r, UINT n)
+{
+   if (n < 2 || n > 16)
+      return false;
+   for (UINT i = 0; i < n; i++) {
+      if (!r[i] || !r[i]->resource)
+         return false;
+      for (UINT k = 0; k < pDevice->zcScanCount; k++)
+         if (pDevice->zcScan[k] == r[i])
+            return false;
+      for (UINT j = 0; j < i; j++)
+         if (r[j] == r[i])
+            return false;
+      const struct pipe_resource *a = r[0]->resource, *b = r[i]->resource;
+      if (a->target != b->target || a->format != b->format || a->width0 != b->width0 || a->height0 != b->height0 ||
+          a->depth0 != b->depth0 || a->array_size != b->array_size || a->last_level != b->last_level ||
+          a->nr_samples != b->nr_samples || r[0]->Format != r[i]->Format || r[0]->MipLevels != r[i]->MipLevels ||
+          r[0]->NumSubResources != r[i]->NumSubResources || r[0]->buffer != r[i]->buffer)
+         return false;
+   }
+   Resource *Resource::*const lists[3] = { &Resource::shadowNext, &Resource::sharedNext, &Resource::proxiedNext };
+   Resource **heads[3] = { &pDevice->shadowHead, &pDevice->sharedHead, &pDevice->proxiedHead };
+   bool member[16][3];
+   Resource snap[16];
+   for (UINT i = 0; i < n; i++) {
+      for (UINT l = 0; l < 3; l++)
+         member[i][l] = InList(*heads[l], lists[l], r[i]);
+      snap[i] = *r[i];
+   }
+   for (UINT i = 0; i < n; i++) {
+      const Resource &from = snap[(i + 1) % n];
+      Resource *to = r[i];
+      Resource keep = *to;
+      *to = from;
+      /* the handle's own: description, list links, views */
+      to->Format = keep.Format;
+      to->MipLevels = keep.MipLevels;
+      to->NumSubResources = keep.NumSubResources;
+      to->buffer = keep.buffer;
+      to->shadowNext = keep.shadowNext;
+      to->sharedNext = keep.sharedNext;
+      to->proxiedNext = keep.proxiedNext;
+      to->views = keep.views;
+   }
+   unsigned moved = 0;
+   for (UINT i = 0; i < n; i++)
+      for (UINT l = 0; l < 3; l++) {
+         bool want = member[(i + 1) % n][l];
+         if (want == member[i][l])
+            continue;
+         moved++;
+         if (want) {
+            r[i]->*lists[l] = *heads[l];
+            *heads[l] = r[i];
+         } else {
+            ListRemove(heads[l], lists[l], r[i]);
+         }
+      }
+   static unsigned logged;
+   if (UmdTrace() && (logged++ < 4 || moved))
+      DebugPrintf("rotate: %u resources %ux%u: identities (allocations 0x%x -> 0x%x%s), list moves %u\n", n,
+                  r[0]->resource->width0, r[0]->resource->height0, snap[0].hAllocation, r[0]->hAllocation,
+                  r[0]->zeroCopy ? ", zero copy": r[0]->shadowed ? ", shadowed": "", moved);
+   return true;
 }
 
 
@@ -1771,6 +1869,7 @@ WddmPresent(Device *pDevice, DXGI_DDI_ARG_PRESENT *pPresentData)
    UINT64 perfIn = PerfNow();
    Resource *pSrc = CastResource(pPresentData->hSurfaceToPresent);
    Resource *pDst = pPresentData->hDstResource ? CastResource(pPresentData->hDstResource): NULL;
+   RotDiag(pDevice, "Present", (int)(pPresentData->Flags.Value | ((UINT)pPresentData->FlipInterval << 8)), pSrc, pDst);
 
    /* R6E: DWM's compositor presents from a shadowed (shared, aperture) back buffer to the primary: with zero
     * copy the shadow texture goes to the next scan-out buffer by a GPU copy (ZcPresentFlip) instead of a CPU

@@ -246,6 +246,7 @@ ClearView11_1(D3D10DDI_HDEVICE hDevice, D3D11DDI_HANDLETYPE viewType, VOID *hVie
       const D3D10_DDI_RECT *r = &pRects[i];
       if (r->right <= r->left || r->bottom <= r->top)
          continue;
+      CfDamage(CastDevice(hDevice), surface->texture, r->left, r->top, r->right, r->bottom);
       pipe->clear_render_target(pipe, surface, &cc, r->left, r->top, r->right - r->left,
                                 r->bottom - r->top, false);
    }

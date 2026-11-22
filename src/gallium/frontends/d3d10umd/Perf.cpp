@@ -194,7 +194,7 @@ PerfFrame(void)
                Ms(InterlockedExchange64(&g_presentSplit[PERF_P_FLUSH], 0)) / n,
                Ms(InterlockedExchange64(&g_presentSplit[PERF_P_CB], 0)) / n,
                Ms(InterlockedExchange64(&g_presentSplit[PERF_P_FLIP], 0)) / n);
-   DebugPrintf("perf: Flush: copy-out %.2f (%.2f/fr), pipe flush %.2f; Rotate: create %.2f, copies %.2f\n",
+   DebugPrintf("perf: Flush: copy-out %.2f (%.2f/fr), pipe flush %.2f; Rotate: identities (or copy temp) %.2f, copy-forward (or copies) %.2f\n",
                Ms(InterlockedExchange64(&g_presentSplit[PERF_F_COPYOUT], 0)) / n,
                (double)InterlockedExchange64(&g_presentSplit[PERF_F_COPYOUTS], 0) / n,
                Ms(InterlockedExchange64(&g_presentSplit[PERF_F_PIPE], 0)) / n,

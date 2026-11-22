@@ -488,6 +488,8 @@ DestroyResource(D3D10DDI_HDEVICE hDevice,       // IN
    }
    free(pResource->transfers);
 
+   ViewsDetach(pResource);
+   RotForget(CastDevice(hDevice), pResource);
    pipe_resource_reference(&pResource->resource, NULL);
    WddmDestroyResource(CastDevice(hDevice), pResource);
 }
@@ -516,6 +518,8 @@ ResourceMap(D3D10DDI_HDEVICE hDevice,                                // IN
    struct pipe_context *pipe = CastPipeContext(hDevice);
    Resource *pResource = CastResource(hResource);
    struct pipe_resource *resource = pResource->resource;
+   if (DDIMap != D3D10_DDI_MAP_READ)
+      CfDamage(CastDevice(hDevice), resource, 0, 0, 1 << 30, 1 << 30);
 
    unsigned usage;
    switch (DDIMap) {
@@ -694,6 +698,8 @@ ResourceCopy(D3D10DDI_HDEVICE hDevice,          // IN
    struct pipe_context *pipe = pDevice->pipe;
    Resource *pDstResource = CastResource(hDstResource);
    Resource *pSrcResource = CastResource(hSrcResource);
+   RotDiag(pDevice, "ResourceCopy", -1, pDstResource, pSrcResource);
+   CfDamage(pDevice, pDstResource->resource, 0, 0, 1 << 30, 1 << 30);
    if (pSrcResource->hShared)
       WddmSyncSharedResource(pDevice, pSrcResource);
    if (pDevice->shadowHead)
@@ -772,6 +778,8 @@ ResourceCopyRegion(D3D10DDI_HDEVICE hDevice,                // IN
    struct pipe_context *pipe = pDevice->pipe;
    Resource *pDstResource = CastResource(hDstResource);
    Resource *pSrcResource = CastResource(hSrcResource);
+   RotDiag(pDevice, "ResourceCopyRegion", -1, pDstResource, pSrcResource);
+   CfDamage(pDevice, pDstResource->resource, 0, 0, 1 << 30, 1 << 30);
    if (pSrcResource->hShared)
       WddmSyncSharedResource(pDevice, pSrcResource);
    if (pDevice->shadowHead)
@@ -917,6 +925,7 @@ ResourceUpdateSubResourceUP(D3D10DDI_HDEVICE hDevice,                // IN
    struct pipe_context *pipe = pDevice->pipe;
    Resource *pDstResource = CastResource(hDstResource);
    struct pipe_resource *dst_resource = pDstResource->resource;
+   CfDamage(pDevice, dst_resource, 0, 0, 1 << 30, 1 << 30);
 
    unsigned level;
    struct pipe_box box;

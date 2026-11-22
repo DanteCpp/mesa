@@ -134,6 +134,17 @@ SetScissorRects(D3D10DDI_HDEVICE hDevice,                            // IN
       memset(states + NumScissorRects, 0,
              sizeof(struct pipe_scissor_state) * ClearScissorRects);
    }
+   {
+      Device *pDevice = CastDevice(hDevice);
+      if (NumScissorRects) {
+         pDevice->scissor0[0] = states[0].minx;
+         pDevice->scissor0[1] = states[0].miny;
+         pDevice->scissor0[2] = states[0].maxx;
+         pDevice->scissor0[3] = states[0].maxy;
+      } else if (ClearScissorRects) {
+         memset(pDevice->scissor0, 0, sizeof pDevice->scissor0);
+      }
+   }
    pipe->set_scissor_states(pipe, 0, NumScissorRects + ClearScissorRects,
                             states);
 }
@@ -243,6 +254,7 @@ CreateRasterizerState(
    state.line_rectangular = 0;
 
    pRasterizerState->handle = pipe->create_rasterizer_state(pipe, &state);
+   pRasterizerState->scissor = state.scissor;
 }
 
 
@@ -289,6 +301,8 @@ SetRasterizerState(D3D10DDI_HDEVICE hDevice,                   // IN
 
    struct pipe_context *pipe = CastPipeContext(hDevice);
    void *state = CastPipeRasterizerState(hRasterizerState);
+   RasterizerState *rs = CastRasterizerState(hRasterizerState);
+   CastDevice(hDevice)->rsScissor = rs && rs->handle && rs->scissor;
 
    pipe->bind_rasterizer_state(pipe, state);
 }

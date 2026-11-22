@@ -237,6 +237,9 @@ SetShaderResources(mesa_shader_stage shader_type,                  // IN
    for (UINT i = 0; i < NumViews; i++) {
       struct pipe_sampler_view *sampler_view =
             CastPipeShaderResourceView(phShaderResourceViews[i]);
+      if (sampler_view)
+         RotDiag(pDevice, shader_type == MESA_SHADER_FRAGMENT ? "PSSetShaderResources" : "SetShaderResources", Offset + i,
+                 CastShaderResourceView(phShaderResourceViews[i])->link.res, NULL);
       if (Offset + i < PIPE_MAX_SHADER_SAMPLER_VIEWS) {
          sampler_views[Offset + i] = sampler_view;
       } else {
@@ -1216,6 +1219,7 @@ CreateShaderResourceView(
    ShaderResourceView *pSRView = CastShaderResourceView(hShaderResourceView);
    struct pipe_resource *resource;
    enum pipe_format format;
+   pSRView->link.res = NULL;
 
    struct pipe_sampler_view desc;
    memset(&desc, 0, sizeof desc);
@@ -1269,6 +1273,10 @@ CreateShaderResourceView(
    }
 
    pSRView->handle = pipe->create_sampler_view(pipe, resource, &desc);
+   pSRView->tmpl = desc;
+   pSRView->tmpl.texture = NULL;
+   if (pSRView->handle)
+      ViewTrack(&pSRView->link, CastResource(pCreateSRView->hDrvResource), VIEW_SRV);
 }
 
 
@@ -1296,6 +1304,7 @@ CreateShaderResourceView1(
    ShaderResourceView *pSRView = CastShaderResourceView(hShaderResourceView);
    struct pipe_resource *resource;
    enum pipe_format format;
+   pSRView->link.res = NULL;
 
    struct pipe_sampler_view desc;
    memset(&desc, 0, sizeof desc);
@@ -1351,6 +1360,10 @@ CreateShaderResourceView1(
    }
 
    pSRView->handle = pipe->create_sampler_view(pipe, resource, &desc);
+   pSRView->tmpl = desc;
+   pSRView->tmpl.texture = NULL;
+   if (pSRView->handle)
+      ViewTrack(&pSRView->link, CastResource(pCreateSRView->hDrvResource), VIEW_SRV);
 }
 
 
@@ -1378,6 +1391,7 @@ DestroyShaderResourceView(D3D10DDI_HDEVICE hDevice,                           //
    Device *pDevice = CastDevice(hDevice);
    struct pipe_context *pipe = pDevice->pipe;
 
+   ViewUntrack(&pSRView->link);
    pipe->sampler_view_release(pipe, pSRView->handle);
    pSRView->handle = NULL;
 }
