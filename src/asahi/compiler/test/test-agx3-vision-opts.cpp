@@ -4931,3 +4931,123 @@ TEST(AGX3VisionOpts, Wave8MergeGlobalWordsStoresAndHazards)
    }
 }
 
+TEST(AGX3VisionOpts, Wave8SwarW8ByteSum)
+{
+   /* Positive 1: two u8x4 R8_UINT loads summed into an accumulator -> SWAR. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "wave8_swar_u8x4");
+      nir_def *base = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0));
+      nir_def *idx = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8));
+      nir_def *acc = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 12));
+
+      nir_def *l0 = nir_load_agx(&b, 4, 8, base, idx,
+                                 .base = AGX_NIR_MEMORY_INDEX_BYTES,
+                                 .format = PIPE_FORMAT_R8_UINT);
+      nir_def *l1 = nir_load_agx(&b, 4, 8, base, nir_iadd_imm(&b, idx, 4),
+                                 .base = AGX_NIR_MEMORY_INDEX_BYTES,
+                                 .format = PIPE_FORMAT_R8_UINT);
+      for (unsigned c = 0; c < 4; ++c)
+         acc = nir_iadd(&b, acc, nir_u2u32(&b, nir_channel(&b, l0, c)));
+      for (unsigned c = 0; c < 4; ++c)
+         acc = nir_iadd(&b, acc, nir_u2u32(&b, nir_channel(&b, l1, c)));
+      nir_store_global(&b, acc, base, .align_mul = 4);
+
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      EXPECT_TRUE(agx_nir_fold_w8_byte_sum(b.shader));
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "wave8 swar u8x4");
+
+      unsigned packed_loads = 0, old_u8_loads = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_agx)
+               continue;
+            if (intr->def.bit_size == 32 && intr->def.num_components == 1 &&
+                ((nir_intrinsic_base(intr) & AGX_NIR_MEMORY_PACKED_COUNT_MASK) >>
+                 AGX_NIR_MEMORY_PACKED_COUNT_SHIFT) == 4)
+               packed_loads++;
+            else if (intr->def.bit_size == 8)
+               old_u8_loads++;
+         }
+      }
+      EXPECT_EQ(packed_loads, 2u);
+      EXPECT_EQ(old_u8_loads, 0u);
+      ralloc_free(b.shader);
+   }
+
+   /* Positive 2: two u8x3 R8_UINT loads summed without initial acc -> SWAR. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "wave8_swar_u8x3");
+      nir_def *base = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0));
+      nir_def *idx = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8));
+
+      nir_def *l0 = nir_load_agx(&b, 3, 8, base, idx,
+                                 .base = AGX_NIR_MEMORY_INDEX_BYTES,
+                                 .format = PIPE_FORMAT_R8_UINT);
+      nir_def *l1 = nir_load_agx(&b, 3, 8, base, nir_iadd_imm(&b, idx, 16),
+                                 .base = AGX_NIR_MEMORY_INDEX_BYTES,
+                                 .format = PIPE_FORMAT_R8_UINT);
+      nir_def *sum = nir_iadd(&b, nir_u2u32(&b, nir_channel(&b, l0, 0)),
+                                  nir_u2u32(&b, nir_channel(&b, l0, 1)));
+      sum = nir_iadd(&b, sum, nir_u2u32(&b, nir_channel(&b, l0, 2)));
+      for (unsigned c = 0; c < 3; ++c)
+         sum = nir_iadd(&b, sum, nir_u2u32(&b, nir_channel(&b, l1, c)));
+      nir_store_global(&b, sum, base, .align_mul = 4);
+
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      EXPECT_TRUE(agx_nir_fold_w8_byte_sum(b.shader));
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "wave8 swar u8x3");
+
+      unsigned packed_loads = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_load_agx &&
+                   ((nir_intrinsic_base(intr) & AGX_NIR_MEMORY_PACKED_COUNT_MASK) >>
+                    AGX_NIR_MEMORY_PACKED_COUNT_SHIFT) == 3)
+                  packed_loads++;
+            }
+         }
+      }
+      EXPECT_EQ(packed_loads, 2u);
+      ralloc_free(b.shader);
+   }
+
+   /* Negative: single u8x3 load, coherent u8x4 load, or partial lane use must stay intact. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "wave8_swar_neg");
+      nir_def *base = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0));
+      nir_def *idx = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8));
+
+      nir_def *s3 = nir_load_agx(&b, 3, 8, base, idx,
+                                 .base = AGX_NIR_MEMORY_INDEX_BYTES,
+                                 .format = PIPE_FORMAT_R8_UINT);
+      nir_def *coh = nir_load_agx(&b, 4, 8, base, nir_iadd_imm(&b, idx, 4),
+                                  .access = ACCESS_COHERENT,
+                                  .base = AGX_NIR_MEMORY_INDEX_BYTES,
+                                  .format = PIPE_FORMAT_R8_UINT);
+      nir_def *part = nir_load_agx(&b, 4, 8, base, nir_iadd_imm(&b, idx, 8),
+                                   .base = AGX_NIR_MEMORY_INDEX_BYTES,
+                                   .format = PIPE_FORMAT_R8_UINT);
+      nir_def *acc = nir_u2u32(&b, nir_channel(&b, s3, 0));
+      acc = nir_iadd(&b, acc, nir_u2u32(&b, nir_channel(&b, s3, 1)));
+      acc = nir_iadd(&b, acc, nir_u2u32(&b, nir_channel(&b, s3, 2)));
+      for (unsigned c = 0; c < 4; ++c)
+         acc = nir_iadd(&b, acc, nir_u2u32(&b, nir_channel(&b, coh, c)));
+      acc = nir_iadd(&b, acc, nir_u2u32(&b, nir_channel(&b, part, 0)));
+      acc = nir_iadd(&b, acc, nir_u2u32(&b, nir_channel(&b, part, 1)));
+      nir_store_global(&b, acc, base, .align_mul = 4);
+
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      EXPECT_FALSE(agx_nir_fold_w8_byte_sum(b.shader));
+      ralloc_free(b.shader);
+   }
+}
