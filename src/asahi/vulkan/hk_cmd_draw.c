@@ -4049,7 +4049,8 @@ hk_m5_pass_merge_dependency(VkPipelineStageFlags2 src_stages,
 
    const bool from_gfx = hk_sync_kinds_src(src_stages) & HK_SYNC_GFX;
    const bool to_gfx =
-      hk_sync_kinds_dst(dst_stages) & (HK_SYNC_GFX | HK_SYNC_GFX_FRAG);
+      hk_sync_kinds_dst(dst_stages) &
+      (HK_SYNC_GFX | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_INDIRECT);
    if (!from_gfx || !to_gfx)
       return HK_M5_MERGE_DEP_LOCAL;
 
@@ -13595,6 +13596,10 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
 
       hk_g17p_note_layer_zero_draw(cmd, cs);
       hk_note_pre_raster_images(cmd, cs);
+      /* The render may read the API draw's parameters. Parameters the
+       * driver's own pre-graphics work writes are ordered by that stream. */
+      if (agx_is_indirect(draw_.b))
+         hk_sync_vertex_indirect(cmd, cs);
       hk_m5_note_render_resources(cmd, cs);
       if (unlikely(dev->frame_anatomy)) {
          hk_frame_anatomy_note_fs(cs, hk_bound_fs(cmd));
@@ -13654,6 +13659,8 @@ hk_record_mesh_launch(struct hk_cmd_buffer *cmd, uint32_t draw_id)
    cs->stats.calls++;
    hk_upload_stat(cmd, draws, 1);
    hk_note_pre_raster_images(cmd, cs);
+   /* The launch may read its grid from GPU memory (an indirect mesh draw). */
+   hk_sync_vertex_indirect(cmd, cs);
    hk_m5_note_render_resources(cmd, cs);
    cs->stats.cmds++;
    vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
@@ -14006,6 +14013,8 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    cs->stats.calls++;
    hk_upload_stat(cmd, draws, 1);
    hk_note_pre_raster_images(cmd, cs);
+   /* The grid may live in GPU memory (an indirect mesh draw). */
+   hk_sync_vertex_indirect(cmd, cs);
    cs->stats.cmds++;
    vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
    gfx->dirty = gfx->shaders_dirty = gfx->linked_dirty = 0;
@@ -14364,6 +14373,8 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    }
    hk_g17p_note_layer_zero_draw(cmd, cs);
    hk_note_pre_raster_images(cmd, cs);
+   /* An indirect record: the render reads the draw's parameters. */
+   hk_sync_vertex_indirect(cmd, cs);
    hk_m5_note_render_resources(cmd, cs);
    if (unlikely(dev->frame_anatomy)) {
       hk_frame_anatomy_note_fs(cs, hk_bound_fs(cmd));

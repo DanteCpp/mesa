@@ -92,18 +92,31 @@ enum hk_sync_kind {
     * render's vertex half only after the latest such stream on the render
     * subqueue (hk_sync_barrier()). */
    HK_SYNC_GFX_MEM = 1 << 5,
+
+   /* Destination scopes only: graphics work in the draw-indirect stage, the
+    * reads of indirect draw parameters (Vulkan 1.4, 7.1.1: the stage of
+    * indirect dispatches too, which are compute work and named
+    * HK_SYNC_COMPUTE alongside this class). Pre-graphics streams, which
+    * patch or rewrite indirect draws, and a render's fragment half wait on
+    * it like on HK_SYNC_GFX; a render's vertex half only once the render
+    * records a draw whose parameters the hardware reads from memory
+    * (hk_sync_vertex_indirect). A dependency into the draw-indirect stage
+    * then leaves the tiling of renders without indirect draws unordered,
+    * e.g. after the indirect dispatches of an acceleration structure build. */
+   HK_SYNC_GFX_INDIRECT = 1 << 6,
 };
 
-#define HK_SYNC_NUM_KINDS 6
+#define HK_SYNC_NUM_KINDS 7
 
 /* The destination classes a stream of the given kinds belongs to: graphics
- * work is in every graphics class (HK_SYNC_GFX_FRAG, HK_SYNC_GFX_IMG). A
- * stream waits for the requirements carried in for each of them. */
+ * work is in every graphics class (HK_SYNC_GFX_FRAG, HK_SYNC_GFX_IMG,
+ * HK_SYNC_GFX_INDIRECT). A stream waits for the requirements carried in for
+ * each of them. */
 static inline uint8_t
 hk_sync_full_kinds(uint8_t kinds)
 {
    return kinds & HK_SYNC_GFX
-             ? kinds | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG
+             ? kinds | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG | HK_SYNC_GFX_INDIRECT
              : kinds;
 }
 
@@ -271,6 +284,12 @@ struct hk_sync_stream {
     * dependency epoch vtx_images_epoch. */
    bool vtx_images;
    uint32_t vtx_images_epoch;
+
+   /* For a render: it records a draw whose parameters the hardware reads
+    * from memory, so its vertex half also waits on HK_SYNC_GFX_INDIRECT, as
+    * of the dependency epoch vtx_indirect_epoch. */
+   bool vtx_indirect;
+   uint32_t vtx_indirect_epoch;
 
    /* A layout transition the driver records as work
     * (brl_sync_transition_begin()), or a stream one was merged into: a
@@ -518,6 +537,10 @@ void hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
 /* The render stream draws with a pre-rasterization shader that reads images:
  * its vertex half joins the image-barrier requirements (HK_SYNC_GFX_IMG). */
 void hk_sync_vertex_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+/* The render stream records a draw whose parameters the hardware reads from
+ * memory: its vertex half joins the draw-indirect requirements
+ * (HK_SYNC_GFX_INDIRECT). */
+void hk_sync_vertex_indirect(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 void hk_sync_note_memory_write(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 /* Every later stream of the given kinds waits on cs. */

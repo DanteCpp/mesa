@@ -313,7 +313,15 @@ stage_kinds(VkPipelineStageFlags2 stages, bool dst)
       kinds |= HK_SYNC_GFX;
    if (stages & HK_SYNC_COMPUTE_STAGES)
       kinds |= HK_SYNC_COMPUTE;
-   if (stages & HK_SYNC_BOTH_STAGES)
+   /* A destination in the draw-indirect stage reads indirect parameters:
+    * graphics work of that class alone (HK_SYNC_GFX_INDIRECT) and compute
+    * work. As a source it is any graphics or compute work. */
+   VkPipelineStageFlags2 both = stages & HK_SYNC_BOTH_STAGES;
+   if (dst && (both & VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT)) {
+      kinds |= HK_SYNC_GFX_INDIRECT | HK_SYNC_COMPUTE;
+      both &= ~VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+   }
+   if (both)
       kinds |= HK_SYNC_GFX | HK_SYNC_COMPUTE;
    if (stages & HK_SYNC_XFER_STAGES)
       kinds |= HK_SYNC_XFER;
@@ -326,7 +334,7 @@ stage_kinds(VkPipelineStageFlags2 stages, bool dst)
    if (stages & ~known)
       kinds = HK_SYNC_ALL;
    if (kinds & HK_SYNC_GFX)
-      kinds &= ~HK_SYNC_GFX_FRAG;
+      kinds &= ~(HK_SYNC_GFX_FRAG | HK_SYNC_GFX_INDIRECT);
 
    return kinds;
 }
@@ -580,7 +588,8 @@ hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
    /* A dependency from the transfer stage into any graphics stage orders
     * every noted transfer write as the application asked. */
    if ((src_kinds & HK_SYNC_XFER) &&
-       (dst_kinds & (HK_SYNC_GFX | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG)) &&
+       (dst_kinds & (HK_SYNC_GFX | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG |
+                     HK_SYNC_GFX_INDIRECT)) &&
        hk_sync_xfer_pending(&cmd->sync))
       xfer_forget_upto(&cmd->sync, UINT32_MAX);
 
@@ -596,17 +605,22 @@ hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
     * kernel orders both halves after compute work either way. */
    const uint8_t render_kinds = HK_SYNC_GFX | HK_SYNC_XFER;
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
-   if ((src_kinds & render_kinds) && (dst_kinds & HK_SYNC_GFX) &&
+   if ((src_kinds & render_kinds) &&
+       (dst_kinds & (HK_SYNC_GFX | HK_SYNC_GFX_INDIRECT)) &&
        agx_chip_g17p_or_m5(chip)) {
       struct hk_sync_dep vtx = dep[HK_SYNC_VDM];
       vtx.cut = memory_cut(vtx.cut);
       if (vtx.prior & render_kinds)
          vtx.prior = (vtx.prior & ~render_kinds) | HK_SYNC_GFX_MEM;
-      const unsigned gfx = util_logbase2(HK_SYNC_GFX);
-      dep_max(&cmd->sync.req[gfx][HK_SYNC_VDM], &vtx);
-      dep_max(&cmd->sync.req[gfx][HK_SYNC_CDM], &dep[HK_SYNC_CDM]);
-      dst_kinds = (dst_kinds & ~HK_SYNC_GFX) | HK_SYNC_GFX_FRAG |
-                  HK_SYNC_GFX_IMG;
+      /* Indirect parameters are memory too: a reader of them follows the
+       * same renders. */
+      u_foreach_bit(k, dst_kinds & (HK_SYNC_GFX | HK_SYNC_GFX_INDIRECT)) {
+         dep_max(&cmd->sync.req[k][HK_SYNC_VDM], &vtx);
+         dep_max(&cmd->sync.req[k][HK_SYNC_CDM], &dep[HK_SYNC_CDM]);
+      }
+      if (dst_kinds & HK_SYNC_GFX)
+         dst_kinds |= HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG;
+      dst_kinds &= ~(HK_SYNC_GFX | HK_SYNC_GFX_INDIRECT);
    }
 
    u_foreach_bit(d, dst_kinds) {
@@ -790,6 +804,21 @@ hk_sync_vertex_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    cs->sync.vtx_images_epoch = cmd->sync.epoch;
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    req_for_mask(cmd, HK_SYNC_GFX_IMG, dep);
+   hk_sync_stream_wait(cs, dep);
+}
+
+void
+hk_sync_vertex_indirect(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   /* Requirements only grow when the epoch advances. */
+   if (cs->sync.vtx_indirect &&
+       cs->sync.vtx_indirect_epoch == cmd->sync.epoch)
+      return;
+
+   cs->sync.vtx_indirect = true;
+   cs->sync.vtx_indirect_epoch = cmd->sync.epoch;
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+   req_for_mask(cmd, HK_SYNC_GFX_INDIRECT, dep);
    hk_sync_stream_wait(cs, dep);
 }
 
@@ -1336,6 +1365,9 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
       into->sync.brl_transition = true;
    }
    into->sync.kind |= from->sync.kind;
+   /* The merged draws' indirect parameters: later submissions' carried
+    * requirements of the class (hk_sync_resolve_submit()). */
+   into->sync.vtx_indirect |= from->sync.vtx_indirect;
 
    for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
       replace_pointer(&st->last[k][sq], from, into);
@@ -1683,6 +1715,12 @@ hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       struct hk_sync_dep img[HK_SYNC_NUM_SQ];
       req_for_mask(cmd, HK_SYNC_GFX_IMG, img);
       hk_sync_stream_wait(cs, img);
+   }
+   /* Likewise for its earlier indirect draws. */
+   if (cs->sync.vtx_indirect) {
+      struct hk_sync_dep ind[HK_SYNC_NUM_SQ];
+      req_for_mask(cmd, HK_SYNC_GFX_INDIRECT, ind);
+      hk_sync_stream_wait(cs, ind);
    }
 
    /* As hk_sync_begin_rendering() followed by the creation of cs: the
@@ -2151,7 +2189,9 @@ hk_sync_resolve_submit(struct hk_queue *queue,
                         cs->sync.brl_transition
                            ? cs->sync.brl_carry
                            : cs->sync.kind |
-                                (cs->sync.vtx_images ? HK_SYNC_GFX_IMG : 0),
+                                (cs->sync.vtx_images ? HK_SYNC_GFX_IMG : 0) |
+                                (cs->sync.vtx_indirect ? HK_SYNC_GFX_INDIRECT
+                                                       : 0),
                         &cs->sync.barrier_ta[sq], &cs->sync.prior_ta[sq]);
          }
       }
