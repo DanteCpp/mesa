@@ -828,6 +828,7 @@ hk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
 
+   hk_flush_deferred_b2i(cmd);
    perf_debug(cmd, "Reset query pool");
 
    /* The reset runs after every earlier use of the pool and before every
@@ -860,6 +861,7 @@ hk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
                       uint32_t query)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_b2i(cmd);
    hk_m5_pass_merge_end_ordered(cmd, "timestamp");
    hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
@@ -1097,6 +1099,7 @@ hk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                            uint32_t index)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_b2i(cmd);
    hk_m5_pass_merge_end_ordered(cmd, "query");
    hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
@@ -1109,6 +1112,7 @@ hk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                          uint32_t query, uint32_t index)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_b2i(cmd);
    hk_m5_pass_merge_end_ordered(cmd, "query");
    hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
@@ -2004,6 +2008,7 @@ hk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
    VK_FROM_HANDLE(hk_buffer, dst_buffer, dstBuffer);
 
+   hk_flush_deferred_b2i(cmd);
    cmd->sync.kind_override = HK_SYNC_ALL;
    hk_cmd_copy_query_pool_results(cmd, pool, firstQuery, queryCount,
                                   dst_buffer, dstOffset, stride, flags);

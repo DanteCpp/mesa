@@ -5368,6 +5368,10 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
 
+   if (unlikely(cmd->state.deferred_b2i.count) &&
+       !cmd->state.deferred_b2i.flushing)
+      hk_flush_deferred_b2i(cmd);
+
    hk_take_pending_z_store(cmd, pRenderingInfo);
 
    if (likely(!cmd->state.deferred_clear_count)) {
@@ -14747,6 +14751,7 @@ hk_CmdBeginConditionalRenderingEXT(
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    /* Predicated draws patch their records in pre-graphics compute. */
+   hk_flush_deferred_b2i(cmd);
    hk_m5_pass_merge_end_ordered(cmd, "conditional rendering");
    hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_buffer, buffer, pConditionalRenderingBegin->buffer);
@@ -14769,6 +14774,7 @@ VKAPI_ATTR void VKAPI_CALL
 hk_CmdEndConditionalRenderingEXT(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_b2i(cmd);
    struct hk_conditional_render_state *conditional =
       &cmd->state.conditional;
 

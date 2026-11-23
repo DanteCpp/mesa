@@ -44,6 +44,13 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
 }
 
 void
+hk_flush_deferred_b2i(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
+void
 hk_sync_check_cs(struct hk_cmd_buffer *cmd)
 {
    (void)cmd;

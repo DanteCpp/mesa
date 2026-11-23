@@ -27,6 +27,7 @@
 #include "nir_builder_opcodes.h"
 #include "nir_format_convert.h"
 #include "shader_enums.h"
+#include "vk_command_pool.h"
 #include "vk_enum_to_str.h"
 #include "vk_format.h"
 #include "vk_meta.h"
@@ -359,6 +360,7 @@ enum hk_meta_object_key_type {
    HK_META_OBJECT_KEY_G17P_BUFFER_FILL_PBE,
    HK_META_OBJECT_KEY_G17P_TILED_UPLOAD,
    HK_META_OBJECT_KEY_BUFFER_COPY_BATCH,
+   HK_META_OBJECT_KEY_G17P_B2I_BATCH,
 };
 
 struct hk_meta_event_wait_info {
@@ -5246,11 +5248,521 @@ hk_xfer_begin_buffer(struct hk_cmd_buffer *cmd, VkBuffer _buffer,
                           device_address);
 }
 
+struct hk_g17p_b2i_batch_push {
+   uint64_t buf_addr;
+   uint32_t row_stride_B;
+   uint32_t img_offset_x;
+   uint32_t img_offset_y;
+   uint32_t extent_x;
+   uint32_t extent_y;
+   uint32_t pad;
+};
+
+struct hk_g17p_b2i_batch_key {
+   enum hk_meta_object_key_type key_type;
+   VkFormat view_format;
+};
+
+#define b2i_batch_push(b, field)                                               \
+   nir_load_push_constant(                                                     \
+      b, 1, sizeof(((struct hk_g17p_b2i_batch_push *)0)->field) * 8,           \
+      nir_imm_int(b, offsetof(struct hk_g17p_b2i_batch_push, field)))
+
+static nir_shader *
+build_g17p_b2i_batch_fs(const struct vk_meta_device *meta,
+                        VkFormat view_format)
+{
+   nir_builder builder = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, NULL, "hk-meta-g17p-b2i-batch-frag");
+   nir_builder *b = &builder;
+
+   nir_terminate_if(b, nir_is_helper_invocation(b, 1));
+
+   const VkFormat buf_fmt = hk_meta_bitwise_copy_format(view_format);
+   const enum pipe_format buf_pfmt = vk_format_to_pipe_format(buf_fmt);
+   const enum pipe_format view_pfmt = vk_format_to_pipe_format(view_format);
+   const unsigned blk_sz = util_format_get_blocksize(buf_pfmt);
+   const unsigned comp_count = util_format_get_nr_components(buf_pfmt);
+   assert(!util_format_is_compressed(buf_pfmt));
+   assert(blk_sz % comp_count == 0);
+   const unsigned comp_sz = (blk_sz / comp_count) * 8;
+
+   nir_def *frag_xy = nir_trim_vector(b, nir_f2u32(b, nir_load_frag_coord(b)), 2);
+   nir_def *img_offs =
+      nir_vec2(b, b2i_batch_push(b, img_offset_x),
+               b2i_batch_push(b, img_offset_y));
+   nir_def *extent =
+      nir_vec2(b, b2i_batch_push(b, extent_x), b2i_batch_push(b, extent_y));
+
+   nir_def *coords = nir_isub(b, frag_xy, img_offs);
+   /* Keep helper invocations outside unaligned rectangles in bounds so a
+    * speculated load never reads past the source buffer. */
+   nir_def *in_bounds = nir_ball(b, nir_ult(b, coords, extent));
+   coords = nir_bcsel(b, in_bounds, coords, nir_imm_ivec2(b, 0, 0));
+
+   nir_def *offset =
+      nir_iadd(b, nir_imul(b, nir_channel(b, coords, 1),
+                           b2i_batch_push(b, row_stride_B)),
+               nir_imul_imm(b, nir_channel(b, coords, 0), blk_sz));
+   nir_def *addr =
+      nir_iadd(b, b2i_batch_push(b, buf_addr), nir_u2u64(b, offset));
+   nir_def *texel = nir_load_global(
+      b, comp_count, comp_sz, addr, .align_mul = 1 << (ffs(blk_sz) - 1));
+
+   if (meta->use_masked_rgba8_buffer_unpack &&
+       buf_fmt == VK_FORMAT_R32_UINT &&
+       view_format == VK_FORMAT_R8G8B8A8_UNORM) {
+      nir_def *channel[4];
+      for (unsigned i = 0; i < ARRAY_SIZE(channel); ++i) {
+         const unsigned shift = i * 8;
+         const uint32_t mask = 0xffu << shift;
+         nir_def *masked = nir_iand(b, texel, nir_imm_int(b, mask));
+         channel[i] = nir_fmul_imm(
+            b, nir_u2f32(b, masked),
+            1.0f / (255.0f * (float)(1u << shift)));
+      }
+      texel = nir_vec4(b, channel[0], channel[1], channel[2], channel[3]);
+   } else if (buf_pfmt != view_pfmt) {
+      nir_def *packed = nir_format_pack_rgba(b, buf_pfmt, texel);
+      texel = nir_format_unpack_rgba(b, packed, view_pfmt);
+   }
+
+   const enum glsl_base_type base_type =
+      util_format_is_pure_sint(view_pfmt)   ? GLSL_TYPE_INT
+      : util_format_is_pure_uint(view_pfmt) ? GLSL_TYPE_UINT
+                                            : GLSL_TYPE_FLOAT;
+   nir_variable *out_var = nir_variable_create(
+      b->shader, nir_var_shader_out, glsl_vector_type(base_type, 4),
+      "gl_FragData[0]");
+   out_var->data.location = FRAG_RESULT_DATA0;
+
+   if (texel->bit_size != 32) {
+      switch (base_type) {
+      case GLSL_TYPE_INT:
+         texel = nir_i2i32(b, texel);
+         break;
+      case GLSL_TYPE_UINT:
+         texel = nir_u2u32(b, texel);
+         break;
+      case GLSL_TYPE_FLOAT:
+         texel = nir_f2f32(b, texel);
+         break;
+      default:
+         UNREACHABLE("invalid fragment output type");
+      }
+   }
+
+   texel = nir_pad_vector_imm_int(b, texel, 0, 4);
+   nir_store_var(b, out_var, texel, nir_component_mask(4));
+   return b->shader;
+}
+
+#undef b2i_batch_push
+
+static VkResult
+hk_get_g17p_b2i_batch_pipeline(struct hk_device *dev, VkFormat view_format,
+                               VkPipelineLayout *layout_out,
+                               VkPipeline *pipeline_out)
+{
+   const enum hk_meta_object_key_type layout_key =
+      HK_META_OBJECT_KEY_G17P_B2I_BATCH;
+   const VkPushConstantRange push_range = {
+      .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .size = sizeof(struct hk_g17p_b2i_batch_push),
+   };
+   VkResult result = vk_meta_get_pipeline_layout(
+      &dev->vk, &dev->meta, NULL, &push_range, &layout_key, sizeof(layout_key),
+      layout_out);
+   if (unlikely(result != VK_SUCCESS))
+      return result;
+
+   const struct hk_g17p_b2i_batch_key key = {
+      .key_type = HK_META_OBJECT_KEY_G17P_B2I_BATCH,
+      .view_format = view_format,
+   };
+   VkPipeline pipeline =
+      vk_meta_lookup_pipeline(&dev->meta, &key, sizeof(key));
+   if (pipeline != VK_NULL_HANDLE) {
+      *pipeline_out = pipeline;
+      return VK_SUCCESS;
+   }
+
+   const VkPipelineShaderStageNirCreateInfoMESA fs_nir_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
+      .nir = build_g17p_b2i_batch_fs(&dev->meta, view_format),
+   };
+   const VkPipelineShaderStageCreateInfo fs_stage = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+      .pNext = &fs_nir_info,
+      .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .pName = "main",
+   };
+   const VkGraphicsPipelineCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+      .stageCount = 1,
+      .pStages = &fs_stage,
+      .layout = *layout_out,
+   };
+   const struct vk_meta_rendering_info render = {
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .view_mask = 0,
+      .color_attachment_count = 1,
+      .color_attachment_formats = {view_format},
+      .color_attachment_write_masks = {
+         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+      },
+   };
+   result = vk_meta_create_graphics_pipeline(
+      &dev->vk, &dev->meta, &info, &render, &key, sizeof(key), pipeline_out);
+   ralloc_free(fs_nir_info.nir);
+   return result;
+}
+
+void
+hk_flush_deferred_b2i(struct hk_cmd_buffer *cmd)
+{
+   if (!cmd->state.deferred_b2i.count || cmd->state.deferred_b2i.flushing)
+      return;
+
+   struct hk_image *const dst_image = cmd->state.deferred_b2i.image;
+   const VkImageLayout dst_layout = cmd->state.deferred_b2i.layout;
+   const uint32_t mip_level = cmd->state.deferred_b2i.mip_level;
+   const uint32_t array_layer = cmd->state.deferred_b2i.array_layer;
+   const uint32_t count = cmd->state.deferred_b2i.count;
+   const struct hk_deferred_b2i_item *const items =
+      cmd->deferred_b2i_items.data;
+   assert(count * sizeof(*items) == cmd->deferred_b2i_items.size);
+
+   cmd->state.deferred_b2i.flushing = true;
+
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+   VkCommandBuffer cb = vk_command_buffer_to_handle(&cmd->vk);
+   struct hk_meta_save save;
+   bool xfer_begun = false;
+   bool meta_begun = false;
+   bool rendering_begun = false;
+
+   if (unlikely(vk_command_buffer_has_error(&cmd->vk)))
+      goto out;
+
+   const VkFormat view_format =
+      hk_meta_compressed_copy_format(dst_image->vk.format);
+   const uint32_t mip_w = u_minify(dst_image->vk.extent.width, mip_level);
+   const uint32_t mip_h = u_minify(dst_image->vk.extent.height, mip_level);
+   const struct hk_deferred_b2i_render_plan plan =
+      hk_g17p_b2i_batch_plan_render(items, count, mip_w, mip_h);
+
+   hk_xfer_begin_image(cmd, vk_image_to_handle(&dst_image->vk));
+   xfer_begun = true;
+
+   hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   meta_begun = true;
+
+   const VkImageViewUsageCreateInfo view_usage = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+   };
+   const VkImageViewCreateInfo view_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .pNext = &view_usage,
+      .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+      .image = vk_image_to_handle(&dst_image->vk),
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = view_format,
+      .subresourceRange = {
+         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+         .baseMipLevel = mip_level,
+         .levelCount = 1,
+         .baseArrayLayer = array_layer,
+         .layerCount = 1,
+      },
+   };
+   VkImageView dst_view;
+   VkResult result =
+      vk_meta_create_image_view(&cmd->vk, &dev->meta, &view_info, &dst_view);
+   if (unlikely(result != VK_SUCCESS)) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      goto out;
+   }
+
+   VkPipelineLayout pipeline_layout;
+   VkPipeline pipeline;
+   result = hk_get_g17p_b2i_batch_pipeline(dev, view_format, &pipeline_layout,
+                                           &pipeline);
+   if (unlikely(result != VK_SUCCESS)) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      goto out;
+   }
+
+   const VkRenderingAttachmentInfo color_att = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .imageView = dst_view,
+      .imageLayout = dst_layout,
+      .loadOp = plan.load_op,
+      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+   };
+   const VkRenderingInfo render_info = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = plan.render_area,
+      .layerCount = 1,
+      .colorAttachmentCount = 1,
+      .pColorAttachments = &color_att,
+   };
+   disp->CmdBeginRendering(cb, &render_info);
+   rendering_begun = true;
+
+   disp->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+   assert(plan.max_x > 0 && plan.max_y > 0);
+   const int xmax_log2 = 1 + util_logbase2(plan.max_x - 1);
+   const int ymax_log2 = 1 + util_logbase2(plan.max_y - 1);
+   const VkViewport viewport = {
+      .x = 0.0f,
+      .y = 0.0f,
+      .width = ldexpf(1.0f, xmax_log2),
+      .height = ldexpf(1.0f, ymax_log2),
+      .minDepth = 0.0f,
+      .maxDepth = 1.0f,
+   };
+   disp->CmdSetViewport(cb, 0, 1, &viewport);
+
+   const VkRect2D scissor = {
+      .offset = {0, 0},
+      .extent = {1u << xmax_log2, 1u << ymax_log2},
+   };
+   disp->CmdSetScissor(cb, 0, 1, &scissor);
+
+   const float x_scale = ldexpf(2.0f, -xmax_log2);
+   const float y_scale = ldexpf(2.0f, -ymax_log2);
+
+   struct hk_b2i_rect_vertex {
+      float x, y, z;
+      uint32_t layer;
+   };
+   static_assert(sizeof(struct hk_b2i_rect_vertex) == 4 * sizeof(uint32_t),
+                 "matches vk_meta_draw_rects_vi_state");
+   const uint32_t rect_vb_size_B = 6 * sizeof(struct hk_b2i_rect_vertex);
+   const uint32_t rects_per_vb =
+      MAX2(1u, dev->meta.max_bind_map_buffer_size_B / rect_vb_size_B);
+
+   uint32_t next = 0;
+   while (next < count) {
+      const uint32_t chunk = MIN2(rects_per_vb, count - next);
+      const VkBufferCreateInfo vtx_info = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+         .size = (VkDeviceSize)chunk * rect_vb_size_B,
+         .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+         .queueFamilyIndexCount = 1,
+         .pQueueFamilyIndices = &cmd->vk.pool->queue_family_index,
+      };
+      VkBuffer vtx_buffer;
+      result = vk_meta_create_buffer(&cmd->vk, &dev->meta, &vtx_info,
+                                     &vtx_buffer);
+      if (unlikely(result != VK_SUCCESS)) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         goto out;
+      }
+
+      void *map = NULL;
+      result = dev->meta.cmd_bind_map_buffer(&cmd->vk, &dev->meta, vtx_buffer,
+                                             &map);
+      if (unlikely(result != VK_SUCCESS)) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         goto out;
+      }
+
+      struct hk_b2i_rect_vertex *verts = map;
+      for (uint32_t i = 0; i < chunk; ++i) {
+         const struct hk_deferred_b2i_item *it = &items[next + i];
+         const float x0 = (float)it->x * x_scale - 1.0f;
+         const float y0 = (float)it->y * y_scale - 1.0f;
+         const float x1 = (float)(it->x + (int32_t)it->width) * x_scale - 1.0f;
+         const float y1 = (float)(it->y + (int32_t)it->height) * y_scale - 1.0f;
+         const struct hk_b2i_rect_vertex quad[6] = {
+            {x0, y1, 0.0f, 0},
+            {x0, y0, 0.0f, 0},
+            {x1, y1, 0.0f, 0},
+            {x1, y0, 0.0f, 0},
+            {x1, y1, 0.0f, 0},
+            {x0, y0, 0.0f, 0},
+         };
+         memcpy(verts + i * 6, quad, sizeof(quad));
+      }
+
+      const VkDeviceSize zero = 0;
+      disp->CmdBindVertexBuffers(cb, 0, 1, &vtx_buffer, &zero);
+
+      for (uint32_t i = 0; i < chunk; ++i) {
+         const struct hk_deferred_b2i_item *it = &items[next + i];
+         const struct hk_g17p_b2i_batch_push push = {
+            .buf_addr = it->buf_addr,
+            .row_stride_B = it->row_stride_B,
+            .img_offset_x = (uint32_t)it->x,
+            .img_offset_y = (uint32_t)it->y,
+            .extent_x = it->width,
+            .extent_y = it->height,
+         };
+         disp->CmdPushConstants(cb, pipeline_layout,
+                                VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push),
+                                &push);
+         disp->CmdDraw(cb, 6, 1, i * 6, 0);
+      }
+
+      next += chunk;
+   }
+
+out:
+   if (rendering_begun)
+      disp->CmdEndRendering(cb);
+   if (meta_begun)
+      hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   if (xfer_begun)
+      hk_sync_xfer_end(cmd);
+   util_dynarray_clear(&cmd->deferred_b2i_items);
+   cmd->state.deferred_b2i = (struct hk_deferred_b2i){0};
+}
+
+/* Queue eligible compressed 1x 2D colour buffer-to-image uploads so both
+ * multi-region calls and consecutive sub-rectangle calls targeting the same
+ * (image, layout, mip, layer) coalesce into one graphics meta render pass. */
+static bool
+hk_defer_b2i(struct hk_cmd_buffer *cmd,
+             const VkCopyBufferToImageInfo2 *info)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   VK_FROM_HANDLE(hk_buffer, src_buffer, info->srcBuffer);
+   VK_FROM_HANDLE(hk_image, dst_image, info->dstImage);
+
+   if (!info->regionCount ||
+       !hk_g17p_b2i_batch_image_eligible(
+          dev->dev.chip, cmd->in_meta, cmd->sync.in_pass,
+          dst_image->vk.image_type, dst_image->vk.samples,
+          dst_image->plane_count,
+          vk_format_is_depth_or_stencil(dst_image->vk.format),
+          vk_format_is_compressed(dst_image->vk.format),
+          dst_image->planes[0].layout.compressed, info->dstImageLayout))
+      return false;
+
+   if (!hk_g17p_copy_buffer_to_image_supported(dev, dst_image, info))
+      return false;
+
+   const VkFormat view_format =
+      hk_meta_compressed_copy_format(dst_image->vk.format);
+   const uint64_t pixel_size = vk_format_get_blocksize(dst_image->vk.format);
+   if ((pixel_size != 1 && pixel_size != 2 && pixel_size != 4 &&
+        pixel_size != 8 && pixel_size != 16) ||
+       vk_format_get_blocksize(view_format) != pixel_size)
+      return false;
+
+   /* Validate every region up front so partial queuing never happens on a
+    * region that needs fallback error handling. */
+   for (uint32_t r = 0; r < info->regionCount; ++r) {
+      const VkBufferImageCopy2 *region = &info->pRegions[r];
+      const uint32_t slices = vk_image_subresource_layer_count(
+         &dst_image->vk, &region->imageSubresource);
+      if (region->imageSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+          region->imageOffset.x < 0 || region->imageOffset.y < 0 ||
+          region->imageExtent.width == 0 || region->imageExtent.height == 0 ||
+          slices == 0)
+         return false;
+
+      const uint64_t columns = region->bufferRowLength
+                                  ? region->bufferRowLength
+                                  : region->imageExtent.width;
+      const uint64_t rows = region->bufferImageHeight
+                               ? region->bufferImageHeight
+                               : region->imageExtent.height;
+      if (columns > UINT32_MAX / pixel_size)
+         return false;
+      const uint64_t row_stride_B = columns * pixel_size;
+      const uint64_t last_row_off =
+         (uint64_t)(region->imageExtent.height - 1) * row_stride_B;
+      const uint64_t row_bytes = (uint64_t)region->imageExtent.width * pixel_size;
+      if (last_row_off > UINT32_MAX - row_bytes)
+         return false;
+      if (rows > UINT64_MAX / row_stride_B)
+         return false;
+      const uint64_t slice_stride_B = rows * row_stride_B;
+      if (slices > 1 &&
+          slice_stride_B > (UINT64_MAX - region->bufferOffset) / (slices - 1))
+         return false;
+   }
+
+   /* Keep deferred clears and deferred B2I uploads strictly ordered. */
+   if (unlikely(cmd->state.deferred_clear_count))
+      hk_flush_deferred_clears(cmd);
+
+   for (uint32_t r = 0; r < info->regionCount; ++r) {
+      const VkBufferImageCopy2 *region = &info->pRegions[r];
+      const uint32_t slices = vk_image_subresource_layer_count(
+         &dst_image->vk, &region->imageSubresource);
+      const uint64_t columns = region->bufferRowLength
+                                  ? region->bufferRowLength
+                                  : region->imageExtent.width;
+      const uint64_t rows = region->bufferImageHeight
+                               ? region->bufferImageHeight
+                               : region->imageExtent.height;
+      const uint32_t row_stride_B = (uint32_t)(columns * pixel_size);
+      const uint64_t slice_stride_B = rows * row_stride_B;
+      const uint32_t level = region->imageSubresource.mipLevel;
+      const uint32_t base_layer = region->imageSubresource.baseArrayLayer;
+
+      for (uint32_t slice = 0; slice < slices; ++slice) {
+         const struct hk_deferred_b2i_batch_key next_key = {
+            .image = dst_image,
+            .layout = info->dstImageLayout,
+            .mip_level = level,
+            .array_layer = base_layer + slice,
+         };
+         const struct hk_deferred_b2i_batch_key cur_key = {
+            .image = cmd->state.deferred_b2i.image,
+            .layout = cmd->state.deferred_b2i.layout,
+            .mip_level = cmd->state.deferred_b2i.mip_level,
+            .array_layer = cmd->state.deferred_b2i.array_layer,
+         };
+         if (cmd->state.deferred_b2i.count > 0 &&
+             !hk_g17p_b2i_batch_can_coalesce(
+                &cur_key, cmd->state.deferred_b2i.count, &next_key))
+            hk_flush_deferred_b2i(cmd);
+
+         struct hk_deferred_b2i_item *slot = util_dynarray_grow_bytes(
+            &cmd->deferred_b2i_items, 1, sizeof(*slot));
+         if (unlikely(!slot)) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+            return true;
+         }
+
+         *slot = (struct hk_deferred_b2i_item){
+            .buf_addr = hk_buffer_address_ro(
+               src_buffer, region->bufferOffset + slice * slice_stride_B),
+            .row_stride_B = row_stride_B,
+            .x = region->imageOffset.x,
+            .y = region->imageOffset.y,
+            .width = region->imageExtent.width,
+            .height = region->imageExtent.height,
+         };
+         if (cmd->state.deferred_b2i.count == 0) {
+            cmd->state.deferred_b2i.image = dst_image;
+            cmd->state.deferred_b2i.layout = info->dstImageLayout;
+            cmd->state.deferred_b2i.mip_level = level;
+            cmd->state.deferred_b2i.array_layer = base_layer + slice;
+         }
+         cmd->state.deferred_b2i.count++;
+      }
+   }
+
+   return true;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_CmdBlitImage2(VkCommandBuffer commandBuffer,
                  const VkBlitImageInfo2 *pBlitImageInfo)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   hk_flush_deferred_b2i(cmd);
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
@@ -5265,6 +5777,8 @@ hk_CmdResolveImage2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
 
+   hk_flush_deferred_b2i(cmd);
+
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
    hk_xfer_begin_image(cmd, pResolveImageInfo->dstImage);
@@ -5276,6 +5790,8 @@ VKAPI_ATTR void VKAPI_CALL
 hk_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   hk_flush_deferred_b2i(cmd);
 
    if (cmd->state.deferred_clear_count) {
       VK_FROM_HANDLE(hk_buffer, src, info->srcBuffer);
@@ -5308,6 +5824,11 @@ hk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
 
+   if (hk_defer_b2i(cmd, pCopyBufferToImageInfo))
+      return;
+
+   hk_flush_deferred_b2i(cmd);
+
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
    hk_xfer_begin_image(cmd, pCopyBufferToImageInfo->dstImage);
@@ -5320,6 +5841,8 @@ hk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
                          const VkCopyImageToBufferInfo2 *pCopyImageToBufferInfo)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   hk_flush_deferred_b2i(cmd);
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
@@ -5334,6 +5857,8 @@ hk_CmdCopyImage2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
 
+   hk_flush_deferred_b2i(cmd);
+
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
    hk_xfer_begin_image(cmd, pCopyImageInfo->dstImage);
@@ -5346,6 +5871,8 @@ hk_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
                  VkDeviceSize dstOffset, VkDeviceSize dstRange, uint32_t data)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   hk_flush_deferred_b2i(cmd);
 
    if (cmd->state.deferred_clear_count) {
       VK_FROM_HANDLE(hk_buffer, buffer, dstBuffer);
@@ -5373,6 +5900,8 @@ hk_CmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
                    const void *pData)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   hk_flush_deferred_b2i(cmd);
 
    if (cmd->state.deferred_clear_count) {
       VK_FROM_HANDLE(hk_buffer, buffer, dstBuffer);

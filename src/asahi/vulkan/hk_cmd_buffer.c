@@ -359,6 +359,7 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    hk_ioto_arena_finish(cmd);
    hk_cmd_buffer_release_bos(cmd, &dev->dev);
    util_dynarray_clear(&cmd->meta_push_saves);
+   util_dynarray_clear(&cmd->deferred_b2i_items);
 }
 
 static void
@@ -373,6 +374,7 @@ hk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    util_dynarray_fini(&cmd->alias_sites);
    util_dynarray_fini(&cmd->large_bos);
    util_dynarray_fini(&cmd->meta_push_saves);
+   util_dynarray_fini(&cmd->deferred_b2i_items);
    free(cmd->retained_set);
    if (cmd->m5_pushed_images)
       _mesa_set_destroy(cmd->m5_pushed_images, NULL);
@@ -412,6 +414,7 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    cmd->large_bos = UTIL_DYNARRAY_INIT;
    cmd->alias_sites = UTIL_DYNARRAY_INIT;
    cmd->meta_push_saves = UTIL_DYNARRAY_INIT;
+   cmd->deferred_b2i_items = UTIL_DYNARRAY_INIT;
    list_inithead(&cmd->alias_link);
 
    cmd->vk.dynamic_graphics_state.vi = &cmd->state.gfx._dynamic_vi;
@@ -521,6 +524,7 @@ hk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
    const struct hk_conditional_render_state primary_conditional =
       cmd->state.conditional;
 
+   hk_flush_deferred_b2i(cmd);
    hk_flush_deferred_clears(cmd);
 
    /* Secondary command buffers are materialized by replaying their common
@@ -544,6 +548,7 @@ hk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
       cmd->state.conditional = primary_conditional;
    }
 
+   hk_flush_deferred_b2i(cmd);
    hk_cmd_invalidate_graphics_state(cmd);
    hk_cmd_invalidate_compute_state(cmd);
 }
@@ -1051,6 +1056,7 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
           "must end rendering before ending the command buffer");
 
    perf_debug(cmd, "End command buffer");
+   hk_flush_deferred_b2i(cmd);
    hk_flush_deferred_clears(cmd);
    hk_sync_flush_pending_timestamp(cmd);
    hk_cmd_buffer_end_compute(cmd);
@@ -1320,6 +1326,8 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   hk_flush_deferred_b2i(cmd);
 
    if (HK_PERF(dev, NOBARRIER))
       return;
@@ -5114,6 +5122,9 @@ hk_deferred_clears_hold_buffer(struct hk_cmd_buffer *cmd, uint64_t addr,
 void
 hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
 {
+   if (unlikely(cmd->state.deferred_b2i.count) &&
+       !cmd->state.deferred_b2i.flushing)
+      hk_flush_deferred_b2i(cmd);
    /* Whatever observes the deferred clears may also read a pending store. */
    cmd->state.pending_z_store.cs = NULL;
    cmd->state.deferred_clear_hold = false;

@@ -209,6 +209,8 @@ hk_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage _image,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(hk_image, image, _image);
 
+   hk_flush_deferred_b2i(cmd);
+
    const VkClearValue value = {.color = *pColor};
    if (hk_defer_clear(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, &value,
                       rangeCount, pRanges))
@@ -242,6 +244,8 @@ hk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage _image,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(hk_image, image, _image);
+
+   hk_flush_deferred_b2i(cmd);
 
    const VkClearValue value = {.depthStencil = *pDepthStencil};
    if (rangeCount == 1 &&

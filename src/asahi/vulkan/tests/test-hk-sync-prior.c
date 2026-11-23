@@ -471,6 +471,13 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
 }
 
 void
+hk_flush_deferred_b2i(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
+void
 hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
                      enum agx_barrier barrier, enum libagx_program idx,
                      void *data, size_t data_size)

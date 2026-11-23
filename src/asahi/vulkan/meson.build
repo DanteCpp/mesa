@@ -58,6 +58,7 @@ hk_files = files(
   'hk_agx3_vdm_decode.c',
   'hk_agx3_vdm_decode.h',
   'hk_ppp_state.h',
+  'hk_g17p_b2i_batch.h',
   'hk_image.c',
   'hk_image.h',
   'hk_image_layout_core.c',
@@ -474,6 +475,20 @@ if with_tests
       'hk_g17p_compression_test',
       files('tests/test-hk-g17p-compression.c'),
       include_directories : [inc_include, inc_src],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'hk_g17p_b2i_batch',
+    executable(
+      'hk_g17p_b2i_batch_test',
+      files('tests/test-hk-g17p-b2i-batch.c', 'hk_g17p_meta_copy_core.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src,
+                             inc_asahi],
+      dependencies : [idep_mesautil, idep_vulkan_util,
+                      idep_vulkan_runtime_headers],
+      gnu_symbol_visibility : 'hidden',
     ),
     suite : ['asahi'],
   )

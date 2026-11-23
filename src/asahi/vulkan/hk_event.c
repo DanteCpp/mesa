@@ -116,6 +116,7 @@ hk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
                 const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_b2i(cmd);
    hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_event, event, _event);
 
@@ -149,6 +150,7 @@ hk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
                   VkPipelineStageFlags2 stageMask)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_b2i(cmd);
    hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_event, event, _event);
 
@@ -172,6 +174,7 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
                   const VkDependencyInfo *pDependencyInfos)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_b2i(cmd);
    hk_flush_deferred_clears(cmd);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    cmd->state.uses_events = true;
@@ -248,6 +251,7 @@ hk_CmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount,
                  const VkImageMemoryBarrier *pImageMemoryBarriers)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_b2i(cmd);
 
    cmd->state.brl_legacy_event_wait = true;
    vk_common_CmdWaitEvents(commandBuffer, eventCount, pEvents, srcStageMask,

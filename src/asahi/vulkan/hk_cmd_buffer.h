@@ -33,6 +33,7 @@
 #include "hk_private.h"
 #include "hk_barrier.h"
 #include "hk_conditional_render_core.h"
+#include "hk_g17p_b2i_batch.h"
 #include "hk_shader.h"
 #include "hk_sync.h"
 #include "hk_tess_batch.h"
@@ -1797,6 +1798,17 @@ struct hk_cmd_buffer {
       /* Recording a buffer-only command that does not touch their memory. */
       bool deferred_clear_hold;
 
+      /* Native AGX3: queued same-subresource compressed 1x colour
+       * vkCmdCopyBufferToImage uploads coalesced into one meta render pass. */
+      struct hk_deferred_b2i {
+         struct hk_image *image;
+         VkImageLayout layout;
+         uint32_t mip_level;
+         uint32_t array_layer;
+         uint32_t count;
+         bool flushing;
+      } deferred_b2i;
+
       /* Suppress consumption of pending resets while recording another reset. */
       bool query_reset_recording;
 
@@ -1934,6 +1946,9 @@ struct hk_cmd_buffer {
    /* The push descriptor sets hk_meta_begin() saves, each only as long as
     * its layout, stacked in the order nested meta operations begin. */
    struct util_dynarray meta_push_saves;
+
+   /* struct hk_deferred_b2i_item entries for state.deferred_b2i. */
+   struct util_dynarray deferred_b2i_items;
 
    /* Owned BOs and retained references needed by recorded commands. */
    struct util_dynarray large_bos;
@@ -2360,6 +2375,8 @@ uint64_t hk_default_sample_positions(unsigned nr_samples);
 void hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why);
 #define hk_flush_deferred_clears(cmd) hk_flush_deferred_clears_why(cmd, __func__)
 
+void hk_flush_deferred_b2i(struct hk_cmd_buffer *cmd);
+
 /* The depth image of the pending store is overwritten as a whole before
  * anything read it: the store is dead (see hk_take_pending_z_store()). */
 static inline void
@@ -2428,8 +2445,12 @@ static inline struct hk_cs *
 hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
                              bool compute)
 {
-   /* Any recorded work may read an image with a deferred clear, or the
-    * depth image of a pending store. */
+   /* Any recorded work may read an image with a deferred clear, a deferred
+    * compressed buffer-to-image upload, or the depth image of a pending
+    * store. */
+   if (unlikely(cmd->state.deferred_b2i.count) &&
+       !cmd->state.deferred_b2i.flushing)
+      hk_flush_deferred_b2i(cmd);
    if (unlikely(cmd->state.deferred_clear_count) &&
        !cmd->state.deferred_clear_flushing && !cmd->state.deferred_clear_hold)
       hk_flush_deferred_clears(cmd);
