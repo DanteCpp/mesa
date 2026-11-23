@@ -8505,6 +8505,54 @@ agx3_is_loop_guard_push(const agx_instr *I)
    return agx3_is_loop_push(I, 0);
 }
 
+/* Whether the first instruction of `block` is a control-flow boundary that
+ * drains the scoreboard: an else or a pop_exec. Its retire carrier is emitted
+ * at the block's start, where a jump to the block lands. */
+static bool
+agx3_block_starts_with_drain(const agx_block *block)
+{
+   if (list_is_empty(&block->instructions))
+      return false;
+
+   const agx_instr *first =
+      list_first_entry(&block->instructions, agx_instr, link);
+   return first->op == AGX_OPCODE_ELSE_ICMP ||
+          first->op == AGX_OPCODE_ELSE_FCMP ||
+          first->op == AGX_OPCODE_POP_EXEC;
+}
+
+/*
+ * How the scoreboard crosses a control-flow instruction. Slot assignment is
+ * linear, which is exact within one arm of an if: an arm is entered only
+ * from the instruction before it. So outstanding results stay in flight into
+ * an arm, through the zero-byte BEGIN_CF, a forward if and a plain
+ * exec-none jump whose target starts with an else or pop_exec, and every
+ * outstanding generation is retired at the end of the arm, before that
+ * else or pop_exec. A skipped arm lands on the same retire carrier: an
+ * exec-none jump targets the start of its block, ahead of the carrier.
+ * Loops, breaks and jumps that land past a carrier keep draining.
+ */
+static enum agx3_slot_cf
+agx3_slot_cf_kind(const agx_instr *I)
+{
+   if (!agx3_is_cf_op(I))
+      return AGX3_SLOT_CF_NONE;
+
+   switch (I->op) {
+   case AGX_OPCODE_BEGIN_CF:
+      return AGX3_SLOT_CF_NONE;
+   case AGX_OPCODE_IF_ICMP:
+   case AGX_OPCODE_IF_FCMP:
+      return I->target ? AGX3_SLOT_CF_NONE : AGX3_SLOT_CF_DRAIN;
+   case AGX_OPCODE_JMP_EXEC_NONE:
+      return I->target && agx3_block_starts_with_drain(I->target)
+                ? AGX3_SLOT_CF_NONE
+                : AGX3_SLOT_CF_DRAIN;
+   default:
+      return AGX3_SLOT_CF_DRAIN;
+   }
+}
+
 static int
 agx3_try_control_flow(struct util_dynarray *emission,
                       struct util_dynarray *fixups, enum agx_isa_encoding enc,
@@ -8527,11 +8575,12 @@ agx3_try_control_flow(struct util_dynarray *emission,
                         I->op == AGX_OPCODE_JMP_EXEC_NONE_AFTER;
 
    /*
-    * Slot assignment is linear, so a control-flow boundary is safe only when
-    * nothing is in flight: then every block is entered with an empty
-    * scoreboard whichever predecessor ran. A result still outstanding here
-    * would carry its slot across the branch (or a backedge), which needs a
-    * predecessor-aware analysis this backend does not have, so it is refused.
+    * Slot assignment is linear, so a result may stay in flight across a
+    * control-flow instruction only where agx3_slot_cf_kind() says the
+    * linear order is exact; the caller passes outstanding = 0 there. Any
+    * other result still outstanding here would carry its slot across a
+    * merge or a backedge, which needs a predecessor-aware analysis this
+    * backend does not have, so it is refused.
     */
    const bool live_begin = enc == AGX_ISA_ENCODING_AGX3C &&
       I->op == AGX_OPCODE_BEGIN_CF;
@@ -13198,12 +13247,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             continue;
          ordered[k] = I;
          struct agx3_slot_instr *e = &sl[k++];
-         /* Emission drains the scoreboard before every control-flow
-          * boundary except AGX3C's architectural BEGIN_CF. */
-         if (agx3_is_cf_op(I) &&
-             !(enc == AGX_ISA_ENCODING_AGX3C && I->op == AGX_OPCODE_BEGIN_CF))
-            e->cf = I->op == AGX_OPCODE_BEGIN_CF ? AGX3_SLOT_CF_DRAIN_EMPTY
-                                                 : AGX3_SLOT_CF_DRAIN;
+         e->cf = agx3_slot_cf_kind(I);
          /* EXPORT is a zero-byte register-ABI declaration after RA, not a
           * physical read. Letting it consume an async dependency marks the
           * slot waited without emitting any wait, so a linked epilog reads
@@ -13634,14 +13678,32 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                     cprog_imports ? 1 : 0, res))
       AGX3_PACK_FAIL();
 
-   /* Emission drains every live scoreboard generation before control flow,
-    * but the linear slot assignment above cannot see that architectural
-    * boundary. Remove waits belonging to those retired generations until a
-    * later producer reuses the slot. Otherwise a post-branch ISEL may carry a
-    * stale slot together with two real producers, escaping the native
-    * slots-1-and-2 pair even though only that pair is live. */
+   /* A branch that itself waits for a result (a compare reading a load)
+    * has no grounded form carrying that wait, so it retires everything
+    * outstanding first, as every branch once did. Drain those and assign
+    * again; each pass only adds drains, so this ends. */
+   for (bool upgraded = true; upgraded;) {
+      upgraded = false;
+      for (unsigned i = 0; i < count; ++i) {
+         if (sl[i].cf == AGX3_SLOT_CF_NONE && agx3_is_cf_op(ordered[i]) &&
+             res[i].wait_mask) {
+            sl[i].cf = AGX3_SLOT_CF_DRAIN;
+            upgraded = true;
+         }
+      }
+      if (upgraded &&
+          !agx3_slot_assign_with_entry(sl, count, nslots, &input_entry,
+                                       cprog_imports ? 1 : 0, res))
+         AGX3_PACK_FAIL();
+   }
+
+   /* Emission drains every live scoreboard generation before a draining
+    * control-flow boundary, and assignment starts after it from an empty
+    * scoreboard. Drop any wait still naming a retired generation: a
+    * post-branch ISEL must not carry a stale slot together with two real
+    * producers, escaping the native slots-1-and-2 pair. */
    /* cf_drains[i], for shader statistics: the drain before ordered[i]
-    * retires something that neither branch reads. */
+    * retires something it does not read. */
    bool *cf_drains = rzalloc_array(ctx, bool, count ? count : 1);
    if (!cf_drains)
       AGX3_PACK_FAIL();
@@ -14043,13 +14105,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             continue;
          }
 
-         /* Give every control-flow boundary an empty scoreboard, rather
-          * than refusing the shader when something is still in flight. */
+         /* Retire everything outstanding at a draining control-flow
+          * boundary (agx3_slot_cf_kind()). Elsewhere results stay in flight
+          * into the arm the boundary opens. */
          uint16_t cf_wait = wait;
          uint16_t cf_outstanding = outstanding_here;
-         const bool live_begin = enc == AGX_ISA_ENCODING_AGX3C &&
-            I->op == AGX_OPCODE_BEGIN_CF;
-         if (agx3_is_cf_op(I) && !live_begin) {
+         if (agx3_is_cf_op(I) && sl[instr_index].cf == AGX3_SLOT_CF_NONE)
+            cf_outstanding = 0;
+         if (agx3_is_cf_op(I) && sl[instr_index].cf != AGX3_SLOT_CF_NONE) {
             const uint16_t retire = (uint16_t)(cf_wait | cf_outstanding);
             if (retire != 0) {
                if (!agx3_retire_slots_noop(emission, enc, retire))

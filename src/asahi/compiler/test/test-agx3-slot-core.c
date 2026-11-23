@@ -739,39 +739,68 @@ int main(void)
    }
 
    /* Control-flow drains: emission retires the load before the branch, so
-    * its consumer after the branch needs no wait, and the drain counts. */
+    * assignment gives its consumer after the branch no wait, and the drain
+    * counts. */
    {
       struct agx3_slot_instr branch = st(0);
       branch.cf = AGX3_SLOT_CF_DRAIN;
       struct agx3_slot_instr p[] = { ld(10), branch, alu(12, 10, 10) };
       bool drained[3] = {0};
       CHECK(agx3_slot_assign(p, 3, 6, r));
-      CHECK(r[2].wait_mask == (1u << (r[0].slot - 1)));
+      CHECK(r[2].wait_mask == 0);
       agx3_slot_retire_at_cf(p, 3, 0, r, drained);
       CHECK(r[2].wait_mask == 0);
       CHECK(!drained[0] && drained[1] && !drained[2]);
    }
-   /* An empty boundary drains what the branch right after it reads: not a
-    * drain, since that branch has to wait for it anyway. */
+   /* A branch that reads the load waits for it itself: not a drain. */
    {
-      struct agx3_slot_instr begin = {0}, branch = st(10);
-      begin.cf = AGX3_SLOT_CF_DRAIN_EMPTY;
+      struct agx3_slot_instr branch = st(10);
       branch.cf = AGX3_SLOT_CF_DRAIN;
-      struct agx3_slot_instr p[] = { ld(10), begin, branch };
+      struct agx3_slot_instr p[] = { ld(10), branch, alu(12, 10, 10) };
+      bool drained[3] = {0};
+      CHECK(agx3_slot_assign(p, 3, 6, r));
+      CHECK(r[1].wait_mask == (1u << (r[0].slot - 1)));
+      agx3_slot_retire_at_cf(p, 3, 0, r, drained);
+      CHECK(!drained[1] && r[2].wait_mask == 0);
+   }
+   /* A non-draining boundary (a forward if) keeps the load in flight: its
+    * consumer inside the arm still waits for it. */
+   {
+      struct agx3_slot_instr branch = st(0);
+      struct agx3_slot_instr p[] = { ld(10), branch, alu(12, 10, 10) };
       bool drained[3] = {0};
       CHECK(agx3_slot_assign(p, 3, 6, r));
       agx3_slot_retire_at_cf(p, 3, 0, r, drained);
-      CHECK(!drained[1] && !drained[2]);
-      CHECK(r[2].wait_mask == 0);
+      CHECK(r[2].wait_mask == (1u << (r[0].slot - 1)));
+      CHECK(!drained[1]);
    }
-   /* A generation issued after the drain keeps its own wait. */
+   /* After a drain every slot is free: the next load takes the next slot in
+    * turn without waiting, keeps its own wait, and the pre-drain value
+    * needs none. */
    {
       struct agx3_slot_instr branch = st(0);
       branch.cf = AGX3_SLOT_CF_DRAIN;
       struct agx3_slot_instr p[] = { ld(10), branch, ld(12), alu(14, 12, 10) };
       CHECK(agx3_slot_assign(p, 4, 6, r));
+      CHECK(r[2].wait_mask == 0 && r[2].slot != 0);
       agx3_slot_retire_at_cf(p, 4, 0, r, NULL);
       CHECK(r[3].wait_mask == (1u << (r[2].slot - 1)));
+   }
+   /* Six loads fill every AGX3B slot; after a drain, six more need no
+    * forced retire of an earlier generation. */
+   {
+      struct agx3_slot_instr p[14];
+      for (unsigned i = 0; i < 6; ++i)
+         p[i] = ld(20 + 2 * i);
+      p[6] = st(0);
+      p[6].cf = AGX3_SLOT_CF_DRAIN;
+      for (unsigned i = 0; i < 6; ++i)
+         p[7 + i] = ld(40 + 2 * i);
+      p[13] = alu(60, 40, 50);
+      CHECK(agx3_slot_assign(p, 14, 6, r));
+      for (unsigned i = 7; i < 13; ++i)
+         CHECK(r[i].wait_mask == 0);
+      CHECK(r[13].wait_mask == ((1u << (r[7].slot - 1)) | (1u << (r[12].slot - 1))));
    }
 
    /* Malformed inputs. */

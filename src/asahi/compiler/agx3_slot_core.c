@@ -368,6 +368,24 @@ agx3_slot_assign_initial(const struct agx3_slot_instr *instrs, unsigned n,
             reg_slot[I->dst[d]] = 0; /* synchronous result, no wait needed */
          }
       }
+
+      /* Emission retires every outstanding generation before a draining
+       * control-flow boundary. Start the code after it from that empty
+       * scoreboard, so allocation neither skips nor waits for generations
+       * the drain already retired. */
+      if (I->cf != AGX3_SLOT_CF_NONE) {
+         memset(reg_slot, 0, token_count * sizeof(reg_slot[0]));
+         memset(reader_slots, 0, token_count * sizeof(reader_slots[0]));
+         active_reader_slots = 0;
+         pending = 0;
+         entry_pending = 0;
+         for (unsigned slot = 1; slot <= nslots; ++slot) {
+            slot_waited[slot] = true;
+            slot_reissuable[slot] = false;
+            slot_join_count[slot] = 0;
+            slot_join_class[slot] = 0;
+         }
+      }
    }
 
    return true;
@@ -418,13 +436,8 @@ agx3_slot_retire_at_cf(const struct agx3_slot_instr *instrs, unsigned n,
       if (instrs[i].cf == AGX3_SLOT_CF_NONE)
          continue;
 
-      if (drained) {
-         uint16_t mask = live;
-         if (instrs[i].cf == AGX3_SLOT_CF_DRAIN_EMPTY && i + 1 < n &&
-             instrs[i + 1].cf != AGX3_SLOT_CF_NONE)
-            mask &= (uint16_t)~res[i + 1].wait_mask;
-         drained[i] = mask != 0;
-      }
+      if (drained)
+         drained[i] = live != 0;
       retired |= live;
       live = 0;
    }
