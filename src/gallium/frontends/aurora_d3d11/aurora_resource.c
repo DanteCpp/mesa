@@ -209,10 +209,45 @@ build_pipe_template(const D3D11DDIARG_CREATERESOURCE *args,
 }
 
 static void
+aurora_mark_cb_dirty_locked(struct aurora_device *dev, struct aurora_resource *r)
+{
+   r->cb_ver++;
+   for (unsigned st = 0; st < AURORA_STAGE_COUNT; ++st) {
+      for (unsigned s = 0; s < AURORA_MAX_CBS; ++s) {
+         if (dev->cb_res[st][s] == r) {
+            dev->cb_dirty[st] = true;
+            break;
+         }
+      }
+   }
+}
+
+static bool
+is_cpu_shadowed_cb(const struct aurora_resource *r, bool is_shared,
+                   bool is_primary)
+{
+   return r->dim == D3D10DDIRESOURCE_BUFFER &&
+          r->bind_flags == D3D10_DDI_BIND_CONSTANT_BUFFER &&
+          r->misc_flags == 0u &&
+          !is_shared && !is_primary &&
+          r->usage != D3D10_DDI_USAGE_STAGING &&
+          r->width > 0u && r->width <= 65536u;
+}
+
+static void
 upload_initial_data(struct aurora_device *dev, struct aurora_resource *r,
                     const D3D10_DDIARG_SUBRESOURCE_UP *init)
 {
-   if (!init || !r->prsrc)
+   if (!init)
+      return;
+   if (r->cb_cpu) {
+      if (init[0].pSysMem) {
+         memcpy(r->cb_cpu, init[0].pSysMem, r->width);
+         r->cb_ver++;
+      }
+      return;
+   }
+   if (!r->prsrc)
       return;
    if (r->dim == D3D10DDIRESOURCE_BUFFER) {
       if (init[0].pSysMem) {
@@ -405,7 +440,15 @@ aurora_CreateResource(D3D10DDI_HDEVICE hDevice,
                      (unsigned)pArgs->Usage, hRTResource.handle);
    }
 
-   if (!r->prsrc) {
+   if (!r->prsrc && is_cpu_shadowed_cb(r, is_shared, is_primary)) {
+      r->cb_cpu = (uint8_t *)calloc(1, r->width);
+      if (!r->cb_cpu) {
+         aurora_unlock(dev);
+         aurora_set_error(dev, E_OUTOFMEMORY);
+         return;
+      }
+      r->cb_ver = 1u;
+   } else if (!r->prsrc) {
       r->prsrc = dev->screen->resource_create(dev->screen, &templ);
       if (!r->prsrc) {
          aurora_unlock(dev);
@@ -551,6 +594,21 @@ aurora_DestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource)
    /* Unbind if currently referenced as index buffer or vertex buffer or CB. */
    if (dev->ib_res == r)
       dev->ib_res = NULL;
+   for (unsigned st = 0; st < AURORA_STAGE_COUNT; ++st) {
+      for (unsigned s = 0; s < AURORA_MAX_CBS; ++s) {
+         if (dev->cb_res[st][s] == r) {
+            dev->cb_res[st][s] = NULL;
+            dev->cb_bound_ver[st][s] = 0u;
+            pipe_resource_reference(&dev->cbs[st][s].buffer, NULL);
+            dev->cbs[st][s].buffer_offset = 0u;
+            dev->cbs[st][s].buffer_size = 0u;
+            dev->cbs[st][s].user_buffer = NULL;
+         }
+      }
+   }
+   pipe_resource_reference(&r->cb_gpu_buf, NULL);
+   free(r->cb_cpu);
+   r->cb_cpu = NULL;
 
    /* Drop Gallium pipe_resource FIRST (unmaps GPU VA + evicts residency),
     * THEN deallocate the runtime allocation if we own it. */
@@ -580,13 +638,23 @@ aurora_ResourceMap(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource,
 {
    struct aurora_device *dev = (struct aurora_device *)hDevice.pDrvPrivate;
    struct aurora_resource *r = (struct aurora_resource *)hResource.pDrvPrivate;
-   if (!dev || !dev->pctx || !r || !r->prsrc || !pMapped) {
+   if (!dev || !dev->pctx || !r || (!r->prsrc && !r->cb_cpu) || !pMapped) {
       aurora_set_error(dev, E_INVALIDARG);
       return;
    }
    memset(pMapped, 0, sizeof(*pMapped));
    if (Subresource >= MAX2(r->num_subresources, 1u)) {
       aurora_set_error(dev, E_INVALIDARG);
+      return;
+   }
+
+   if (r->cb_cpu) {
+      aurora_lock(dev);
+      r->cb_mapped_write = (DDIMap != D3D10_DDI_MAP_READ);
+      pMapped->pData = r->cb_cpu;
+      pMapped->RowPitch = r->width;
+      pMapped->DepthPitch = r->width;
+      aurora_unlock(dev);
       return;
    }
 
@@ -667,8 +735,19 @@ aurora_ResourceUnmap(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource,
 {
    struct aurora_device *dev = (struct aurora_device *)hDevice.pDrvPrivate;
    struct aurora_resource *r = (struct aurora_resource *)hResource.pDrvPrivate;
-   if (!dev || !dev->pctx || !r || !r->transfers ||
-       Subresource >= MAX2(r->num_subresources, 1u))
+   if (!dev || !dev->pctx || !r || Subresource >= MAX2(r->num_subresources, 1u))
+      return;
+
+   if (r->cb_cpu) {
+      aurora_lock(dev);
+      if (r->cb_mapped_write) {
+         r->cb_mapped_write = false;
+         aurora_mark_cb_dirty_locked(dev, r);
+      }
+      aurora_unlock(dev);
+      return;
+   }
+   if (!r->transfers)
       return;
 
    aurora_lock(dev);
@@ -697,8 +776,22 @@ update_subresource_common(struct aurora_device *dev, struct aurora_resource *r,
                           const VOID *pSysMemUP, UINT RowPitch, UINT DepthPitch,
                           UINT CopyFlags)
 {
-   if (!dev || !dev->pctx || !r || !r->prsrc || !pSysMemUP)
+   if (!dev || !dev->pctx || !r || (!r->prsrc && !r->cb_cpu) || !pSysMemUP)
       return;
+
+   if (r->cb_cpu) {
+      UINT offset = pDstBox ? pDstBox->left : 0u;
+      UINT size = pDstBox ? (pDstBox->right - pDstBox->left) : r->width;
+      if (offset < r->width && size > 0u) {
+         if (size > r->width - offset)
+            size = r->width - offset;
+         aurora_lock(dev);
+         memcpy(r->cb_cpu + offset, pSysMemUP, size);
+         aurora_mark_cb_dirty_locked(dev, r);
+         aurora_unlock(dev);
+      }
+      return;
+   }
 
    unsigned map_flags = PIPE_MAP_WRITE;
    if (CopyFlags & D3D11_1DDI_COPY_DISCARD)
@@ -839,7 +932,39 @@ aurora_ResourceCopy(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDst,
    struct aurora_device *dev = (struct aurora_device *)hDevice.pDrvPrivate;
    struct aurora_resource *dst = (struct aurora_resource *)hDst.pDrvPrivate;
    struct aurora_resource *src = (struct aurora_resource *)hSrc.pDrvPrivate;
-   if (!dev || !dev->pctx || !dst || !src || !dst->prsrc || !src->prsrc)
+   if (!dev || !dev->pctx || !dst || !src)
+      return;
+
+   if (dst->cb_cpu || src->cb_cpu) {
+      UINT bytes = MIN2(dst->width, src->width);
+      if (bytes == 0u)
+         return;
+      aurora_lock(dev);
+      if (dst->cb_cpu && src->cb_cpu) {
+         memcpy(dst->cb_cpu, src->cb_cpu, bytes);
+         aurora_mark_cb_dirty_locked(dev, dst);
+      } else if (src->cb_cpu && dst->prsrc) {
+         unsigned flags = PIPE_MAP_WRITE;
+         if (bytes == dst->width)
+            flags |= PIPE_MAP_DISCARD_WHOLE_RESOURCE;
+         dev->pctx->buffer_subdata(dev->pctx, dst->prsrc, flags,
+                                   0, bytes, src->cb_cpu);
+      } else if (dst->cb_cpu && src->prsrc) {
+         struct pipe_transfer *xfer = NULL;
+         struct pipe_box box = { .x = 0, .y = 0, .z = 0,
+                                 .width = (int)bytes, .height = 1, .depth = 1 };
+         void *ptr = dev->pctx->buffer_map(dev->pctx, src->prsrc, 0,
+                                           PIPE_MAP_READ, &box, &xfer);
+         if (ptr && xfer) {
+            memcpy(dst->cb_cpu, ptr, bytes);
+            dev->pctx->buffer_unmap(dev->pctx, xfer);
+            aurora_mark_cb_dirty_locked(dev, dst);
+         }
+      }
+      aurora_unlock(dev);
+      return;
+   }
+   if (!dst->prsrc || !src->prsrc)
       return;
 
    aurora_lock(dev);
@@ -881,7 +1006,44 @@ aurora_ResourceCopyRegion(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDst,
    struct aurora_device *dev = (struct aurora_device *)hDevice.pDrvPrivate;
    struct aurora_resource *dst = (struct aurora_resource *)hDst.pDrvPrivate;
    struct aurora_resource *src = (struct aurora_resource *)hSrc.pDrvPrivate;
-   if (!dev || !dev->pctx || !dst || !src || !dst->prsrc || !src->prsrc)
+   if (!dev || !dev->pctx || !dst || !src)
+      return;
+
+   if (dst->cb_cpu || src->cb_cpu) {
+      UINT src_off = pSrcBox ? pSrcBox->left : 0u;
+      UINT bytes = pSrcBox ? (pSrcBox->right - pSrcBox->left) : src->width;
+      if (src_off >= src->width || DstX >= dst->width || bytes == 0u)
+         return;
+      if (bytes > src->width - src_off)
+         bytes = src->width - src_off;
+      if (bytes > dst->width - DstX)
+         bytes = dst->width - DstX;
+      aurora_lock(dev);
+      if (dst->cb_cpu && src->cb_cpu) {
+         memcpy(dst->cb_cpu + DstX, src->cb_cpu + src_off, bytes);
+         aurora_mark_cb_dirty_locked(dev, dst);
+      } else if (src->cb_cpu && dst->prsrc) {
+         unsigned flags = PIPE_MAP_WRITE;
+         if (DstX == 0u && bytes == dst->width)
+            flags |= PIPE_MAP_DISCARD_WHOLE_RESOURCE;
+         dev->pctx->buffer_subdata(dev->pctx, dst->prsrc, flags,
+                                   DstX, bytes, src->cb_cpu + src_off);
+      } else if (dst->cb_cpu && src->prsrc) {
+         struct pipe_transfer *xfer = NULL;
+         struct pipe_box box = { .x = (int)src_off, .y = 0, .z = 0,
+                                 .width = (int)bytes, .height = 1, .depth = 1 };
+         void *ptr = dev->pctx->buffer_map(dev->pctx, src->prsrc, 0,
+                                           PIPE_MAP_READ, &box, &xfer);
+         if (ptr && xfer) {
+            memcpy(dst->cb_cpu + DstX, ptr, bytes);
+            dev->pctx->buffer_unmap(dev->pctx, xfer);
+            aurora_mark_cb_dirty_locked(dev, dst);
+         }
+      }
+      aurora_unlock(dev);
+      return;
+   }
+   if (!dst->prsrc || !src->prsrc)
       return;
 
    UINT dst_mips = MAX2(dst->mip_levels, 1u);

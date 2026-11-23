@@ -33,17 +33,31 @@ submit_present(struct aurora_device *dev, struct aurora_resource *src,
       return DXGI_ERROR_UNSUPPORTED;
    }
 
-   /* Flush pending GPU commands targeting the primary.
-    * For direct-scanout primaries, flush() synchronously calls D3DKMTSubmitCommand
-    * (with primary_writes marking the BO gpu_dirty in KMD) WITHOUT blocking the
-    * compositor thread on GPU completion; KMD's hardware IRQ wakes the display
-    * worker on completion. For non-direct primaries, wait for completion first. */
+   /* Flush pending GPU commands targeting the presented surface.
+    * - Direct-scanout primaries: flush() synchronously submits DMA with
+    *   primary_writes marking the BO gpu_dirty in KMD; KMD's hardware IRQ
+    *   retires it before DCP scanout.
+    * - Windowed/shared swapchain backbuffers: flush() non-blocking, then queue
+    *   a native WDDM 2.0 GPU-to-GPU WaitForSynchronizationObjectFromGpu on
+    *   dev->hKMContext against the render queue's monitored fence so dxgkrnl
+    *   orders DWM/Present strictly after GPU completion with ZERO CPU stall
+    *   (falling back to aurora_flush_and_wait only if the callback fails). */
+   uint32_t wait_sync = 0u;
+   uint64_t wait_val = 0u;
+   bool need_cpu_wait = false;
    aurora_lock(dev);
    if (dev->pctx) {
-      if (src->is_direct_scanout)
-         dev->pctx->flush(dev->pctx, NULL, 0);
-      else
-         aurora_flush_and_wait(dev);
+      dev->pctx->flush(dev->pctx, NULL, 0);
+      if (!src->is_direct_scanout) {
+         if (agx_context_get_last_submit_fence(dev->pctx, &wait_sync, &wait_val)) {
+            if (!dev->kt_callbacks.pfnWaitForSynchronizationObjectFromGpuCb)
+               need_cpu_wait = true;
+         }
+      }
+   }
+   if (need_cpu_wait) {
+      aurora_flush_and_wait(dev);
+      wait_sync = 0u;
    }
    aurora_unlock(dev);
 
@@ -56,6 +70,27 @@ submit_present(struct aurora_device *dev, struct aurora_resource *src,
 
    if (dev->locks_init)
       EnterCriticalSection(&dev->km_ctx_lock);
+   if (wait_sync != 0u && dev->kt_callbacks.pfnWaitForSynchronizationObjectFromGpuCb) {
+      D3DKMT_HANDLE sync_arr[1] = { (D3DKMT_HANDLE)wait_sync };
+      UINT64 val_arr[1] = { wait_val };
+      D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMGPU wcb;
+      memset(&wcb, 0, sizeof(wcb));
+      wcb.hContext = dev->hKMContext;
+      wcb.ObjectCount = 1u;
+      wcb.ObjectHandleArray = sync_arr;
+      wcb.MonitoredFenceValueArray = val_arr;
+      HRESULT whr = dev->kt_callbacks.pfnWaitForSynchronizationObjectFromGpuCb(
+         dev->hRTDevice.handle, &wcb);
+      if (FAILED(whr)) {
+         if (dev->locks_init)
+            LeaveCriticalSection(&dev->km_ctx_lock);
+         aurora_lock(dev);
+         aurora_flush_and_wait(dev);
+         aurora_unlock(dev);
+         if (dev->locks_init)
+            EnterCriticalSection(&dev->km_ctx_lock);
+      }
+   }
    HRESULT hr = dev->pfnPresentCb(dev->hRTDevice.handle, &cb);
    if (dev->locks_init)
       LeaveCriticalSection(&dev->km_ctx_lock);

@@ -124,4 +124,12 @@ int agx_d3dkmt_bo_export_external(
  */
 struct util_sync_provider *util_sync_provider_d3dkmt(struct agx_device *dev);
 
+/* Query the per-context monitored fence for the most recent submit on
+ * `queue_id`. Returns true if GPU work is still in flight (CPU VA < value)
+ * so callers (e.g. DXGI Present on a separate context) can queue an async
+ * GPU-to-GPU WaitForSynchronizationObjectFromGpu instead of stalling the CPU. */
+bool agx_d3dkmt_queue_last_fence(struct agx_device *dev, uint32_t queue_id,
+                                 agx_kmt_handle *out_sync,
+                                 uint64_t *out_value);
+
 extern const agx_device_ops_t agx_device_d3dkmt_ops;

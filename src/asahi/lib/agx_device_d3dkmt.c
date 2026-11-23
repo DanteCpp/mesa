@@ -1878,18 +1878,34 @@ d3dkmt_bo_unbind_object(struct agx_device *dev, uint32_t object_handle)
  * SUBMIT.
  * ------------------------------------------------------------------------- */
 static struct agx_bo *
-staging_for(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx, uint32_t size)
+staging_for(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx, uint32_t size,
+            size_t *out_offset)
 {
    struct agx_d3dkmt_winsys *ws = agx_d3dkmt_ws(dev);
    unsigned slot = ctx->staging_slot;
-   struct agx_bo *bo = ctx->staging[slot];
 
-   if (bo != NULL && bo->size < size) {
-      /* Wait for the slot to retire before recycling its memory. */
+   if (ctx->staging_retire[slot] != 0) {
+      /* Wait for this ring slot to retire before overwriting its memory. */
       if (agx_d3dkmt_wait_fence(ws, ctx->fence, ctx->fence_cpu,
                                 ctx->staging_retire[slot],
                                 AGX_D3DKMT_INFINITE))
          return NULL;
+   }
+
+   if (size <= AIL_PAGESIZE) {
+      if (ctx->staging_ring == NULL) {
+         ctx->staging_ring = agx_bo_create(
+            dev, (size_t)AGX_D3DKMT_STAGING_RING * AIL_PAGESIZE, 0, 0,
+            "D3DKMT cmdbuf ring");
+         if (ctx->staging_ring == NULL)
+            return NULL;
+      }
+      *out_offset = (size_t)slot * AIL_PAGESIZE;
+      return ctx->staging_ring;
+   }
+
+   struct agx_bo *bo = ctx->staging[slot];
+   if (bo != NULL && bo->size < size) {
       agx_bo_unreference(dev, bo);
       bo = ctx->staging[slot] = NULL;
    }
@@ -1903,14 +1919,9 @@ staging_for(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx, uint32_t size)
       if (bo == NULL)
          return NULL;
       ctx->staging[slot] = bo;
-      ctx->staging_retire[slot] = 0;
-   } else if (ctx->staging_retire[slot] != 0) {
-      if (agx_d3dkmt_wait_fence(ws, ctx->fence, ctx->fence_cpu,
-                                ctx->staging_retire[slot],
-                                AGX_D3DKMT_INFINITE))
-         return NULL;
    }
 
+   *out_offset = 0;
    return bo;
 }
 
@@ -2058,20 +2069,23 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
 
    /* The DMA buffer: header + verbatim AGX command stream, in a BO this
     * winsys owns and has already mapped to GPU VA. */
+   size_t staging_offset = 0;
    struct agx_bo *staging =
       staging_for(dev, ctx,
                   (uint32_t)sizeof(struct agxw_dma_header) +
-                     submit->cmdbuf_size);
+                     submit->cmdbuf_size,
+                  &staging_offset);
    if (staging == NULL) {
       errno = ENOMEM;
       goto out;
    }
 
-   uint8_t *map = agx_bo_map(staging);
-   if (map == NULL) {
+   uint8_t *map_base = agx_bo_map(staging);
+   if (map_base == NULL) {
       errno = ENOMEM;
       goto out;
    }
+   uint8_t *map = map_base + staging_offset;
 
    struct agxw_dma_header dma = {
       .magic = AGXW_DMA_MAGIC,
@@ -2246,7 +2260,7 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    }
 
    struct agx_kmt_submitcommand cmd = {
-      .Commands = staging->va->addr,
+      .Commands = staging->va->addr + staging_offset,
       .CommandLength =
          (uint32_t)sizeof(struct agxw_dma_header) + submit->cmdbuf_size,
       .pPrivateDriverData = priv,
@@ -2850,7 +2864,52 @@ d3dkmt_queue_create(struct agx_device *dev, struct drm_asahi_queue_create *q)
 
 out:
    simple_mtx_unlock(&ws->lock);
+   if (ret == 0) {
+      /* Pre-allocate the 16 x 16 KiB command staging ring BO while the GPU is
+       * idle so submits 1..16 never trigger mid-frame UpdateGpuVA GPU drains. */
+      struct agx_bo *ring = agx_bo_create(
+         dev, (size_t)AGX_D3DKMT_STAGING_RING * AIL_PAGESIZE, 0, 0,
+         "D3DKMT cmdbuf ring");
+      if (ring != NULL) {
+         simple_mtx_lock(&ws->lock);
+         struct agx_d3dkmt_ctx *live = ctx_get(ws, q->queue_id);
+         if (live != NULL && live->staging_ring == NULL) {
+            live->staging_ring = ring;
+            ring = NULL;
+         }
+         simple_mtx_unlock(&ws->lock);
+         if (ring != NULL)
+            agx_bo_unreference(dev, ring);
+      }
+   }
    return ret;
+}
+
+bool
+agx_d3dkmt_queue_last_fence(struct agx_device *dev, uint32_t queue_id,
+                            agx_kmt_handle *out_sync, uint64_t *out_value)
+{
+   if (dev == NULL || out_sync == NULL || out_value == NULL)
+      return false;
+   struct agx_d3dkmt_winsys *ws = agx_d3dkmt_ws(dev);
+   if (ws == NULL)
+      return false;
+
+   *out_sync = 0;
+   *out_value = 0;
+
+   simple_mtx_lock(&ws->lock);
+   struct agx_d3dkmt_ctx *ctx = ctx_get(ws, queue_id);
+   bool pending = false;
+   if (ctx != NULL && ctx->fence != 0 && ctx->fence_next != 0) {
+      if (ctx->fence_cpu == NULL || *ctx->fence_cpu < ctx->fence_next) {
+         *out_sync = ctx->fence;
+         *out_value = ctx->fence_next;
+         pending = true;
+      }
+   }
+   simple_mtx_unlock(&ws->lock);
+   return pending;
 }
 
 static int
@@ -2883,6 +2942,8 @@ d3dkmt_queue_destroy(struct agx_device *dev, struct drm_asahi_queue_destroy *q)
               q->queue_id, (unsigned)local.hContext,
               (unsigned)destroy_status);
 
+   if (local.staging_ring != NULL)
+      agx_bo_unreference(dev, local.staging_ring);
    for (unsigned i = 0; i < AGX_D3DKMT_STAGING_RING; ++i) {
       if (local.staging[i] != NULL)
          agx_bo_unreference(dev, local.staging[i]);
@@ -3477,6 +3538,8 @@ agx_d3dkmt_close_device(struct agx_device *dev)
                  "NTAGX_ENUM destroy_context close slot=%u context=0x%08x status=0x%08x\n",
                  i, (unsigned)dc.hContext, (unsigned)status);
 
+      if (ws->ctxs[i].staging_ring != NULL)
+         agx_bo_unreference(dev, ws->ctxs[i].staging_ring);
       for (unsigned slot = 0; slot < AGX_D3DKMT_STAGING_RING; ++slot) {
          if (ws->ctxs[i].staging[slot] != NULL)
             agx_bo_unreference(dev, ws->ctxs[i].staging[slot]);

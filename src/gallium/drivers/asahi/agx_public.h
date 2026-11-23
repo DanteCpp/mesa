@@ -32,6 +32,11 @@ struct pipe_resource *agx_resource_from_d3dkmt_allocation(
    bool is_primary);
 
 uint32_t agx_resource_get_d3dkmt_allocation(struct pipe_resource *prsrc);
+
+struct pipe_context;
+bool agx_context_get_last_submit_fence(struct pipe_context *pctx,
+                                       uint32_t *out_sync_handle,
+                                       uint64_t *out_fence_value);
 #endif
 
 #ifdef __cplusplus

@@ -240,6 +240,16 @@ struct aurora_resource {
    /* Active CPU Map transfers, indexed by subresource. */
    struct pipe_transfer **transfers;
    UINT num_subresources;
+
+   /* CPU-shadowed fast path for small pure constant buffers (uploaded into
+    * Gallium's persistent const_uploader ring on Draw/Dispatch instead of
+    * allocating/shadowing per-update 16 KiB D3DKMT GPU BOs). */
+   uint8_t *cb_cpu;
+   uint64_t cb_ver;
+   struct pipe_resource *cb_gpu_buf;
+   unsigned cb_gpu_off;
+   uint64_t cb_gpu_ver;
+   bool cb_mapped_write;
 };
 
 struct aurora_rtv {
@@ -391,6 +401,11 @@ struct aurora_device {
    UINT max_sampler_slot[AURORA_STAGE_COUNT];
 
    struct pipe_constant_buffer cbs[AURORA_STAGE_COUNT][AURORA_MAX_CBS];
+   struct aurora_resource *cb_res[AURORA_STAGE_COUNT][AURORA_MAX_CBS];
+   UINT cb_off[AURORA_STAGE_COUNT][AURORA_MAX_CBS];
+   UINT cb_sz[AURORA_STAGE_COUNT][AURORA_MAX_CBS];
+   uint64_t cb_bound_ver[AURORA_STAGE_COUNT][AURORA_MAX_CBS];
+   bool cb_dirty[AURORA_STAGE_COUNT];
 
    struct pipe_vertex_buffer vbs[AURORA_MAX_VBS];
    uint32_t vb_strides[AURORA_MAX_VBS];

@@ -56,6 +56,10 @@ struct agx_d3dkmt_ctx {
    bool completion_unknown;
    uint32_t submit_refs;
 
+   /* Single pre-allocated 16-slot x 16 KiB command staging ring BO, avoiding
+    * lazy per-submit D3DKMTCreateAllocation2/UpdateGpuVA GPU-idle stalls.
+    * Per-slot `staging[]` is only used for rare oversized (>16 KiB) submits. */
+   struct agx_bo *staging_ring;
    struct agx_bo *staging[AGX_D3DKMT_STAGING_RING];
    uint64_t staging_retire[AGX_D3DKMT_STAGING_RING];
    unsigned staging_slot;

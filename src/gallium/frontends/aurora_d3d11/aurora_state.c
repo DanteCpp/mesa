@@ -8,6 +8,7 @@
  */
 #include "aurora_d3d11.h"
 #include "aurora_format.h"
+#include "util/u_upload_mgr.h"
 
 #include <string.h>
 
@@ -933,19 +934,32 @@ set_constant_buffers_common(struct aurora_device *dev, enum aurora_stage stage,
       struct aurora_resource *r =
          phBuffers ? (struct aurora_resource *)phBuffers[i].pDrvPrivate : NULL;
       struct pipe_constant_buffer *cb = &dev->cbs[stage][slot];
-      if (r && r->prsrc) {
+      if (r && (r->prsrc || r->cb_cpu)) {
          UINT offset_bytes = pFirstConstant ? (pFirstConstant[i] * 16u) : 0u;
          UINT size_bytes = pNumConstants ? (pNumConstants[i] * 16u) : r->width;
          if (offset_bytes > r->width)
             offset_bytes = r->width;
          if (size_bytes > r->width - offset_bytes)
             size_bytes = r->width - offset_bytes;
-         pipe_resource_reference(&cb->buffer, r->prsrc);
-         cb->buffer_offset = offset_bytes;
-         cb->buffer_size = size_bytes;
-         cb->user_buffer = NULL;
-         dev->pctx->set_constant_buffer(dev->pctx, mst, slot, cb);
+         dev->cb_res[stage][slot] = r;
+         dev->cb_off[stage][slot] = offset_bytes;
+         dev->cb_sz[stage][slot] = size_bytes;
+         if (r->cb_cpu) {
+            dev->cb_bound_ver[stage][slot] = 0u;
+            dev->cb_dirty[stage] = true;
+         } else {
+            dev->cb_bound_ver[stage][slot] = 0u;
+            pipe_resource_reference(&cb->buffer, r->prsrc);
+            cb->buffer_offset = offset_bytes;
+            cb->buffer_size = size_bytes;
+            cb->user_buffer = NULL;
+            dev->pctx->set_constant_buffer(dev->pctx, mst, slot, cb);
+         }
       } else {
+         dev->cb_res[stage][slot] = NULL;
+         dev->cb_off[stage][slot] = 0u;
+         dev->cb_sz[stage][slot] = 0u;
+         dev->cb_bound_ver[stage][slot] = 0u;
          pipe_resource_reference(&cb->buffer, NULL);
          cb->buffer_offset = 0;
          cb->buffer_size = 0;
@@ -1080,6 +1094,29 @@ void
 aurora_sync_stage_resources(struct aurora_device *dev, enum aurora_stage stage)
 {
    mesa_shader_stage mst = aurora_stage_to_mesa(stage);
+   if (dev->cb_dirty[stage]) {
+      for (UINT i = 0; i < AURORA_MAX_CBS; ++i) {
+         struct aurora_resource *r = dev->cb_res[stage][i];
+         if (!r || !r->cb_cpu)
+            continue;
+         if (r->cb_gpu_ver != r->cb_ver || !r->cb_gpu_buf) {
+            u_upload_data_ref(dev->pctx->const_uploader, 0, r->width, 64,
+                              r->cb_cpu, &r->cb_gpu_off, &r->cb_gpu_buf);
+            if (r->cb_gpu_buf)
+               r->cb_gpu_ver = r->cb_ver;
+         }
+         if (r->cb_gpu_buf && dev->cb_bound_ver[stage][i] != r->cb_ver) {
+            struct pipe_constant_buffer *cb = &dev->cbs[stage][i];
+            pipe_resource_reference(&cb->buffer, r->cb_gpu_buf);
+            cb->buffer_offset = r->cb_gpu_off + dev->cb_off[stage][i];
+            cb->buffer_size = dev->cb_sz[stage][i];
+            cb->user_buffer = NULL;
+            dev->pctx->set_constant_buffer(dev->pctx, mst, i, cb);
+            dev->cb_bound_ver[stage][i] = r->cb_ver;
+         }
+      }
+      dev->cb_dirty[stage] = false;
+   }
    if (dev->srv_dirty[stage]) {
       struct pipe_sampler_view *views[PIPE_MAX_SAMPLERS];
       memset(views, 0, sizeof(views));

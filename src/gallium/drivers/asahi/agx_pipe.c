@@ -950,6 +950,11 @@ agx_prepare_for_map(struct agx_context *ctx, struct agx_resource *rsrc,
    if (!(usage & PIPE_MAP_WRITE))
       return;
 
+   /* Reclaim already-retired batches first (non-blocking) so finished readers
+    * release their BOs to the cache and do not trigger spurious shadowing or
+    * sync stalls on subsequent CPU uploads. */
+   while (agx_cleanup_batches(ctx) >= 0) {}
+
    /* If there are no readers, we're done. We check at the start to
     * avoid expensive shadowing paths or duplicated checks in this hapyp path.
     */
@@ -2436,6 +2441,26 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    agx_scratch_init(agx_device(screen), &ctx->scratch_fs);
    agx_scratch_init(agx_device(screen), &ctx->scratch_cs);
 
+#ifdef _WIN32
+   /* Pre-warm 4 sets of batch BOs (Encoder 512 KiB, Batch pool 256 KiB,
+    * executable pipeline pool 256 KiB) into bo_cache while the GPU is idle so
+    * pipelined multi-frame rendering never stalls mid-frame on WDDM VidMm
+    * UpdateGpuVirtualAddress address-space idle drains. */
+   {
+      struct agx_bo *warm[12] = {0};
+      unsigned nwarm = 0;
+      for (unsigned k = 0; k < 4; ++k) {
+         warm[nwarm++] = agx_bo_create(dev, 0x80000, 0, 0, "Encoder warm");
+         warm[nwarm++] = agx_bo_create(dev, 256 * 1024, 0, 0, "Batch pool warm");
+         warm[nwarm++] = agx_bo_create(dev, 256 * 1024, 0,
+                                       AGX_BO_LOW_VA | AGX_BO_EXEC,
+                                       "Pipeline pool warm");
+      }
+      for (unsigned k = 0; k < nwarm; ++k)
+         agx_bo_unreference(dev, warm[k]);
+   }
+#endif
+
    return pctx;
 }
 
@@ -3346,5 +3371,23 @@ agx_resource_get_d3dkmt_allocation(struct pipe_resource *prsrc)
       return 0;
    struct agx_resource *rsrc = agx_resource(prsrc);
    return rsrc->bo ? rsrc->bo->uapi_handle : 0;
+}
+
+bool
+agx_context_get_last_submit_fence(struct pipe_context *pctx,
+                                  uint32_t *out_sync_handle,
+                                  uint64_t *out_fence_value)
+{
+   if (!pctx || !pctx->screen || !out_sync_handle || !out_fence_value)
+      return false;
+   struct agx_context *ctx = agx_context(pctx);
+   struct agx_device *dev = agx_device(pctx->screen);
+   agx_kmt_handle sync = 0;
+   uint64_t val = 0;
+   if (!agx_d3dkmt_queue_last_fence(dev, ctx->queue_id, &sync, &val))
+      return false;
+   *out_sync_handle = (uint32_t)sync;
+   *out_fence_value = val;
+   return true;
 }
 #endif
