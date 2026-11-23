@@ -1430,7 +1430,7 @@ agx3_pack_scoped_barrier(enum agx_isa_encoding encoding,
                          enum agx3_barrier_scope scope,
                          struct agx3_encoded_scoped_barrier *out)
 {
-   if (scope == AGX3_BARRIER_SCOPE_SUBGROUP_SHARED) {
+   if (scope == AGX3_BARRIER_SCOPE_SHARED_ORDER) {
       if (!agx_isa_is_agx3(encoding) || out == NULL)
          return false;
       memset(out, 0, sizeof(*out));

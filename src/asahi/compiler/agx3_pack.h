@@ -189,8 +189,12 @@ enum agx3_barrier_scope {
    AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT,
    /* AGX3C only: a memory-only texture fence at threadgroup scope. */
    AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP,
-   /* Compiler ordering only: M5 subgroup shared memory needs no rendezvous. */
-   AGX3_BARRIER_SCOPE_SUBGROUP_SHARED,
+   /* Compiler ordering only, no instruction: a shared-memory fence without a
+    * workgroup execution barrier. Threadgroup memory needs no fence
+    * instruction, as on AGX2; a rendezvous here would make every invocation
+    * of the workgroup arrive, which a fence in divergent control flow does
+    * not do. */
+   AGX3_BARRIER_SCOPE_SHARED_ORDER,
    /* Captured native mesh_amplified entry before the payload device load. */
    AGX3_BARRIER_SCOPE_MESH_PAYLOAD_ENTRY,
    /* Captured object.write_childcount after the API workgroup barrier. */

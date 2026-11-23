@@ -672,13 +672,13 @@ int main(void)
    puts("M5_DEVICE_FENCE_PASS");
    memset(&fence, 0xa5, sizeof(fence));
    if (!agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3C,
-                                AGX3_BARRIER_SCOPE_SUBGROUP_SHARED, &fence) ||
+                                AGX3_BARRIER_SCOPE_SHARED_ORDER, &fence) ||
        fence.length != 0 ||
        !agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3B,
-                                AGX3_BARRIER_SCOPE_SUBGROUP_SHARED, &fence) ||
+                                AGX3_BARRIER_SCOPE_SHARED_ORDER, &fence) ||
        fence.length != 0)
       return 1;
-   puts("M5_SUBGROUP_SHARED_NO_RENDEZVOUS_PASS");
+   puts("SHARED_ORDER_NO_RENDEZVOUS_PASS");
 
 
    static const unsigned char expected[] = {
