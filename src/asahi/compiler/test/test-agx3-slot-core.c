@@ -803,6 +803,75 @@ int main(void)
       CHECK(r[13].wait_mask == ((1u << (r[7].slot - 1)) | (1u << (r[12].slot - 1))));
    }
 
+   /* Arms (enum agx3_slot_cf): a drain at the end of an arm runs under
+    * the arm's exec mask, which may be empty, so it retires only what the
+    * arm issued. A load from before the if is still waited for by its
+    * consumers after the arm and in an else arm. */
+   {
+      struct agx3_slot_instr open = st(0), close = st(0);
+      open.cf_push = 1;
+      open.cf_arm = true;
+      close.cf = AGX3_SLOT_CF_DRAIN;
+      close.cf_pop = 1;
+      struct agx3_slot_instr p[] = {
+         ld(10), open, alu(12, 10, 10), close, alu(14, 10, 10),
+      };
+      CHECK(agx3_slot_assign(p, 5, 6, r));
+      CHECK(r[2].wait_mask == (1u << (r[0].slot - 1)));
+      CHECK(r[4].wait_mask == (1u << (r[0].slot - 1)));
+   }
+   {
+      struct agx3_slot_instr open = st(0), other = st(0), close = st(0);
+      open.cf_push = 1;
+      open.cf_arm = true;
+      other.cf = AGX3_SLOT_CF_DRAIN;
+      other.cf_else = true;
+      close.cf = AGX3_SLOT_CF_DRAIN;
+      close.cf_pop = 1;
+      struct agx3_slot_instr p[] = {
+         ld(10), open, alu(12, 10, 10), other, alu(14, 10, 10), close,
+      };
+      CHECK(agx3_slot_assign(p, 6, 6, r));
+      CHECK(r[4].wait_mask == (1u << (r[0].slot - 1)));
+   }
+   /* What the arm issued is retired by the drain at its end. */
+   {
+      struct agx3_slot_instr open = st(0), close = st(0);
+      open.cf_push = 1;
+      open.cf_arm = true;
+      close.cf = AGX3_SLOT_CF_DRAIN;
+      close.cf_pop = 1;
+      struct agx3_slot_instr p[] = { open, ld(10), close, alu(12, 10, 10) };
+      CHECK(agx3_slot_assign(p, 4, 6, r));
+      CHECK(r[3].wait_mask == 0);
+   }
+   /* A non-arm level (a loop push, or an if that drains) drains as before. */
+   {
+      struct agx3_slot_instr open = st(0), close = st(0);
+      open.cf = AGX3_SLOT_CF_DRAIN;
+      open.cf_push = 1;
+      close.cf = AGX3_SLOT_CF_DRAIN;
+      close.cf_pop = 1;
+      struct agx3_slot_instr p[] = {
+         ld(10), open, alu(12, 10, 10), close, alu(14, 10, 10),
+      };
+      CHECK(agx3_slot_assign(p, 5, 6, r));
+      CHECK(r[2].wait_mask == 0 && r[4].wait_mask == 0);
+   }
+   /* An arm closed together with another level, or an unbalanced pop, is
+    * refused: the packer then drains everywhere. */
+   {
+      struct agx3_slot_instr open = st(0), close = st(0);
+      open.cf_push = 1;
+      open.cf_arm = true;
+      close.cf = AGX3_SLOT_CF_DRAIN;
+      close.cf_pop = 2;
+      struct agx3_slot_instr p[] = { open, open, close };
+      CHECK(!agx3_slot_assign(p, 3, 6, r));
+      struct agx3_slot_instr q[] = { close };
+      CHECK(!agx3_slot_assign(q, 1, 6, r));
+   }
+
    /* Malformed inputs. */
    CHECK(!agx3_slot_assign(NULL, 1, 6, r));
    { struct agx3_slot_instr p=ld(0); CHECK(!agx3_slot_assign(&p,1,0,r)); CHECK(!agx3_slot_assign(&p,1,9,r)); }

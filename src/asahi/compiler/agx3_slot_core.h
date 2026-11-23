@@ -68,10 +68,27 @@ enum agx3_slot_cf {
    AGX3_SLOT_CF_DRAIN,
 };
 
+/*
+ * A drain's retire carrier runs under the exec mask current where it is
+ * emitted, and an instruction no lane executes does not reliably wait. So the
+ * carrier at the end of an if arm (its else or pop_exec) retires only what
+ * that arm issued: a generation issued before the if, under the enclosing
+ * mask, may still be outstanding if the arm had no lanes. After an arm ends,
+ * assignment therefore resumes from the state at the if, and consumers of
+ * generations issued before it wait for them themselves; each consumer only
+ * runs with lanes, where its wait holds.
+ */
+
 struct agx3_slot_instr {
    bool is_async;   /* produces a scoreboard-tracked result */
    bool drain;      /* retire preceding async operations before a fence */
    uint8_t cf;      /* enum agx3_slot_cf */
+   /* Structured control flow: exec levels this instruction opens (an if or
+    * a loop push) and closes (pop_exec). cf_arm marks an opened level whose
+    * arm keeps results in flight (cf == AGX3_SLOT_CF_NONE); cf_else ends one
+    * arm of the innermost level and starts the next. */
+   uint8_t cf_push, cf_pop;
+   bool cf_arm, cf_else;
    /* This asynchronous instruction reads its sources when it retires rather
     * than when it issues, so redefining one of them first changes what it
     * transfers. Set it for device stores, whose payload nothing else tracks:

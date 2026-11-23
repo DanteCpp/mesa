@@ -13674,9 +13674,73 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                               resource_use_count, sl, count,
                               AGX3_SLOT_RESOURCE_HALVES, resource_bases, sl)))
       AGX3_PACK_FAIL();
+   /* Structured levels: an if or loop push opens one, pop_exec n closes n
+    * and an else switches arms. A forward if keeps results in flight into
+    * its arm only when the pop closing it closes nothing else, and a skip
+    * jump only right after such an if or its else (enum agx3_slot_cf in
+    * agx3_slot_core.h). Anything else drains as it always did. */
+   {
+      unsigned *open = rzalloc_array(ctx, unsigned, count ? count : 1);
+      unsigned *level_of = rzalloc_array(ctx, unsigned, count ? count : 1);
+      if (!open || !level_of)
+         AGX3_PACK_FAIL();
+      unsigned depth = 0;
+      bool balanced = !ctx->agx3_cf_drain_all;
+      for (unsigned i = 0; i < count && balanced; ++i) {
+         const agx_instr *I = ordered[i];
+         level_of[i] = depth ? open[depth - 1] + 1 : 0;
+         if (I->op == AGX_OPCODE_IF_ICMP || I->op == AGX_OPCODE_IF_FCMP) {
+            sl[i].cf_push = 1;
+            open[depth++] = i;
+         } else if (I->op == AGX_OPCODE_ELSE_ICMP ||
+                    I->op == AGX_OPCODE_ELSE_FCMP) {
+            sl[i].cf_else = true;
+            balanced = depth > 0;
+         } else if (I->op == AGX_OPCODE_POP_EXEC) {
+            balanced = I->nest <= depth;
+            sl[i].cf_pop = balanced ? I->nest : 0;
+            for (unsigned p = 0; balanced && p < I->nest; ++p) {
+               const unsigned at = open[--depth];
+               sl[at].cf_arm = sl[at].cf == AGX3_SLOT_CF_NONE && I->nest == 1;
+            }
+         }
+      }
+      balanced &= depth == 0;
+      for (unsigned i = 0; i < count; ++i) {
+         const agx_instr *I = ordered[i];
+         if (!balanced) {
+            sl[i].cf_push = sl[i].cf_pop = 0;
+            sl[i].cf_else = sl[i].cf_arm = false;
+         }
+         if ((I->op == AGX_OPCODE_IF_ICMP || I->op == AGX_OPCODE_IF_FCMP) &&
+             !sl[i].cf_arm)
+            sl[i].cf = AGX3_SLOT_CF_DRAIN;
+         if (I->op == AGX_OPCODE_JMP_EXEC_NONE &&
+             sl[i].cf == AGX3_SLOT_CF_NONE) {
+            const agx_instr *P = i ? ordered[i - 1] : NULL;
+            const bool after_arm_if = P && sl[i - 1].cf_arm;
+            const bool after_arm_else = P && sl[i - 1].cf_else &&
+               level_of[i - 1] && sl[level_of[i - 1] - 1].cf_arm;
+            if (!balanced || !(after_arm_if || after_arm_else))
+               sl[i].cf = AGX3_SLOT_CF_DRAIN;
+         }
+      }
+   }
+
    if (!agx3_slot_assign_with_entry(sl, count, nslots, &input_entry,
-                                    cprog_imports ? 1 : 0, res))
-      AGX3_PACK_FAIL();
+                                    cprog_imports ? 1 : 0, res)) {
+      /* Fall back to draining at every control-flow boundary. */
+      for (unsigned i = 0; i < count; ++i) {
+         sl[i].cf_push = sl[i].cf_pop = 0;
+         sl[i].cf_else = sl[i].cf_arm = false;
+         if (agx3_is_cf_op(ordered[i]) &&
+             ordered[i]->op != AGX_OPCODE_BEGIN_CF)
+            sl[i].cf = AGX3_SLOT_CF_DRAIN;
+      }
+      if (!agx3_slot_assign_with_entry(sl, count, nslots, &input_entry,
+                                       cprog_imports ? 1 : 0, res))
+         AGX3_PACK_FAIL();
+   }
 
    /* A branch that itself waits for a result (a compare reading a load)
     * has no grounded form carrying that wait, so it retires everything
@@ -13688,6 +13752,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          if (sl[i].cf == AGX3_SLOT_CF_NONE && agx3_is_cf_op(ordered[i]) &&
              res[i].wait_mask) {
             sl[i].cf = AGX3_SLOT_CF_DRAIN;
+            sl[i].cf_arm = false;
             upgraded = true;
          }
       }
@@ -13759,6 +13824,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
    const bool *tps_rereads = agx3_static_reload_rereads(ctx, ordered, count);
    if (!tps_rereads)
+      AGX3_PACK_FAIL();
+
+   /* The emission ledger follows the same arms as assignment: after an arm
+    * ends, what was outstanding at its if is outstanding again. */
+   uint16_t *cf_out_stack = rzalloc_array(ctx, uint16_t, count ? count : 1);
+   bool *cf_arm_stack = rzalloc_array(ctx, bool, count ? count : 1);
+   unsigned cf_depth = 0;
+   if (!cf_out_stack || !cf_arm_stack)
       AGX3_PACK_FAIL();
 
    k = 0;
@@ -14183,6 +14256,18 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          if (cf < 0)
             AGX3_REFUSE(I);
          if (cf > 0) {
+            const struct agx3_slot_instr *cf_e = &sl[instr_index];
+            if (cf_e->cf_else && cf_depth && cf_arm_stack[cf_depth - 1])
+               outstanding = cf_out_stack[cf_depth - 1];
+            for (unsigned p = 0; p < cf_e->cf_pop && cf_depth; ++p) {
+               --cf_depth;
+               if (cf_arm_stack[cf_depth])
+                  outstanding = cf_out_stack[cf_depth];
+            }
+            for (unsigned p = 0; p < cf_e->cf_push && cf_depth < count; ++p) {
+               cf_arm_stack[cf_depth] = cf_e->cf_arm;
+               cf_out_stack[cf_depth++] = outstanding;
+            }
             if (loop_entry_push)
                loop_depth++;
             else if (loop_pop && loop_depth > 0) {
@@ -23438,8 +23523,34 @@ agx3_pack_program(agx_context *ctx, struct util_dynarray *emission)
 {
    const unsigned staging_halfs = ctx->agx3_staging_halfs;
    const unsigned max_reg = ctx->max_reg;
+   /* Everything else a pack attempt records in the context, so a second
+    * attempt starts from the same state as the first. */
+   const struct agx3_colour_link_info colour_link = ctx->agx3_colour_link;
+   const bool staging_known = ctx->agx3_staging_known;
+   const bool fltnorm_start = ctx->agx3_fltnorm_start;
+   const bool g18_mixed_protocol = ctx->agx3_g18_mixed_protocol;
+   const unsigned uvs_reloc_count = ctx->agx3_uvs_reloc_count;
+   const unsigned uvs_relocs_size = ctx->agx3_uvs_relocs.size;
    ctx->agx3_g18g_output_staging_floor = 0;
    ctx->agx3_g18g_read_staging_end = 0;
+   ctx->agx3_cf_drain_all = false;
+   if (agx3_pack_binary(ctx, emission))
+      return true;
+
+   /* Results kept in flight into if arms can leave a consumer after the arm
+    * waiting on generations no form of it can name together (a select's
+    * two-slot rule). Draining at every boundary is the established form. */
+   ctx->agx3_staging_halfs = staging_halfs;
+   ctx->max_reg = max_reg;
+   ctx->agx3_colour_link = colour_link;
+   ctx->agx3_staging_known = staging_known;
+   ctx->agx3_fltnorm_start = fltnorm_start;
+   ctx->agx3_g18_mixed_protocol = g18_mixed_protocol;
+   ctx->agx3_uvs_reloc_count = uvs_reloc_count;
+   ctx->agx3_uvs_relocs.size = uvs_relocs_size;
+   ctx->agx3_g18g_output_staging_floor = 0;
+   ctx->agx3_g18g_read_staging_end = 0;
+   ctx->agx3_cf_drain_all = true;
    if (agx3_pack_binary(ctx, emission))
       return true;
 
@@ -23451,6 +23562,12 @@ agx3_pack_program(agx_context *ctx, struct util_dynarray *emission)
 
    ctx->agx3_staging_halfs = staging_halfs;
    ctx->max_reg = max_reg;
+   ctx->agx3_colour_link = colour_link;
+   ctx->agx3_staging_known = staging_known;
+   ctx->agx3_fltnorm_start = fltnorm_start;
+   ctx->agx3_g18_mixed_protocol = g18_mixed_protocol;
+   ctx->agx3_uvs_reloc_count = uvs_reloc_count;
+   ctx->agx3_uvs_relocs.size = uvs_relocs_size;
    ctx->agx3_g18g_read_staging_end = 0;
    ctx->agx3_g18g_output_staging_floor = output_floor;
    const bool packed = agx3_pack_binary(ctx, emission);
