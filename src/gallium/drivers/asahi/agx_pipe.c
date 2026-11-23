@@ -7,8 +7,14 @@
  */
 #include <errno.h>
 #include <stdio.h>
+#ifndef _WIN32
 #include <xf86drm.h>
 #include <linux/dma-buf.h>
+#include "gallium/auxiliary/renderonly/renderonly.h"
+#else
+#include "asahi/lib/agx_device_d3dkmt.h"
+#include "drm-uapi/drm.h"
+#endif
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/layout/layout.h"
 #include "asahi/genxml/agx3_cmdstream.h"
@@ -18,7 +24,6 @@
 #include "drm-uapi/asahi_drm.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "frontend/winsys_handle.h"
-#include "gallium/auxiliary/renderonly/renderonly.h"
 #include "gallium/auxiliary/util/u_debug_cb.h"
 #include "gallium/auxiliary/util/u_framebuffer.h"
 #include "gallium/auxiliary/util/u_sample_positions.h"
@@ -104,11 +109,13 @@ agx_resource_debug(struct agx_resource *res, const char *msg)
       return;
 
    int ino = -1;
+#ifndef _WIN32
    if (res->bo->prime_fd >= 0) {
       struct stat sb;
       if (!fstat(res->bo->prime_fd, &sb))
          ino = sb.st_ino;
    }
+#endif
 
    agx_msg(
       "%s%s %dx%dx%d %dL %d/%dM %dS M:%llx %s%s %s%s S:0x%llx LS:0x%llx CS:0x%llx "
@@ -193,6 +200,13 @@ agx_resource_from_handle(struct pipe_screen *pscreen,
                          const struct pipe_resource *templat,
                          struct winsys_handle *whandle, unsigned usage)
 {
+#ifdef _WIN32
+   (void)pscreen;
+   (void)templat;
+   (void)whandle;
+   (void)usage;
+   return NULL;
+#else
    struct agx_device *dev = agx_device(pscreen);
    struct agx_resource *rsc;
    struct pipe_resource *prsc;
@@ -271,6 +285,7 @@ agx_resource_from_handle(struct pipe_screen *pscreen,
    agx_resource_debug(rsc, "Import: ");
 
    return prsc;
+#endif
 }
 
 static bool
@@ -278,6 +293,14 @@ agx_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *ctx,
                         struct pipe_resource *pt, struct winsys_handle *handle,
                         unsigned usage)
 {
+#ifdef _WIN32
+   (void)pscreen;
+   (void)ctx;
+   (void)pt;
+   (void)handle;
+   (void)usage;
+   return false;
+#else
    struct agx_device *dev = agx_device(pscreen);
    struct pipe_resource *cur = pt;
 
@@ -337,6 +360,7 @@ agx_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *ctx,
    handle->modifier = rsrc->modifier;
 
    return true;
+#endif
 }
 
 static bool
@@ -712,8 +736,10 @@ agx_resource_destroy(struct pipe_screen *screen, struct pipe_resource *prsrc)
    if (prsrc->target == PIPE_BUFFER)
       util_range_destroy(&rsrc->valid_buffer_range);
 
+#ifndef _WIN32
    if (rsrc->scanout)
       renderonly_scanout_destroy(rsrc->scanout, agx_screen->dev.ro);
+#endif
 
    agx_bo_unreference(&agx_screen->dev, rsrc->bo);
    FREE(rsrc);
@@ -827,7 +853,7 @@ agx_shadow(struct agx_context *ctx, struct agx_resource *rsrc, bool needs_copy)
 static void
 agx_sync_foreign_writer(struct agx_context *ctx, struct agx_resource *rsrc)
 {
-   struct agx_device *dev = agx_device(ctx->base.screen);
+   struct agx_screen *screen = agx_screen(ctx->base.screen);
    struct agx_bo *bos[2] = {rsrc->bo,
                             rsrc->separate_stencil ? rsrc->separate_stencil->bo
                                                    : NULL};
@@ -842,11 +868,12 @@ agx_sync_foreign_writer(struct agx_context *ctx, struct agx_resource *rsrc)
          uint32_t syncobj = agx_bo_writer_syncobj(writer);
          int ret;
          do {
-            ret = drmSyncobjWait(dev->fd, &syncobj, 1, INT64_MAX,
-                                 DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+            ret = agx_syncobj_wait(screen, &syncobj, 1, INT64_MAX,
+                                   DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
          } while (ret == -EINTR);
       }
 
+#ifndef _WIN32
       if ((bo->flags & AGX_BO_SHARED) && bo->prime_fd >= 0) {
          struct dma_buf_sync sync = {
             .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
@@ -856,6 +883,7 @@ agx_sync_foreign_writer(struct agx_context *ctx, struct agx_resource *rsrc)
             drmIoctl(bo->prime_fd, DMA_BUF_IOCTL_SYNC, &sync);
          }
       }
+#endif
    }
 }
 
@@ -2154,14 +2182,16 @@ agx_destroy_context(struct pipe_context *pctx)
     **/
    u_rwlock_wrlock(&screen->destroy_lock);
 
-   drmSyncobjDestroy(dev->fd, ctx->in_sync_obj);
-   drmSyncobjDestroy(dev->fd, ctx->dummy_syncobj);
+   agx_syncobj_destroy(screen, ctx->in_sync_obj);
+   agx_syncobj_destroy(screen, ctx->dummy_syncobj);
+#ifndef _WIN32
    if (ctx->in_sync_fd != -1)
       close(ctx->in_sync_fd);
+#endif
 
    for (unsigned i = 0; i < AGX_MAX_BATCHES; ++i) {
       if (ctx->batches.slots[i].syncobj)
-         drmSyncobjDestroy(dev->fd, ctx->batches.slots[i].syncobj);
+         agx_syncobj_destroy(screen, ctx->batches.slots[i].syncobj);
    }
 
    if (ctx->timestamps) {
@@ -2371,12 +2401,12 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 
    /* Sync object/FD used for NATIVE_FENCE_FD. */
    ctx->in_sync_fd = -1;
-   ret = drmSyncobjCreate(agx_device(screen)->fd, 0, &ctx->in_sync_obj);
+   ret = agx_syncobj_create(agx_screen(screen), 0, &ctx->in_sync_obj);
    assert(!ret);
 
    /* Dummy sync object used before any work has been submitted. */
-   ret = drmSyncobjCreate(agx_device(screen)->fd, DRM_SYNCOBJ_CREATE_SIGNALED,
-                          &ctx->dummy_syncobj);
+   ret = agx_syncobj_create(agx_screen(screen), DRM_SYNCOBJ_CREATE_SIGNALED,
+                            &ctx->dummy_syncobj);
    assert(!ret);
    ctx->syncobj = ctx->dummy_syncobj;
 
@@ -2495,8 +2525,10 @@ agx_init_shader_caps(struct pipe_screen *pscreen)
          caps->max_texture_samplers = PIPE_MAX_SAMPLERS;
       else if (strcmp(util_get_process_name(), "run") == 0)
          caps->max_texture_samplers = PIPE_MAX_SAMPLERS;
+#ifndef _WIN32
       else if (strcasestr(util_get_process_name(), "ryujinx") != NULL)
          caps->max_texture_samplers = PIPE_MAX_SAMPLERS;
+#endif
       else
          caps->max_texture_samplers = 16;
 
@@ -2976,14 +3008,24 @@ agx_destroy_screen(struct pipe_screen *pscreen)
    if (p_atomic_read(&screen->submit_quarantined))
       return;
 
-   drmSyncobjDestroy(screen->dev.fd, screen->flush_syncobj);
+   if (screen->sync) {
+      if (screen->flush_syncobj)
+         agx_syncobj_destroy(screen, screen->flush_syncobj);
+      screen->sync->finalize(screen->sync);
+      screen->sync = NULL;
+   }
 
+#ifndef _WIN32
    if (screen->dev.ro)
       screen->dev.ro->destroy(screen->dev.ro);
+#endif
 
    agx_bo_unreference(&screen->dev, screen->rodata);
    u_transfer_helper_destroy(pscreen->transfer_helper);
    agx_close_device(&screen->dev);
+#ifdef _WIN32
+   agx_d3dkmt_close_device(&screen->dev);
+#endif
    disk_cache_destroy(screen->disk_cache);
    ralloc_free(screen);
 }
@@ -3062,41 +3104,10 @@ agx_get_cl_cts_version(struct pipe_screen *pscreen)
    return NULL;
 }
 
-struct pipe_screen *
-agx_screen_create(int fd, struct renderonly *ro,
-                  const struct pipe_screen_config *config)
+static struct pipe_screen *
+agx_screen_init_common(struct agx_screen *agx_screen)
 {
-   struct agx_screen *agx_screen;
-   struct pipe_screen *screen;
-
-   agx_screen = rzalloc(NULL, struct agx_screen);
-   if (!agx_screen)
-      return NULL;
-
-   screen = &agx_screen->pscreen;
-
-   /* parse driconf configuration now for device specific overrides */
-   driParseConfigFiles(config->options, config->options_info,
-                       &(driConfigFileParseParams) {
-                          .driverName = "aurora",
-                          .driverNameAlias = "asahi",
-                       });
-
-   agx_screen->dev.fd = fd;
-   agx_screen->dev.ro = ro;
-   u_rwlock_init(&agx_screen->destroy_lock);
-
-   /* Try to open an AGX device */
-   if (!agx_open_device(agx_screen, &agx_screen->dev)) {
-      ralloc_free(agx_screen);
-      return NULL;
-   }
-
-   /* Forward no16 flag from driconf. This must happen after opening the device,
-    * since agx_open_device sets debug.
-    */
-   if (driQueryOptionb(config->options, "asahi_no_fp16"))
-      agx_screen->dev.debug |= AGX_DBG_NO16;
+   struct pipe_screen *screen = &agx_screen->pscreen;
 
    /* G18G's packer has grounded half-precision forms for only part of what
     * mediump lowering produces (half FSEL/ADD/FMA with immediates or abs
@@ -3105,16 +3116,14 @@ agx_screen_create(int fd, struct renderonly *ro,
    if (agx_screen->dev.chip == AGX_CHIP_G18G)
       agx_screen->dev.debug |= AGX_DBG_NO16;
 
-   int ret =
-      drmSyncobjCreate(agx_device(screen)->fd, 0, &agx_screen->flush_syncobj);
-   assert(!ret);
+   if (!agx_screen->sync)
+      return NULL;
+
+   int ret = agx_syncobj_create(agx_screen, 0, &agx_screen->flush_syncobj);
+   if (ret)
+      return NULL;
 
    simple_mtx_init(&agx_screen->flush_seqid_lock, mtx_plain);
-
-   agx_screen->heap_memory_percent =
-      driQueryOptionf(config->options, "heap_memory_percent");
-   if (agx_screen->heap_memory_percent == OS_GPU_HEAP_SIZE_HEURISTIC)
-      agx_screen->heap_memory_percent = 1.0f;
 
    screen->destroy = agx_destroy_screen;
    screen->get_screen_fd = agx_screen_get_fd;
@@ -3168,6 +3177,8 @@ agx_screen_create(int fd, struct renderonly *ro,
    {
       struct agx_bo *bo =
          agx_bo_create(&agx_screen->dev, 16384, 0, 0, "Rodata");
+      if (!bo)
+         return NULL;
 
       agx_pack_txf_sampler((struct agx_sampler_packed *)agx_bo_map(bo));
 
@@ -3182,3 +3193,152 @@ agx_screen_create(int fd, struct renderonly *ro,
 
    return screen;
 }
+
+struct pipe_screen *
+agx_screen_create(int fd, struct renderonly *ro,
+                  const struct pipe_screen_config *config)
+{
+#ifdef _WIN32
+   (void)fd;
+   (void)ro;
+   (void)config;
+   return NULL;
+#else
+   struct agx_screen *agx_screen;
+
+   agx_screen = rzalloc(NULL, struct agx_screen);
+   if (!agx_screen)
+      return NULL;
+
+   /* parse driconf configuration now for device specific overrides */
+   driParseConfigFiles(config->options, config->options_info,
+                       &(driConfigFileParseParams) {
+                          .driverName = "aurora",
+                          .driverNameAlias = "asahi",
+                       });
+
+   agx_screen->dev.fd = fd;
+   agx_screen->dev.ro = ro;
+   u_rwlock_init(&agx_screen->destroy_lock);
+
+   /* Try to open an AGX device */
+   if (!agx_open_device(agx_screen, &agx_screen->dev)) {
+      ralloc_free(agx_screen);
+      return NULL;
+   }
+
+   /* Forward no16 flag from driconf. This must happen after opening the device,
+    * since agx_open_device sets debug.
+    */
+   if (driQueryOptionb(config->options, "asahi_no_fp16"))
+      agx_screen->dev.debug |= AGX_DBG_NO16;
+
+   agx_screen->heap_memory_percent =
+      driQueryOptionf(config->options, "heap_memory_percent");
+   if (agx_screen->heap_memory_percent == OS_GPU_HEAP_SIZE_HEURISTIC)
+      agx_screen->heap_memory_percent = 1.0f;
+
+   agx_screen->sync = util_sync_provider_drm(fd);
+   struct pipe_screen *screen = agx_screen_init_common(agx_screen);
+   if (!screen) {
+      agx_destroy_screen(&agx_screen->pscreen);
+      return NULL;
+   }
+   return screen;
+#endif
+}
+
+#ifdef _WIN32
+struct pipe_screen *
+agx_screen_create_d3dkmt(const struct agx_kmt_luid *luid,
+                         const void *rt_bridge)
+{
+   struct agx_screen *agx_screen = rzalloc(NULL, struct agx_screen);
+   if (!agx_screen)
+      return NULL;
+
+   u_rwlock_init(&agx_screen->destroy_lock);
+   agx_screen->heap_memory_percent = 1.0f;
+
+   if (!agx_d3dkmt_open_device_rt(&agx_screen->dev, luid, rt_bridge)) {
+      ralloc_free(agx_screen);
+      return NULL;
+   }
+
+   if (!agx_open_device(agx_screen, &agx_screen->dev)) {
+      agx_d3dkmt_close_device(&agx_screen->dev);
+      ralloc_free(agx_screen);
+      return NULL;
+   }
+
+   agx_screen->sync = util_sync_provider_d3dkmt(&agx_screen->dev);
+   struct pipe_screen *screen = agx_screen_init_common(agx_screen);
+   if (!screen) {
+      agx_destroy_screen(&agx_screen->pscreen);
+      return NULL;
+   }
+   return screen;
+}
+
+struct pipe_resource *
+agx_resource_from_d3dkmt_allocation(struct pipe_screen *pscreen,
+                                    const struct pipe_resource *templ,
+                                    uint32_t allocation, size_t size,
+                                    uint32_t linear_stride_B, bool linear,
+                                    bool is_primary)
+{
+   struct agx_device *dev = agx_device(pscreen);
+   struct agx_resource *rsc = CALLOC_STRUCT(agx_resource);
+   if (!rsc)
+      return NULL;
+
+   rsc->base = *templ;
+   rsc->base.screen = pscreen;
+   pipe_reference_init(&rsc->base.reference, 1);
+
+   rsc->modifier =
+      linear ? DRM_FORMAT_MOD_LINEAR : DRM_FORMAT_MOD_APPLE_GPU_TILED;
+   rsc->mipmapped = (templ->last_level > 0);
+   if (is_primary)
+      rsc->base.bind |= PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET;
+   rsc->base.bind |= PIPE_BIND_SHARED;
+
+   agx_resource_setup(dev, rsc);
+   if (linear && linear_stride_B != 0)
+      rsc->layout.linear_stride_B = linear_stride_B;
+   ail_make_miptree(&rsc->layout);
+
+   const size_t import_size = MAX2(size, (size_t)rsc->layout.size_B);
+   rsc->bo = agx_d3dkmt_bo_import_local(
+      dev, allocation, import_size,
+      is_primary ? "D3D11 Primary" : "D3D11 Shared");
+   if (!rsc->bo) {
+      FREE(rsc);
+      return NULL;
+   }
+
+   if (rsc->layout.size_B > rsc->bo->size) {
+      agx_bo_unreference(dev, rsc->bo);
+      FREE(rsc);
+      return NULL;
+   }
+
+   if (is_primary)
+      rsc->bo->flags |= AGX_BO_PRIMARY;
+
+   if (rsc->base.target == PIPE_BUFFER)
+      util_range_init(&rsc->valid_buffer_range);
+
+   agx_resource_debug(rsc, "D3DKMT Import: ");
+   return &rsc->base;
+}
+
+uint32_t
+agx_resource_get_d3dkmt_allocation(struct pipe_resource *prsrc)
+{
+   if (!prsrc)
+      return 0;
+   struct agx_resource *rsrc = agx_resource(prsrc);
+   return rsrc->bo ? rsrc->bo->uapi_handle : 0;
+}
+#endif

@@ -3149,7 +3149,8 @@ d3dkmt_device_lease_release(struct agx_d3dkmt_winsys *ws)
 }
 
 bool
-agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
+agx_d3dkmt_open_device_rt(struct agx_device *dev, const struct agx_kmt_luid *luid,
+                          const void *rt_bridge)
 {
    struct agx_d3dkmt_winsys *ws = calloc(1, sizeof(*ws));
    if (ws == NULL)
@@ -3234,7 +3235,7 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
    /* This current-Mesa runtime port audits the J813/M5 layout. Native AGX3
     * has mutable fixed context/low-slot aliases requiring a distinct lifetime
     * contract, so it must not inherit the legacy content-defined alias model. */
-   if (agx_d3dkmt_bridge_enabled() &&
+   if ((rt_bridge != NULL || agx_d3dkmt_bridge_enabled()) &&
        (!ws->m5_guard_required || identity.chip_id != 0x8142 ||
         identity.gpu_generation != 17 || identity.gpu_variant != 'G'))
       goto fail_params;
@@ -3253,9 +3254,11 @@ agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
     * (d3dkmt_submit() places them exactly where the ioctl carries
     * them). The winsys neither splits nor rewrites the stream. */
 
-   bool device_status = agx_d3dkmt_bridge_enabled()
-                           ? agx_d3dkmt_bridge_install(ws)
-                           : d3dkmt_device_lease_acquire(ws);
+   bool device_status =
+      rt_bridge != NULL
+         ? agx_d3dkmt_bridge_install_direct(ws, rt_bridge)
+         : (agx_d3dkmt_bridge_enabled() ? agx_d3dkmt_bridge_install(ws)
+                                        : d3dkmt_device_lease_acquire(ws));
    if (enum_log_enabled())
       d3dkmt_log_flushed(
               "NTAGX_ENUM create_device status=%u device=0x%08x shared=%u\n",
@@ -3323,6 +3326,12 @@ fail_adapter:;
 fail_alloc:
    free(ws);
    return false;
+}
+
+bool
+agx_d3dkmt_open_device(struct agx_device *dev, const struct agx_kmt_luid *luid)
+{
+   return agx_d3dkmt_open_device_rt(dev, luid, NULL);
 }
 
 void

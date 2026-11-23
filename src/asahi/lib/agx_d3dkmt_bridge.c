@@ -1824,6 +1824,102 @@ bridge_adapter_matches(struct agx_d3dkmt_winsys *ws, const AuroraGpuBridge *b)
    return valid && qualifying == 1 && own_luid;
 }
 
+static bool
+agx_d3dkmt_bridge_install_common(struct agx_d3dkmt_winsys *ws,
+                                 const AuroraGpuBridge *b,
+                                 HMODULE umd,
+                                 bool require_resource_handoff)
+{
+   if (b == NULL || b->struct_size != sizeof(*b) ||
+       b->abi_version != AURORA_GPU_BRIDGE_ABI_VERSION ||
+       b->callbacks == NULL || b->hRTDevice == NULL || b->hRTAdapter == NULL ||
+       b->alive == NULL || b->in_flight == NULL || b->query_adapter_info == NULL) {
+      fprintf(stderr, "agx_d3dkmt_bridge: invalid runtime bridge descriptor\n");
+      return false;
+   }
+   if (!bridge_adapter_matches(ws, b)) {
+      fprintf(stderr, "agx_d3dkmt_bridge: runtime/raw adapter identity ambiguous or mismatched\n");
+      return false;
+   }
+   const struct agxw_ddi_devicecallbacks *callbacks =
+      (const struct agxw_ddi_devicecallbacks *)b->callbacks;
+   if ((require_resource_handoff &&
+        (g_resource_acquire == NULL || g_resource_complete == NULL)) ||
+       callbacks->pfnAllocateCb == NULL ||
+       callbacks->pfnCreateContextVirtualCb == NULL ||
+       callbacks->pfnCreatePagingQueueCb == NULL ||
+       callbacks->pfnCreateSynchronizationObject2Cb == NULL ||
+       callbacks->pfnDeallocate2Cb == NULL ||
+       callbacks->pfnDestroyContextCb == NULL ||
+       callbacks->pfnDestroyPagingQueueCb == NULL ||
+       callbacks->pfnDestroySynchronizationObjectCb == NULL ||
+       callbacks->pfnEscapeCb == NULL ||
+       callbacks->pfnEvictCb == NULL ||
+       callbacks->pfnFreeGpuVirtualAddressCb == NULL ||
+       callbacks->pfnInvalidateCacheCb == NULL ||
+       callbacks->pfnLock2Cb == NULL ||
+       callbacks->pfnMakeResidentCb == NULL ||
+       callbacks->pfnReserveGpuVirtualAddressCb == NULL ||
+       callbacks->pfnSignalSynchronizationObjectFromCpuCb == NULL ||
+       callbacks->pfnSignalSynchronizationObjectFromGpuCb == NULL ||
+       callbacks->pfnSubmitCommandCb == NULL ||
+       callbacks->pfnUnlock2Cb == NULL ||
+       callbacks->pfnUpdateGpuVirtualAddressCb == NULL ||
+       callbacks->pfnWaitForSynchronizationObjectFromCpuCb == NULL ||
+       callbacks->pfnWaitForSynchronizationObjectFromGpuCb == NULL) {
+      fprintf(stderr,
+              "agx_d3dkmt_bridge: required runtime device callbacks missing\n");
+      return false;
+   }
+
+   AcquireSRWLockExclusive(&g_registry_lock);
+   int slot = agxw_bridge_provider_alloc(&g_registry, b->callbacks, b->hRTDevice);
+   if (slot >= 0 && !InitializeCriticalSectionEx(&g_context_gate[slot], 0, 0)) {
+      agxw_bridge_provider_free(&g_registry, (unsigned)slot);
+      slot = -1;
+   }
+   if (slot >= 0) {
+      g_publisher[slot] = umd;
+      g_raw_adapter[slot] = ws->adapter;
+      g_raw_escape[slot] = ws->fns.Escape;
+      g_registry.prov[slot].hRTAdapter = b->hRTAdapter;
+      g_registry.prov[slot].alive = (const void *)b->alive;
+      g_registry.prov[slot].alive_value = (uint64_t)b->alive_value;
+      g_registry.prov[slot].in_flight = (const void *)b->in_flight;
+      InterlockedExchange(&g_local_closing[slot], 0);
+   }
+   ReleaseSRWLockExclusive(&g_registry_lock);
+   if (slot < 0) {
+      fprintf(stderr,
+              "agx_d3dkmt_bridge: all %u provider slots in use; refusing device\n",
+              AGXW_BRIDGE_MAX_DEVICES);
+      return false;
+   }
+
+   AcquireSRWLockExclusive(&g_diag_lock[slot]);
+   memset(&g_diag[slot], 0, sizeof(g_diag[slot]));
+   ReleaseSRWLockExclusive(&g_diag_lock[slot]);
+
+   install_slot(&ws->fns, (unsigned)slot);
+   ws->device = agxw_bridge_sentinel_for_slot((unsigned)slot);
+   ws->device_lease_held = false;
+
+   fprintf(stderr,
+           "agx_d3dkmt_bridge: installed on runtime device %p slot=%d live=%u "
+           "(callbacks %p direct=%u)\n",
+           b->hRTDevice, slot, agxw_bridge_provider_count(&g_registry),
+           b->callbacks, umd == NULL ? 1u : 0u);
+   return true;
+}
+
+bool
+agx_d3dkmt_bridge_install_direct(struct agx_d3dkmt_winsys *ws,
+                                 const void *rt_bridge)
+{
+   return agx_d3dkmt_bridge_install_common(
+      ws, (const AuroraGpuBridge *)rt_bridge, NULL, false);
+}
+
 bool
 agx_d3dkmt_bridge_install(struct agx_d3dkmt_winsys *ws)
 {
@@ -1856,92 +1952,19 @@ agx_d3dkmt_bridge_install(struct agx_d3dkmt_winsys *ws)
     * last resort for the lone-device case and safely returns 0 when ambiguous. */
    int ok = (acquire_current != NULL && acquire_current(&b)) ||
             (acquire_single != NULL && acquire_single(&b));
-   if (!ok || b.struct_size != sizeof(b) ||
-       b.abi_version != AURORA_GPU_BRIDGE_ABI_VERSION ||
-       b.callbacks == NULL || b.hRTDevice == NULL || b.hRTAdapter == NULL ||
-       b.alive == NULL || b.in_flight == NULL || b.query_adapter_info == NULL) {
+   if (!ok || resource_acquire == NULL || resource_complete == NULL) {
       fprintf(stderr, "agx_d3dkmt_bridge: no runtime bridge published for this "
                       "thread (ABI/version mismatch or device not creating)\n");
-      FreeLibrary(umd);
-      return false;
-   }
-   if (!bridge_adapter_matches(ws, &b)) {
-      fprintf(stderr, "agx_d3dkmt_bridge: runtime/raw adapter identity ambiguous or mismatched\n");
-      FreeLibrary(umd);
-      return false;
-   }
-   const struct agxw_ddi_devicecallbacks *callbacks =
-      (const struct agxw_ddi_devicecallbacks *)b.callbacks;
-   if (resource_acquire == NULL || resource_complete == NULL ||
-       callbacks->pfnAllocateCb == NULL ||
-       callbacks->pfnCreateContextVirtualCb == NULL ||
-       callbacks->pfnCreatePagingQueueCb == NULL ||
-       callbacks->pfnCreateSynchronizationObject2Cb == NULL ||
-       callbacks->pfnDeallocate2Cb == NULL ||
-       callbacks->pfnDestroyContextCb == NULL ||
-       callbacks->pfnDestroyPagingQueueCb == NULL ||
-       callbacks->pfnDestroySynchronizationObjectCb == NULL ||
-       callbacks->pfnEscapeCb == NULL ||
-       callbacks->pfnEvictCb == NULL ||
-       callbacks->pfnFreeGpuVirtualAddressCb == NULL ||
-       callbacks->pfnInvalidateCacheCb == NULL ||
-       callbacks->pfnLock2Cb == NULL ||
-       callbacks->pfnMakeResidentCb == NULL ||
-       callbacks->pfnReserveGpuVirtualAddressCb == NULL ||
-       callbacks->pfnSignalSynchronizationObjectFromCpuCb == NULL ||
-       callbacks->pfnSignalSynchronizationObjectFromGpuCb == NULL ||
-       callbacks->pfnSubmitCommandCb == NULL ||
-       callbacks->pfnUnlock2Cb == NULL ||
-       callbacks->pfnUpdateGpuVirtualAddressCb == NULL ||
-       callbacks->pfnWaitForSynchronizationObjectFromCpuCb == NULL ||
-       callbacks->pfnWaitForSynchronizationObjectFromGpuCb == NULL) {
-      fprintf(stderr,
-              "agx_d3dkmt_bridge: runtime-resource handoff ABI/callbacks "
-              "missing; refusing partial bridge\n");
       FreeLibrary(umd);
       return false;
    }
    g_resource_acquire = resource_acquire;
    g_resource_complete = resource_complete;
 
-   AcquireSRWLockExclusive(&g_registry_lock);
-   int slot = agxw_bridge_provider_alloc(&g_registry, b.callbacks, b.hRTDevice);
-   if (slot >= 0 && !InitializeCriticalSectionEx(&g_context_gate[slot], 0, 0)) {
-      agxw_bridge_provider_free(&g_registry, (unsigned)slot);
-      slot = -1;
-   }
-   if (slot >= 0) {
-      g_publisher[slot] = umd;
-      g_raw_adapter[slot] = ws->adapter;
-      g_raw_escape[slot] = ws->fns.Escape;
-      g_registry.prov[slot].hRTAdapter = b.hRTAdapter;
-      g_registry.prov[slot].alive = (const void *)b.alive;
-      g_registry.prov[slot].alive_value = (uint64_t)b.alive_value;
-      g_registry.prov[slot].in_flight = (const void *)b.in_flight;
-      InterlockedExchange(&g_local_closing[slot], 0);
-   }
-   ReleaseSRWLockExclusive(&g_registry_lock);
-   if (slot < 0) {
-      fprintf(stderr,
-              "agx_d3dkmt_bridge: all %u provider slots in use; refusing device\n",
-              AGXW_BRIDGE_MAX_DEVICES);
+   if (!agx_d3dkmt_bridge_install_common(ws, &b, umd, true)) {
       FreeLibrary(umd);
       return false;
    }
-
-   AcquireSRWLockExclusive(&g_diag_lock[slot]);
-   memset(&g_diag[slot], 0, sizeof(g_diag[slot]));
-   ReleaseSRWLockExclusive(&g_diag_lock[slot]);
-
-   install_slot(&ws->fns, (unsigned)slot);
-   ws->device = agxw_bridge_sentinel_for_slot((unsigned)slot);
-   ws->device_lease_held = false;
-
-   fprintf(stderr,
-           "agx_d3dkmt_bridge: installed on runtime device %p slot=%d live=%u "
-           "(callbacks %p)\n",
-           b.hRTDevice, slot, agxw_bridge_provider_count(&g_registry),
-           b.callbacks);
    return true;
 }
 

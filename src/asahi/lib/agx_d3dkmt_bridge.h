@@ -52,6 +52,17 @@ bool agx_d3dkmt_bridge_enabled(void);
  */
 bool agx_d3dkmt_bridge_install(struct agx_d3dkmt_winsys *ws);
 
+/*
+ * Direct in-process bridge install for a native D3D11 UMD that already holds
+ * its own AuroraGpuBridge (hRTDevice, hRTAdapter, D3DDDI_DEVICECALLBACKS, etc.).
+ * Avoids GetModuleHandle/GetProcAddress and environment-variable gating; does
+ * not require Triton resource-handoff callbacks because the native UMD creates
+ * primary/shared runtime allocations directly and imports them via
+ * agx_d3dkmt_bo_import_local().
+ */
+bool agx_d3dkmt_bridge_install_direct(struct agx_d3dkmt_winsys *ws,
+                                      const void *rt_bridge);
+
 /* Bytes still free in the shared AGBP carveout, or 0 if unavailable.
  * Adapter-scoped AGXW_ESC_GET_POOL escape, throttled internally. Lets the ICD
  * report a heap budget that means something instead of a synthetic constant. */

@@ -72,6 +72,14 @@ bool agx_d3dkmt_open_device(struct agx_device *dev,
                             const struct agx_kmt_luid *luid);
 
 /*
+ * Open `luid` directly on an in-process D3D11 runtime device (rt_bridge points
+ * to an AuroraGpuBridge struct, or NULL to fall back to agx_d3dkmt_open_device).
+ */
+bool agx_d3dkmt_open_device_rt(struct agx_device *dev,
+                               const struct agx_kmt_luid *luid,
+                               const void *rt_bridge);
+
+/*
  * Tear down what agx_d3dkmt_open_device() built. Call AFTER
  * agx_close_device(), which still owns the BO cache and VMA heaps.
  */

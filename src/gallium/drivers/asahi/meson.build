@@ -44,18 +44,28 @@ if with_tests
   # links the whole driver, so it lives after libasahi below.
 endif
 
+asahi_gallium_deps = [idep_nir, idep_mesautil, idep_agx_pack, idep_libagx, idep_libagx_shaders_h]
+if system_has_kms_drm
+  asahi_gallium_deps += dep_libdrm
+endif
+
 libasahi = static_library(
   'asahi',
   [files_asahi],
   include_directories : [inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
   c_args : [c_msvc_compat_args, '-Wno-c2x-extensions'],
   gnu_symbol_visibility : 'hidden',
-  dependencies : [idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx, idep_libagx_shaders_h],
+  dependencies : asahi_gallium_deps,
 )
+
+asahi_gallium_links = [libasahi, libasahi_compiler, libasahi_lib, libasahi_layout, libasahi_decode]
+if system_has_kms_drm
+  asahi_gallium_links += libasahiwinsys
+endif
 
 driver_asahi = declare_dependency(
   compile_args : '-DGALLIUM_ASAHI',
-  link_with : [libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib, libasahi_layout, libasahi_decode]
+  link_with : asahi_gallium_links,
 )
 
 if with_tests and with_tools.contains('drm-shim')

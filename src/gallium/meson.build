@@ -71,7 +71,9 @@ else
 endif
 
 if with_gallium_asahi
-  subdir('winsys/asahi/drm')
+  if system_has_kms_drm
+    subdir('winsys/asahi/drm')
+  endif
   subdir('drivers/asahi')
 else
   driver_asahi = declare_dependency()

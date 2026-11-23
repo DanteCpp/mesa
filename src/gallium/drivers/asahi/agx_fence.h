@@ -14,6 +14,8 @@ struct agx_context;
 struct pipe_fence_handle {
    struct pipe_reference reference;
    uint32_t syncobj;
+   uint64_t timeline_value;
+   bool is_timeline;
    bool signaled;
 };
 

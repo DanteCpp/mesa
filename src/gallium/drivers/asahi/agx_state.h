@@ -6,7 +6,10 @@
 
 #pragma once
 
+#ifndef _WIN32
 #include <xf86drm.h>
+#endif
+#include <errno.h>
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/genxml/agx_pack.h"
 #include "asahi/layout/layout.h"
@@ -33,6 +36,7 @@
 #include "util/set.h"
 #include "util/u_atomic.h"
 #include "util/u_range.h"
+#include "util/u_sync_provider.h"
 #include "agx_bg_eot.h"
 #include "agx_helpers.h"
 #include "agx_native_descriptor.h"
@@ -49,7 +53,11 @@
 /* The CPU-wait fallbacks for failed fence imports and merges block without a
  * timeout: log each one so a stalled process shows where it is waiting.
  */
+#ifndef _WIN32
 #define agx_fallback_wait(fd, why)                                                (agx_msg("CPU wait on a fence: %s\n", why), sync_wait(fd, -1))
+#else
+#define agx_fallback_wait(fd, why) ((void)(fd), (void)(why), -1)
+#endif
 
 #define AGX_NUM_TEXTURE_STATE_REGS 16
 
@@ -1294,6 +1302,7 @@ struct agx_sampler_view {
 struct agx_screen {
    struct pipe_screen pscreen;
    struct agx_device dev;
+   struct util_sync_provider *sync;
    struct disk_cache *disk_cache;
 
    /* Atomic: a context with unknown completion keeps the device alive. */
@@ -1312,6 +1321,91 @@ struct agx_screen {
 
    float heap_memory_percent;
 };
+
+static inline int
+agx_sync_norm_err(int ret)
+{
+   if (ret == -1 && errno)
+      return -errno;
+   return ret;
+}
+
+static inline int
+agx_syncobj_create(struct agx_screen *screen, uint32_t flags, uint32_t *handle)
+{
+   errno = 0;
+   return agx_sync_norm_err(screen->sync->create(screen->sync, flags, handle));
+}
+
+static inline int
+agx_syncobj_destroy(struct agx_screen *screen, uint32_t handle)
+{
+   errno = 0;
+   return agx_sync_norm_err(screen->sync->destroy(screen->sync, handle));
+}
+
+static inline int
+agx_syncobj_wait(struct agx_screen *screen, uint32_t *handles, unsigned count,
+                 int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled)
+{
+   errno = 0;
+   return agx_sync_norm_err(screen->sync->wait(
+      screen->sync, handles, count, timeout_nsec, flags, first_signaled));
+}
+
+static inline int
+agx_syncobj_timeline_wait(struct agx_screen *screen, uint32_t *handles,
+                          uint64_t *points, unsigned count,
+                          int64_t timeout_nsec, unsigned flags,
+                          uint32_t *first_signaled)
+{
+   errno = 0;
+   return agx_sync_norm_err(screen->sync->timeline_wait(
+      screen->sync, handles, points, count, timeout_nsec, flags, first_signaled));
+}
+
+static inline int
+agx_syncobj_signal(struct agx_screen *screen, const uint32_t *handles,
+                   uint32_t count)
+{
+   errno = 0;
+   return agx_sync_norm_err(screen->sync->signal(screen->sync, handles, count));
+}
+
+static inline int
+agx_syncobj_transfer(struct agx_screen *screen, uint32_t dst_handle,
+                     uint64_t dst_point, uint32_t src_handle,
+                     uint64_t src_point, uint32_t flags)
+{
+   errno = 0;
+   return agx_sync_norm_err(screen->sync->transfer(
+      screen->sync, dst_handle, dst_point, src_handle, src_point, flags));
+}
+
+static inline int
+agx_syncobj_export_sync_file(struct agx_screen *screen, uint32_t handle,
+                             int *fd)
+{
+   errno = 0;
+   return agx_sync_norm_err(
+      screen->sync->export_sync_file(screen->sync, handle, fd));
+}
+
+static inline int
+agx_syncobj_import_sync_file(struct agx_screen *screen, uint32_t handle, int fd)
+{
+   errno = 0;
+   return agx_sync_norm_err(
+      screen->sync->import_sync_file(screen->sync, handle, fd));
+}
+
+static inline int
+agx_syncobj_fd_to_handle(struct agx_screen *screen, int fd, uint32_t *handle)
+{
+   errno = 0;
+   return agx_sync_norm_err(
+      screen->sync->fd_to_handle(screen->sync, fd, handle));
+}
 
 static inline struct agx_screen *
 agx_screen(struct pipe_screen *p)

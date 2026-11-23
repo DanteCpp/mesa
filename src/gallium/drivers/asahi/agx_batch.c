@@ -8,18 +8,23 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <xf86drm.h>
 #include "asahi/lib/agx_device_virtio.h"
+#include "drm-uapi/dma-buf.h"
+#include "util/libsync.h"
+#include "vdrm.h"
+#else
+#include "asahi/lib/agx_primary_write.h"
+#include "drm-uapi/drm.h"
+#endif
 #include "asahi/lib/agx_va_runtime_hole.h"
 #include "asahi/lib/decode.h"
-#include "drm-uapi/dma-buf.h"
 #include "util/bitset.h"
-#include "util/libsync.h"
 #include "util/u_dynarray.h"
 #include "util/u_range.h"
 #include "agx_device.h"
 #include "agx_state.h"
-#include "vdrm.h"
 
 #define foreach_active(ctx, idx)                                               \
    BITSET_FOREACH_SET(idx, ctx->batches.active, AGX_MAX_BATCHES)
@@ -444,7 +449,7 @@ agx_batch_init(struct agx_context *ctx,
    batch->reduced_prim = MESA_PRIM_COUNT;
 
    if (!batch->syncobj) {
-      int ret = drmSyncobjCreate(dev->fd, 0, &batch->syncobj);
+      int ret = agx_syncobj_create(agx_screen(ctx->base.screen), 0, &batch->syncobj);
       assert(!ret && batch->syncobj);
    }
 
@@ -638,7 +643,8 @@ agx_cleanup_batches(struct agx_context *ctx)
    if (!count)
       return -1;
 
-   int ret = drmSyncobjWait(dev->fd, syncobjs, count, 0, 0, &first);
+   int ret = agx_syncobj_wait(agx_screen(ctx->base.screen), syncobjs, count, 0,
+                              0, &first);
    assert(!ret || ret == -ETIME);
    if (ret)
       return -1;
@@ -1041,12 +1047,14 @@ agx_batch_writes_range(struct agx_batch *batch, struct agx_resource *rsrc,
 static bool
 agx_get_in_sync(struct agx_context *ctx, uint32_t *syncobj)
 {
-   struct agx_device *dev = agx_device(ctx->base.screen);
    *syncobj = 0;
+
+#ifndef _WIN32
+   struct agx_screen *screen = agx_screen(ctx->base.screen);
 
    if (ctx->in_sync_fd >= 0) {
       int ret =
-         drmSyncobjImportSyncFile(dev->fd, ctx->in_sync_obj, ctx->in_sync_fd);
+         agx_syncobj_import_sync_file(screen, ctx->in_sync_obj, ctx->in_sync_fd);
 
       /* A native-fence import can fail under transient kernel allocation
        * pressure. Waiting on the original sync file preserves the acquire
@@ -1064,6 +1072,9 @@ agx_get_in_sync(struct agx_context *ctx, uint32_t *syncobj)
       if (!ret)
          *syncobj = ctx->in_sync_obj;
    }
+#else
+   (void)ctx;
+#endif
 
    return true;
 }
@@ -1092,6 +1103,7 @@ struct agx_shared_bo_sync {
    uint32_t in_syncobj;
 };
 
+#ifndef _WIN32
 static bool
 agx_wait_shared_bo(struct agx_bo *bo)
 {
@@ -1105,6 +1117,7 @@ agx_wait_shared_bo(struct agx_bo *bo)
    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW;
    return drmIoctl(bo->prime_fd, DMA_BUF_IOCTL_SYNC, &sync) == 0;
 }
+#endif
 
 /* A fresh private output distinguishes publication by this ioctl from a fence
  * left in the reusable batch syncobj by an earlier generation. The supported
@@ -1112,7 +1125,7 @@ agx_wait_shared_bo(struct agx_bo *bo)
  * no work was accepted. Earlier failures can leave the output without a fence.
  */
 static bool
-agx_wait_failed_submit(struct agx_device *dev, uint32_t syncobj, bool accepted)
+agx_wait_failed_submit(struct agx_screen *screen, uint32_t syncobj, bool accepted)
 {
    if (!syncobj)
       return true;
@@ -1123,7 +1136,7 @@ agx_wait_failed_submit(struct agx_device *dev, uint32_t syncobj, bool accepted)
        * do not use sync-file export: it can also return EINVAL on allocation
        * failure even when a fence exists.
        */
-      int ret = drmSyncobjWait(dev->fd, &syncobj, 1, 0, 0, NULL);
+      int ret = agx_syncobj_wait(screen, &syncobj, 1, 0, 0, NULL);
       if (ret == 0 || ret == -EINVAL)
          return true;
       if (ret != -ETIME)
@@ -1132,8 +1145,8 @@ agx_wait_failed_submit(struct agx_device *dev, uint32_t syncobj, bool accepted)
 
    int ret;
    do {
-      ret = drmSyncobjWait(dev->fd, &syncobj, 1, INT64_MAX,
-                           DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+      ret = agx_syncobj_wait(screen, &syncobj, 1, INT64_MAX,
+                             DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
    } while (ret == -EINTR);
 
    return ret == 0;
@@ -1147,11 +1160,12 @@ agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
                          struct util_dynarray *cmdbuf, int error,
                          uint32_t accepted_syncobj, uint32_t error_syncobj)
 {
+   struct agx_screen *screen = agx_screen(ctx->base.screen);
    struct agx_device *dev = agx_device(ctx->base.screen);
 
    for (unsigned i = 0; i < shared_bo_count; ++i) {
       if (shared_bos[i].in_syncobj)
-         drmSyncobjDestroy(dev->fd, shared_bos[i].in_syncobj);
+         agx_syncobj_destroy(screen, shared_bos[i].in_syncobj);
    }
 
    free(syncs);
@@ -1176,9 +1190,9 @@ agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
     * failed ioctl's aggregate (if published) and any earlier split compute.
     * Keep both handles alive until completion is established.
     */
-   bool complete = refused || agx_wait_failed_submit(dev, error_syncobj, false);
+   bool complete = refused || agx_wait_failed_submit(screen, error_syncobj, false);
    if (!refused)
-      complete &= agx_wait_failed_submit(dev, accepted_syncobj, true);
+      complete &= agx_wait_failed_submit(screen, accepted_syncobj, true);
 
    /* Never put resources in the BO cache on an inconclusive wait. Keep the
     * entire batch, its fences, context and screen until process exit. This
@@ -1190,15 +1204,15 @@ agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
    agx_batch_mark_submitted(batch);
    if (complete) {
       if (accepted_syncobj)
-         drmSyncobjDestroy(dev->fd, accepted_syncobj);
+         agx_syncobj_destroy(screen, accepted_syncobj);
       if (error_syncobj)
-         drmSyncobjDestroy(dev->fd, error_syncobj);
+         agx_syncobj_destroy(screen, error_syncobj);
       /* A G17 refusal signals an error fence into every output, and
        * ctx->syncobj may name this one. A later wait on it would fail as a
        * cancelled dependency, so replace it with a clean signalled fence:
        * the slot's earlier work has completed and this batch ran nothing. */
       if (g17 && (refused || g17_refused))
-         drmSyncobjSignal(dev->fd, &batch->syncobj, 1);
+         agx_syncobj_signal(screen, &batch->syncobj, 1);
       agx_batch_cleanup(ctx, batch, false);
    } else {
       batch->submit_quarantined = true;
@@ -1359,22 +1373,26 @@ agx_g18_indirect_empty(struct agx_batch *batch,
    if (!map)
       return ENOMEM;
 
+#ifndef _WIN32
    const bool shared = bo->flags & AGX_BO_SHARED;
    struct dma_buf_sync sync = {.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
    if (shared && (bo->prime_fd < 0 ||
                   drmIoctl(bo->prime_fd, DMA_BUF_IOCTL_SYNC, &sync)))
       return bo->prime_fd < 0 ? EINVAL : (errno ? errno : EIO);
+#endif
 
    uint32_t dims[6] = {0};
    __sync_synchronize();
    memcpy(dims, map + (address - bo->va->addr), size);
    __sync_synchronize();
 
+#ifndef _WIN32
    if (shared) {
       sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
       if (drmIoctl(bo->prime_fd, DMA_BUF_IOCTL_SYNC, &sync))
          return errno ? errno : EIO;
    }
+#endif
 
    /* A malformed local size is not valid empty work. */
    if (local && (!dims[3] || !dims[4] || !dims[5]))
@@ -1560,6 +1578,41 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    uint64_t wait_seqid = p_atomic_read(&screen->flush_wait_seqid);
 
    struct agx_submit_virt virt = {.ring_idx = ctx->virt_ring_idx};
+#ifdef _WIN32
+   struct agx_primary_write_set primary_writes = {0};
+   if (dev->primary_write_contract) {
+      primary_writes.observed = true;
+      if (compute || batch->incoherent_writes || batch->m5_shader_writes) {
+         primary_writes.conservative_primaries = true;
+      } else if (render) {
+         const struct pipe_framebuffer_state *fb = &batch->key;
+         for (unsigned i = 0; i < fb->nr_cbufs; ++i) {
+            if (fb->cbufs[i].texture) {
+               struct agx_bo *bo = agx_resource(fb->cbufs[i].texture)->bo;
+               if (bo && bo->va && (bo->flags & AGX_BO_PRIMARY))
+                  agx_primary_write_add(&primary_writes, bo->va->addr, bo->size);
+            }
+         }
+         if (fb->resolve) {
+            struct agx_bo *bo = agx_resource(fb->resolve)->bo;
+            if (bo && bo->va && (bo->flags & AGX_BO_PRIMARY))
+               agx_primary_write_add(&primary_writes, bo->va->addr, bo->size);
+         }
+         if (fb->zsbuf.texture) {
+            struct agx_resource *rsrc = agx_resource(fb->zsbuf.texture);
+            if (rsrc->bo && rsrc->bo->va && (rsrc->bo->flags & AGX_BO_PRIMARY))
+               agx_primary_write_add(&primary_writes, rsrc->bo->va->addr, rsrc->bo->size);
+            if (rsrc->separate_stencil && rsrc->separate_stencil->bo &&
+                rsrc->separate_stencil->bo->va &&
+                (rsrc->separate_stencil->bo->flags & AGX_BO_PRIMARY))
+               agx_primary_write_add(&primary_writes,
+                                     rsrc->separate_stencil->bo->va->addr,
+                                     rsrc->separate_stencil->bo->size);
+         }
+      }
+      virt.primary_writes = &primary_writes;
+   }
+#endif
 
    /* Elide syncing against our own queue */
    if (wait_seqid && wait_seqid == ctx->flush_my_seqid) {
@@ -1601,6 +1654,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    AGX_BATCH_FOREACH_BO(batch, entry) {
       struct agx_bo *bo = *entry;
 
+#ifndef _WIN32
       if (bo->flags & AGX_BO_SHARED) {
          batch_debug(batch, "Waits on shared BO @ 0x%" PRIx64, bo->va->addr);
 
@@ -1608,13 +1662,13 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          int in_sync_fd = agx_export_sync_file(dev, bo);
          uint32_t sync_handle = 0;
          int ret = in_sync_fd >= 0
-                      ? drmSyncobjCreate(dev->fd, 0, &sync_handle)
+                      ? agx_syncobj_create(screen, 0, &sync_handle)
                       : -1;
 
          if (!ret) {
-            ret = drmSyncobjImportSyncFile(dev->fd, sync_handle, in_sync_fd);
+            ret = agx_syncobj_import_sync_file(screen, sync_handle, in_sync_fd);
             if (ret) {
-               drmSyncobjDestroy(dev->fd, sync_handle);
+               agx_syncobj_destroy(screen, sync_handle);
                sync_handle = 0;
             }
          }
@@ -1648,7 +1702,9 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          };
          if (dev->is_virtio)
             virt.extres_count++;
-      } else {
+      } else
+#endif
+      {
          /* Deal with BOs which are not externally shared, but which have been
           * written from another context within the same screen. We also need to
           * wait on these using their syncobj.
@@ -1665,6 +1721,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       }
    }
 
+#ifndef _WIN32
    if (dev->is_virtio && virt.extres_count) {
       virt.extres =
          malloc(virt.extres_count * sizeof(struct asahi_ccmd_submit_res));
@@ -1680,6 +1737,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          virt.extres[i].flags = ASAHI_EXTRES_READ | ASAHI_EXTRES_WRITE;
       }
    }
+#endif
 
    if (dev->debug & AGX_DBG_SCRATCH) {
       if (compute)
@@ -1737,7 +1795,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
     */
    uint32_t compute_syncobj = 0;
    uint32_t submit_syncobj = 0;
-   int create_ret = drmSyncobjCreate(dev->fd, 0, &submit_syncobj);
+   int create_ret = agx_syncobj_create(screen, 0, &submit_syncobj);
    if (create_ret) {
       const int error = create_ret < -1 ? -create_ret : (errno ? errno : EIO);
       u_rwlock_rdunlock(&screen->destroy_lock);
@@ -1754,7 +1812,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       struct util_dynarray compute_cmdbuf = UTIL_DYNARRAY_INIT;
       struct drm_asahi_sync *compute_syncs =
          malloc((in_sync_count + 1) * sizeof(*compute_syncs));
-      int ret = compute_syncs ? drmSyncobjCreate(dev->fd, 0, &compute_syncobj)
+      int ret = compute_syncs ? agx_syncobj_create(screen, 0, &compute_syncobj)
                               : -1;
 
       if (!ret) {
@@ -1798,7 +1856,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       if (ret) {
          fprintf(stderr, "DRM_IOCTL_ASAHI_SUBMIT compute failed: %s\n",
                  strerror(compute_errno));
-         drmSyncobjDestroy(dev->fd, submit_syncobj);
+         agx_syncobj_destroy(screen, submit_syncobj);
          u_rwlock_rdunlock(&screen->destroy_lock);
          agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                   shared_bo_count, virt.extres, &cmdbuf,
@@ -1898,7 +1956,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
 
          if (chunk_syncs &&
              (compute_syncobj ||
-              !drmSyncobjCreate(dev->fd, 0, &compute_syncobj))) {
+              !agx_syncobj_create(screen, 0, &compute_syncobj))) {
             memcpy(chunk_syncs, syncs, in_sync_count * sizeof(*syncs));
             chunk_syncs[in_sync_count] = (struct drm_asahi_sync){
                .sync_type = DRM_ASAHI_SYNC_SYNCOBJ,
@@ -1936,7 +1994,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          if (ret) {
             fprintf(stderr, "DRM_IOCTL_ASAHI_SUBMIT compute failed: %s\n",
                     strerror(chunk_errno));
-            drmSyncobjDestroy(dev->fd, submit_syncobj);
+            agx_syncobj_destroy(screen, submit_syncobj);
             u_rwlock_rdunlock(&screen->destroy_lock);
             /* Earlier chunks are in flight: their fence is the accepted
              * one. Without them the syncobj holds no fence. */
@@ -1991,7 +2049,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
             const int ret = dev->ops.submit(dev, &wait, &virt);
             if (ret) {
                const int error = ret < -1 ? -ret : (errno ? errno : EIO);
-               drmSyncobjDestroy(dev->fd, submit_syncobj);
+               agx_syncobj_destroy(screen, submit_syncobj);
                u_rwlock_rdunlock(&screen->destroy_lock);
                agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                         shared_bo_count, virt.extres, &cmdbuf,
@@ -2007,7 +2065,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
             if (error) {
                fprintf(stderr, "asahi: cannot resolve indirect dispatch %u: %s\n",
                        i + 1, strerror(error));
-               drmSyncobjDestroy(dev->fd, submit_syncobj);
+               agx_syncobj_destroy(screen, submit_syncobj);
                u_rwlock_rdunlock(&screen->destroy_lock);
                agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                         shared_bo_count, virt.extres, &cmdbuf,
@@ -2043,7 +2101,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
                        "DRM_IOCTL_ASAHI_SUBMIT compute dispatch %u/%u failed: %s\n",
                        i + 1, m5_split_count,
                        strerror(prepass_errno));
-               drmSyncobjDestroy(dev->fd, submit_syncobj);
+               agx_syncobj_destroy(screen, submit_syncobj);
                u_rwlock_rdunlock(&screen->destroy_lock);
                agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                         shared_bo_count, virt.extres, &cmdbuf,
@@ -2064,7 +2122,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
                ? agx_g18_indirect_empty(batch, &cdm_dispatch[last], &empty) : 0;
             if (error) {
                fprintf(stderr, "asahi: cannot resolve indirect tail: %s\n", strerror(error));
-               drmSyncobjDestroy(dev->fd, submit_syncobj);
+               agx_syncobj_destroy(screen, submit_syncobj);
                u_rwlock_rdunlock(&screen->destroy_lock);
                agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
                                         shared_bo_count, virt.extres, &cmdbuf,
@@ -2246,25 +2304,26 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
 
    /* Successful enqueue retains the fences in the kernel. */
    if (compute_syncobj)
-      drmSyncobjDestroy(dev->fd, compute_syncobj);
-   drmSyncobjDestroy(dev->fd, submit_syncobj);
+      agx_syncobj_destroy(screen, compute_syncobj);
+   agx_syncobj_destroy(screen, submit_syncobj);
 
    /* Add the screen point held back above. Failing that, finish the batch on
     * the CPU and keep the older point: later work is ordered after it anyway. */
    bool point_published = true;
-   if (late_point && drmSyncobjTransfer(dev->fd, screen->flush_syncobj, seqid,
-                                        batch->syncobj, 0, 0)) {
+   if (late_point && agx_syncobj_transfer(screen, screen->flush_syncobj, seqid,
+                                          batch->syncobj, 0, 0)) {
       agx_msg("timeline point transfer failed; waiting for the batch\n");
-      drmSyncobjWait(dev->fd, &batch->syncobj, 1, INT64_MAX,
-                     DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+      agx_syncobj_wait(screen, &batch->syncobj, 1, INT64_MAX,
+                       DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
       point_published = false;
    }
 
    /* Now stash our batch fence into any shared BOs. */
+#ifndef _WIN32
    if (shared_bo_count) {
       /* Convert our handle to a sync file */
       int out_sync_fd = -1;
-      int ret = drmSyncobjExportSyncFile(dev->fd, batch->syncobj, &out_sync_fd);
+      int ret = agx_syncobj_export_sync_file(screen, batch->syncobj, &out_sync_fd);
       bool transfer_failed = ret || out_sync_fd < 0;
 
       for (unsigned i = 0; i < shared_bo_count; i++) {
@@ -2273,7 +2332,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
 
          /* Free the in_sync handle we just acquired */
          if (shared_bos[i].in_syncobj) {
-            ret = drmSyncobjDestroy(dev->fd, shared_bos[i].in_syncobj);
+            ret = agx_syncobj_destroy(screen, shared_bos[i].in_syncobj);
             if (ret)
                transfer_failed = true;
             shared_bos[i].in_syncobj = 0;
@@ -2293,8 +2352,8 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
        * dma-buf is safe for its next owner even when sync-file transfer runs
        * out of kernel resources. */
       if (transfer_failed) {
-         ret = drmSyncobjWait(dev->fd, &batch->syncobj, 1, INT64_MAX,
-                              DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+         ret = agx_syncobj_wait(screen, &batch->syncobj, 1, INT64_MAX,
+                                DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
          if (ret) {
             agx_msg("shared BO release-fence fallback wait failed: %s\n",
                     strerror(ret < -1 ? -ret : (errno ? errno : EIO)));
@@ -2305,6 +2364,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          }
       }
    }
+#endif
 
    /* Record the syncobj on each BO we write, so it can be added post-facto as a
     * fence if the BO is exported later...
@@ -2343,7 +2403,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       }
 
       /* Wait so we can get errors reported back */
-      int ret = drmSyncobjWait(dev->fd, &batch->syncobj, 1, INT64_MAX, 0, NULL);
+      int ret = agx_syncobj_wait(screen, &batch->syncobj, 1, INT64_MAX, 0, NULL);
       assert(!ret);
 
       agx_batch_print_stats(dev, batch);
@@ -2395,8 +2455,8 @@ agx_poll_batch(struct agx_context *ctx, struct agx_batch *batch)
    if (!agx_batch_is_submitted(batch))
       return true;
 
-   struct agx_device *dev = agx_device(ctx->base.screen);
-   int ret = drmSyncobjWait(dev->fd, &batch->syncobj, 1, 0, 0, NULL);
+   struct agx_screen *screen = agx_screen(ctx->base.screen);
+   int ret = agx_syncobj_wait(screen, &batch->syncobj, 1, 0, 0, NULL);
    assert(!ret || ret == -ETIME);
    if (ret)
       return false;
@@ -2408,7 +2468,7 @@ agx_poll_batch(struct agx_context *ctx, struct agx_batch *batch)
 void
 agx_sync_batch(struct agx_context *ctx, struct agx_batch *batch)
 {
-   struct agx_device *dev = agx_device(ctx->base.screen);
+   struct agx_screen *screen = agx_screen(ctx->base.screen);
 
    if (agx_batch_is_active(batch))
       agx_flush_batch(ctx, batch);
@@ -2421,7 +2481,7 @@ agx_sync_batch(struct agx_context *ctx, struct agx_batch *batch)
       return;
 
    assert(batch->syncobj);
-   int ret = drmSyncobjWait(dev->fd, &batch->syncobj, 1, INT64_MAX, 0, NULL);
+   int ret = agx_syncobj_wait(screen, &batch->syncobj, 1, INT64_MAX, 0, NULL);
    assert(!ret);
    agx_batch_cleanup(ctx, batch, false);
 }
