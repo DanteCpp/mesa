@@ -2241,6 +2241,8 @@ struct agx_ptr hk_pool_vdm_primary_alloc(struct hk_cmd_buffer *cmd,
                                          uint32_t size, uint32_t alignment);
 
 uint64_t hk_g17p_vdm_compact(struct hk_cmd_buffer *cmd, uint64_t primary);
+bool hk_vdm_substream_range_compactable(struct hk_cmd_buffer *cmd,
+                                        uint64_t primary, uint64_t size);
 uint64_t hk_g17p_vdm_alias(struct hk_cmd_buffer *cmd, uint64_t primary);
 
 uint64_t hk_pool_upload(struct hk_cmd_buffer *cmd, const void *data,
@@ -2850,6 +2852,17 @@ void hk_m5_pass_merge_note_set_bind(struct hk_cmd_buffer *cmd);
 uint64_t hk_m5_multi_draw_vertex_program(struct hk_cmd_buffer *cmd,
                                          struct hk_shader *s,
                                          struct hk_linked_shader *linked);
+
+/* Build a pre-patched AGX3 vertex Ioto program template and its dynamic
+ * draw-params / draw-id relocations for GPU-side DrawIndirectCount sub-stream
+ * generation (hk_cmd_buffer.c). Returns false to fall back to CPU emission. */
+bool hk_g17p_multi_draw_ioto_template(
+   struct hk_cmd_buffer *cmd, struct hk_shader *s,
+   struct hk_linked_shader *linked,
+   uint64_t draw_params_first, uint64_t draw_params_last,
+   uint64_t draw_id_first, uint64_t draw_id_last,
+   uint8_t *tmpl_out, size_t tmpl_cap, uint32_t *tmpl_len_out,
+   struct libagx_ioto_dyn_reloc *relocs_out, uint32_t *reloc_count_out);
 
 void hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
                                   const VkCommandBufferBeginInfo *pBeginInfo);

@@ -602,3 +602,25 @@ libagx_trace_rays_indirect_setup(global uint32_t *out_record_dims,
       .z = depth,
    };
 }
+
+KERNEL(1)
+libagx_prep_vdm_indirect_count_gen(
+   global struct libagx_vdm_truncate_state *state,
+   global uint32_t *out_grid,
+   constant uint32_t *draw_count,
+   uint64_t draw0_addr, uint64_t after_draw0_addr, uint64_t sub_vdm_va,
+   uint32_t max_draw_count, uint32_t vdm_rec_bytes,
+   uint32_t sub_link_w0, uint32_t sub_link_w1,
+   uint32_t end_link_w0, uint32_t end_link_w1)
+{
+   libagx_vdm_prep_indirect_count_gen_impl(
+      state, out_grid, draw_count, draw0_addr, after_draw0_addr, sub_vdm_va,
+      max_draw_count, vdm_rec_bytes, sub_link_w0, sub_link_w1, end_link_w0,
+      end_link_w1);
+}
+
+KERNEL(64)
+libagx_build_vdm_indirect_count(constant struct libagx_vdm_gen_desc *desc)
+{
+   libagx_vdm_build_indirect_count_impl(desc, get_global_id(0));
+}

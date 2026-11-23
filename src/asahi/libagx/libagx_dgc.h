@@ -1303,3 +1303,218 @@ libagx_vdm_draw_site_valid(const void *cs_before, const void *cs_after,
    return after >= before && (after - before) >= 8u;
 }
 #endif
+
+#define LIBAGX_VDM_GEN_MAX_IOTO_RELOCS 4u
+#define LIBAGX_VDM_GEN_MAX_VDM_WORDS   16u
+#define LIBAGX_VDM_GEN_WG_SIZE         64u
+
+#define LIBAGX_IOTO_RELOC_KIND_DRAW_ID (1u << 0)
+#define LIBAGX_IOTO_RELOC_LOW_SHORT    (1u << 1)
+#define LIBAGX_IOTO_RELOC_HIGH_SHORT   (1u << 2)
+
+/*
+ * Dynamic relocation within a pre-patched AGX3 vertex Ioto loader template,
+ * patched per visible draw on the GPU for DrawIndirectCount.
+ */
+struct libagx_ioto_dyn_reloc {
+   uint64_t dest_lo;
+   uint64_t dest_hi;
+   uint32_t delta;
+   uint16_t offset;
+   uint16_t flags;
+   uint32_t _pad[2];
+};
+static_assert(sizeof(struct libagx_ioto_dyn_reloc) == 32,
+              "Ioto dynamic reloc host/device ABI");
+
+/*
+ * Immutable per-call template for GPU-generated DrawIndirectCount sub-streams.
+ */
+struct libagx_vdm_gen_desc {
+   uint64_t sub_vdm_va;
+   uint64_t sub_ioto_va;
+   uint64_t draw_ids_va;
+   uint64_t in_base_va;
+   uint64_t ioto_tmpl_va;
+   uint64_t count_addr;
+   uint32_t max_draw_count;
+   uint32_t in_stride;
+   uint32_t draw_params_offset;
+   uint32_t vdm_rec_words;
+   uint32_t vdm_addr_hi_idx;
+   uint32_t vdm_addr_lo_idx;
+   uint32_t vdm_pipe_raw_tmpl;
+   uint32_t ioto_stride;
+   uint32_t ioto_copy_words;
+   uint32_t reloc_count;
+   uint32_t vdm_tmpl[LIBAGX_VDM_GEN_MAX_VDM_WORDS];
+   struct libagx_ioto_dyn_reloc relocs[LIBAGX_VDM_GEN_MAX_IOTO_RELOCS];
+};
+static_assert(sizeof(struct libagx_vdm_gen_desc) == 280,
+              "VDM gen desc host/device ABI");
+
+static inline uint64_t
+libagx_ioto_ldimm_long_immediate(uint32_t immediate)
+{
+   return ((uint64_t)((immediate & 0x7fu) << 8)) |
+          (((uint64_t)(((immediate >> 25) & 0x7fu) << 9)) << 16) |
+          (((uint64_t)((((immediate >> 7) & 0xfu) << 1) |
+                       (((immediate >> 11) & 0x3u) << 10))) << 32) |
+          (((uint64_t)(((immediate >> 13) & 0xfu) |
+                       (((immediate >> 17) & 0xffu) << 4))) << 48);
+}
+
+static inline void
+libagx_ioto_patch_ldimm(GLOBAL uint8_t *out, bool is_short, uint64_t dest,
+                        uint32_t immediate)
+{
+   if (is_short) {
+      out[1] = (uint8_t)immediate;
+   } else {
+      uint64_t word = dest | libagx_ioto_ldimm_long_immediate(immediate);
+      GLOBAL uint16_t *p = (GLOBAL uint16_t *)out;
+      p[0] = (uint16_t)word;
+      p[1] = (uint16_t)(word >> 16);
+      p[2] = (uint16_t)(word >> 32);
+      p[3] = (uint16_t)(word >> 48);
+   }
+}
+
+/*
+ * Stage 1 (1 thread) of GPU-generated DrawIndirectCount sub-stream:
+ * restores draw 0 if a prior submission observed *draw_count == 0, links
+ * draw 0 -> sub_vdm (when count >= 2) or end_vdm (when count <= 1), places
+ * the trailing end_link at sub_vdm + (count - 1) * vdm_rec_bytes, and writes
+ * the indirect dispatch grid {ceil((count - 1) / 64), 1, 1} for stage 2.
+ */
+static inline void
+libagx_vdm_prep_indirect_count_gen_impl(
+   GLOBAL struct libagx_vdm_truncate_state *state,
+   GLOBAL uint32_t *out_grid,
+   CONST uint32_t *draw_count,
+   uint64_t draw0_addr, uint64_t after_draw0_addr, uint64_t sub_vdm_va,
+   uint32_t max_draw_count, uint32_t vdm_rec_bytes,
+   uint32_t sub_link_w0, uint32_t sub_link_w1,
+   uint32_t end_link_w0, uint32_t end_link_w1)
+{
+   uint64_t prev = state->patched_addr;
+   if (prev != 0) {
+      GLOBAL uint32_t *prev_dst = (GLOBAL uint32_t *)(uintptr_t)prev;
+      prev_dst[0] = state->orig_w0;
+      prev_dst[1] = state->orig_w1;
+      state->patched_addr = 0;
+   }
+
+   uint32_t n = *draw_count;
+   if (n > max_draw_count)
+      n = max_draw_count;
+
+   if (n == 0) {
+      GLOBAL uint32_t *d0 = (GLOBAL uint32_t *)(uintptr_t)draw0_addr;
+      state->orig_w0 = d0[0];
+      state->orig_w1 = d0[1];
+      state->patched_addr = draw0_addr;
+      d0[0] = end_link_w0;
+      d0[1] = end_link_w1;
+      out_grid[0] = 0u;
+      out_grid[1] = 1u;
+      out_grid[2] = 1u;
+      return;
+   }
+
+   GLOBAL uint32_t *after_d0 = (GLOBAL uint32_t *)(uintptr_t)after_draw0_addr;
+   if (n == 1) {
+      after_d0[0] = end_link_w0;
+      after_d0[1] = end_link_w1;
+      out_grid[0] = 0u;
+      out_grid[1] = 1u;
+      out_grid[2] = 1u;
+      return;
+   }
+
+   uint32_t rem = n - 1u;
+   after_d0[0] = sub_link_w0;
+   after_d0[1] = sub_link_w1;
+
+   GLOBAL uint32_t *sub_end =
+      (GLOBAL uint32_t *)(uintptr_t)(sub_vdm_va + (uint64_t)rem * vdm_rec_bytes);
+   sub_end[0] = end_link_w0;
+   sub_end[1] = end_link_w1;
+
+   out_grid[0] = ((rem - 1u) >> 6) + 1u;
+   out_grid[1] = 1u;
+   out_grid[2] = 1u;
+}
+
+/*
+ * Stage 2 (1 thread per visible draw 1..count-1) of GPU-generated
+ * DrawIndirectCount sub-stream: materializes draw `tid + 1`'s vertex Ioto
+ * program (if republishing) and VDM record directly into the sub-stream BOs.
+ */
+static inline void
+libagx_vdm_build_indirect_count_impl(
+   CONST struct libagx_vdm_gen_desc *desc, uint32_t tid)
+{
+   uint32_t n = *(CONST uint32_t *)(uintptr_t)desc->count_addr;
+   if (n > desc->max_draw_count)
+      n = desc->max_draw_count;
+   if (n <= 1u)
+      return;
+   uint32_t rem = n - 1u;
+   if (tid >= rem)
+      return;
+
+   uint64_t cmd_addr = desc->in_base_va + (uint64_t)tid * desc->in_stride;
+   uint64_t ioto_va = 0;
+
+   if (desc->sub_ioto_va != 0) {
+      ioto_va = desc->sub_ioto_va + (uint64_t)tid * desc->ioto_stride;
+      GLOBAL uint32_t *ioto_dst_w = (GLOBAL uint32_t *)(uintptr_t)ioto_va;
+      CONST uint32_t *ioto_src_w =
+         (CONST uint32_t *)(uintptr_t)desc->ioto_tmpl_va;
+      uint32_t copy_words = desc->ioto_copy_words;
+      for (uint32_t i = 0; i < copy_words; ++i)
+         ioto_dst_w[i] = ioto_src_w[i];
+
+      uint64_t draw_id_va = 0;
+      if (desc->draw_ids_va != 0) {
+         draw_id_va = desc->draw_ids_va + (uint64_t)tid * 4u;
+         *(GLOBAL uint32_t *)(uintptr_t)draw_id_va = tid + 1u;
+      }
+
+      GLOBAL uint8_t *ioto_dst = (GLOBAL uint8_t *)(uintptr_t)ioto_va;
+      uint32_t reloc_count = desc->reloc_count;
+      for (uint32_t r = 0; r < reloc_count; ++r) {
+         struct libagx_ioto_dyn_reloc rel = desc->relocs[r];
+         uint64_t base =
+            ((rel.flags & LIBAGX_IOTO_RELOC_KIND_DRAW_ID)
+                ? draw_id_va
+                : (cmd_addr + desc->draw_params_offset)) +
+            rel.delta;
+         bool low_short = (rel.flags & LIBAGX_IOTO_RELOC_LOW_SHORT) != 0;
+         bool high_short = (rel.flags & LIBAGX_IOTO_RELOC_HIGH_SHORT) != 0;
+         uint32_t off = rel.offset;
+         libagx_ioto_patch_ldimm(ioto_dst + off, low_short, rel.dest_lo,
+                                 (uint32_t)base);
+         libagx_ioto_patch_ldimm(ioto_dst + off + (low_short ? 2u : 8u),
+                                 high_short, rel.dest_hi,
+                                 (uint32_t)(base >> 32));
+      }
+   }
+
+   uint32_t vdm_words = desc->vdm_rec_words;
+   GLOBAL uint32_t *vdm_dst =
+      (GLOBAL uint32_t *)(uintptr_t)(desc->sub_vdm_va +
+                                     (uint64_t)tid * (vdm_words * 4u));
+   for (uint32_t i = 0; i < vdm_words; ++i)
+      vdm_dst[i] = desc->vdm_tmpl[i];
+
+   if (desc->sub_ioto_va != 0) {
+      vdm_dst[2] = desc->vdm_pipe_raw_tmpl |
+                   (uint32_t)(((ioto_va >> 38) & 0x3ffu) << 22);
+      vdm_dst[3] = (uint32_t)(ioto_va >> 6);
+   }
+
+   vdm_dst[desc->vdm_addr_hi_idx] = (uint32_t)((cmd_addr >> 32) & 0xffffu);
+   vdm_dst[desc->vdm_addr_lo_idx] = (uint32_t)cmd_addr;
+}
