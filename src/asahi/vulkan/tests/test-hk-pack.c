@@ -1375,6 +1375,149 @@ test_compute_pair_stream_safety(void)
      !hk_copy4_classify_intervals(true, 2, b_fadd, 0, 64, 256, &same));
 }
 
+/* Fake hk_pack_fusion_cost_fn: attempt 0 is the DUAL_PAD4 variant, attempt 1
+ * the clamp-only fallback. */
+struct fake_fusion {
+   struct hk_pack_fusion_cost cost[2];
+   bool available[2];
+   unsigned calls, order[4];
+};
+
+static bool
+fake_fusion_cost(void *data, unsigned attempt, struct hk_pack_fusion_cost *cost)
+{
+   struct fake_fusion *f = data;
+   if (f->calls < 4)
+      f->order[f->calls] = attempt;
+   f->calls++;
+   if (attempt >= 2 || !f->available[attempt])
+      return false;
+   *cost = f->cost[attempt];
+   return true;
+}
+
+/* Submit-time re-accounting of a packed run [GEMM producer, clamp, pad4, X]:
+ * when the DUAL_PAD4 replacement of [producer, clamp, pad4] would exceed the
+ * run's work or unbounded-loop budget it is rejected, and the clamp-only
+ * fusion of [producer, clamp] is taken instead, leaving pad4 as its own
+ * dispatch in the packet; when that also does not fit, nothing is fused and
+ * the run keeps all four dispatches with its budget unchanged. */
+static void
+test_fusion_rejects_over_budget_dual_pad4(void)
+{
+   const uint64_t threads = 1u << 12;
+   struct hk_cs cs[4] = {0};
+   uint64_t w = 0;
+   cs[0].pack_loops = hk_pack_account_dispatch_work(threads, 64, true, 13, &w);
+   cs[0].pack_static_work = w;                 /* GEMM producer, bounded */
+   cs[1].pack_static_work = threads * 8;       /* clamp */
+   cs[2].pack_static_work = threads * 16;      /* pad4 */
+   const struct hk_pack_member members[4] = {
+      {.cs = &cs[0]}, {.cs = &cs[1]}, {.cs = &cs[2]}, {.cs = &cs[3]},
+   };
+   const uint64_t replaced_clamp = cs[0].pack_static_work + cs[1].pack_static_work;
+   const uint64_t replaced_dual = replaced_clamp + cs[2].pack_static_work;
+
+   const struct hk_pack_fusion_cost clamp_only = {
+      .span = 2, .threads = threads, .instrs = 66, .has_loops = true,
+      .loop_bound = 13,
+   };
+   const uint64_t clamp_work = threads * 66 * 13;
+   /* DUAL_PAD4 adds the border and zero-fill loops: a large proven bound. */
+   const struct hk_pack_fusion_cost dual_pad4 = {
+      .span = 3, .threads = threads, .instrs = 90, .has_loops = true,
+      .loop_bound = 13 + 4096,
+   };
+   const uint64_t dual_work = threads * 90 * (13 + 4096);
+
+   /* X fills the run so that the clamp-only fusion fits and DUAL_PAD4 not. */
+   cs[3].pack_static_work = HK_PACK_MAX_STATIC_WORK - replaced_dual -
+                            (dual_work - replaced_dual) / 2;
+   uint64_t run_work, run_work0;
+   unsigned run_loops, run_loops0;
+   hk_pack_run_budget(members, 0, 4, &run_work0, &run_loops0);
+   T("pack run budget sums the members",
+     run_work0 == replaced_dual + cs[3].pack_static_work && run_loops0 == 0);
+
+   struct fake_fusion f = {
+      .cost = {dual_pad4, clamp_only}, .available = {true, true},
+   };
+   run_work = run_work0; run_loops = run_loops0;
+   int chosen = hk_pack_choose_fusion(members, 0, 4, 2, fake_fusion_cost, &f,
+                                      &run_work, &run_loops);
+   T("over-budget DUAL_PAD4 falls back to clamp-only",
+     chosen == 1 && f.calls == 2 && f.order[0] == 0 && f.order[1] == 1);
+   T("clamp-only fallback replaces only producer and clamp",
+     f.cost[chosen].span == 2);
+   T("clamp-only fallback re-accounts the run with pad4 still in it",
+     run_work == run_work0 - replaced_clamp + clamp_work &&
+     run_work - cs[2].pack_static_work - cs[3].pack_static_work == clamp_work &&
+     run_loops == 0);
+
+   /* The same run with room for DUAL_PAD4 takes it. */
+   cs[3].pack_static_work = 1000;
+   hk_pack_run_budget(members, 0, 4, &run_work0, &run_loops0);
+   run_work = run_work0; run_loops = run_loops0;
+   f = (struct fake_fusion){.cost = {dual_pad4, clamp_only}, .available = {true, true}};
+   chosen = hk_pack_choose_fusion(members, 0, 4, 2, fake_fusion_cost, &f,
+                                  &run_work, &run_loops);
+   T("DUAL_PAD4 within budget is taken first",
+     chosen == 0 && f.calls == 1 &&
+     run_work == run_work0 - replaced_dual + dual_work && run_loops == 0);
+
+   /* DUAL_PAD4 whose zero-fill loop has no proven bound is a second
+    * unbounded loop when X already loops without a bound. */
+   cs[3].pack_loops = true;
+   hk_pack_run_budget(members, 0, 4, &run_work0, &run_loops0);
+   struct hk_pack_fusion_cost unbounded = dual_pad4;
+   unbounded.loop_bound = 0;
+   run_work = run_work0; run_loops = run_loops0;
+   f = (struct fake_fusion){.cost = {unbounded, clamp_only}, .available = {true, true}};
+   chosen = hk_pack_choose_fusion(members, 0, 4, 2, fake_fusion_cost, &f,
+                                  &run_work, &run_loops);
+   T("unbounded DUAL_PAD4 beside another unbounded loop falls back to clamp-only",
+     chosen == 1 && run_loops == 1 &&
+     run_work == run_work0 - replaced_clamp + clamp_work);
+   cs[3].pack_loops = false;
+
+   /* Neither variant fits: no fusion and the run is untouched. */
+   cs[3].pack_static_work = HK_PACK_MAX_STATIC_WORK - replaced_clamp;
+   hk_pack_run_budget(members, 0, 4, &run_work0, &run_loops0);
+   run_work = run_work0; run_loops = run_loops0;
+   f = (struct fake_fusion){.cost = {dual_pad4, clamp_only}, .available = {true, true}};
+   chosen = hk_pack_choose_fusion(members, 0, 4, 2, fake_fusion_cost, &f,
+                                  &run_work, &run_loops);
+   T("no fusion when clamp-only also exceeds the run budget",
+     chosen == -1 && f.calls == 2 && run_work == run_work0 &&
+     run_loops == run_loops0);
+
+   /* Clamp-only unavailable (did not compile): no fusion. */
+   cs[3].pack_static_work = HK_PACK_MAX_STATIC_WORK - replaced_dual -
+                            (dual_work - replaced_dual) / 2;
+   hk_pack_run_budget(members, 0, 4, &run_work0, &run_loops0);
+   run_work = run_work0; run_loops = run_loops0;
+   f = (struct fake_fusion){.cost = {dual_pad4, clamp_only}, .available = {true, false}};
+   chosen = hk_pack_choose_fusion(members, 0, 4, 2, fake_fusion_cost, &f,
+                                  &run_work, &run_loops);
+   T("no fusion when the clamp-only fallback is unavailable",
+     chosen == -1 && run_work == run_work0 && run_loops == run_loops0);
+
+   /* Pad4 with no clamp: a single attempt, no clamp-only fallback. */
+   run_work = run_work0; run_loops = run_loops0;
+   f = (struct fake_fusion){.cost = {dual_pad4, clamp_only}, .available = {true, true}};
+   chosen = hk_pack_choose_fusion(members, 0, 4, 1, fake_fusion_cost, &f,
+                                  &run_work, &run_loops);
+   T("over-budget DUAL_PAD4 without a clamp is not fused",
+     chosen == -1 && f.calls == 1 && run_work == run_work0);
+
+   /* A span past the end of the run is never taken. */
+   run_work = run_work0; run_loops = run_loops0;
+   f = (struct fake_fusion){.cost = {dual_pad4, clamp_only}, .available = {true, true}};
+   chosen = hk_pack_choose_fusion(members, 2, 4, 1, fake_fusion_cost, &f,
+                                  &run_work, &run_loops);
+   T("fusion span past the run end is rejected", chosen == -1);
+}
+
 int
 main(void)
 {
@@ -1397,6 +1540,78 @@ main(void)
    test_random();
    test_history();
    test_compute_pair_stream_safety();
+   test_fusion_rejects_over_budget_dual_pad4();
+
+   /* Bounded-loop accounting, NIR-bound expression eval, and post-fusion budget checks. */
+   {
+      uint64_t w = 0;
+      T("unbounded looping dispatch sets pack_loops",
+        hk_pack_account_dispatch_work(1024, 64, true, 0, &w) && w == 65536);
+      T("bounded looping dispatch scales work and clears pack_loops",
+        !hk_pack_account_dispatch_work(1024, 64, true, 13, &w) && w == 1024ull * 64 * 13);
+      T("bounded looping dispatch over work limit sets pack_loops and saturates",
+        hk_pack_account_dispatch_work(1ull << 24, 256, true, 16, &w) && w == UINT64_MAX);
+      T("overflowing bounded loop sets pack_loops and saturates",
+        hk_pack_account_dispatch_work(UINT64_MAX / 2, 4, true, 4, &w) && w == UINT64_MAX);
+
+      /* Expression evaluator: max(3, kh * (1 + kw)) */
+      struct hk_pack_loop_bound lb = {
+         .valid = true,
+         .count = 7,
+         .ops = {
+            [0] = { .kind = HK_PACK_LOOP_OP_CONST, .imm = 3 },
+            [1] = { .kind = HK_PACK_LOOP_OP_PARAM, .imm = HK_PACK_LOOP_PARAM_DW_KH },
+            [2] = { .kind = HK_PACK_LOOP_OP_CONST, .imm = 1 },
+            [3] = { .kind = HK_PACK_LOOP_OP_PARAM, .imm = HK_PACK_LOOP_PARAM_DW_KW },
+            [4] = { .kind = HK_PACK_LOOP_OP_ADD, .lhs = 2, .rhs = 3 },
+            [5] = { .kind = HK_PACK_LOOP_OP_MUL, .lhs = 1, .rhs = 4 },
+            [6] = { .kind = HK_PACK_LOOP_OP_MAX, .lhs = 0, .rhs = 5 },
+         },
+      };
+      uint64_t params[HK_PACK_LOOP_PARAM_COUNT] = {0};
+      params[HK_PACK_LOOP_PARAM_DW_KH] = 3;
+      params[HK_PACK_LOOP_PARAM_DW_KW] = 3;
+      uint64_t bval = 0;
+      T("eval nested depthwise back-edges expression",
+        hk_pack_eval_loop_bound(&lb, params, &bval) && bval == 12);
+      params[HK_PACK_LOOP_PARAM_DW_KH] = UINT64_MAX;
+      params[HK_PACK_LOOP_PARAM_DW_KW] = 2;
+      T("eval rejects overflow cleanly",
+        !hk_pack_eval_loop_bound(&lb, params, &bval) && bval == 0);
+      lb.valid = false;
+      T("eval rejects invalid loop bound",
+        !hk_pack_eval_loop_bound(&lb, params, &bval) && bval == 0);
+
+      /* Post-fusion run re-accounting (e.g. DUAL_PAD4 zero-fill loop). */
+      uint64_t nw = 0;
+      unsigned nl = 0;
+      T("fusion fits when post-fusion work stays within HK_PACK_MAX_STATIC_WORK",
+        hk_pack_fusion_fits_run(10000, 0, 3000, 0, 4500, false, &nw, &nl) &&
+        nw == 11500 && nl == 0);
+      T("fusion rejected when DUAL_PAD4 zero-fill blows HK_PACK_MAX_STATIC_WORK",
+        !hk_pack_fusion_fits_run(HK_PACK_MAX_STATIC_WORK - 1000, 0, 500, 0,
+                                 5000, false, &nw, &nl));
+      T("fusion rejected when adding a second unbounded loop to a packed run",
+        !hk_pack_fusion_fits_run(10000, 1, 2000, 0, 2000, true, &nw, &nl));
+      T("fusion accepted when replacing the run's only unbounded loop",
+        hk_pack_fusion_fits_run(10000, 1, 2000, 1, 2500, true, &nw, &nl) &&
+        nw == 10500 && nl == 1);
+
+      /* Two bounded-loop members pack into one packet. */
+      struct hk_cmd_buffer *cbs[2] = { plain(1), plain(1) };
+      for (unsigned i = 0; i < 2; ++i) {
+         struct hk_cs *cs = first_cs(cbs[i]);
+         cs->pack_loops = hk_pack_account_dispatch_work(
+            4096, 128, true, 13, &w);
+         cs->pack_static_work = w;
+      }
+      struct hk_pack_run runs[2];
+      unsigned rc = 0;
+      plan_on(cbs, 2, 0, false, runs, &rc);
+      T("two bounded looping members pack into one packet",
+        rc == 1 && runs[0].count == 2);
+   }
+
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

@@ -9,9 +9,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "hk_pack_loop_bound.h"
 #include "hk_sync.h"
 
 struct hk_cmd_buffer;
+struct hk_pack_member;
 struct hk_cs;
 struct hk_device;
 struct hk_sync_queue;
@@ -83,6 +85,47 @@ enum hk_pack_boundary {
 };
 
 enum hk_pack_boundary hk_pack_boundary(const struct hk_device *dev);
+
+bool hk_pack_account_dispatch_work(uint64_t threads, uint64_t instrs,
+                                   bool has_loops, uint64_t loop_bound,
+                                   uint64_t *work_out);
+
+bool hk_pack_fusion_fits_run(uint64_t run_work, unsigned run_loops,
+                             uint64_t replaced_work, unsigned replaced_loops,
+                             uint64_t fused_work, bool fused_loops,
+                             uint64_t *new_work_out, unsigned *new_loops_out);
+
+/* What one submit-time fusion attempt would put in place of its members. */
+struct hk_pack_fusion_cost {
+   /* Members it replaces, starting at the producer. */
+   unsigned span;
+   /* Global threads, instructions and loops of the fused dispatch. */
+   uint64_t threads;
+   uint64_t instrs;
+   bool has_loops;
+   /* Evaluated worst-case loop bound, or 0 when none could be proven. */
+   uint64_t loop_bound;
+};
+
+/* Fills `cost` for attempt `attempt`, or returns false when that variant is
+ * unavailable (it did not compile or cannot be emitted). */
+typedef bool (*hk_pack_fusion_cost_fn)(void *data, unsigned attempt,
+                                       struct hk_pack_fusion_cost *cost);
+
+/* Work and unbounded-loop count of members[start, end), saturating. */
+void hk_pack_run_budget(const struct hk_pack_member *members, unsigned start,
+                        unsigned end, uint64_t *work_out, unsigned *loops_out);
+
+/* Tries `attempts` fusion variants in order (the dual-write variant first,
+ * then the clamp-only fallback) for the producer members[first] of a run whose
+ * budget is *run_work / *run_loops. Returns the first attempt whose fused
+ * dispatch keeps the run within HK_PACK_MAX_STATIC_WORK and at most one
+ * unbounded loop, and updates the budget; returns -1 and leaves the budget
+ * and the run's members unchanged when none fits. */
+int hk_pack_choose_fusion(const struct hk_pack_member *members, unsigned first,
+                          unsigned end, unsigned attempts,
+                          hk_pack_fusion_cost_fn cost_fn, void *data,
+                          uint64_t *run_work, unsigned *run_loops);
 
 /* Whether a member may end with a strong flush without memory scope, as an
  * application barrier at the end of a command buffer leaves it: at every

@@ -35,6 +35,136 @@
  *   command deadline, attachment limits) is not qualified. AGX2 streams have
  *   neither the terminate nor the tail records this checks.
  */
+/* Compute static work for a single direct compute dispatch and return whether
+ * the stream must be marked pack_loops (unbounded). When a looping shader has
+ * a NIR-derived worst-case (total loop back-edges + 1) bound > 0, scale the
+ * static work by loop_bound and allow it to share a packet while the scaled
+ * work stays within HK_PACK_MAX_STATIC_WORK; on overflow or excess work,
+ * saturate and fall back to pack_loops. */
+bool
+hk_pack_account_dispatch_work(uint64_t threads, uint64_t instrs,
+                              bool has_loops, uint64_t loop_bound,
+                              uint64_t *work_out)
+{
+   uint64_t work = 0;
+   if (__builtin_mul_overflow(threads, instrs, &work))
+      work = UINT64_MAX;
+
+   if (!has_loops) {
+      *work_out = work;
+      return false;
+   }
+
+   if (loop_bound > 0) {
+      uint64_t bounded = 0;
+      if (!__builtin_mul_overflow(work, loop_bound, &bounded) &&
+          bounded <= HK_PACK_MAX_STATIC_WORK) {
+         *work_out = bounded;
+         return false;
+      }
+      *work_out = UINT64_MAX;
+      return true;
+   }
+
+   *work_out = work;
+   return true;
+}
+
+/* Re-check a packed run's work and unbounded-loop limits before submit-time
+ * fusion replaces producer/consumer dispatches with a fused variant (such as
+ * DUAL_PAD4, which adds border/zero-fill loops not present in the original
+ * producer). */
+bool
+hk_pack_fusion_fits_run(uint64_t run_work, unsigned run_loops,
+                        uint64_t replaced_work, unsigned replaced_loops,
+                        uint64_t fused_work, bool fused_loops,
+                        uint64_t *new_work_out, unsigned *new_loops_out)
+{
+   if (replaced_work > run_work || replaced_loops > run_loops)
+      return false;
+   const uint64_t rem_work = run_work - replaced_work;
+   const unsigned rem_loops = run_loops - replaced_loops;
+   const unsigned new_loops = rem_loops + (fused_loops ? 1u : 0u);
+   if (new_loops > 1u)
+      return false;
+   uint64_t new_work = 0;
+   if (__builtin_add_overflow(rem_work, fused_work, &new_work) ||
+       new_work > HK_PACK_MAX_STATIC_WORK)
+      return false;
+   if (new_work_out)
+      *new_work_out = new_work;
+   if (new_loops_out)
+      *new_loops_out = new_loops;
+   return true;
+}
+
+void
+hk_pack_run_budget(const struct hk_pack_member *members, unsigned start,
+                   unsigned end, uint64_t *work_out, unsigned *loops_out)
+{
+   uint64_t work = 0;
+   unsigned loops = 0;
+   for (unsigned j = start; j < end; ++j) {
+      if (!members[j].cs)
+         continue;
+      if (__builtin_add_overflow(work, members[j].cs->pack_static_work, &work))
+         work = UINT64_MAX;
+      if (members[j].cs->pack_loops)
+         loops++;
+   }
+   *work_out = work;
+   *loops_out = loops;
+}
+
+int
+hk_pack_choose_fusion(const struct hk_pack_member *members, unsigned first,
+                      unsigned end, unsigned attempts,
+                      hk_pack_fusion_cost_fn cost_fn, void *data,
+                      uint64_t *run_work, unsigned *run_loops)
+{
+   for (unsigned attempt = 0; attempt < attempts; ++attempt) {
+      struct hk_pack_fusion_cost cost = {0};
+      if (!cost_fn(data, attempt, &cost) || cost.span == 0 ||
+          cost.span > end - first)
+         continue;
+
+      uint64_t replaced_work = 0;
+      unsigned replaced_loops = 0;
+      bool replaced_overflow = false;
+      for (unsigned j = first; j < first + cost.span; ++j) {
+         if (!members[j].cs)
+            continue;
+         if (__builtin_add_overflow(replaced_work,
+                                    members[j].cs->pack_static_work,
+                                    &replaced_work)) {
+            replaced_overflow = true;
+            break;
+         }
+         if (members[j].cs->pack_loops)
+            replaced_loops++;
+      }
+      if (replaced_overflow)
+         continue;
+
+      uint64_t fused_work = 0;
+      const bool fused_loops = hk_pack_account_dispatch_work(
+         cost.threads, cost.instrs, cost.has_loops, cost.loop_bound,
+         &fused_work);
+
+      uint64_t new_work = 0;
+      unsigned new_loops = 0;
+      if (!hk_pack_fusion_fits_run(*run_work, *run_loops, replaced_work,
+                                   replaced_loops, fused_work, fused_loops,
+                                   &new_work, &new_loops))
+         continue;
+
+      *run_work = new_work;
+      *run_loops = new_loops;
+      return (int)attempt;
+   }
+   return -1;
+}
+
 enum hk_pack_boundary
 hk_pack_boundary(const struct hk_device *dev)
 {

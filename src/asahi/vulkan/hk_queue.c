@@ -2886,6 +2886,81 @@ struct hk_pack_fuse_plan {
    bool is_self_copy;
 };
 
+struct hk_pack_fusion_attempts {
+   struct hk_device *dev;
+   const struct hk_compute_pair_dispatch *p;
+   const struct hk_nir_clamp_epilogue *ep;
+   const struct hk_pack_member *members;
+   unsigned first;
+   enum hk_compute_pair_dual_write dual;
+   unsigned dual_idx;
+   struct hk_shader *shader[2];
+   unsigned span[2];
+};
+
+/* hk_pack_fusion_cost_fn for hk_pack_runs(): compiles (or finds) the fused
+ * variant of attempt `attempt` and reports what it would cost the run. */
+static bool
+hk_pack_fusion_attempt_cost(void *data, unsigned attempt,
+                            struct hk_pack_fusion_cost *cost)
+{
+   struct hk_pack_fusion_attempts *at = data;
+   const struct hk_compute_pair_dispatch *p = at->p;
+   const enum hk_compute_pair_dual_write dual =
+      attempt == 0 ? at->dual : HK_COMPUTE_PAIR_DUAL_NONE;
+
+   struct hk_shader *cand = hk_compute_pair_get_or_compile_fused(
+      at->dev, p->producer, at->ep, p->alt_kind, dual);
+   if (!cand || !hk_fused_compute_shader_eligible(at->dev, cand, p))
+      return false;
+
+   const uint64_t fused_threads =
+      (uint64_t)p->exec_threads[0] *
+      (uint64_t)p->exec_threads[1] *
+      (uint64_t)p->exec_threads[2];
+   uint64_t fused_params[HK_PACK_LOOP_PARAM_COUNT];
+   memcpy(fused_params, p->pack_loop_params, sizeof(fused_params));
+   bool params_ok = true;
+   if (dual == HK_COMPUTE_PAIR_DUAL_PAD4) {
+      const struct hk_compute_pair_pad4 *pad =
+         &at->members[at->dual_idx].cs->compute_pair->extra.pad4;
+      fused_params[HK_PACK_LOOP_PARAM_PAD_H] =
+         pad->out_shape[1] > pad->in_shape[1]
+            ? (uint64_t)(pad->out_shape[1] - pad->in_shape[1]) : 0;
+      fused_params[HK_PACK_LOOP_PARAM_PAD_W] =
+         pad->out_shape[2] > pad->in_shape[2]
+            ? (uint64_t)(pad->out_shape[2] - pad->in_shape[2]) : 0;
+      uint64_t hw = 0, out_total = 0;
+      if (fused_threads == 0 ||
+          __builtin_mul_overflow((uint64_t)pad->out_shape[1],
+                                 (uint64_t)pad->out_shape[2], &hw) ||
+          __builtin_mul_overflow(hw, (uint64_t)pad->out_shape[3],
+                                 &out_total)) {
+         params_ok = false;
+      } else {
+         fused_params[HK_PACK_LOOP_PARAM_PAD_ZLP_ITERS] =
+            DIV_ROUND_UP(out_total, fused_threads);
+      }
+   }
+
+   uint64_t fused_bound = 0;
+   if (params_ok)
+      hk_pack_eval_loop_bound(&cand->pack_loop_bound, fused_params,
+                              &fused_bound);
+
+   at->shader[attempt] = cand;
+   at->span[attempt] = dual != HK_COMPUTE_PAIR_DUAL_NONE
+                          ? (at->dual_idx - at->first + 1) : 2u;
+   *cost = (struct hk_pack_fusion_cost){
+      .span = at->span[attempt],
+      .threads = fused_threads,
+      .instrs = cand->b.info.stats.instrs,
+      .has_loops = cand->b.info.has_loops,
+      .loop_bound = fused_bound,
+   };
+   return true;
+}
+
 static bool
 hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
              const struct vk_queue_submit *submit, struct hk_packed_runs *out)
@@ -2962,6 +3037,9 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
       for (unsigned r = 0; r < run_count; ++r) {
          const unsigned start = runs[r].first;
          const unsigned end = start + runs[r].count;
+         uint64_t run_work = 0;
+         unsigned run_loops = 0;
+         hk_pack_run_budget(members, start, end, &run_work, &run_loops);
          for (unsigned i = start; i < end; ++i) {
             const struct hk_cs *cs_i = members[i].cs;
             if (!cs_i || !hk_compute_pair_stream_eligible(cs_i))
@@ -3013,25 +3091,25 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
             if (!ep && dual == HK_COMPUTE_PAIR_DUAL_NONE)
                continue;
 
-            struct hk_shader *fused = hk_compute_pair_get_or_compile_fused(
-               dev, p->producer, ep, p->alt_kind, dual);
-            if (!fused || !hk_fused_compute_shader_eligible(dev, fused, p)) {
-               /* If dual-write compilation failed but clamp-only is available,
-                * fall back cleanly to clamp-only fusion. */
-               if (ep && dual != HK_COMPUTE_PAIR_DUAL_NONE) {
-                  dual = HK_COMPUTE_PAIR_DUAL_NONE;
-                  dual_idx = 0;
-                  fused = hk_compute_pair_get_or_compile_fused(
-                     dev, p->producer, ep, p->alt_kind, HK_COMPUTE_PAIR_DUAL_NONE);
-                  if (!fused || !hk_fused_compute_shader_eligible(dev, fused, p))
-                     continue;
-               } else {
-                  continue;
-               }
+            /* Attempt 0 is the requested variant (dual-write when matched),
+             * attempt 1 the clamp-only fallback when both were matched. */
+            struct hk_pack_fusion_attempts at = {
+               .dev = dev, .p = p, .ep = ep, .members = members,
+               .first = i, .dual = dual, .dual_idx = dual_idx,
+            };
+            const unsigned attempts =
+               (ep && dual != HK_COMPUTE_PAIR_DUAL_NONE) ? 2u : 1u;
+            const int chosen = hk_pack_choose_fusion(
+               members, i, end, attempts, hk_pack_fusion_attempt_cost, &at,
+               &run_work, &run_loops);
+            if (chosen < 0)
+               continue;
+            struct hk_shader *fused = at.shader[chosen];
+            const unsigned span = at.span[chosen];
+            if (chosen == 1) {
+               dual = HK_COMPUTE_PAIR_DUAL_NONE;
+               dual_idx = 0;
             }
-
-            const unsigned span =
-               dual != HK_COMPUTE_PAIR_DUAL_NONE ? (dual_idx - i + 1) : 2u;
             plans[i] = (struct hk_pack_fuse_plan){
                .shader = fused,
                .dual_write = dual,
