@@ -215,6 +215,8 @@ agx_bo_cache_has(struct agx_device *dev, size_t size, size_t align,
 {
    size = ALIGN_POT(size, AIL_PAGESIZE);
    align = MAX2(align, AIL_PAGESIZE);
+   if (dev->ops.bo_normalize_flags)
+      flags = (uint32_t)dev->ops.bo_normalize_flags(dev, (enum agx_bo_flags)flags);
 
    simple_mtx_lock(&dev->bo_cache.lock);
    bool found = false;
@@ -651,6 +653,8 @@ agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
    /* BOs are allocated in pages */
    size = ALIGN_POT(size, AIL_PAGESIZE);
    align = MAX2(align, AIL_PAGESIZE);
+   if (dev->ops.bo_normalize_flags)
+      flags = dev->ops.bo_normalize_flags(dev, flags);
 
    /* See if we have a BO already in the cache */
    bo = agx_bo_cache_fetch(dev, size, align, flags, true);

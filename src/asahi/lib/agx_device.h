@@ -157,6 +157,10 @@ typedef struct {
     * winsys publishes the range through D3DKMTInvalidateCache. */
    int (*bo_sync_for_device)(struct agx_device *dev, struct agx_bo *bo,
                              size_t offset, size_t size);
+   /* Normalize caller BO flags before BO-cache lookup and allocation so cache
+    * bucket/equality checks match the flags stored on newly created BOs. */
+   enum agx_bo_flags (*bo_normalize_flags)(struct agx_device *dev,
+                                           enum agx_bo_flags flags);
    void (*bo_free)(struct agx_device *dev, uint32_t handle);
 
 } agx_device_ops_t;

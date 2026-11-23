@@ -201,6 +201,7 @@ struct agx_d3dkmt_allocation_record {
    bool borrowed;
    /* Validated KMD metadata, never an importer-provided mapping hint. */
    bool cpu_mapping_forbidden;
+   bool is_primary;
 };
 
 struct agx_d3dkmt_handle_pool {

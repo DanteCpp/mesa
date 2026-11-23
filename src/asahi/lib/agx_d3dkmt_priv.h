@@ -140,6 +140,7 @@ struct agx_d3dkmt_winsys {
    bool v6_log;
    uint32_t v6_submits;      /* submits seen (bounds the per-submit lines) */
    uint32_t v6_kinds_logged; /* AGX_D3DKMT_V6_* first-of-kind bits already logged */
+   uint32_t primary_bo_count; /* live AGX_BO_PRIMARY BOs; 0 skips v6 read-set scan */
 };
 
 /* First-of-kind refusal lines of the version-6 path. */

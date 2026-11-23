@@ -543,10 +543,15 @@ d3dkmt_adopt_allocation(
    const struct agx_d3dkmt_allocation_record *record)
 {
    struct agx_d3dkmt_winsys *ws = agx_d3dkmt_ws(dev);
+   struct agx_d3dkmt_allocation_record rec = *record;
    struct agx_bo *bo;
 
+   rec.is_primary = (flags & AGX_BO_PRIMARY) != 0;
+
    simple_mtx_lock(&ws->lock);
-   uint32_t handle = agx_d3dkmt_pool_alloc_record(&ws->pool, record);
+   uint32_t handle = agx_d3dkmt_pool_alloc_record(&ws->pool, &rec);
+   if (handle != 0 && rec.is_primary)
+      __atomic_add_fetch(&ws->primary_bo_count, 1u, __ATOMIC_RELEASE);
    simple_mtx_unlock(&ws->lock);
 
    if (handle == 0) {
@@ -568,6 +573,8 @@ d3dkmt_adopt_allocation(
       struct agx_d3dkmt_allocation_record released;
       bool found =
          agx_d3dkmt_pool_release_record(&ws->pool, handle, &released);
+      if (found && released.is_primary)
+         __atomic_sub_fetch(&ws->primary_bo_count, 1u, __ATOMIC_RELEASE);
       simple_mtx_unlock(&ws->lock);
       if (found)
          d3dkmt_destroy_record(ws, &released);
@@ -617,6 +624,19 @@ static int d3dkmt_query_allocation(struct agx_d3dkmt_winsys *ws,
                                    agx_kmt_handle allocation,
                                    struct agx_d3dkmt_allocation_info *info);
 
+/* Normalize BO creation flags before BO-cache lookup and allocation so cached
+ * BOs match caller queries instead of missing 100% on AGX_BO_EXEC pools.
+ * On G17+, KMD Local Segment 2 maps non-primary UMD BOs write-combined anyway,
+ * so keeping EXEC write-combined avoids unnecessary D3DKMTInvalidateCache
+ * syscalls on both Local Segment 2 and aperture fallback. */
+static enum agx_bo_flags
+d3dkmt_bo_normalize_flags(struct agx_device *dev, enum agx_bo_flags flags)
+{
+   if (dev != NULL && dev->params.gpu_generation >= 17u)
+      return flags;
+   return (enum agx_bo_flags)agx_d3dkmt_cpu_visible_flags((uint32_t)flags);
+}
+
 static struct agx_bo *
 d3dkmt_bo_alloc(struct agx_device *dev, size_t size, size_t align,
                 enum agx_bo_flags flags)
@@ -625,7 +645,7 @@ d3dkmt_bo_alloc(struct agx_device *dev, size_t size, size_t align,
 
    /* executable implies low va */
    assert(!(flags & AGX_BO_EXEC) || (flags & AGX_BO_LOW_VA));
-   flags = (enum agx_bo_flags)agx_d3dkmt_cpu_visible_flags((uint32_t)flags);
+   flags = d3dkmt_bo_normalize_flags(dev, flags);
 
    struct agx_d3dkmt_allocation_record record;
    enum agx_d3dkmt_external_memory_type external_type =
@@ -667,6 +687,8 @@ d3dkmt_bo_free(struct agx_device *dev, uint32_t handle)
    simple_mtx_lock(&ws->lock);
    struct agx_d3dkmt_allocation_record record;
    bool found = agx_d3dkmt_pool_release_record(&ws->pool, handle, &record);
+   if (found && record.is_primary)
+      __atomic_sub_fetch(&ws->primary_bo_count, 1u, __ATOMIC_RELEASE);
    simple_mtx_unlock(&ws->lock);
 
    if (!found)
@@ -916,7 +938,7 @@ agx_d3dkmt_bo_create_external(
    size = ALIGN_POT(size, AIL_PAGESIZE);
    align = MAX2(align, AIL_PAGESIZE);
    flags |= AGX_BO_SHARED | AGX_BO_SHAREABLE;
-   flags = (enum agx_bo_flags)agx_d3dkmt_cpu_visible_flags((uint32_t)flags);
+   flags = d3dkmt_bo_normalize_flags(dev, flags);
 
    struct agx_d3dkmt_winsys *ws = agx_d3dkmt_ws(dev);
    struct agx_d3dkmt_allocation_record record;
@@ -1541,6 +1563,21 @@ d3dkmt_bo_sync_for_device(struct agx_device *dev, struct agx_bo *bo,
    if (size == 0)
       return 0;
 
+   /* Write-combined BOs (everything without AGX_BO_WRITEBACK: batch pools,
+    * encoders, G17 executable pools, command-buffer staging) are guaranteed
+    * uncached (FlagsWddm2.Cached == 0) in KMD across all segments/chips.
+    * Drain the CPU write-combining store buffer to Point of Coherency in EL0
+    * instead of paying a dxgkrnl/VidMm D3DKMTInvalidateCache kernel transition
+    * on every pool upload. Explicit WRITEBACK BOs keep D3DKMTInvalidateCache. */
+   if ((bo->flags & AGX_BO_WRITEBACK) == 0) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+      __asm__ volatile("dsb sy" ::: "memory");
+#else
+      MemoryBarrier();
+#endif
+      return 0;
+   }
+
    const struct agx_kmt_invalidatecache invalidate = {
       .hDevice = ws->device,
       .hAllocation = bo->uapi_handle,
@@ -1580,6 +1617,15 @@ d3dkmt_build_read_set(struct agx_device *dev, struct agx_bo *staging,
    const bool v6 = dev->primary_write_contract;
    uint32_t count = 0, named = 0;
    uint64_t staging_va = staging->va->addr;
+
+   if (v6 &&
+       __atomic_load_n(&agx_d3dkmt_ws(dev)->primary_bo_count,
+                       __ATOMIC_ACQUIRE) == 0u) {
+      *range_count = 0;
+      if (named_bos)
+         *named_bos = 0;
+      return 0;
+   }
 
    if (agx_d3dkmt_read_set_names_staging(v6) &&
        agx_d3dkmt_read_range_add_layout(
@@ -1851,7 +1897,9 @@ staging_for(struct agx_device *dev, struct agx_d3dkmt_ctx *ctx, uint32_t size)
    if (bo == NULL) {
       size_t alloc = ALIGN_POT(MAX2((size_t)size, (size_t)AIL_PAGESIZE),
                                AIL_PAGESIZE);
-      bo = agx_bo_create(dev, alloc, 0, AGX_BO_WRITEBACK, "D3DKMT cmdbuf");
+      /* CPU only writes the DMA header + cmdbuf sequentially and never reads
+       * it back; write-combined avoids per-submit D3DKMTInvalidateCache. */
+      bo = agx_bo_create(dev, alloc, 0, 0, "D3DKMT cmdbuf");
       if (bo == NULL)
          return NULL;
       ctx->staging[slot] = bo;
@@ -2953,6 +3001,7 @@ const agx_device_ops_t agx_device_d3dkmt_ops = {
    .simple_ioctl = d3dkmt_simple_ioctl,
    .bo_munmap = d3dkmt_bo_munmap,
    .bo_sync_for_device = d3dkmt_bo_sync_for_device,
+   .bo_normalize_flags = d3dkmt_bo_normalize_flags,
    .bo_free = d3dkmt_bo_free,
 };
 
