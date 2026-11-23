@@ -87,9 +87,19 @@ struct agx_d3dkmt_winsys {
    const volatile uint64_t *va_fence_cpu;
    uint64_t va_fence_next;
 
-   simple_mtx_t lock; /* guards pool, syncs, ctxs and the staging rings */
+   simple_mtx_t lock; /* guards pool, syncs, sync_cache, ctxs and the staging rings */
    struct agx_d3dkmt_handle_pool pool;
    struct agx_d3dkmt_sync_table syncs;
+
+   /* Recycled monitored-fence pool: avoids per-frame Create/DestroySyncObject
+    * kernel transitions and VidMm GPU VA 0x10200 page-table map/unmap stalls. */
+#define AGX_D3DKMT_SYNC_CACHE_SIZE 64u
+   struct {
+      agx_kmt_handle kmt;
+      const volatile uint64_t *cpu_va;
+      uint64_t min_ready;
+   } sync_cache[AGX_D3DKMT_SYNC_CACHE_SIZE];
+   uint32_t sync_cache_count;
 
    struct agx_d3dkmt_ctx *ctxs;
    uint32_t ctx_capacity;

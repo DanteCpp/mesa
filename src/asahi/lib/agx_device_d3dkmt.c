@@ -339,10 +339,12 @@ agx_d3dkmt_create_monitored_fence(struct agx_d3dkmt_winsys *ws,
       gpu_va >= AGX_M5_DRIVER_BASE &&
       gpu_va - AGX_M5_DRIVER_BASE < AGX_M5_DRIVER_SIZE;
 
-   d3dkmt_log_flushed(
-           "D3DKMT: monitored fence (%s) 0x%08x GPU VA 0x%llx%s\n", what,
-           (unsigned)create->hSyncObject, (unsigned long long)gpu_va,
-           in_driver_window ? " INSIDE the driver window: refused" : "");
+   if (in_driver_window || ws->monitored_fences_created <= 16u) {
+      d3dkmt_log_flushed(
+              "D3DKMT: monitored fence (%s) 0x%08x GPU VA 0x%llx%s\n", what,
+              (unsigned)create->hSyncObject, (unsigned long long)gpu_va,
+              in_driver_window ? " INSIDE the driver window: refused" : "");
+   }
    if (in_driver_window) {
       struct agx_kmt_destroysyncobj d = {.hSyncObject = create->hSyncObject};
       ws->fns.DestroySynchronizationObject(&d);
@@ -1625,11 +1627,11 @@ d3dkmt_v6_pages(const struct agxw_submit_read_range *r, uint32_t n)
    return pages;
 }
 
-/* The per-submit line: the first 20 submits and every hundredth after. */
+/* The per-submit line: only the first 4 submits to avoid per-frame stderr flushes. */
 static bool
 d3dkmt_v6_sample(struct agx_d3dkmt_winsys *ws, uint32_t n)
 {
-   return ws->v6_log && (n <= 20 || n % 100 == 0);
+   return ws->v6_log && n <= 4u;
 }
 
 /* -------------------------------------------------------------------------
@@ -2111,7 +2113,7 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
       }
       waits[i] = s->kmt;
       wait_values[i] = syncs[i].sync_type == DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ
-                          ? syncs[i].timeline_value
+                          ? (s->timeline_offset + syncs[i].timeline_value)
                           : agx_d3dkmt_binary_wait_value(s);
    }
 
@@ -2127,7 +2129,7 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
 
       uint64_t v;
       if (src->sync_type == DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ) {
-         v = src->timeline_value;
+         v = e->timeline_offset + src->timeline_value;
       } else {
          /* DRM binary out_sync replaces any prior fence without requiring an
           * explicit reset (drm_syncobj_replace_fence). Advance the epoch past
@@ -3426,6 +3428,12 @@ agx_d3dkmt_close_device(struct agx_device *dev)
 
    struct agx_kmt_closeadapter ca = {.hAdapter = ws->adapter};
    ws->fns.CloseAdapter(&ca);
+
+   for (uint32_t i = 0; i < ws->sync_cache_count; ++i) {
+      struct agx_kmt_destroysyncobj ds = {.hSyncObject = ws->sync_cache[i].kmt};
+      ws->fns.DestroySynchronizationObject(&ds);
+   }
+   ws->sync_cache_count = 0;
 
    agx_d3dkmt_pool_finish(&ws->pool);
    agx_d3dkmt_sync_table_finish(&ws->syncs);

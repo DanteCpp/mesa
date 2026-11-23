@@ -389,7 +389,8 @@ uint32_t agx_d3dkmt_va_split_carveout(uint64_t base, uint64_t size,
 struct agx_d3dkmt_sync {
    agx_kmt_handle kmt;    /* monitored fence handle; 0 = free slot */
    uint64_t base;         /* binary epoch */
-   uint64_t last_request; /* highest value we have asked anyone to signal */
+   uint64_t last_request; /* highest raw value we have asked anyone to signal */
+   uint64_t timeline_offset; /* raw offset when recycling a pooled monitored fence */
    /* CONTRACT.md SS6.3: guaranteed non-NULL by the miniport. Kept optional
     * here so the degradation is explicit rather than a crash if it ever
     * isn't. */

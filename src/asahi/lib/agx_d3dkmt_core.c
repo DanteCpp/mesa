@@ -630,8 +630,9 @@ agx_d3dkmt_sync_transfer_values(const struct agx_d3dkmt_sync *src,
     * D3DKMT monitored fence never has a replaceable binary payload, so the
     * portable epoch model maps that payload to base + 1.  Non-zero points
     * are timeline values and pass through unchanged. */
-   *src_value = src_point ? src_point : agx_d3dkmt_binary_wait_value(src);
-   *dst_value = dst_point ? dst_point
+   *src_value = src_point ? (src->timeline_offset + src_point)
+                          : agx_d3dkmt_binary_wait_value(src);
+   *dst_value = dst_point ? (dst->timeline_offset + dst_point)
                           : agx_d3dkmt_binary_signal_value(dst, NULL);
 }
 

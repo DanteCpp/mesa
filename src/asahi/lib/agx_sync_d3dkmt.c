@@ -98,8 +98,47 @@ d3dkmt_syncobj_create(struct util_sync_provider *p, uint32_t flags,
                       uint32_t *handle)
 {
    struct agx_d3dkmt_winsys *ws = ws_of(p);
+   const bool want_signaled = (flags & DRM_SYNCOBJ_CREATE_SIGNALED) != 0;
+
    simple_mtx_lock(&ws->lock);
    bool lost = ws->device_lost;
+   if (!lost && ws->sync_cache_count > 0) {
+      /* Reuse a retired monitored fence from the pool: zero kernel syncobj
+       * create/destroy transitions and zero VidMm GPU VA page-table churn. */
+      for (uint32_t i = ws->sync_cache_count; i > 0; --i) {
+         uint32_t idx = i - 1;
+         const volatile uint64_t *cpu_va = ws->sync_cache[idx].cpu_va;
+         uint64_t cur = *cpu_va;
+         if (cur < ws->sync_cache[idx].min_ready)
+            continue;
+         if (want_signaled && cur == 0)
+            continue;
+         agx_kmt_handle kmt = ws->sync_cache[idx].kmt;
+         ws->sync_cache[idx] = ws->sync_cache[--ws->sync_cache_count];
+         uint32_t h = agx_d3dkmt_sync_table_add(&ws->syncs, kmt, cpu_va, cur);
+         if (h == 0) {
+            ws->sync_cache[ws->sync_cache_count].kmt = kmt;
+            ws->sync_cache[ws->sync_cache_count].cpu_va = cpu_va;
+            ws->sync_cache[ws->sync_cache_count].min_ready = cur;
+            ws->sync_cache_count++;
+            simple_mtx_unlock(&ws->lock);
+            errno = ENOMEM;
+            return -1;
+         }
+         struct agx_d3dkmt_sync *s = agx_d3dkmt_sync_table_get(&ws->syncs, h);
+         if (want_signaled) {
+            s->base = cur - 1;
+            s->timeline_offset = cur - 1;
+         } else {
+            s->base = cur;
+            s->timeline_offset = cur;
+         }
+         s->last_request = cur;
+         simple_mtx_unlock(&ws->lock);
+         *handle = h;
+         return 0;
+      }
+   }
    simple_mtx_unlock(&ws->lock);
    if (lost) {
       errno = EIO;
@@ -111,7 +150,7 @@ d3dkmt_syncobj_create(struct util_sync_provider *p, uint32_t flags,
     * model that is simply an initial fence value of 1, since binary-signalled
     * is defined as fence >= base + 1 and base starts at 0.
     */
-   const uint64_t initial = (flags & DRM_SYNCOBJ_CREATE_SIGNALED) ? 1 : 0;
+   const uint64_t initial = want_signaled ? 1 : 0;
 
    struct agx_kmt_createsyncobj2 create = {
       .hDevice = ws->device,
@@ -151,9 +190,24 @@ static int
 d3dkmt_syncobj_destroy(struct util_sync_provider *p, uint32_t handle)
 {
    struct agx_d3dkmt_winsys *ws = ws_of(p);
+   agx_kmt_handle kmt = 0;
 
    simple_mtx_lock(&ws->lock);
-   agx_kmt_handle kmt = agx_d3dkmt_sync_table_remove(&ws->syncs, handle);
+   struct agx_d3dkmt_sync *s = agx_d3dkmt_sync_table_get(&ws->syncs, handle);
+   if (s != NULL) {
+      const volatile uint64_t *cpu_va = s->cpu_va;
+      uint64_t min_ready = s->last_request > s->base ? s->last_request : s->base;
+      kmt = agx_d3dkmt_sync_table_remove(&ws->syncs, handle);
+      if (kmt != 0 && !ws->device_lost && cpu_va != NULL &&
+          ws->sync_cache_count < AGX_D3DKMT_SYNC_CACHE_SIZE) {
+         ws->sync_cache[ws->sync_cache_count].kmt = kmt;
+         ws->sync_cache[ws->sync_cache_count].cpu_va = cpu_va;
+         ws->sync_cache[ws->sync_cache_count].min_ready = min_ready;
+         ws->sync_cache_count++;
+         simple_mtx_unlock(&ws->lock);
+         return 0;
+      }
+   }
    simple_mtx_unlock(&ws->lock);
 
    if (kmt == 0) {
@@ -210,21 +264,26 @@ d3dkmt_wait_common(struct util_sync_provider *p, uint32_t *handles,
                    uint32_t *first_signaled)
 {
    struct agx_d3dkmt_winsys *ws = ws_of(p);
-   agx_kmt_handle *kmt = NULL;
-   uint64_t *values = NULL;
-   const volatile uint64_t **current = NULL;
+   agx_kmt_handle stack_kmt[8];
+   uint64_t stack_values[8];
+   const volatile uint64_t *stack_current[8];
+   agx_kmt_handle *kmt = stack_kmt;
+   uint64_t *values = stack_values;
+   const volatile uint64_t **current = stack_current;
    int ret = -1;
 
    if (num_handles == 0)
       return 0;
    const int64_t wait_start_ns = ws->v6_log ? now_nsec() : 0;
 
-   kmt = malloc((size_t)num_handles * sizeof(*kmt));
-   values = malloc((size_t)num_handles * sizeof(*values));
-   current = malloc((size_t)num_handles * sizeof(*current));
-   if (kmt == NULL || values == NULL || current == NULL) {
-      errno = ENOMEM;
-      goto out;
+   if (num_handles > ARRAY_SIZE(stack_kmt)) {
+      kmt = malloc((size_t)num_handles * sizeof(*kmt));
+      values = malloc((size_t)num_handles * sizeof(*values));
+      current = malloc((size_t)num_handles * sizeof(*current));
+      if (kmt == NULL || values == NULL || current == NULL) {
+         errno = ENOMEM;
+         goto out;
+      }
    }
 
    simple_mtx_lock(&ws->lock);
@@ -242,7 +301,8 @@ d3dkmt_wait_common(struct util_sync_provider *p, uint32_t *handles,
          goto out;
       }
       kmt[i] = s->kmt;
-      values[i] = points ? points[i] : agx_d3dkmt_binary_wait_value(s);
+      values[i] = points ? (s->timeline_offset + points[i])
+                         : agx_d3dkmt_binary_wait_value(s);
       current[i] = s->cpu_va;
    }
    simple_mtx_unlock(&ws->lock);
@@ -315,9 +375,12 @@ out:
          errno = saved_errno;
       }
    }
-   free(kmt);
-   free(values);
-   free(current);
+   if (kmt != stack_kmt)
+      free(kmt);
+   if (values != stack_values)
+      free(values);
+   if (current != stack_current)
+      free(current);
    return ret;
 }
 
@@ -452,16 +515,22 @@ d3dkmt_syncobj_timeline_signal(struct util_sync_provider *p,
                                uint32_t handle_count)
 {
    struct agx_d3dkmt_winsys *ws = ws_of(p);
-   agx_kmt_handle *kmt = NULL;
+   agx_kmt_handle stack_kmt[8];
+   uint64_t stack_vals[8];
+   agx_kmt_handle *kmt = stack_kmt;
+   uint64_t *vals = stack_vals;
    int ret = -1;
 
    if (handle_count == 0)
       return 0;
 
-   kmt = malloc((size_t)handle_count * sizeof(*kmt));
-   if (kmt == NULL) {
-      errno = ENOMEM;
-      goto out;
+   if (handle_count > ARRAY_SIZE(stack_kmt)) {
+      kmt = malloc((size_t)handle_count * sizeof(*kmt));
+      vals = malloc((size_t)handle_count * sizeof(*vals));
+      if (kmt == NULL || vals == NULL) {
+         errno = ENOMEM;
+         goto out;
+      }
    }
 
    simple_mtx_lock(&ws->lock);
@@ -478,9 +547,11 @@ d3dkmt_syncobj_timeline_signal(struct util_sync_provider *p,
          errno = EINVAL;
          goto out;
       }
+      uint64_t raw = s->timeline_offset + points[i];
       kmt[i] = s->kmt;
-      if (points[i] > s->last_request)
-         s->last_request = points[i];
+      vals[i] = raw;
+      if (raw > s->last_request)
+         s->last_request = raw;
    }
    simple_mtx_unlock(&ws->lock);
 
@@ -488,7 +559,7 @@ d3dkmt_syncobj_timeline_signal(struct util_sync_provider *p,
       .hDevice = ws->device,
       .ObjectCount = handle_count,
       .ObjectHandleArray = kmt,
-      .FenceValueArray = points,
+      .FenceValueArray = vals,
    };
 
    agx_kmt_status st = ws->fns.SignalSynchronizationObjectFromCpu(&signal);
@@ -500,7 +571,10 @@ d3dkmt_syncobj_timeline_signal(struct util_sync_provider *p,
    }
 
 out:
-   free(kmt);
+   if (kmt != stack_kmt)
+      free(kmt);
+   if (vals != stack_vals)
+      free(vals);
    return ret;
 }
 
@@ -535,9 +609,10 @@ d3dkmt_syncobj_query(struct util_sync_provider *p, uint32_t *handles,
       /* DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED asks for the last value
        * SUBMITTED rather than the last SIGNALLED; that is exactly what our
        * own bookkeeping tracks. */
-      points[i] = (flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED)
-                     ? s->last_request
-                     : agx_d3dkmt_sync_current(s);
+      uint64_t raw = (flags & DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED)
+                        ? s->last_request
+                        : agx_d3dkmt_sync_current(s);
+      points[i] = raw > s->timeline_offset ? (raw - s->timeline_offset) : 0;
    }
    simple_mtx_unlock(&ws->lock);
 
@@ -613,7 +688,8 @@ d3dkmt_syncobj_transfer(struct util_sync_provider *p, uint32_t dst_handle,
    uint64_t src_value, dst_value;
    if (dst_point == 0) {
       /* Compute src_value before advancing dst->base (handles src == dst). */
-      src_value = src_point ? src_point : agx_d3dkmt_binary_wait_value(src);
+      src_value = src_point ? (src->timeline_offset + src_point)
+                            : agx_d3dkmt_binary_wait_value(src);
       dst->base = agx_d3dkmt_binary_reset_base(dst);
       dst_value = agx_d3dkmt_binary_signal_value(dst, NULL);
    } else {
