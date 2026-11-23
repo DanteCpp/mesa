@@ -1,0 +1,4 @@
+LIBRARY AuroraD3D11
+EXPORTS
+    OpenAdapter10
+    OpenAdapter10_2

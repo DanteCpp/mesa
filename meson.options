@@ -908,3 +908,10 @@ option(
   value : false,
   description : 'Build panfrost Rust components.'
 )
+
+option(
+  'aurora-d3d11-winddk-dir',
+  type : 'string',
+  value : '',
+  description : 'Path to staged Windows WDK DDI headers for building native AuroraD3D11.dll'
+)

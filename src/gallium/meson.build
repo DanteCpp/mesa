@@ -238,6 +238,10 @@ if with_platform_haiku
   subdir('frontends/hgl')
 endif
 if with_platform_windows
+  if with_gallium_asahi and get_option('aurora-d3d11-winddk-dir') != ''
+    subdir('frontends/aurora_d3d11')
+    subdir('targets/aurora_d3d11')
+  endif
   if with_opengl
     subdir('frontends/wgl')
     if with_gallium_d3d12
