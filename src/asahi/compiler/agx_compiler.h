@@ -1382,6 +1382,7 @@ void agx_opt_empty_else(agx_context *ctx);
 void agx_opt_register_cache(agx_context *ctx);
 void agx_opt_break_if(agx_context *ctx);
 void agx_opt_jmp_none(agx_context *ctx);
+bool agx_opt_loop_invariant_copies(agx_context *ctx);
 void agx_pack_binary(agx_context *ctx, struct util_dynarray *emission);
 
 /* AGX3 (M3/M4/M5) binary emission. Returns false -- failing the shader,

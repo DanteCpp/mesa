@@ -13519,6 +13519,12 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
    AGX_PASS(ctx, agx3_merge_m5_word_loads);
 
+   /* Uniform-source lowering and immediate legalization above put a copy next
+    * to each use; take the loop-invariant ones out of their loops. */
+   if (agx_isa_is_agx3(key->dev.encoding) &&
+       !(agx_compiler_debug & AGX_DBG_NOOPT))
+      AGX_PASS(ctx, agx_opt_loop_invariant_copies);
+
    /* RA correctness depends on DCE */
    AGX_PASS(ctx, agx_dce, true);
 
