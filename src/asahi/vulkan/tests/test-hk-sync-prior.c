@@ -391,6 +391,217 @@ test_timestamp_execution_scopes(void)
         timed->sync.prior[HK_SYNC_CDM] == 1);
    }
 }
+static bool test_allow_carrier_alloc;
+static uint64_t test_carrier_gpu_addr = 0x100000;
+
+static void
+free_carrier_streams(struct hk_cmd_buffer *cmd, struct hk_cs *first_carrier)
+{
+   bool freeing = false;
+   list_for_each_entry_safe(struct hk_cs, cs, &cmd->control_streams, node) {
+      if (cs == first_carrier)
+         freeing = true;
+      if (freeing) {
+         list_del(&cs->node);
+         util_dynarray_fini(&cs->compute_resources);
+         util_dynarray_fini(&cs->render_resources);
+         free(cs);
+      }
+   }
+}
+
+/* Exercise consecutive standalone timestamp carriers through the real
+ * hk_sync_write_timestamp() -> timestamp_only_stream() -> hk_sync_resolve_submit()
+ * path: on G17P with exact priors, back-to-back carriers must not emit a
+ * same-CDM barrier onto earlier timestamp carriers while preserving recorded
+ * barriers, query resets, cross-engine VDM dependencies, query copies, and
+ * simultaneous-use submissions.
+ */
+static void
+test_timestamp_consecutive_carriers(void)
+{
+   test_allow_carrier_alloc = true;
+
+   const struct agx_timestamp_req q0 = {
+      .handle = 1, .addr = 0x10000, .offset_B = 0};
+
+   /* 1. Consecutive empty timestamps after a barrier: G17P exact vs legacy. */
+   for (unsigned exact = 0; exact < 2; ++exact) {
+      struct hk_queue *queue = new_queue(exact);
+      struct hk_cmd_buffer *prev = timestamp_cmd(AGX_CHIP_G17P, exact);
+      add(prev, true);
+      add(prev, false);
+      T("prior frame work resolves", submit(queue, prev));
+
+      struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G17P, exact);
+      hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_GFX_FRAG | HK_SYNC_COMPUTE);
+      hk_sync_write_timestamp(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, q0);
+      end_timestamp(cmd, 1);
+      end_timestamp(cmd, 2);
+
+      T("three consecutive timestamps create three CDM carriers",
+        list_length(&cmd->control_streams) == 3);
+      struct hk_cs *s[3];
+      unsigned n = 0;
+      list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node)
+         s[n++] = cs;
+
+      T("consecutive carriers resolve", submit(queue, cmd));
+      T("carriers record distinct timestamp slots",
+        s[0]->timestamp.end.offset_B == 0 &&
+        s[1]->timestamp.end.offset_B == 8 &&
+        s[2]->timestamp.end.offset_B == 16);
+      if (exact) {
+         T("G17P exact carriers avoid same-CDM barrier chain",
+           s[0]->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+           s[1]->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+           s[2]->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE);
+         T("G17P exact carriers preserve recorded compute barrier prior",
+           s[0]->sync.prior[HK_SYNC_CDM] == 1 &&
+           s[1]->sync.prior[HK_SYNC_CDM] == 1 &&
+           s[2]->sync.prior[HK_SYNC_CDM] == 1);
+         T("G17P exact carriers preserve cross-engine VDM scope",
+           s[0]->sync.prior[HK_SYNC_VDM] == 0 &&
+           s[1]->sync.prior[HK_SYNC_VDM] == 1 &&
+           s[2]->sync.prior[HK_SYNC_VDM] == 1);
+      } else {
+         T("legacy kernel retains conservative carrier CDM barriers",
+           s[1]->sync.barrier[HK_SYNC_CDM] == 1 &&
+           s[2]->sync.barrier[HK_SYNC_CDM] == 2);
+      }
+
+      /* Simultaneous-use submission of the same 3-carrier command buffer:
+       * occurrence 1 carries the prior submit's CDM ordinal (no intra-run
+       * CDM barriers), and occurrence 2's explicit COMPUTE->COMPUTE barrier
+       * orders all 3 of its carriers after occurrence 1's stream 3 without
+       * chaining barriers across its own consecutive carriers (4, 5). */
+      if (exact) {
+         struct hk_cmd_buffer *dup[] = {cmd, cmd};
+         struct hk_sync_resolved out[6];
+         T("simultaneous-use consecutive carriers resolve",
+           hk_sync_resolve_submit(queue, dup, 2, false, false, 0, out));
+         T("simultaneous-use carriers keep no intra-run CDM barrier chain",
+           out[0].barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+           out[1].barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+           out[2].barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+           out[3].barrier[HK_SYNC_CDM] == 3 &&
+           out[4].barrier[HK_SYNC_CDM] == 3 &&
+           out[5].barrier[HK_SYNC_CDM] == 3 &&
+           out[1].prior[HK_SYNC_VDM] == 1 &&
+           out[4].prior[HK_SYNC_VDM] == 1);
+      }
+
+      free_carrier_streams(cmd, s[0]);
+   }
+
+   /* 2. Non-G17P chips retain the conservative same-CDM carrier barriers. */
+   const enum agx_chip other_chips[] = {AGX_CHIP_G16G, AGX_CHIP_G13G};
+   for (unsigned c = 0; c < ARRAY_SIZE(other_chips); ++c) {
+      struct hk_queue *queue = new_queue(true);
+      struct hk_cmd_buffer *cmd = timestamp_cmd(other_chips[c], true);
+      end_timestamp(cmd, 0);
+      end_timestamp(cmd, 1);
+      end_timestamp(cmd, 2);
+      struct hk_cs *s[3];
+      unsigned n = 0;
+      list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node)
+         s[n++] = cs;
+      T("non-G17P consecutive carriers resolve", submit(queue, cmd));
+      T("non-G17P retains same-CDM carrier barriers",
+        s[1]->sync.barrier[HK_SYNC_CDM] == 1 &&
+        s[2]->sync.barrier[HK_SYNC_CDM] == 2);
+      free_carrier_streams(cmd, s[0]);
+   }
+
+   /* 3. Query reset followed by consecutive timestamps keeps reset ordering
+    *    without cascading barriers onto later timestamp carriers. */
+   {
+      struct hk_queue *queue = new_queue(true);
+      struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G17P, true);
+      cmd->sync.kind_override = HK_SYNC_ALL;
+      struct hk_cs *reset = add(cmd, true);
+      cmd->sync.kind_override = 0;
+      cmd->current_cs.cs = reset;
+      reset->g17p_timestamp_query = true;
+      reset->stats.cmds = 1;
+      hk_sync_after_stream(cmd, reset, HK_SYNC_ALL);
+
+      end_timestamp(cmd, 0);
+      end_timestamp(cmd, 1);
+      end_timestamp(cmd, 2);
+
+      struct hk_cs *s[3];
+      unsigned n = 0;
+      list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node)
+         s[n++] = cs;
+      T("reset plus consecutive timestamps resolves",
+        n == 3 && submit(queue, cmd));
+      T("carriers wait on reset stream without chaining to earlier carriers",
+        s[0] == reset &&
+        s[1]->sync.barrier[HK_SYNC_CDM] == 1 &&
+        s[2]->sync.barrier[HK_SYNC_CDM] == 1);
+      free_carrier_streams(cmd, s[1]);
+   }
+
+   /* 4. Render with end stamp followed by another ALL_COMMANDS timestamp must
+    *    order the new CDM carrier after that render, and must never reuse an
+    *    older open compute stream positioned ahead of the render. */
+   {
+      struct hk_queue *queue = new_queue(true);
+      struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G17P, true);
+      struct hk_cs *open_cdm = add(cmd, true);
+      cmd->current_cs.cs = open_cdm;
+      open_cdm->stats.cmds = 1;
+
+      struct hk_cs *render = add(cmd, false);
+      render->stats.cmds = 1;
+      end_timestamp(cmd, 0);
+      end_timestamp(cmd, 1);
+
+      struct hk_cs *carrier = list_last_entry(&cmd->control_streams,
+                                              struct hk_cs, node);
+      T("post-render timestamp opens fresh carrier after render",
+        list_length(&cmd->control_streams) == 3 &&
+        carrier != open_cdm &&
+        carrier->sync.seq > render->sync.seq &&
+        !open_cdm->timestamp.end.handle &&
+        render->timestamp.end.offset_B == 0 &&
+        carrier->timestamp.end.offset_B == 8);
+      T("post-render carrier resolves", submit(queue, cmd));
+      T("post-render carrier waits on the timestamped render",
+        carrier->sync.barrier[HK_SYNC_VDM] == 1 &&
+        carrier->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE);
+      free_carrier_streams(cmd, carrier);
+   }
+
+   /* 5. Query copy after consecutive carriers waits on the final carrier. */
+   {
+      struct hk_queue *queue = new_queue(true);
+      struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G17P, true);
+      end_timestamp(cmd, 0);
+      end_timestamp(cmd, 1);
+      end_timestamp(cmd, 2);
+
+      struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+      hk_sync_src_dep(cmd, HK_SYNC_ALL, NULL, dep);
+      cmd->sync.kind_override = HK_SYNC_ALL;
+      struct hk_cs *copy = hk_sync_get_cs_after(cmd, dep);
+      cmd->sync.kind_override = 0;
+      copy->g17p_timestamp_query = true;
+      copy->stats.cmds = 1;
+
+      T("query copy after consecutive carriers resolves",
+        list_length(&cmd->control_streams) == 4 && submit(queue, cmd));
+      T("query copy waits on the last timestamp carrier",
+        copy->sync.barrier[HK_SYNC_CDM] == 3);
+      struct hk_cs *first = list_first_entry(&cmd->control_streams,
+                                             struct hk_cs, node);
+      free_carrier_streams(cmd, first);
+   }
+
+   test_allow_carrier_alloc = false;
+}
+
 /* Fixtures never queue immediate writes. Emitting one is a bug. */
 void
 hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
@@ -435,8 +646,11 @@ void
 hk_g17p_meta_fill_addr(struct hk_cmd_buffer *cmd, struct hk_cs **target,
                        uint64_t address, uint64_t size, uint32_t value)
 {
-   (void)cmd; (void)target; (void)address; (void)size; (void)value;
-   abort();
+   (void)cmd; (void)address; (void)size; (void)value;
+   if (!test_allow_carrier_alloc)
+      abort();
+   if (target && *target)
+      (*target)->stats.cmds++;
 }
 
 struct agx_ptr
@@ -444,22 +658,31 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd, struct hk_uploader *uploader,
                          uint32_t size, uint32_t alignment,
                          enum hk_cmd_bo_type type)
 {
-   (void)cmd; (void)uploader; (void)size; (void)alignment; (void)type;
-   abort();
+   (void)cmd; (void)uploader; (void)alignment; (void)type;
+   if (!test_allow_carrier_alloc)
+      abort();
+   uint64_t gpu = test_carrier_gpu_addr;
+   test_carrier_gpu_addr += MAX2(size, 64u);
+   return (struct agx_ptr){.cpu = test_alloc(MAX2(size, 16u)), .gpu = gpu};
 }
 
 struct agx_ptr
 hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 {
-   (void)cmd; (void)size; (void)alignment;
-   abort();
+   (void)cmd; (void)alignment;
+   if (!test_allow_carrier_alloc)
+      abort();
+   uint64_t gpu = test_carrier_gpu_addr;
+   test_carrier_gpu_addr += MAX2(size, 1024u);
+   return (struct agx_ptr){.cpu = test_alloc(MAX2(size, 64u)), .gpu = gpu};
 }
 
 void
 hk_drm_attachment_set_init(struct hk_drm_attachment_set *set)
 {
-   (void)set;
-   abort();
+   if (!test_allow_carrier_alloc)
+      abort();
+   memset(set, 0, sizeof(*set));
 }
 
 void
@@ -2138,6 +2361,7 @@ main(void)
    test_timestamp_reused_compute();
    test_timestamp_top_in_pass();
    test_timestamp_leading_top();
+   test_timestamp_consecutive_carriers();
    {
       /* A submission longer than the 16-bit barrier field: a wait on a
        * command past it is named by its ordinal (that command went in an

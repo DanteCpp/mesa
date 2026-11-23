@@ -1377,15 +1377,21 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
 /* An end stamp is written when a command completes, so ordering it after
  * earlier work orders that command's completion: for a render, its fragment
  * half alone. */
+static bool
+timestamp_elides_same_cdm_dep(const struct hk_cmd_buffer *cmd)
+{
+   const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   return agx_chip_native_agx3(dev->dev.chip) &&
+          dev->dev.chip == AGX_CHIP_G17P &&
+          (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS);
+}
+
 static void
 stamp_wait(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
            const struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
 {
    if (cs->type == HK_CS_CDM) {
-      const struct hk_device *dev = hk_cmd_buffer_device(cmd);
-      if (agx_chip_native_agx3(dev->dev.chip) &&
-          dev->dev.chip == AGX_CHIP_G17P &&
-          (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)) {
+      if (timestamp_elides_same_cdm_dep(cmd)) {
          /* The logical compute queue already orders these GPU commands by
           * their mandatory kick parents. Adding the timestamp's same-CDM
           * prefix also waits for earlier CPU timestamp publication, which
@@ -1442,8 +1448,18 @@ static struct hk_cs *
 timestamp_only_stream(struct hk_cmd_buffer *cmd,
                       const struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
 {
+   struct hk_sync_dep filtered[HK_SYNC_NUM_SQ];
+   memcpy(filtered, dep, sizeof(filtered));
+   if (timestamp_elides_same_cdm_dep(cmd))
+      filtered[HK_SYNC_CDM] = (struct hk_sync_dep){0};
+
+   /* A standalone timestamp carrier must not reuse an earlier open compute
+    * stream positioned ahead of the latest recorded stream. */
+   if (!cmd->sync.pin_cs)
+      hk_cmd_buffer_end_compute(cmd);
+
    cmd->sync.kind_override = HK_SYNC_ALL;
-   struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
+   struct hk_cs *cs = hk_sync_get_cs_after(cmd, filtered);
    cmd->sync.kind_override = 0;
    return cs;
 }
@@ -1583,9 +1599,9 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
 
    struct hk_cs *tail = last_stream(cmd);
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, src_kinds, tail, dep);
 
    if (tail && !tail->timestamp.end.handle) {
+      hk_sync_src_dep(cmd, src_kinds, tail, dep);
       tail->timestamp.end = req;
       stamp_wait(cmd, tail, dep);
 
@@ -1598,6 +1614,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       return;
    }
 
+   hk_sync_src_dep(cmd, src_kinds, NULL, dep);
    struct hk_cs *cs = timestamp_only_stream(cmd, dep);
    if (!cs)
       return;
