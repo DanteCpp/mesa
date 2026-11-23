@@ -90,6 +90,10 @@ bool hk_pack_account_dispatch_work(uint64_t threads, uint64_t instrs,
                                    bool has_loops, uint64_t loop_bound,
                                    uint64_t *work_out);
 
+bool hk_pack_account_dispatch_work_eff(uint64_t threads, uint64_t instrs,
+                                       bool has_loops, uint64_t eff_instrs,
+                                       uint64_t *work_out);
+
 bool hk_pack_fusion_fits_run(uint64_t run_work, unsigned run_loops,
                              uint64_t replaced_work, unsigned replaced_loops,
                              uint64_t fused_work, bool fused_loops,
@@ -103,8 +107,9 @@ struct hk_pack_fusion_cost {
    uint64_t threads;
    uint64_t instrs;
    bool has_loops;
-   /* Evaluated worst-case loop bound, or 0 when none could be proven. */
-   uint64_t loop_bound;
+   /* Evaluated worst-case per-thread instructions of a looping dispatch
+    * (hk_pack_eval_effective_instrs()), or 0 when no bound could be proven. */
+   uint64_t eff_instrs;
 };
 
 /* Fills `cost` for attempt `attempt`, or returns false when that variant is

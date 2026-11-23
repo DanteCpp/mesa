@@ -2943,10 +2943,11 @@ hk_pack_fusion_attempt_cost(void *data, unsigned attempt,
       }
    }
 
-   uint64_t fused_bound = 0;
+   uint64_t fused_eff_instrs = 0;
    if (params_ok)
-      hk_pack_eval_loop_bound(&cand->pack_loop_bound, fused_params,
-                              &fused_bound);
+      hk_pack_eval_effective_instrs(&cand->pack_loop_bound,
+                                    cand->b.info.stats.instrs, fused_params,
+                                    &fused_eff_instrs);
 
    at->shader[attempt] = cand;
    at->span[attempt] = dual != HK_COMPUTE_PAIR_DUAL_NONE
@@ -2956,7 +2957,7 @@ hk_pack_fusion_attempt_cost(void *data, unsigned attempt,
       .threads = fused_threads,
       .instrs = cand->b.info.stats.instrs,
       .has_loops = cand->b.info.has_loops,
-      .loop_bound = fused_bound,
+      .eff_instrs = fused_eff_instrs,
    };
    return true;
 }
