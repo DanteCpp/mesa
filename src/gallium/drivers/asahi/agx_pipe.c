@@ -1784,8 +1784,12 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
        c->bg_partial_rsrc_spec_hi || c->bg_eot_partial_rsrc_spec_hi)
       c->flags |= DRM_ASAHI_RENDER_RSRC_SPEC_HI;
 
-   /* XXX is this correct? */
-   c->bg.usc = pipeline_clear.usc | (framebuffer->nr_cbufs >= 4 ? 8 : 4);
+   /* AGX3 background/EOT USC descriptors always carry tag 4 (matching
+    * Borealis hk_queue.c); preserve the legacy >= 4 cbufs tag on AGX2. */
+   c->bg.usc = pipeline_clear.usc |
+               (agx_chip_agx3_path(dev->chip)
+                   ? 4
+                   : (framebuffer->nr_cbufs >= 4 ? 8 : 4));
    c->eot.usc = pipeline_store.usc | 4;
    c->partial_bg.usc = pipeline_load.usc | 4;
    c->partial_eot.usc = pipeline_store.usc | 4;
