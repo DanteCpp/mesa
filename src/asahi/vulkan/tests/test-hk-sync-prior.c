@@ -1333,6 +1333,130 @@ test_image_barrier_vertex_class(void)
    hk_sync_end_rendering(cmd, false);
 }
 
+/* A dependency into the draw-indirect stage orders compute work, pre-graphics
+ * work and a render's fragment half; a render's vertex half only once it
+ * records an indirect draw (hk_sync_vertex_indirect()). Renders that draw
+ * directly after the indirect dispatches of, say, an acceleration structure
+ * build keep their tiling unordered. */
+static void
+test_indirect_barrier_vertex_class(void)
+{
+   const VkMemoryBarrier2 build = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                      VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+   };
+   const VkMemoryBarrier2 reads = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                      VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+   };
+   const VkDependencyInfo build_dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &build,
+   };
+   const VkDependencyInfo reads_dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &reads,
+   };
+   uint8_t src, dst;
+   hk_sync_dependency_kinds(&build_dep, true, &src, &dst);
+   T("draw-indirect destination names the indirect class and compute",
+     src == HK_SYNC_COMPUTE &&
+        dst == (HK_SYNC_COMPUTE | HK_SYNC_GFX_INDIRECT));
+   hk_sync_dependency_kinds(&reads_dep, true, &src, &dst);
+   T("draw-indirect source is graphics and compute work",
+     src == (HK_SYNC_GFX | HK_SYNC_COMPUTE));
+   T("a graphics destination subsumes the indirect class",
+     dst == (HK_SYNC_GFX | HK_SYNC_COMPUTE));
+   T("graphics streams belong to the indirect class",
+     hk_sync_full_kinds(HK_SYNC_GFX) & HK_SYNC_GFX_INDIRECT);
+
+   struct hk_cmd_buffer *cmd = new_cmd();
+   struct hk_cs *producer = add(cmd, true);
+   hk_sync_barrier(cmd, HK_SYNC_COMPUTE,
+                   HK_SYNC_COMPUTE | HK_SYNC_GFX_INDIRECT);
+   struct hk_cs *plain = add(cmd, false);
+   T("fragment half waits on the indirect producer",
+     plain->sync.dep[HK_SYNC_CDM].cut == producer);
+   T("vertex half of a direct render does not",
+     !plain->sync.dep_ta[HK_SYNC_CDM].cut &&
+        !plain->sync.dep_ta[HK_SYNC_CDM].prior);
+   struct hk_cs *reader = add(cmd, false);
+   hk_sync_vertex_indirect(cmd, reader);
+   T("indirect-drawing vertex half waits on the producer",
+     reader->sync.dep_ta[HK_SYNC_CDM].cut == producer);
+   struct hk_cs *dispatch = add(cmd, true);
+   T("indirect dispatch waits on the producer",
+     dispatch->sync.dep[HK_SYNC_CDM].cut == producer);
+   struct hk_queue *queue = new_queue(true);
+   T("indirect class submit", submit(queue, cmd));
+   T("direct render splits its vertex half off",
+     plain->sync.ta_split &&
+        plain->sync.barrier_ta[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+        plain->sync.prior_ta[HK_SYNC_CDM] == 0 &&
+        plain->sync.barrier[HK_SYNC_CDM] != DRM_ASAHI_BARRIER_NONE);
+   T("indirect render keeps its vertex half ordered",
+     reader->sync.barrier_ta[HK_SYNC_CDM] ==
+        reader->sync.barrier[HK_SYNC_CDM] &&
+     reader->sync.prior_ta[HK_SYNC_CDM] == reader->sync.prior[HK_SYNC_CDM]);
+
+   /* Carried into a later command buffer of the same submission. */
+   struct hk_cmd_buffer *a = new_cmd(), *b = new_cmd();
+   add(a, true);
+   hk_sync_barrier(a, HK_SYNC_COMPUTE,
+                   HK_SYNC_COMPUTE | HK_SYNC_GFX_INDIRECT);
+   plain = add(b, false);
+   reader = add(b, false);
+   hk_sync_vertex_indirect(b, reader);
+   queue = new_queue(true);
+   struct hk_cmd_buffer *pair[] = {a, b};
+   T("carried indirect class submit",
+     hk_sync_resolve_submit(queue, pair, 2, false, false, 0, NULL));
+   T("carried indirect class leaves a direct vertex half unordered",
+     plain->sync.barrier_ta[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+     plain->sync.prior_ta[HK_SYNC_CDM] == 0);
+   T("carried indirect class orders an indirect vertex half",
+     reader->sync.barrier_ta[HK_SYNC_CDM] != DRM_ASAHI_BARRIER_NONE ||
+     reader->sync.prior_ta[HK_SYNC_CDM] != 0);
+
+   /* Pre-graphics work (indirect count, byte count, robust index) reads the
+    * parameters whether or not the render draws indirectly. */
+   cmd = new_cmd();
+   producer = add(cmd, true);
+   hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_GFX_INDIRECT);
+   hk_sync_begin_rendering(cmd, false);
+   add_slot(cmd, &cmd->current_cs.gfx, false);
+   struct hk_cs *pre = add_slot(cmd, &cmd->current_cs.pre_gfx, true);
+   T("pre-graphics honours the indirect class",
+     pre->sync.dep[HK_SYNC_CDM].cut == producer);
+   hk_sync_end_rendering(cmd, false);
+
+   /* G17P: parameters a render wrote can only come from a render that writes
+    * memory, as for the vertex inputs (hk_sync_barrier()). */
+   cmd = timestamp_cmd(AGX_CHIP_G17P, true);
+   struct hk_cs *attachments_only = add(cmd, false);
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX_INDIRECT);
+   reader = add(cmd, false);
+   hk_sync_vertex_indirect(cmd, reader);
+   T("G17P indirect vertex half skips renders writing attachments only",
+     !reader->sync.dep_ta[HK_SYNC_VDM].cut &&
+        !(reader->sync.dep_ta[HK_SYNC_VDM].prior & HK_SYNC_GFX));
+   (void)attachments_only;
+   cmd = timestamp_cmd(AGX_CHIP_G17P, true);
+   struct hk_cs *writer = add(cmd, false);
+   hk_sync_note_memory_write(cmd, writer);
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX_INDIRECT);
+   reader = add(cmd, false);
+   hk_sync_vertex_indirect(cmd, reader);
+   T("G17P indirect vertex half waits on a memory-writing render",
+     reader->sync.dep_ta[HK_SYNC_VDM].cut == writer);
+}
+
 /* A layout transition the driver performs as work (the metadata clear of a
  * discarded compressed storage image): brl_sync_transition_*(), recorded the
  * way brl_discard_init_prepare()/_record() and hk_CmdWaitEvents2() record it.
@@ -2127,6 +2251,7 @@ main(void)
    test_loaded_color_preservation();
    test_pass_software_graphics_dependencies();
    test_image_barrier_vertex_class();
+   test_indirect_barrier_vertex_class();
    test_discard_transition();
    test_discard_transition_carry();
    test_g17p_vertex_after_memory_writers();
