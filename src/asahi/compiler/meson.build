@@ -4,6 +4,7 @@
 
 libasahi_agx_files = files(
   'agx_compile.c',
+  'agx_nir_m5_ray_query.c',
   'agx_nir_lower_cmat.c',
   'agx_dce.c',
   'agx_liveness.c',
