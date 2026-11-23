@@ -409,13 +409,17 @@ struct aurora_device {
    UINT num_scissors;
    bool scissor_dirty;
 
-   /* Cached default objects (created lazily on first use). */
+   /* Cached default & internal clear CSOs. */
    void *default_blend_cso;
    void *default_dsa_cso;
    void *default_rast_cso;
    void *default_sampler_cso;
+   void *empty_velems_cso;
    void *clear_vs_cso;
    void *clear_fs_cso;
+   void *clear_blend_cso;
+   void *clear_dsa_cso;
+   void *clear_rast_cso;
 
    /* Cached per-format CheckFormatSupport results (fast path for D2D/DWM). */
    UINT fmt_caps_cache[192];

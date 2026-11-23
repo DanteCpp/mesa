@@ -7,6 +7,8 @@
  */
 #include "aurora_d3d11.h"
 #include "aurora_format.h"
+#include "compiler/glsl_types.h"
+#include "compiler/nir/nir_builder.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -679,7 +681,257 @@ aurora_DestroyUAV(D3D10DDI_HDEVICE hDevice, D3D11DDI_HUNORDEREDACCESSVIEW hUAV)
 
 /* =========================================================================
  * Clears, Discard, GenerateMips
+ *
+ * Gallium Asahi implements pctx->clear (hardware tile-memory fast clear) and
+ * pctx->clear_buffer, NOT clear_render_target / clear_depth_stencil /
+ * clear_texture. We map full-surface RTV/DSV clears directly to pctx->clear
+ * (reusing the active framebuffer when already bound so the clear merges into
+ * the tile render pass with zero extra pass!), and partial-rect ClearView to a
+ * cached NIR fullscreen-triangle scissored clear pass.
  * ========================================================================= */
+static bool
+surfaces_match(const struct pipe_surface *a, const struct pipe_surface *b)
+{
+   return a->texture == b->texture &&
+          a->format == b->format &&
+          a->level == b->level &&
+          a->first_layer == b->first_layer &&
+          a->last_layer == b->last_layer;
+}
+
+static void
+clear_rtv_full_locked(struct aurora_device *dev, const struct pipe_surface *surf,
+                      const union pipe_color_union *color)
+{
+   /* Fast path: if this RTV is already bound in the current framebuffer, sync
+    * FB and clear that exact color attachment without breaking the batch! */
+   for (UINT i = 0; i < dev->num_rtvs; ++i) {
+      struct pipe_surface bound;
+      if (dev->rtvs[i] && aurora_rtv_fill_surface(dev->rtvs[i], &bound) &&
+          surfaces_match(&bound, surf)) {
+         aurora_sync_framebuffer(dev);
+         dev->pctx->clear(dev->pctx, PIPE_CLEAR_COLOR0 << i, 0xfu, 0u,
+                          NULL, color, 0.0, 0u);
+         return;
+      }
+   }
+
+   /* Unbound RTV: temporarily bind a 1-target framebuffer and fast-clear. */
+   struct pipe_framebuffer_state fb;
+   memset(&fb, 0, sizeof(fb));
+   fb.width = u_minify(surf->texture->width0, surf->level);
+   fb.height = u_minify(surf->texture->height0, surf->level);
+   fb.nr_cbufs = 1;
+   fb.cbufs[0] = *surf;
+   dev->pctx->set_framebuffer_state(dev->pctx, &fb);
+   dev->pctx->clear(dev->pctx, PIPE_CLEAR_COLOR0, 0xfu, 0u, NULL, color, 0.0, 0u);
+   dev->fb_dirty = true;
+}
+
+static void
+clear_dsv_full_locked(struct aurora_device *dev, const struct pipe_surface *surf,
+                      unsigned clear_flags, double depth, unsigned stencil)
+{
+   union pipe_color_union zero;
+   memset(&zero, 0, sizeof(zero));
+
+   struct pipe_surface bound;
+   if (dev->dsv && aurora_dsv_fill_surface(dev->dsv, &bound) &&
+       surfaces_match(&bound, surf)) {
+      aurora_sync_framebuffer(dev);
+      dev->pctx->clear(dev->pctx, clear_flags, 0u, 0xffu, NULL, &zero,
+                       depth, stencil);
+      return;
+   }
+
+   struct pipe_framebuffer_state fb;
+   memset(&fb, 0, sizeof(fb));
+   fb.width = u_minify(surf->texture->width0, surf->level);
+   fb.height = u_minify(surf->texture->height0, surf->level);
+   fb.nr_cbufs = 0;
+   fb.zsbuf = *surf;
+   dev->pctx->set_framebuffer_state(dev->pctx, &fb);
+   dev->pctx->clear(dev->pctx, clear_flags, 0u, 0xffu, NULL, &zero,
+                    depth, stencil);
+   dev->fb_dirty = true;
+}
+
+static bool
+ensure_clear_pipeline_locked(struct aurora_device *dev)
+{
+   if (dev->clear_vs_cso && dev->clear_fs_cso &&
+       dev->clear_blend_cso && dev->clear_dsa_cso && dev->clear_rast_cso)
+      return true;
+
+   const nir_shader_compiler_options *vs_opts =
+      dev->screen->nir_options[MESA_SHADER_VERTEX];
+   const nir_shader_compiler_options *fs_opts =
+      dev->screen->nir_options[MESA_SHADER_FRAGMENT];
+   if (!vs_opts || !fs_opts)
+      return false;
+
+   if (!dev->clear_vs_cso) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, vs_opts,
+                                                     "aurora_clear_vs");
+      nir_variable *pos = nir_variable_create(b.shader, nir_var_shader_out,
+                                              glsl_vec4_type(), "gl_Position");
+      pos->data.location = VARYING_SLOT_POS;
+      nir_def *vid = nir_load_vertex_id(&b);
+      /* Fullscreen triangle: (0)->(-1,-1), (1)->(3,-1), (2)->(-1,3) */
+      nir_def *x = nir_bcsel(&b, nir_ieq_imm(&b, vid, 1),
+                             nir_imm_float(&b, 3.0f), nir_imm_float(&b, -1.0f));
+      nir_def *y = nir_bcsel(&b, nir_ieq_imm(&b, vid, 2),
+                             nir_imm_float(&b, 3.0f), nir_imm_float(&b, -1.0f));
+      nir_store_var(&b, pos, nir_vec4(&b, x, y, nir_imm_float(&b, 0.0f),
+                                      nir_imm_float(&b, 1.0f)), 0xf);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      struct pipe_shader_state st;
+      memset(&st, 0, sizeof(st));
+      st.type = PIPE_SHADER_IR_NIR;
+      st.ir.nir = b.shader;
+      dev->clear_vs_cso = dev->pctx->create_vs_state(dev->pctx, &st);
+   }
+
+   if (!dev->clear_fs_cso) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, fs_opts,
+                                                     "aurora_clear_fs");
+      b.shader->info.num_ubos = 1;
+      nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                              glsl_vec4_type(), "out_color");
+      out->data.location = FRAG_RESULT_DATA0;
+      nir_def *col = nir_load_ubo(&b, 4, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                                  .align_mul = 16, .align_offset = 0,
+                                  .range_base = 0, .range = 16);
+      nir_store_var(&b, out, col, 0xf);
+      nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+      struct pipe_shader_state st;
+      memset(&st, 0, sizeof(st));
+      st.type = PIPE_SHADER_IR_NIR;
+      st.ir.nir = b.shader;
+      dev->clear_fs_cso = dev->pctx->create_fs_state(dev->pctx, &st);
+   }
+
+   if (!dev->clear_blend_cso) {
+      struct pipe_blend_state bs;
+      memset(&bs, 0, sizeof(bs));
+      bs.rt[0].colormask = PIPE_MASK_RGBA;
+      dev->clear_blend_cso = dev->pctx->create_blend_state(dev->pctx, &bs);
+   }
+   if (!dev->clear_dsa_cso) {
+      struct pipe_depth_stencil_alpha_state ds;
+      memset(&ds, 0, sizeof(ds));
+      dev->clear_dsa_cso =
+         dev->pctx->create_depth_stencil_alpha_state(dev->pctx, &ds);
+   }
+   if (!dev->clear_rast_cso) {
+      struct pipe_rasterizer_state rs;
+      memset(&rs, 0, sizeof(rs));
+      rs.flatshade_first = 1;
+      rs.clip_halfz = 1;
+      rs.half_pixel_center = 1;
+      rs.depth_clip_near = 1;
+      rs.depth_clip_far = 1;
+      rs.cull_face = PIPE_FACE_NONE;
+      rs.fill_front = PIPE_POLYGON_MODE_FILL;
+      rs.fill_back = PIPE_POLYGON_MODE_FILL;
+      rs.scissor = 1;
+      rs.line_width = 1.0f;
+      rs.point_size = 1.0f;
+      dev->clear_rast_cso = dev->pctx->create_rasterizer_state(dev->pctx, &rs);
+   }
+
+   return dev->clear_vs_cso && dev->clear_fs_cso &&
+          dev->clear_blend_cso && dev->clear_dsa_cso && dev->clear_rast_cso;
+}
+
+static void
+clear_rtv_rects_locked(struct aurora_device *dev, const struct pipe_surface *surf,
+                       const FLOAT Color[4], const D3D10_DDI_RECT *pRects,
+                       UINT NumRects)
+{
+   if (!ensure_clear_pipeline_locked(dev))
+      return;
+
+   UINT sw = u_minify(surf->texture->width0, surf->level);
+   UINT sh = u_minify(surf->texture->height0, surf->level);
+
+   struct pipe_framebuffer_state fb;
+   memset(&fb, 0, sizeof(fb));
+   fb.width = sw;
+   fb.height = sh;
+   fb.nr_cbufs = 1;
+   fb.cbufs[0] = *surf;
+   dev->pctx->set_framebuffer_state(dev->pctx, &fb);
+
+   struct pipe_viewport_state vp;
+   memset(&vp, 0, sizeof(vp));
+   vp.scale[0] = 0.5f * (float)sw;
+   vp.scale[1] = -0.5f * (float)sh;
+   vp.scale[2] = 1.0f;
+   vp.translate[0] = 0.5f * (float)sw;
+   vp.translate[1] = 0.5f * (float)sh;
+   vp.translate[2] = 0.0f;
+   vp.swizzle_x = PIPE_VIEWPORT_SWIZZLE_POSITIVE_X;
+   vp.swizzle_y = PIPE_VIEWPORT_SWIZZLE_POSITIVE_Y;
+   vp.swizzle_z = PIPE_VIEWPORT_SWIZZLE_POSITIVE_Z;
+   vp.swizzle_w = PIPE_VIEWPORT_SWIZZLE_POSITIVE_W;
+   dev->pctx->set_viewport_states(dev->pctx, 0, 1, &vp);
+
+   dev->pctx->bind_vs_state(dev->pctx, dev->clear_vs_cso);
+   dev->pctx->bind_fs_state(dev->pctx, dev->clear_fs_cso);
+   dev->pctx->bind_blend_state(dev->pctx, dev->clear_blend_cso);
+   dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dev->clear_dsa_cso);
+   dev->pctx->bind_rasterizer_state(dev->pctx, dev->clear_rast_cso);
+   dev->pctx->bind_vertex_elements_state(dev->pctx, dev->empty_velems_cso);
+   dev->pctx->set_sample_mask(dev->pctx, 0xffffffffu);
+
+   struct pipe_constant_buffer cb;
+   memset(&cb, 0, sizeof(cb));
+   cb.user_buffer = Color;
+   cb.buffer_size = sizeof(float) * 4u;
+   dev->pctx->set_constant_buffer(dev->pctx, MESA_SHADER_FRAGMENT, 0, &cb);
+
+   struct pipe_draw_info info;
+   memset(&info, 0, sizeof(info));
+   info.mode = MESA_PRIM_TRIANGLES;
+   info.instance_count = 1;
+   struct pipe_draw_start_count_bias draw = { .start = 0, .count = 3, .index_bias = 0 };
+
+   for (UINT i = 0; i < NumRects; ++i) {
+      LONG l = CLAMP(pRects[i].left, 0, (LONG)sw);
+      LONG t = CLAMP(pRects[i].top, 0, (LONG)sh);
+      LONG r = CLAMP(pRects[i].right, 0, (LONG)sw);
+      LONG b = CLAMP(pRects[i].bottom, 0, (LONG)sh);
+      if (r <= l || b <= t)
+         continue;
+      struct pipe_scissor_state sc = {
+         .minx = (unsigned)l, .miny = (unsigned)t,
+         .maxx = (unsigned)r, .maxy = (unsigned)b,
+      };
+      dev->pctx->set_scissor_states(dev->pctx, 0, 1, &sc);
+      dev->pctx->draw_vbo(dev->pctx, &info, 0, NULL, &draw, 1);
+   }
+
+   /* Restore caller's pipeline state. */
+   dev->pctx->bind_vs_state(dev->pctx, dev->vs ? dev->vs->cso : NULL);
+   dev->pctx->bind_fs_state(dev->pctx, dev->ps ? dev->ps->cso : NULL);
+   dev->pctx->bind_blend_state(dev->pctx,
+      (dev->blend && dev->blend->cso) ? dev->blend->cso : dev->default_blend_cso);
+   dev->pctx->bind_depth_stencil_alpha_state(dev->pctx,
+      (dev->dsa && dev->dsa->cso) ? dev->dsa->cso : dev->default_dsa_cso);
+   dev->pctx->bind_rasterizer_state(dev->pctx,
+      (dev->rast && dev->rast->cso) ? dev->rast->cso : dev->default_rast_cso);
+   dev->pctx->set_sample_mask(dev->pctx, dev->sample_mask);
+   dev->pctx->set_constant_buffer(dev->pctx, MESA_SHADER_FRAGMENT, 0,
+      dev->cbs[AURORA_STAGE_PS][0].buffer ? &dev->cbs[AURORA_STAGE_PS][0] : NULL);
+   if (dev->num_viewports > 0u)
+      dev->pctx->set_viewport_states(dev->pctx, 0, dev->num_viewports, dev->viewports);
+   if (dev->num_scissors > 0u)
+      dev->pctx->set_scissor_states(dev->pctx, 0, dev->num_scissors, dev->scissors);
+   dev->velems_dirty = true;
+   dev->fb_dirty = true;
+}
+
 void APIENTRY
 aurora_ClearRenderTargetView(D3D10DDI_HDEVICE hDevice,
                              D3D10DDI_HRENDERTARGETVIEW hRTV, FLOAT Color[4])
@@ -694,9 +946,7 @@ aurora_ClearRenderTargetView(D3D10DDI_HDEVICE hDevice,
    if (aurora_rtv_fill_surface(rtv, &surf)) {
       union pipe_color_union c;
       memcpy(c.f, Color, sizeof(float) * 4u);
-      UINT w = u_minify(surf.texture->width0, surf.level);
-      UINT h = u_minify(surf.texture->height0, surf.level);
-      dev->pctx->clear_render_target(dev->pctx, &surf, &c, 0, 0, w, h, false);
+      clear_rtv_full_locked(dev, &surf, &c);
    }
    aurora_unlock(dev);
 }
@@ -722,10 +972,7 @@ aurora_ClearDepthStencilView(D3D10DDI_HDEVICE hDevice,
    aurora_lock(dev);
    struct pipe_surface surf;
    if (aurora_dsv_fill_surface(dsv, &surf)) {
-      UINT w = u_minify(surf.texture->width0, surf.level);
-      UINT h = u_minify(surf.texture->height0, surf.level);
-      dev->pctx->clear_depth_stencil(dev->pctx, &surf, clear_flags,
-                                     (double)Depth, Stencil, 0, 0, w, h, false);
+      clear_dsv_full_locked(dev, &surf, clear_flags, (double)Depth, Stencil);
    }
    aurora_unlock(dev);
 }
@@ -744,48 +991,26 @@ aurora_ClearView(D3D10DDI_HDEVICE hDevice, D3D11DDI_HANDLETYPE ViewType,
       struct aurora_rtv *rtv = (struct aurora_rtv *)hView;
       struct pipe_surface surf;
       if (aurora_rtv_fill_surface(rtv, &surf)) {
-         union pipe_color_union c;
-         memcpy(c.f, Color, sizeof(float) * 4u);
          UINT sw = u_minify(surf.texture->width0, surf.level);
          UINT sh = u_minify(surf.texture->height0, surf.level);
-         if (!pRects || NumRects == 0u) {
-            dev->pctx->clear_render_target(dev->pctx, &surf, &c, 0, 0, sw, sh, false);
+         bool full = (!pRects || NumRects == 0u ||
+                      (NumRects == 1u &&
+                       pRects[0].left <= 0 && pRects[0].top <= 0 &&
+                       pRects[0].right >= (LONG)sw &&
+                       pRects[0].bottom >= (LONG)sh));
+         if (full) {
+            union pipe_color_union c;
+            memcpy(c.f, Color, sizeof(float) * 4u);
+            clear_rtv_full_locked(dev, &surf, &c);
          } else {
-            for (UINT i = 0; i < NumRects; ++i) {
-               LONG l = CLAMP(pRects[i].left, 0, (LONG)sw);
-               LONG t = CLAMP(pRects[i].top, 0, (LONG)sh);
-               LONG r = CLAMP(pRects[i].right, 0, (LONG)sw);
-               LONG b = CLAMP(pRects[i].bottom, 0, (LONG)sh);
-               if (r > l && b > t) {
-                  dev->pctx->clear_render_target(
-                     dev->pctx, &surf, &c, (unsigned)l, (unsigned)t,
-                     (unsigned)(r - l), (unsigned)(b - t), false);
-               }
-            }
+            clear_rtv_rects_locked(dev, &surf, Color, pRects, NumRects);
          }
       }
    } else if (ViewType == D3D10DDI_HT_DEPTHSTENCILVIEW) {
       struct aurora_dsv *dsv = (struct aurora_dsv *)hView;
       struct pipe_surface surf;
       if (aurora_dsv_fill_surface(dsv, &surf)) {
-         UINT sw = u_minify(surf.texture->width0, surf.level);
-         UINT sh = u_minify(surf.texture->height0, surf.level);
-         if (!pRects || NumRects == 0u) {
-            dev->pctx->clear_depth_stencil(dev->pctx, &surf, PIPE_CLEAR_DEPTH,
-                                           (double)Color[0], 0, 0, 0, sw, sh, false);
-         } else {
-            for (UINT i = 0; i < NumRects; ++i) {
-               LONG l = CLAMP(pRects[i].left, 0, (LONG)sw);
-               LONG t = CLAMP(pRects[i].top, 0, (LONG)sh);
-               LONG r = CLAMP(pRects[i].right, 0, (LONG)sw);
-               LONG b = CLAMP(pRects[i].bottom, 0, (LONG)sh);
-               if (r > l && b > t) {
-                  dev->pctx->clear_depth_stencil(
-                     dev->pctx, &surf, PIPE_CLEAR_DEPTH, (double)Color[0], 0,
-                     (unsigned)l, (unsigned)t, (unsigned)(r - l), (unsigned)(b - t), false);
-               }
-            }
-         }
+         clear_dsv_full_locked(dev, &surf, PIPE_CLEAR_DEPTH, (double)Color[0], 0u);
       }
    }
    aurora_unlock(dev);
@@ -808,16 +1033,17 @@ aurora_ClearUAVUint(D3D10DDI_HDEVICE hDevice, D3D11DDI_HUNORDEREDACCESSVIEW hUAV
          dev->pctx->clear_buffer(dev->pctx, uav->res->prsrc, off, sz,
                                  &Values[0], sizeof(uint32_t));
       }
-   } else if (dev->pctx->clear_texture) {
-      UINT lvl = uav->img_templ.u.tex.level;
-      struct pipe_box box = {
-         .x = 0, .y = 0, .z = (int)uav->img_templ.u.tex.first_layer,
-         .width = (int)u_minify(uav->res->width, lvl),
-         .height = (int)u_minify(uav->res->height, lvl),
-         .depth = (int)(uav->img_templ.u.tex.last_layer -
-                        uav->img_templ.u.tex.first_layer + 1u),
-      };
-      dev->pctx->clear_texture(dev->pctx, uav->res->prsrc, lvl, &box, Values);
+   } else {
+      struct pipe_surface surf;
+      memset(&surf, 0, sizeof(surf));
+      surf.texture = uav->res->prsrc;
+      surf.format = uav->img_templ.format;
+      surf.level = uav->img_templ.u.tex.level;
+      surf.first_layer = uav->img_templ.u.tex.first_layer;
+      surf.last_layer = uav->img_templ.u.tex.last_layer;
+      union pipe_color_union c;
+      memcpy(c.ui, Values, sizeof(c.ui));
+      clear_rtv_full_locked(dev, &surf, &c);
    }
    aurora_unlock(dev);
 }
@@ -975,8 +1201,8 @@ create_shader_common(struct aurora_device *dev, mesa_shader_stage stage,
    nir_shader *nir = aurora_sm5_to_nir(pCode, num_dwords, in_sig, num_in,
                                        out_sig, num_out, opts, &sh->info);
    if (!nir) {
-      aurora_log("CreateShader(stage=%d): SM5->NIR failed ver=0x%08x len=%u",
-                 (int)stage, pCode[0], pCode[1]);
+      aurora_log("CreateShader(stage=%d): SM5->NIR failed ver=0x%08x len=%u err=%s",
+                 (int)stage, pCode[0], pCode[1], sh->info.err);
       aurora_set_error(dev, E_FAIL);
       return;
    }

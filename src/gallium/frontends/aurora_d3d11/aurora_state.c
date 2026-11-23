@@ -234,8 +234,11 @@ aurora_DestroyBlendState(D3D10DDI_HDEVICE hDevice, D3D10DDI_HBLENDSTATE hState)
    if (!dev || !dev->pctx || !st)
       return;
    aurora_lock(dev);
-   if (dev->blend == st)
+   if (dev->blend == st) {
       dev->blend = NULL;
+      if (dev->default_blend_cso)
+         dev->pctx->bind_blend_state(dev->pctx, dev->default_blend_cso);
+   }
    if (st->cso) {
       dev->pctx->delete_blend_state(dev->pctx, st->cso);
       st->cso = NULL;
@@ -334,8 +337,11 @@ aurora_DestroyDepthStencilState(D3D10DDI_HDEVICE hDevice,
    if (!dev || !dev->pctx || !st)
       return;
    aurora_lock(dev);
-   if (dev->dsa == st)
+   if (dev->dsa == st) {
       dev->dsa = NULL;
+      if (dev->default_dsa_cso)
+         dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dev->default_dsa_cso);
+   }
    if (st->cso) {
       dev->pctx->delete_depth_stencil_alpha_state(dev->pctx, st->cso);
       st->cso = NULL;
@@ -506,8 +512,11 @@ aurora_DestroyRasterizerState(D3D10DDI_HDEVICE hDevice,
    if (!dev || !dev->pctx || !st)
       return;
    aurora_lock(dev);
-   if (dev->rast == st)
+   if (dev->rast == st) {
       dev->rast = NULL;
+      if (dev->default_rast_cso)
+         dev->pctx->bind_rasterizer_state(dev->pctx, dev->default_rast_cso);
+   }
    if (st->cso) {
       dev->pctx->delete_rasterizer_state(dev->pctx, st->cso);
       st->cso = NULL;
@@ -1144,6 +1153,8 @@ aurora_sync_draw_state(struct aurora_device *dev)
 
    if (dev->velems_dirty) {
       if (dev->active_velems_cso) {
+         if (dev->empty_velems_cso)
+            dev->pctx->bind_vertex_elements_state(dev->pctx, dev->empty_velems_cso);
          dev->pctx->delete_vertex_elements_state(dev->pctx, dev->active_velems_cso);
          dev->active_velems_cso = NULL;
       }
@@ -1159,34 +1170,19 @@ aurora_sync_draw_state(struct aurora_device *dev)
          dev->active_velems_cso = dev->pctx->create_vertex_elements_state(
             dev->pctx, dev->velems->count, elems);
          dev->pctx->bind_vertex_elements_state(dev->pctx, dev->active_velems_cso);
+      } else if (dev->empty_velems_cso) {
+         dev->pctx->bind_vertex_elements_state(dev->pctx, dev->empty_velems_cso);
       }
       dev->velems_dirty = false;
    }
 
-   /* Ensure default blend / dsa / rast are bound if app hasn't called Set*. */
-   if (!dev->blend && !dev->default_blend_cso) {
-      struct pipe_blend_state def;
-      memset(&def, 0, sizeof(def));
-      def.rt[0].colormask = PIPE_MASK_RGBA;
-      dev->default_blend_cso = dev->pctx->create_blend_state(dev->pctx, &def);
+   /* Ensure default blend / dsa / rast are bound if app hasn't set them. */
+   if (!dev->blend && dev->default_blend_cso)
       dev->pctx->bind_blend_state(dev->pctx, dev->default_blend_cso);
-   }
-   if (!dev->rast && !dev->default_rast_cso) {
-      struct pipe_rasterizer_state def;
-      memset(&def, 0, sizeof(def));
-      def.flatshade_first = 1;
-      def.clip_halfz = 1;
-      def.half_pixel_center = 1;
-      def.depth_clip_near = 1;
-      def.depth_clip_far = 1;
-      def.cull_face = PIPE_FACE_BACK;
-      def.fill_front = PIPE_POLYGON_MODE_FILL;
-      def.fill_back = PIPE_POLYGON_MODE_FILL;
-      def.line_width = 1.0f;
-      def.point_size = 1.0f;
-      dev->default_rast_cso = dev->pctx->create_rasterizer_state(dev->pctx, &def);
+   if (!dev->dsa && dev->default_dsa_cso)
+      dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dev->default_dsa_cso);
+   if (!dev->rast && dev->default_rast_cso)
       dev->pctx->bind_rasterizer_state(dev->pctx, dev->default_rast_cso);
-   }
 
    aurora_sync_stage_resources(dev, AURORA_STAGE_VS);
    aurora_sync_stage_resources(dev, AURORA_STAGE_PS);

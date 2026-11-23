@@ -308,23 +308,29 @@ aurora_CreateResource(D3D10DDI_HDEVICE hDevice,
        d3d_fmt != 0u && hRTResource.handle != NULL) {
       uint64_t std_desc = 0u;
       uint32_t bpp = util_format_get_blocksize(templ.format);
-      uint32_t row_bytes = r->width * bpp;
+      uint32_t alloc_flags = AURORA_AGXW_ALLOC_SHAREABLE;
+      if (direct_scanout) {
+         /* agxw_contract.h: DIRECT_SCANOUT requires PRIMARY|SHAREABLE and
+          * tight pitch; NO_CPU_MAP, WRITEBACK, PITCH_ALIGN128 are refused! */
+         alloc_flags |= AURORA_AGXW_ALLOC_PRIMARY |
+                        AURORA_AGXW_ALLOC_DIRECT_SCANOUT;
+      } else if (is_primary) {
+         alloc_flags |= AURORA_AGXW_ALLOC_PRIMARY;
+      } else if (bpp == 4u && ((r->width * 4u) & 15u) != 0u) {
+         /* AGX linear texture strides must be 16-byte aligned (ail_initialize_linear). */
+         alloc_flags |= AURORA_AGXW_ALLOC_PITCH_ALIGN128;
+      }
+      uint32_t row_bytes = (bpp == 4u)
+                              ? aurora_agxw_alloc_pitch(r->width, alloc_flags)
+                              : (r->width * bpp);
       uint64_t used_bytes = (uint64_t)row_bytes * (uint64_t)r->height;
       uint64_t alloc_size = (used_bytes + AURORA_AGXW_WDDM_LARGE_PAGE_MASK) &
                             ~AURORA_AGXW_WDDM_LARGE_PAGE_MASK;
       if (alloc_size == 0u)
          alloc_size = AURORA_AGXW_WDDM_LARGE_PAGE_SIZE;
 
-      uint32_t alloc_flags = AURORA_AGXW_ALLOC_SHAREABLE;
-      if (direct_scanout) {
-         alloc_flags |= AURORA_AGXW_ALLOC_PRIMARY |
-                        AURORA_AGXW_ALLOC_DIRECT_SCANOUT |
-                        AURORA_AGXW_ALLOC_NO_CPU_MAP;
-      } else if (is_primary) {
-         alloc_flags |= AURORA_AGXW_ALLOC_PRIMARY;
-      }
-
-      if (aurora_agxw_standard_desc_pack(r->width, r->height, d3d_fmt, &std_desc) == 0) {
+      if ((row_bytes & 15u) == 0u &&
+          aurora_agxw_standard_desc_pack(r->width, r->height, d3d_fmt, &std_desc) == 0) {
          D3DKMT_HANDLE km_res = 0u, km_alloc = 0u;
          UINT vidpn = is_primary ? pArgs->pPrimaryDesc->VidPnSourceId : 0u;
          HRESULT hr = allocate_runtime_surface(

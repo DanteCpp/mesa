@@ -13,6 +13,11 @@
 #include <stdio.h>
 #include <string.h>
 
+_Static_assert(offsetof(D3DDDI_DEVICECALLBACKS, pfnDeallocate2Cb) == 46 * sizeof(void *),
+               "D3DDDI_DEVICECALLBACKS layout must match agxw_ddi_devicecallbacks");
+_Static_assert(sizeof(struct aurora_gpu_bridge_v4) == 64,
+               "aurora_gpu_bridge_v4 size must match AuroraGpuBridge v4 (LLP64)");
+
 /* =========================================================================
  * Driver-Key Admission Gate & Diagnostics Log
  * Mirrors core/agxw_agreement.h section 5 (Enum\ACPI\AURA8171\0 -> Class key).
@@ -416,6 +421,8 @@ aurora_DestroyDevice(D3D10DDI_HDEVICE hDevice)
 
       if (dev->active_velems_cso)
          dev->pctx->delete_vertex_elements_state(dev->pctx, dev->active_velems_cso);
+      if (dev->empty_velems_cso)
+         dev->pctx->delete_vertex_elements_state(dev->pctx, dev->empty_velems_cso);
       if (dev->default_blend_cso)
          dev->pctx->delete_blend_state(dev->pctx, dev->default_blend_cso);
       if (dev->default_dsa_cso)
@@ -428,6 +435,12 @@ aurora_DestroyDevice(D3D10DDI_HDEVICE hDevice)
          dev->pctx->delete_vs_state(dev->pctx, dev->clear_vs_cso);
       if (dev->clear_fs_cso)
          dev->pctx->delete_fs_state(dev->pctx, dev->clear_fs_cso);
+      if (dev->clear_blend_cso)
+         dev->pctx->delete_blend_state(dev->pctx, dev->clear_blend_cso);
+      if (dev->clear_dsa_cso)
+         dev->pctx->delete_depth_stencil_alpha_state(dev->pctx, dev->clear_dsa_cso);
+      if (dev->clear_rast_cso)
+         dev->pctx->delete_rasterizer_state(dev->pctx, dev->clear_rast_cso);
 
       dev->pctx->destroy(dev->pctx);
       dev->pctx = NULL;
@@ -809,6 +822,45 @@ aurora_CreateDevice(D3D10DDI_HADAPTER hAdapter,
    InitializeCriticalSection(&dev->lock);
    InitializeCriticalSection(&dev->km_ctx_lock);
    dev->locks_init = true;
+
+   /* Eagerly create and bind D3D11 default CSOs so Gallium Asahi's ctx->blend,
+    * ctx->zs, ctx->rast, and ctx->attributes are NEVER NULL at draw time. */
+   {
+      struct pipe_blend_state bdef;
+      memset(&bdef, 0, sizeof(bdef));
+      bdef.max_rt = AURORA_MAX_RTVS - 1u;
+      bdef.rt[0].colormask = PIPE_MASK_RGBA;
+      dev->default_blend_cso = dev->pctx->create_blend_state(dev->pctx, &bdef);
+      dev->pctx->bind_blend_state(dev->pctx, dev->default_blend_cso);
+
+      struct pipe_depth_stencil_alpha_state ddef;
+      memset(&ddef, 0, sizeof(ddef));
+      ddef.depth_enabled = 1;
+      ddef.depth_writemask = 1;
+      ddef.depth_func = PIPE_FUNC_LESS;
+      dev->default_dsa_cso =
+         dev->pctx->create_depth_stencil_alpha_state(dev->pctx, &ddef);
+      dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dev->default_dsa_cso);
+
+      struct pipe_rasterizer_state rdef;
+      memset(&rdef, 0, sizeof(rdef));
+      rdef.flatshade_first = 1;
+      rdef.clip_halfz = 1;
+      rdef.half_pixel_center = 1;
+      rdef.depth_clip_near = 1;
+      rdef.depth_clip_far = 1;
+      rdef.cull_face = PIPE_FACE_BACK;
+      rdef.fill_front = PIPE_POLYGON_MODE_FILL;
+      rdef.fill_back = PIPE_POLYGON_MODE_FILL;
+      rdef.line_width = 1.0f;
+      rdef.point_size = 1.0f;
+      dev->default_rast_cso = dev->pctx->create_rasterizer_state(dev->pctx, &rdef);
+      dev->pctx->bind_rasterizer_state(dev->pctx, dev->default_rast_cso);
+
+      dev->empty_velems_cso = dev->pctx->create_vertex_elements_state(dev->pctx, 0, NULL);
+      dev->pctx->bind_vertex_elements_state(dev->pctx, dev->empty_velems_cso);
+      dev->pctx->set_sample_mask(dev->pctx, dev->sample_mask);
+   }
 
    /* Wire DXGI 1.0..1.5 callbacks + capture pfnPresentCb / pfnPresentMpoCb. */
    aurora_install_dxgi_funcs(dev, pArgs);

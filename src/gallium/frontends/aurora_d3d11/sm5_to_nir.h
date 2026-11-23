@@ -42,6 +42,7 @@ struct aurora_sm5_info {
    uint32_t cb_mask;
    uint32_t sampler_mask;
    uint32_t workgroup_size[3];
+   char err[256];
 };
 
 /*

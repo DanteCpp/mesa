@@ -2595,6 +2595,11 @@ aurora_sm5_to_nir(const uint32_t *code, size_t max_dwords,
    return nir;
 
 fail:
+   if (info_out) {
+      *info_out = c->info;
+      snprintf(info_out->err, sizeof(info_out->err), "%s (word %zu/%zu)",
+               c->err[0] ? c->err : "unknown error", c->pos, c->num_dwords);
+   }
    ralloc_free(c->nir);
    free(c->temps);
    free(c);
