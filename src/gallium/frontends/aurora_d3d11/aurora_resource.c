@@ -191,6 +191,14 @@ build_pipe_template(const D3D11DDIARG_CREATERESOURCE *args,
    if (args->Usage == D3D10_DDI_USAGE_STAGING) {
       templ->usage = PIPE_USAGE_STAGING;
       templ->bind |= PIPE_BIND_LINEAR;
+      if (args->ResourceDimension == D3D10DDIRESOURCE_TEXTURE2D &&
+          templ->format != PIPE_FORMAT_NONE &&
+          !util_format_is_depth_or_stencil(templ->format) &&
+          !util_format_is_compressed(templ->format)) {
+         /* Allow GPU-side blit into/from 2D staging textures when copying
+          * from non-CPU-visible shared or direct-scanout allocations. */
+         templ->bind |= PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
+      }
    } else if (args->Usage == D3D10_DDI_USAGE_DYNAMIC) {
       templ->usage = PIPE_USAGE_STREAM;
    } else if (args->Usage == D3D10_DDI_USAGE_IMMUTABLE) {
@@ -737,6 +745,54 @@ aurora_ResourceUpdateSubresourceUP_11_1(D3D10DDI_HDEVICE hDevice,
                              RowPitch, DepthPitch, CopyFlags);
 }
 
+static bool
+should_gpu_blit_copy(const struct aurora_resource *dst,
+                     const struct aurora_resource *src)
+{
+   if (!dst || !src || !dst->prsrc || !src->prsrc)
+      return false;
+   if (dst->dim != D3D10DDIRESOURCE_TEXTURE2D ||
+       src->dim != D3D10DDIRESOURCE_TEXTURE2D)
+      return false;
+   if (!(src->is_shared || dst->is_shared ||
+         src->is_direct_scanout || dst->is_direct_scanout))
+      return false;
+   if (util_format_is_depth_or_stencil(dst->prsrc->format) ||
+       util_format_is_depth_or_stencil(src->prsrc->format) ||
+       util_format_is_compressed(dst->prsrc->format) ||
+       util_format_is_compressed(src->prsrc->format))
+      return false;
+   return true;
+}
+
+static void
+gpu_blit_2d_locked(struct aurora_device *dev, struct pipe_resource *dst,
+                   unsigned dst_lvl, unsigned dstx, unsigned dsty, unsigned dstz,
+                   struct pipe_resource *src, unsigned src_lvl,
+                   const struct pipe_box *box)
+{
+   struct pipe_blit_info info;
+   memset(&info, 0, sizeof(info));
+   info.dst.resource = dst;
+   info.dst.level = dst_lvl;
+   info.dst.format = dst->format;
+   info.dst.box.x = (int)dstx;
+   info.dst.box.y = (int)dsty;
+   info.dst.box.z = (int)dstz;
+   info.dst.box.width = box->width;
+   info.dst.box.height = box->height;
+   info.dst.box.depth = box->depth;
+
+   info.src.resource = src;
+   info.src.level = src_lvl;
+   info.src.format = src->format;
+   info.src.box = *box;
+
+   info.mask = PIPE_MASK_RGBA;
+   info.filter = PIPE_TEX_FILTER_NEAREST;
+   dev->pctx->blit(dev->pctx, &info);
+}
+
 void APIENTRY
 aurora_ResourceCopy(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDst,
                     D3D10DDI_HRESOURCE hSrc)
@@ -755,6 +811,7 @@ aurora_ResourceCopy(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDst,
       dev->pctx->resource_copy_region(dev->pctx, dst->prsrc, 0, 0, 0, 0,
                                       src->prsrc, 0, &box);
    } else {
+      bool use_blit = should_gpu_blit_copy(dst, src);
       UINT mips = MIN2(MAX2(dst->mip_levels, 1u), MAX2(src->mip_levels, 1u));
       UINT layers = (dst->dim == D3D10DDIRESOURCE_TEXTURE3D)
                        ? 1u : MIN2(MAX2(dst->array_size, 1u), MAX2(src->array_size, 1u));
@@ -766,8 +823,11 @@ aurora_ResourceCopy(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDst,
             .depth = (dst->dim == D3D10DDIRESOURCE_TEXTURE3D)
                         ? (int)u_minify(src->depth, m) : (int)layers,
          };
-         dev->pctx->resource_copy_region(dev->pctx, dst->prsrc, m, 0, 0, 0,
-                                         src->prsrc, m, &box);
+         if (use_blit)
+            gpu_blit_2d_locked(dev, dst->prsrc, m, 0, 0, 0, src->prsrc, m, &box);
+         else
+            dev->pctx->resource_copy_region(dev->pctx, dst->prsrc, m, 0, 0, 0,
+                                            src->prsrc, m, &box);
       }
    }
    aurora_unlock(dev);
@@ -815,9 +875,13 @@ aurora_ResourceCopyRegion(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDst,
       return;
 
    aurora_lock(dev);
-   dev->pctx->resource_copy_region(dev->pctx, dst->prsrc, dst_lvl,
-                                   DstX, DstY, dst_lyr,
-                                   src->prsrc, src_lvl, &box);
+   if (should_gpu_blit_copy(dst, src))
+      gpu_blit_2d_locked(dev, dst->prsrc, dst_lvl, DstX, DstY, dst_lyr,
+                         src->prsrc, src_lvl, &box);
+   else
+      dev->pctx->resource_copy_region(dev->pctx, dst->prsrc, dst_lvl,
+                                      DstX, DstY, dst_lyr,
+                                      src->prsrc, src_lvl, &box);
    aurora_unlock(dev);
 }
 

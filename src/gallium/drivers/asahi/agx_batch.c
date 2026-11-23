@@ -2165,7 +2165,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
             asahi_add_attachment(&att, rsrc->separate_stencil);
       }
 
-      if (att.count) {
+      if (att.count && !dev->write_set_contract) {
          struct drm_asahi_cmd_header header = {
             .cmd_type = DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS,
             .size = sizeof(att.list[0]) * att.count,

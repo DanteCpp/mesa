@@ -412,6 +412,7 @@ struct aurora_device {
    /* Cached default & internal clear CSOs. */
    void *default_blend_cso;
    void *default_dsa_cso;
+   void *no_depth_dsa_cso;
    void *default_rast_cso;
    void *default_sampler_cso;
    void *empty_velems_cso;

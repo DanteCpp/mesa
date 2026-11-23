@@ -427,6 +427,8 @@ aurora_DestroyDevice(D3D10DDI_HDEVICE hDevice)
          dev->pctx->delete_blend_state(dev->pctx, dev->default_blend_cso);
       if (dev->default_dsa_cso)
          dev->pctx->delete_depth_stencil_alpha_state(dev->pctx, dev->default_dsa_cso);
+      if (dev->no_depth_dsa_cso)
+         dev->pctx->delete_depth_stencil_alpha_state(dev->pctx, dev->no_depth_dsa_cso);
       if (dev->default_rast_cso)
          dev->pctx->delete_rasterizer_state(dev->pctx, dev->default_rast_cso);
       if (dev->default_sampler_cso)
@@ -840,7 +842,14 @@ aurora_CreateDevice(D3D10DDI_HADAPTER hAdapter,
       ddef.depth_func = PIPE_FUNC_LESS;
       dev->default_dsa_cso =
          dev->pctx->create_depth_stencil_alpha_state(dev->pctx, &ddef);
-      dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dev->default_dsa_cso);
+
+      struct pipe_depth_stencil_alpha_state dnone;
+      memset(&dnone, 0, sizeof(dnone));
+      dev->no_depth_dsa_cso =
+         dev->pctx->create_depth_stencil_alpha_state(dev->pctx, &dnone);
+      /* Start with depth disabled until a DSV is bound (G17G rejects
+       * depth_enabled=1 when fb.zsbuf.texture == NULL). */
+      dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dev->no_depth_dsa_cso);
 
       struct pipe_rasterizer_state rdef;
       memset(&rdef, 0, sizeof(rdef));

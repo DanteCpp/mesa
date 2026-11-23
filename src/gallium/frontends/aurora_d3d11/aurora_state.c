@@ -1035,6 +1035,7 @@ aurora_sync_framebuffer(struct aurora_device *dev)
    struct pipe_framebuffer_state fb;
    memset(&fb, 0, sizeof(fb));
    UINT fb_w = 0, fb_h = 0;
+   UINT active_cbufs = 0;
 
    for (UINT i = 0; i < dev->num_rtvs; ++i) {
       if (dev->rtvs[i] && aurora_rtv_fill_surface(dev->rtvs[i], &fb.cbufs[i])) {
@@ -1043,9 +1044,10 @@ aurora_sync_framebuffer(struct aurora_device *dev)
          UINT h = u_minify(tex->height0, fb.cbufs[i].level);
          if (fb_w == 0 || w < fb_w) fb_w = w;
          if (fb_h == 0 || h < fb_h) fb_h = h;
+         active_cbufs = i + 1u;
       }
    }
-   fb.nr_cbufs = (uint8_t)dev->num_rtvs;
+   fb.nr_cbufs = (uint8_t)active_cbufs;
 
    if (dev->dsv && aurora_dsv_fill_surface(dev->dsv, &fb.zsbuf)) {
       struct pipe_resource *tex = fb.zsbuf.texture;
@@ -1176,11 +1178,18 @@ aurora_sync_draw_state(struct aurora_device *dev)
       dev->velems_dirty = false;
    }
 
-   /* Ensure default blend / dsa / rast are bound if app hasn't set them. */
+   /* Ensure default blend / dsa / rast are bound; when no DSV is bound, ALWAYS
+    * bind no_depth_dsa_cso because G17G refuses depth_enabled=1 without zsbuf. */
    if (!dev->blend && dev->default_blend_cso)
       dev->pctx->bind_blend_state(dev->pctx, dev->default_blend_cso);
-   if (!dev->dsa && dev->default_dsa_cso)
-      dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dev->default_dsa_cso);
+   if (!dev->dsv) {
+      if (dev->no_depth_dsa_cso)
+         dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dev->no_depth_dsa_cso);
+   } else {
+      void *dsa_cso = (dev->dsa && dev->dsa->cso) ? dev->dsa->cso : dev->default_dsa_cso;
+      if (dsa_cso)
+         dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dsa_cso);
+   }
    if (!dev->rast && dev->default_rast_cso)
       dev->pctx->bind_rasterizer_state(dev->pctx, dev->default_rast_cso);
 
