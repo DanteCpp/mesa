@@ -1570,7 +1570,8 @@ create_query_common(struct aurora_device *dev, struct aurora_query *q,
       q->pq = dev->pctx->create_query(dev->pctx, PIPE_QUERY_TIMESTAMP, 0);
       break;
    case D3D10DDI_QUERY_TIMESTAMPDISJOINT:
-      q->pq = dev->pctx->create_query(dev->pctx, PIPE_QUERY_TIMESTAMP_DISJOINT, 0);
+      if (dev->screen->caps.query_timestamp)
+         q->pq = dev->pctx->create_query(dev->pctx, PIPE_QUERY_TIMESTAMP_DISJOINT, 0);
       break;
    case D3D10DDI_QUERY_PIPELINESTATS:
    case D3D11DDI_QUERY_PIPELINESTATS:
@@ -1651,6 +1652,16 @@ aurora_QueryEnd(D3D10DDI_HDEVICE hDevice, D3D10DDI_HQUERY hQuery)
    if (q->ddi_type == D3D10DDI_QUERY_EVENT) {
       dev->screen->fence_reference(dev->screen, &q->event_fence, NULL);
       dev->pctx->flush(dev->pctx, &q->event_fence, 0);
+   } else if (q->ddi_type == D3D10DDI_QUERY_TIMESTAMP && !q->pq) {
+      dev->screen->fence_reference(dev->screen, &q->event_fence, NULL);
+      dev->pctx->flush(dev->pctx, &q->event_fence, 0);
+      q->timestamp_ready = false;
+      if (!q->event_fence) {
+         LARGE_INTEGER now;
+         QueryPerformanceCounter(&now);
+         q->timestamp_val = (UINT64)now.QuadPart;
+         q->timestamp_ready = true;
+      }
    } else if (q->pq) {
       dev->pctx->end_query(dev->pctx, q->pq);
    }
@@ -1684,6 +1695,45 @@ aurora_QueryGetData(D3D10DDI_HDEVICE hDevice, D3D10DDI_HQUERY hQuery,
       }
       if (pData && DataSize >= sizeof(BOOL))
          *(BOOL *)pData = TRUE;
+      return;
+   }
+
+   if (q->ddi_type == D3D10DDI_QUERY_TIMESTAMP && !q->pq) {
+      if (!q->timestamp_ready) {
+         bool done = true;
+         if (q->event_fence) {
+            done = dev->screen->fence_finish(dev->screen, dev->pctx,
+                                             q->event_fence, 0);
+            if (done)
+               dev->screen->fence_reference(dev->screen, &q->event_fence, NULL);
+         }
+         if (!done) {
+            aurora_unlock(dev);
+            aurora_set_error(dev, DXGI_DDI_ERR_WASSTILLDRAWING);
+            return;
+         }
+         LARGE_INTEGER now;
+         QueryPerformanceCounter(&now);
+         q->timestamp_val = (UINT64)now.QuadPart;
+         q->timestamp_ready = true;
+      }
+      UINT64 val = q->timestamp_val;
+      aurora_unlock(dev);
+      if (pData && DataSize >= sizeof(UINT64))
+         *(UINT64 *)pData = val;
+      return;
+   }
+
+   if (q->ddi_type == D3D10DDI_QUERY_TIMESTAMPDISJOINT && !q->pq) {
+      aurora_unlock(dev);
+      if (pData && DataSize >= sizeof(D3D10_DDI_QUERY_DATA_TIMESTAMP_DISJOINT)) {
+         LARGE_INTEGER freq;
+         QueryPerformanceFrequency(&freq);
+         D3D10_DDI_QUERY_DATA_TIMESTAMP_DISJOINT *td =
+            (D3D10_DDI_QUERY_DATA_TIMESTAMP_DISJOINT *)pData;
+         td->Frequency = freq.QuadPart > 0 ? (UINT64)freq.QuadPart : 24000000ULL;
+         td->Disjoint = FALSE;
+      }
       return;
    }
 

@@ -327,6 +327,8 @@ struct aurora_query {
    UINT misc_flags;
    struct pipe_query *pq;
    struct pipe_fence_handle *event_fence;
+   UINT64 timestamp_val;
+   bool timestamp_ready;
    bool begun;
    bool ended;
 };

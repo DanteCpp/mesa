@@ -422,6 +422,7 @@ agx_linear_allowed(const struct agx_resource *pres)
    switch (pres->base.target) {
    /* Buffers are always linear, even with image atomics */
    case PIPE_BUFFER:
+      return true;
 
    /* Linear textures require specifying their strides explicitly, which only
     * works for 2D textures. Rectangle textures are a special case of 2D.

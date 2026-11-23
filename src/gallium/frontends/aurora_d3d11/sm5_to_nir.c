@@ -1701,6 +1701,7 @@ sm5_emit_typed_uav(struct sm5_ctx *c, bool is_store,
       sm5_dim_to_glsl(d->declared ? d->dim : SM5_DIM_TEXTURE2D, &is_array);
    if (u + 1 > c->nir->info.num_images)
       c->nir->info.num_images = u + 1;
+   BITSET_SET(c->nir->info.images_used, u);
 
    nir_def *coord = sm5_load_src(c, coord_op, true);
    nir_def *idx = nir_imm_int(b, (int32_t)u);
@@ -1810,6 +1811,7 @@ sm5_emit_atomic(struct sm5_ctx *c, enum sm5_opcode opcode, bool has_ret)
          enum glsl_sampler_dim dim = sm5_dim_to_glsl(c->uavs[u].dim, &is_array);
          if (u + 1 > c->nir->info.num_images)
             c->nir->info.num_images = u + 1;
+         BITSET_SET(c->nir->info.images_used, u);
          res = is_cmp
                   ? nir_image_atomic_swap(b, 32, nir_imm_int(b, (int32_t)u), a4,
                                           nir_imm_int(b, 0), v0, v1,

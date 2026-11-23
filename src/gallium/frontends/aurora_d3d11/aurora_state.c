@@ -1183,10 +1183,8 @@ aurora_sync_stage_resources(struct aurora_device *dev, enum aurora_stage stage)
             max_img = i + 1u;
          }
       }
-      if (max_ssbo > 0u) {
-         dev->pctx->set_shader_buffers(dev->pctx, mst, 0, max_ssbo,
-                                       ssbos, writable_mask);
-      }
+      dev->pctx->set_shader_buffers(dev->pctx, mst, 0, AURORA_SSBO_UAV_COUNT,
+                                    ssbos, writable_mask);
       dev->pctx->set_shader_images(dev->pctx, mst, 0, max_img,
                                    AURORA_MAX_UAVS - max_img, imgs);
       dev->uav_dirty[stage] = false;
