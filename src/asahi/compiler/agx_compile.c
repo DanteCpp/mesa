@@ -2132,11 +2132,30 @@ agx_emit_store(agx_builder *b, nir_intrinsic_instr *instr)
               nir_src_bit_size(instr->src[0]) == 8 &&
               nir_src_num_components(instr->src[0]) > 1) {
       /* Preserve one W8 vector transaction while packing its register payload
-       * two bytes per 16-bit lane. */
+       * two bytes per 16-bit lane. agx_pack_integer_8_agx3 masks low lanes to
+       * 0xff and shifts high lanes by 8 (and a trailing odd lane is truncated
+       * to 8 bits by device_store), so bypass a redundant u2u8 0xff mask. */
       const unsigned nr = nir_src_num_components(instr->src[0]);
+      const bool bypass_u2u8 = !b->shader->key->dev.emit_agx3d;
       agx_index channels[4] = {agx_null()};
-      for (unsigned i = 0; i < nr; ++i)
+      for (unsigned i = 0; i < nr; ++i) {
+         nir_scalar sc_val = nir_scalar_resolved(instr->src[0].ssa, i);
+         if (bypass_u2u8 && nir_scalar_is_alu(sc_val) &&
+             nir_scalar_alu_op(sc_val) == nir_op_u2u8) {
+            nir_scalar wide = nir_scalar_chase_alu_src(sc_val, 0);
+            if (!nir_scalar_is_const(wide) && !nir_scalar_is_undef(wide) &&
+                wide.def->num_components == 1 && wide.def->bit_size == 16) {
+               channels[i] = agx_def_index(wide.def);
+               continue;
+            } else if (!nir_scalar_is_const(wide) && !nir_scalar_is_undef(wide) &&
+                       wide.def->num_components == 1 && wide.def->bit_size == 32) {
+               channels[i] = agx_temp(b->shader, AGX_SIZE_16);
+               agx_subdivide_to(b, channels[i], agx_def_index(wide.def), 0);
+               continue;
+            }
+         }
          channels[i] = agx_extract_nir_src(b, instr->src[0], i);
+      }
 
       agx_index packed[2] = {agx_null()};
       const unsigned nr_packed =
@@ -2156,9 +2175,11 @@ agx_emit_store(agx_builder *b, nir_intrinsic_instr *instr)
       if (nir_scalar_is_alu(sc_val) &&
           nir_scalar_alu_op(sc_val) == nir_op_u2u8) {
          nir_scalar wide = nir_scalar_chase_alu_src(sc_val, 0);
-         if (wide.def->num_components == 1 && wide.def->bit_size == 16) {
+         if (!nir_scalar_is_const(wide) && !nir_scalar_is_undef(wide) &&
+             wide.def->num_components == 1 && wide.def->bit_size == 16) {
             value = agx_def_index(wide.def);
-         } else if (wide.def->num_components == 1 && wide.def->bit_size == 32) {
+         } else if (!nir_scalar_is_const(wide) && !nir_scalar_is_undef(wide) &&
+                    wide.def->num_components == 1 && wide.def->bit_size == 32) {
             value = agx_temp(b->shader, AGX_SIZE_16);
             agx_subdivide_to(b, value, agx_def_index(wide.def), 0);
          } else {

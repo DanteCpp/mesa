@@ -4835,3 +4835,99 @@ TEST(AGX3VisionOpts, Wave8FoldSignedPow2Idiv)
    }
 }
 
+TEST(AGX3VisionOpts, Wave8MergeGlobalWordsStoresAndHazards)
+{
+   auto make_base = [](nir_builder *b) {
+      nir_def *desc_ptr = nir_load_preamble(b, 1, 64, .base = 4);
+      nir_def *desc = nir_load_global_constant(
+         b, 4, 32, desc_ptr,
+         .access = (gl_access_qualifier)(ACCESS_CAN_SPECULATE |
+                                         ACCESS_BUFFER_DESCRIPTOR_AGX |
+                                         ACCESS_BUFFER_BINDING_AGX),
+         .align_mul = 16);
+      return nir_pack_64_2x32_split(b, nir_channel(b, desc, 0), nir_channel(b, desc, 1));
+   };
+
+   /* Positive: 4 consecutive 8-bit stores (both forward 0..3 and reverse 3..0)
+    * merge into one 8x4 store_global. */
+   for (bool reverse : {false, true}) {
+      SCOPED_TRACE(reverse);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "wave8_merge_u8_stores");
+      nir_def *base = make_base(&b);
+      nir_def *idx = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *off = nir_ishl_imm(&b, idx, 2);
+      for (unsigned k = 0; k < 4; k++) {
+         unsigned lane = reverse ? (3u - k) : k;
+         nir_def *val = nir_u2u8(&b, nir_iadd_imm(&b, idx, lane + 10));
+         nir_def *addr = nir_iadd(&b, base, nir_u2u64(&b, nir_iadd_imm(&b, off, lane)));
+         nir_store_global(&b, val, addr,
+                          .access = ACCESS_NON_READABLE,
+                          .write_mask = 1,
+                          .align_mul = 1);
+      }
+      EXPECT_TRUE(agx_nir_merge_global_words(b.shader));
+      nir_validate_shader(b.shader, "wave8 merge u8 stores");
+
+      unsigned stores = 0, vec4_u8 = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_store_global) {
+               stores++;
+               if (nir_src_num_components(intr->src[0]) == 4 &&
+                   nir_src_bit_size(intr->src[0]) == 8)
+                  vec4_u8++;
+            }
+         }
+      }
+      EXPECT_EQ(stores, 1u);
+      EXPECT_EQ(vec4_u8, 1u);
+      ralloc_free(b.shader);
+   }
+
+   /* Negative: intervening mutable load_global (RAW hazard) MUST NOT merge. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "wave8_merge_store_raw_hazard");
+      nir_def *base = make_base(&b);
+      nir_def *idx = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *a0 = nir_iadd(&b, base, nir_u2u64(&b, idx));
+      nir_def *a1 = nir_iadd(&b, base, nir_u2u64(&b, nir_iadd_imm(&b, idx, 1)));
+      nir_store_global(&b, nir_imm_intN_t(&b, 1, 8), a0,
+                       .write_mask = 1, .align_mul = 1);
+      nir_def *ld = nir_load_global(&b, 1, 8, a0, .align_mul = 1);
+      nir_store_global(&b, ld, a1, .write_mask = 1, .align_mul = 1);
+
+      EXPECT_FALSE(agx_nir_merge_global_words(b.shader));
+      nir_validate_shader(b.shader, "wave8 merge store raw hazard");
+      ralloc_free(b.shader);
+   }
+
+   /* Negative: intervening barrier or duplicate offset or coherent MUST NOT merge. */
+   for (unsigned mode = 0; mode < 3; mode++) {
+      SCOPED_TRACE(mode);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "wave8_merge_store_neg");
+      nir_def *base = make_base(&b);
+      nir_def *idx = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      gl_access_qualifier acc =
+         mode == 2 ? (gl_access_qualifier)(ACCESS_NON_READABLE | ACCESS_COHERENT)
+                   : ACCESS_NON_READABLE;
+      nir_def *a0 = nir_iadd(&b, base, nir_u2u64(&b, idx));
+      nir_def *a1 = nir_iadd(&b, base, nir_u2u64(&b, nir_iadd_imm(&b, idx, mode == 1 ? 0 : 1)));
+      nir_store_global(&b, nir_imm_intN_t(&b, 7, 8), a0,
+                       .access = acc, .write_mask = 1, .align_mul = 1);
+      if (mode == 0)
+         nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP);
+      nir_store_global(&b, nir_imm_intN_t(&b, 9, 8), a1,
+                       .access = acc, .write_mask = 1, .align_mul = 1);
+
+      EXPECT_FALSE(agx_nir_merge_global_words(b.shader));
+      nir_validate_shader(b.shader, "wave8 merge store neg");
+      ralloc_free(b.shader);
+   }
+}
+
