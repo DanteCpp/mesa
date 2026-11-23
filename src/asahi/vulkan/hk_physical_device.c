@@ -2284,7 +2284,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
        * the kernel's v2 render programs, which graphics-stage queries need
        * for their SCS fields. */
       supported_extensions.KHR_ray_query =
-         pdev->dev.chip == AGX_CHIP_G17S &&
+         agx_chip_g17_m5(pdev->dev.chip) &&
          (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2) &&
          pdev->m5_rt.rq_instances && pdev->m5_rt.rq_candidate_api;
       /* Explicit pipeline qualification profile; the default remains gated. */

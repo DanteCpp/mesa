@@ -138,7 +138,7 @@ agx3_rt_m5_ift_loader_generate(
          KV(73, (1u << words) - 1), KV(75, 2), KV(76, 16 * c),
       };
       uint8_t size;
-      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "lddev", 0,
+      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_lddev, 0,
                              fields, sizeof(fields) / sizeof(fields[0]),
                              NULL, 0, staged + used, &size))
          return false;
@@ -151,12 +151,12 @@ agx3_rt_m5_ift_loader_generate(
       KV(23, 1),
    };
    uint8_t size;
-   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "specLM", 0,
+   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_specLM, 0,
                           local, sizeof(local) / sizeof(local[0]),
                           NULL, 0, staged + used, &size))
       return false;
    used += size;
-   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "ldshdr", 0,
+   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_ldshdr, 0,
                           shader, sizeof(shader) / sizeof(shader[0]),
                           NULL, 0, staged + used, &size))
       return false;
@@ -190,7 +190,7 @@ agx3_rt_m5_ift_entry_generate(
       KV(0, 3), KV(1, 166), KV(20, d->tpr20 ? 20 : 0),
       KV(21, d->tpr20 ? 20 : 0),
    };
-   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "specTPR", 0, tpr,
+   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_specTPR, 0, tpr,
                           sizeof(tpr) / sizeof(tpr[0]), NULL, 0,
                           staged + used, &n))
       return false;
@@ -205,7 +205,7 @@ agx3_rt_m5_ift_entry_generate(
          KV(2, dest), KV(9, 2), KV(10, 2), KV(14, value),
          KV(15, 3), KV(16, 105),
       };
-      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "ldimm", 2,
+      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_ldimm, 2,
                              imm, sizeof(imm) / sizeof(imm[0]), NULL, 0,
                              staged + used, &n))
          return false;
@@ -215,7 +215,7 @@ agx3_rt_m5_ift_entry_generate(
             KV(2, 2), KV(9, 2), KV(10, 1), KV(12, 1), KV(21, 14),
             KV(23, 7), KV(24, 1), KV(28, 4), KV(29, 144), KV(38, 1),
          };
-         if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "rld", 1, sr,
+         if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_rld, 1, sr,
                                 sizeof(sr) / sizeof(sr[0]), NULL, 0,
                                 staged + used, &n))
             return false;
@@ -226,7 +226,7 @@ agx3_rt_m5_ift_entry_generate(
             KV(38, 2), KV(39, 2), KV(44, 3), KV(45, 80), KV(46, 1),
             KV(55, 4),
          };
-         if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "iadd32", 0, add,
+         if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_iadd32, 0, add,
                                 sizeof(add) / sizeof(add[0]), NULL, 0,
                                 staged + used, &n))
             return false;
@@ -236,7 +236,7 @@ agx3_rt_m5_ift_entry_generate(
    const struct agx3_field_kv call[] = {
       KV(9, 2), KV(10, 3), KV(15, 2), KV(16, 27), KV(17, 1), KV(25, 1),
    };
-   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "cndcall", 0, call,
+   if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_cndcall, 0, call,
                           sizeof(call) / sizeof(call[0]), NULL, 0,
                           staged + used, &n))
       return false;
@@ -247,7 +247,7 @@ agx3_rt_m5_ift_entry_generate(
          KV(16, d->uniforms[i].register_half), KV(23, 2), KV(24, 2),
          KV(27, 1), KV(28, 1), KV(29, 35), KV(31, i == 0),
       };
-      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "copy", 0, copy,
+      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_copy, 0, copy,
                              sizeof(copy) / sizeof(copy[0]), NULL, 0,
                              staged + used, &n))
          return false;
@@ -258,7 +258,7 @@ agx3_rt_m5_ift_entry_generate(
          KV(9, 2), KV(10, 1), KV(23, 2), KV(24, 1), KV(28, 3),
          KV(29, 35), KV(42, 1),
       };
-      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "copy", 1, copy,
+      if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, AGX3_MN_copy, 1, copy,
                              sizeof(copy) / sizeof(copy[0]), NULL, 0,
                              staged + used, &n))
          return false;
@@ -298,13 +298,13 @@ agx3_rt_m5_hit_commit_generate(
    used += n; \
 } while (0)
 #define RLD(dst, sr, slot, ep, waits) \
-   OP("rld", ep, KV(2,dst), KV(9,2), KV(10,1), KV(11,waits), KV(12,slot), \
+   OP(AGX3_MN_rld, ep, KV(2,dst), KV(9,2), KV(10,1), KV(11,waits), KV(12,slot), \
       KV(21,sr), KV(23,7), KV(24,1), KV(28,4), KV(29,144), KV(38,1))
    RLD(0,58,1,0,0);
    /* Extract the lane's 64-byte packet offset. */
-   OP("bit_and",1,KV(2,6),KV(9,2),KV(10,1),KV(11,1),KV(23,2),KV(24,1),
+   OP(AGX3_MN_bit_and,1,KV(2,6),KV(9,2),KV(10,1),KV(11,1),KV(23,2),KV(24,1),
       KV(27,1),KV(31,7),KV(37,3),KV(38,1),KV(42,3),KV(43,10),KV(44,1));
-   OP("imadd32",0,KV(2,10),KV(9,2),KV(10,2),KV(16,6),KV(23,2),KV(24,1),
+   OP(AGX3_MN_imadd32,0,KV(2,10),KV(9,2),KV(10,2),KV(16,6),KV(23,2),KV(24,1),
       KV(30,64),KV(38,1),KV(39,1),KV(53,1),KV(54,1),KV(59,3),KV(60,84));
    struct agx3_scs_desc scs = {
       .data=2,.width=AGX3_MEM_W32,.byte_offset=48,
@@ -319,17 +319,17 @@ agx3_rt_m5_hit_commit_generate(
    used += n;
    RLD(4,57,1,0,0);
    RLD(8,7,2,1,1);
-   OP("ldimm",2,KV(9,2),KV(10,2),KV(14,0x40000000),KV(15,3),KV(16,105));
-   OP("imadd32",0,KV(2,4),KV(9,2),KV(10,2),KV(16,4),KV(23,2),KV(24,1),
+   OP(AGX3_MN_ldimm,2,KV(9,2),KV(10,2),KV(14,0x40000000),KV(15,3),KV(16,105));
+   OP(AGX3_MN_imadd32,0,KV(2,4),KV(9,2),KV(10,2),KV(16,4),KV(23,2),KV(24,1),
       KV(27,1),KV(32,d->context6_uniform),KV(38,3),KV(39,1),
       KV(53,1),KV(54,1),KV(59,3),KV(60,84),KV(61,1));
-   OP("bit_or",1,KV(2,2),KV(9,2),KV(10,2),KV(11,1),KV(16,2),KV(23,2),
+   OP(AGX3_MN_bit_or,1,KV(2,2),KV(9,2),KV(10,2),KV(11,1),KV(16,2),KV(23,2),
       KV(24,2),KV(27,1),KV(31,10),KV(37,3),KV(38,2),KV(42,3),
       KV(43,16),KV(51,1));
-   OP("clr",0,KV(2,9),KV(9,2),KV(10,1),KV(14,3),KV(15,25));
-   OP("iadd32",0,KV(2,6),KV(9,2),KV(10,1),KV(16,6),KV(23,2),KV(24,1),
+   OP(AGX3_MN_clr,0,KV(2,9),KV(9,2),KV(10,1),KV(14,3),KV(15,25));
+   OP(AGX3_MN_iadd32,0,KV(2,6),KV(9,2),KV(10,1),KV(16,6),KV(23,2),KV(24,1),
       KV(27,1),KV(32,d->context8_uniform),KV(38,3),KV(39,1),KV(44,3),KV(45,80));
-   OP("clr",0,KV(2,7),KV(9,2),KV(10,1),KV(14,3),KV(15,25));
+   OP(AGX3_MN_clr,0,KV(2,7),KV(9,2),KV(10,1),KV(14,3),KV(15,25));
    scs=(struct agx3_scs_desc){
       .data=0,.width=AGX3_MEM_W32,.byte_offset=44,
       .address_kind=AGX3_SCS_ADDRESS_UNIFORM_INDEXED,.index=10,
@@ -341,23 +341,23 @@ agx3_rt_m5_hit_commit_generate(
       return false;
    used += n;
    /* This form consumes a 16-bit index, unlike the general SCS helpers. */
-   OP("stscs",0,KV(2,6),KV(9,2),KV(10,2),KV(13,1),KV(16,8),KV(23,2),
+   OP(AGX3_MN_stscs,0,KV(2,6),KV(9,2),KV(10,2),KV(13,1),KV(16,8),KV(23,2),
       KV(24,2),KV(27,1),KV(31,4),KV(38,2),KV(39,2),KV(42,1),KV(45,15),
       KV(53,1),KV(54,1),KV(59,188),KV(61,1),KV(68,1),KV(70,2),KV(76,1));
    /* Shared return: select the per-thread continuation record at
     * 192 + SR57 * 512, issue its destination-less SCS load, then return. */
    RLD(4,57,1,0,0);
-   OP("ldimm",2,KV(9,2),KV(10,2),KV(11,1),KV(14,192),KV(15,3),KV(16,105));
-   OP("ldimm",2,KV(2,2),KV(9,2),KV(10,2),KV(11,1),KV(14,512),KV(15,3),KV(16,105));
-   OP("imadd32",0,KV(9,2),KV(10,2),KV(16,4),KV(23,2),KV(24,1),KV(27,1),
+   OP(AGX3_MN_ldimm,2,KV(9,2),KV(10,2),KV(11,1),KV(14,192),KV(15,3),KV(16,105));
+   OP(AGX3_MN_ldimm,2,KV(2,2),KV(9,2),KV(10,2),KV(11,1),KV(14,512),KV(15,3),KV(16,105));
+   OP(AGX3_MN_imadd32,0,KV(9,2),KV(10,2),KV(16,4),KV(23,2),KV(24,1),KV(27,1),
       KV(31,2),KV(38,2),KV(39,2),KV(42,1),KV(53,2),KV(54,2),KV(57,1),
       KV(59,3),KV(60,84),KV(61,1));
    /* Immediate-zero slot-A operand; the indexed epilogue API intentionally
     * does not cover this native return form. */
-   OP("ldscs",0,KV(10,2),KV(23,1),KV(24,1),KV(28,1),KV(38,2),KV(39,2),
+   OP(AGX3_MN_ldscs,0,KV(10,2),KV(23,1),KV(24,1),KV(28,1),KV(38,2),KV(39,2),
       KV(42,1),KV(45,15),KV(53,1),KV(54,1),KV(59,106),KV(68,3),KV(76,2),KV(80,1));
-   OP("barrier",0,KV(14,3),KV(15,9),KV(25,1),KV(30,1),KV(39,1));
-   OP("end",0,KV(0,3),KV(1,39));
+   OP(AGX3_MN_barrier,0,KV(14,3),KV(15,9),KV(25,1),KV(30,1),KV(39,1));
+   OP(AGX3_MN_end,0,KV(0,3),KV(1,39));
 #undef RLD
 #undef OP
    if (used > sizeof(staged))

@@ -1910,7 +1910,6 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                                          ARRAY_SIZE(ranges), &count))
       goto refused;
    if (s->b.info.uses_ray_traversal) {
-      reason = "native query dispatch shape";
       /* Internal query kernels use the compute query ABI. A software vertex
        * variant keeps the vertex ABI (hk_g17p_internal_graphics_uniform_ranges)
        * and therefore stays refused. */
@@ -2049,7 +2048,6 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       hk_cmd_buffer_retain_bo(cmd, dev->m5_rq_code);
       hk_cmd_buffer_retain_bo(cmd, dev->m5_rq_ift);
    }
-   reason = "program bound";
    size_t capacity;
    if (!agx3_g17g_graphics_program_bound(dev->dev.chip, ranges, count, &capacity))
       goto refused;
