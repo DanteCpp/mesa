@@ -1093,17 +1093,12 @@ hk_get_device_features(
        */
       features->shaderQuadControl = dev->chip == AGX_CHIP_G17P;
 
-      if (dev->chip == AGX_CHIP_G17P) {
-         features->computeDerivativeGroupQuads = true;
-         features->computeDerivativeGroupLinear = true;
-      }
       features->textureCompressionASTC_HDR =
          supported_extensions->EXT_texture_compression_astc_hdr;
    }
 
-   /* Compute derivatives are NIR quad-swap lowering plus explicit-gradient
-    * samples, both available on M5; quad control remains restricted to G17P. */
-   if (agx_chip_g17_m5(dev->chip)) {
+   /* Compute derivatives lower to quad swaps and explicit-gradient samples. */
+   if (supported_extensions->KHR_compute_shader_derivatives) {
       features->computeDerivativeGroupQuads = true;
       features->computeDerivativeGroupLinear = true;
    }
@@ -2307,8 +2302,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    supported_extensions.EXT_texture_compression_astc_hdr =
       agx_chip_native_agx3(pdev->dev.chip);
 
-   if (agx_chip_g17p_or_m5(pdev->dev.chip))
-      supported_extensions.KHR_compute_shader_derivatives = true;
+   supported_extensions.KHR_compute_shader_derivatives =
+      agx_chip_native_or_m5(pdev->dev.chip);
 
    /* The native and M5 paths share float32 atomic lowering, including
     * compare-and-swap loops for operations the hardware cannot encode. */
