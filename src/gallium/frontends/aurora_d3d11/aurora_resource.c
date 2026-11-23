@@ -310,6 +310,16 @@ aurora_CreateResource(D3D10DDI_HDEVICE hDevice,
 
    aurora_lock(dev);
 
+   if (is_primary && !direct_scanout) {
+      aurora_unlock(dev);
+      aurora_log("CreateResource: primary refused (not direct-scanout) %ux%u fmt=%u bind=0x%08x misc=0x%08x",
+                 (unsigned)r->width, (unsigned)r->height,
+                 (unsigned)r->dxgi_format, (unsigned)pArgs->BindFlags,
+                 (unsigned)pArgs->MiscFlags);
+      aurora_set_error(dev, DXGI_ERROR_UNSUPPORTED);
+      return;
+   }
+
    if ((is_primary || is_shared) &&
        r->dim == D3D10DDIRESOURCE_TEXTURE2D &&
        r->mip_levels == 1u && r->array_size == 1u && r->sample_count <= 1u &&
@@ -318,10 +328,12 @@ aurora_CreateResource(D3D10DDI_HDEVICE hDevice,
       uint32_t bpp = util_format_get_blocksize(templ.format);
       uint32_t alloc_flags = AURORA_AGXW_ALLOC_SHAREABLE;
       if (direct_scanout) {
-         /* agxw_contract.h: DIRECT_SCANOUT requires PRIMARY|SHAREABLE and
-          * tight pitch; NO_CPU_MAP, WRITEBACK, PITCH_ALIGN128 are refused! */
+         /* agxw_contract.c:251: DIRECT_SCANOUT requires PRIMARY | SHAREABLE |
+          * NO_CPU_MAP and tight pitch; WRITEBACK, VM_PRIVATE, PITCH_ALIGN128
+          * are refused. */
          alloc_flags |= AURORA_AGXW_ALLOC_PRIMARY |
-                        AURORA_AGXW_ALLOC_DIRECT_SCANOUT;
+                        AURORA_AGXW_ALLOC_DIRECT_SCANOUT |
+                        AURORA_AGXW_ALLOC_NO_CPU_MAP;
       } else if (is_primary) {
          alloc_flags |= AURORA_AGXW_ALLOC_PRIMARY;
       } else if (bpp == 4u && ((r->width * 4u) & 15u) != 0u) {
@@ -341,6 +353,8 @@ aurora_CreateResource(D3D10DDI_HDEVICE hDevice,
           aurora_agxw_standard_desc_pack(r->width, r->height, d3d_fmt, &std_desc) == 0) {
          D3DKMT_HANDLE km_res = 0u, km_alloc = 0u;
          UINT vidpn = is_primary ? pArgs->pPrimaryDesc->VidPnSourceId : 0u;
+         if (is_primary)
+            pArgs->pPrimaryDesc->DriverFlags = 0u;
          HRESULT hr = allocate_runtime_surface(
             dev, hRTResource, alloc_size, alloc_flags, std_desc,
             is_primary, vidpn, &km_res, &km_alloc);
@@ -375,9 +389,10 @@ aurora_CreateResource(D3D10DDI_HDEVICE hDevice,
                        (unsigned)row_bytes, (unsigned long long)alloc_size);
          } else {
             aurora_unlock(dev);
-            aurora_log("CreateResource: runtime AllocateCb FAILED hr=0x%08lx %ux%u primary=%u",
+            aurora_log("CreateResource: runtime AllocateCb FAILED hr=0x%08lx %ux%u primary=%u direct=%u flags=0x%x fmt=%u",
                        (unsigned long)hr, (unsigned)r->width, (unsigned)r->height,
-                       is_primary ? 1u : 0u);
+                       is_primary ? 1u : 0u, direct_scanout ? 1u : 0u,
+                       (unsigned)alloc_flags, (unsigned)r->dxgi_format);
             aurora_set_error(dev, FAILED(hr) ? hr : E_OUTOFMEMORY);
             return;
          }

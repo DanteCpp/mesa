@@ -445,6 +445,7 @@ static HRESULT
 submit_mpo(struct aurora_device *dev, struct aurora_resource *res,
            UINT subresource, bool enabled, void *dxgi_ctx)
 {
+   static volatile LONG mpo_log_count = 0;
    if (!dev)
       return E_INVALIDARG;
    if (!aurora_gate_present_real())
@@ -487,6 +488,16 @@ submit_mpo(struct aurora_device *dev, struct aurora_resource *res,
       LeaveCriticalSection(&dev->km_ctx_lock);
 
    InterlockedDecrement(&dev->present_in_flight);
+   LONG n = InterlockedIncrement(&mpo_log_count);
+   if (n <= 8 || FAILED(hr)) {
+      aurora_log("present(MPO) #%ld enabled=%u alloc=%u %ux%u direct=%u hr=0x%08lx",
+                 (long)n, enabled ? 1u : 0u,
+                 (enabled && res) ? (unsigned)res->hKMAllocation : 0u,
+                 (enabled && res) ? (unsigned)res->width : 0u,
+                 (enabled && res) ? (unsigned)res->height : 0u,
+                 (enabled && res && res->is_direct_scanout) ? 1u : 0u,
+                 (unsigned long)hr);
+   }
    return hr;
 }
 
