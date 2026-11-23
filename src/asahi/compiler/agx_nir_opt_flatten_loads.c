@@ -5,6 +5,7 @@
 
 #include "asahi/lib/agx_abi.h"
 #include "compiler/nir/nir_builder.h"
+#include "util/set.h"
 #include "agx_nir.h"
 #include "nir.h"
 #include "nir_intrinsics.h"
@@ -394,9 +395,194 @@ redirect_loads(nir_builder *b, nir_block *block, nir_def *taken)
    }
 }
 
+/* Match val == base + delta via 1..4 chained constant-offset iadd ops. */
+static bool
+match_iv_step(nir_def *val, nir_def *base, int64_t *delta_out)
+{
+   int64_t total = 0;
+   nir_def *cur = val;
+   for (unsigned depth = 0; depth < 4 && cur != base; ++depth) {
+      nir_instr *instr = nir_def_instr(cur);
+      if (instr->type != nir_instr_type_alu)
+         return false;
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (alu->op != nir_op_iadd)
+         return false;
+      nir_scalar s0 =
+         nir_scalar_resolved(alu->src[0].src.ssa, alu->src[0].swizzle[0]);
+      nir_scalar s1 =
+         nir_scalar_resolved(alu->src[1].src.ssa, alu->src[1].swizzle[0]);
+      if (nir_scalar_is_const(s1)) {
+         total += nir_scalar_as_int(s1);
+         cur = alu->src[0].src.ssa;
+      } else if (nir_scalar_is_const(s0)) {
+         total += nir_scalar_as_int(s0);
+         cur = alu->src[1].src.ssa;
+      } else {
+         return false;
+      }
+   }
+   if (cur != base || total == 0)
+      return false;
+   *delta_out = total;
+   return true;
+}
+
+static bool
+cond_compares_iv(nir_def *cond, nir_def *iv, unsigned depth)
+{
+   nir_instr *ci = nir_def_instr(cond);
+   if (ci->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(ci);
+   switch (alu->op) {
+   case nir_op_ilt:
+   case nir_op_ult:
+   case nir_op_ige:
+   case nir_op_uge:
+   case nir_op_ieq:
+   case nir_op_ine:
+      return alu->src[0].src.ssa == iv || alu->src[1].src.ssa == iv;
+   case nir_op_ior:
+   case nir_op_iand:
+      return depth > 0 &&
+             (cond_compares_iv(alu->src[0].src.ssa, iv, depth - 1) ||
+              cond_compares_iv(alu->src[1].src.ssa, iv, depth - 1));
+   case nir_op_inot:
+      return depth > 0 && cond_compares_iv(alu->src[0].src.ssa, iv, depth - 1);
+   default:
+      return false;
+   }
+}
+
+static bool
+is_uniform_single_then_if(nir_if *nif)
+{
+   if (nir_src_is_divergent(&nif->condition))
+      return false;
+   nir_block *tb = nir_if_first_then_block(nif);
+   nir_block *eb = nir_if_first_else_block(nif);
+   if (nir_if_last_then_block(nif) != tb || nir_if_last_else_block(nif) != eb)
+      return false;
+   return exec_list_is_empty(&eb->instr_list);
+}
+
+static bool
+match_tail_iv_step_if(nir_if *nif, nir_def *expected_iv,
+                      nir_def **iv_out_out, int64_t *delta_out)
+{
+   if (!is_uniform_single_then_if(nif))
+      return false;
+
+   nir_block *tb = nir_if_first_then_block(nif);
+   nir_block *eb = nir_if_first_else_block(nif);
+   nir_block *merge = nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node));
+   nir_foreach_phi(phi, merge) {
+      if (phi->def.num_components != 1 || phi->def.bit_size != 32)
+         continue;
+      nir_phi_src *ts = nir_phi_get_src_from_block(phi, tb);
+      nir_phi_src *es = nir_phi_get_src_from_block(phi, eb);
+      if (!ts || !es)
+         continue;
+      nir_def *vin = es->src.ssa;
+      if (expected_iv && vin != expected_iv)
+         continue;
+      if (!cond_compares_iv(nif->condition.ssa, vin, 2))
+         continue;
+      int64_t delta = 0;
+      if (!match_iv_step(ts->src.ssa, vin, &delta))
+         continue;
+      int64_t ad = delta < 0 ? -delta : delta;
+      if (ad == 4 || ad == 2 || ad == 1) {
+         *iv_out_out = &phi->def;
+         *delta_out = delta;
+         return true;
+      }
+   }
+   return false;
+}
+
+/* Binary-tail cascades emitted by agx_nir_unroll_runtime_loops consist of
+ * >= 2 sequential single-arm uniform ifs comparing a live induction variable
+ * and stepping it by halving power-of-2 deltas (+/-4 -> +/-2 -> +/-1, with
+ * the final 1-chunk allowed to drop the dead IV phi). Skip them locally inside
+ * load flattening without marking nir_selection_control_dont_flatten, so
+ * nir_opt_peephole_select stays free to fold pure-ALU / speculatable tails. */
+static void
+collect_binary_tail_ifs(struct exec_list *cf_list, struct set *skip_ifs)
+{
+   struct {
+      nir_if *ifs[4];
+      unsigned nifs;
+      nir_def *iv_out;
+      int64_t last_delta;
+   } chains[8];
+   unsigned nchains = 0;
+
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         collect_binary_tail_ifs(&nif->then_list, skip_ifs);
+         collect_binary_tail_ifs(&nif->else_list, skip_ifs);
+
+         bool extended = false;
+         for (unsigned c = 0; c < nchains; ++c) {
+            if (!chains[c].iv_out || chains[c].nifs >= ARRAY_SIZE(chains[c].ifs))
+               continue;
+            int64_t abs_prev = chains[c].last_delta < 0 ? -chains[c].last_delta
+                                                        : chains[c].last_delta;
+            if (abs_prev != 4 && abs_prev != 2)
+               continue;
+            nir_def *vout = NULL;
+            int64_t delta = 0;
+            if (match_tail_iv_step_if(nif, chains[c].iv_out, &vout, &delta) &&
+                delta * 2 == chains[c].last_delta) {
+               chains[c].ifs[chains[c].nifs++] = nif;
+               chains[c].iv_out = vout;
+               chains[c].last_delta = delta;
+               extended = true;
+               break;
+            }
+            if (abs_prev == 2 && is_uniform_single_then_if(nif) &&
+                cond_compares_iv(nif->condition.ssa, chains[c].iv_out, 2)) {
+               chains[c].ifs[chains[c].nifs++] = nif;
+               chains[c].iv_out = NULL;
+               chains[c].last_delta = chains[c].last_delta / 2;
+               extended = true;
+               break;
+            }
+         }
+         if (!extended && nchains < ARRAY_SIZE(chains)) {
+            nir_def *vout = NULL;
+            int64_t delta = 0;
+            if (match_tail_iv_step_if(nif, NULL, &vout, &delta)) {
+               int64_t ad = delta < 0 ? -delta : delta;
+               if (ad == 4 || ad == 2) {
+                  chains[nchains].ifs[0] = nif;
+                  chains[nchains].nifs = 1;
+                  chains[nchains].iv_out = vout;
+                  chains[nchains].last_delta = delta;
+                  nchains++;
+               }
+            }
+         }
+      } else if (node->type == nir_cf_node_loop) {
+         collect_binary_tail_ifs(&nir_cf_node_as_loop(node)->body, skip_ifs);
+      }
+   }
+
+   for (unsigned c = 0; c < nchains; ++c) {
+      if (chains[c].nifs < 2)
+         continue;
+      for (unsigned i = 0; i < chains[c].nifs; ++i)
+         _mesa_set_add(skip_ifs, chains[c].ifs[i]);
+   }
+}
+
 static bool
 flatten_block(nir_builder *b, nir_block *block,
-              const struct flatten_options *options)
+              const struct flatten_options *options,
+              const struct set *skip_ifs)
 {
    if (nir_cf_node_is_first(&block->cf_node))
       return false;
@@ -414,6 +600,7 @@ flatten_block(nir_builder *b, nir_block *block,
     * both every time. */
    nir_if *nif = nir_cf_node_as_if(prev_node);
    if (nif->control == nir_selection_control_dont_flatten ||
+       _mesa_set_search(skip_ifs, nif) != NULL ||
        nir_src_is_divergent(&nif->condition))
       return false;
 
@@ -477,12 +664,16 @@ agx_nir_opt_flatten_loads(nir_shader *shader, unsigned limit,
 
    nir_foreach_function_impl(impl, shader) {
       nir_metadata_require(impl, nir_metadata_divergence);
+      struct set *skip_ifs = _mesa_pointer_set_create(NULL);
+      collect_binary_tail_ifs(&impl->body, skip_ifs);
+
       nir_builder b = nir_builder_create(impl);
       bool impl_progress = false;
 
       nir_foreach_block_safe(block, impl)
-         impl_progress |= flatten_block(&b, block, &options);
+         impl_progress |= flatten_block(&b, block, &options, skip_ifs);
 
+      _mesa_set_destroy(skip_ifs, NULL);
       progress |= nir_progress(impl_progress, impl, nir_metadata_none);
    }
 

@@ -641,11 +641,13 @@ INSTANTIATE_TEST_SUITE_P(
              (std::get<2>(info.param) == ARM_THEN ? "Then" : "Else");
    });
 
-/* The pass is M5's: G18G compiles as AGX3C with emit_agx3d and keeps the if.
- * A guarded load compiles to a different program with and without
- * dont_flatten on M5, to the same one on G18G. */
+/* The pass runs on AGX3B and AGX3C (not G18G, which compiles as AGX3C with
+ * emit_agx3d and keeps the if). A guarded load compiles to a different program
+ * with and without dont_flatten on AGX3B and AGX3C, and to the same one on
+ * G18G. */
 static std::vector<uint8_t>
-compile_guarded_load(bool emit_agx3d, bool dont_flatten)
+compile_guarded_load(enum agx_isa_encoding encoding, enum agx_chip chip,
+                     bool emit_agx3d, bool dont_flatten)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, &agx_nir_options, "guarded load");
@@ -666,8 +668,8 @@ compile_guarded_load(bool emit_agx3d, bool dont_flatten)
    agx_preprocess_nir(b.shader);
 
    agx_shader_key key = {};
-   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
-   key.dev.chip = emit_agx3d ? AGX_CHIP_G17G : AGX_CHIP_G17C;
+   key.dev.encoding = encoding;
+   key.dev.chip = chip;
    key.dev.emit_agx3d = emit_agx3d;
    key.reserved_preamble = 10;
    key.no_preamble = true;
@@ -683,13 +685,70 @@ compile_guarded_load(bool emit_agx3d, bool dont_flatten)
    return binary;
 }
 
-TEST_F(FlattenLoadsKeeps, G18GKeepsTheIf)
+TEST_F(FlattenLoadsKeeps, AGX3BAndM5FlattenWhileG18GKeepsTheIf)
 {
-   const std::vector<uint8_t> m5 = compile_guarded_load(false, false);
-   EXPECT_FALSE(m5.empty());
-   EXPECT_NE(m5, compile_guarded_load(false, true));
+   const std::vector<uint8_t> g15g = compile_guarded_load(
+      AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G, false, false);
+   EXPECT_FALSE(g15g.empty());
+   EXPECT_NE(g15g, compile_guarded_load(AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G,
+                                        false, true));
 
-   const std::vector<uint8_t> g18g = compile_guarded_load(true, false);
+   const std::vector<uint8_t> agx3b = compile_guarded_load(
+      AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, false);
+   EXPECT_FALSE(agx3b.empty());
+   EXPECT_NE(agx3b, compile_guarded_load(AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P,
+                                         false, true));
+
+   const std::vector<uint8_t> m5 = compile_guarded_load(
+      AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17C, false, false);
+   EXPECT_FALSE(m5.empty());
+   EXPECT_NE(m5, compile_guarded_load(AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17C,
+                                      false, true));
+
+   const std::vector<uint8_t> g18g = compile_guarded_load(
+      AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, true, false);
    EXPECT_FALSE(g18g.empty());
-   EXPECT_EQ(g18g, compile_guarded_load(true, true));
+   EXPECT_EQ(g18g, compile_guarded_load(AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G,
+                                        true, true));
+}
+
+TEST_F(FlattenLoadsKeeps, SkipsBinaryTailCascade)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "binary_tail_skip");
+   nir_def *iv = nir_load_preamble(&b, 1, 32, .base = 0);
+   nir_def *n = nir_load_preamble(&b, 1, 32, .base = 2);
+   nir_def *buf = nir_load_preamble(&b, 1, 64, .base = 4);
+   nir_def *out = nir_load_preamble(&b, 1, 64, .base = 8);
+
+   nir_def *acc = nir_imm_int(&b, 0);
+   for (unsigned step : {4u, 2u, 1u}) {
+      nir_def *lim = step > 1 ? nir_iadd_imm(&b, n, -(int)(step - 1)) : n;
+      nir_if *nif = nir_push_if(&b, nir_ilt(&b, iv, lim));
+      nir_def *v = nir_load_global(
+         &b, 1, 32, nir_iadd(&b, buf, nir_u2u64(&b, nir_ishl_imm(&b, iv, 2))),
+         .align_mul = 4);
+      nir_def *next_acc = nir_iadd(&b, acc, v);
+      nir_def *next_iv = nir_iadd_imm(&b, iv, step);
+      nir_pop_if(&b, nif);
+      acc = nir_if_phi(&b, next_acc, acc);
+      if (step > 1)
+         iv = nir_if_phi(&b, next_iv, iv);
+   }
+   nir_store_global(&b, acc, out, .align_mul = 4);
+
+   EXPECT_FALSE(agx_nir_opt_flatten_loads(b.shader, 64, 4));
+   unsigned ifs = 0;
+   nir_foreach_function_impl(impl, b.shader) {
+      foreach_list_typed(nir_cf_node, node, node, &impl->body) {
+         if (node->type == nir_cf_node_if) {
+            EXPECT_EQ(nir_cf_node_as_if(node)->control,
+                      nir_selection_control_none);
+            ifs++;
+         }
+      }
+   }
+   EXPECT_EQ(ifs, 3u);
+   nir_validate_shader(b.shader, "binary_tail_skip");
+   ralloc_free(b.shader);
 }
