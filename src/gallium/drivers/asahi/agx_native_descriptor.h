@@ -181,10 +181,11 @@ agx_gallium_native_pbe_supported(
  * 24+24-byte descriptor pair and has no AGX3 build, so only AGX2 qualifies.
  * On AGX3 the compressed PBE itself is encoded (Gen9 GPU-tiled 2D and 2x/4x
  * multisample 2D, see agx_gallium_pack_native_pbe()); G17P compresses its
- * private images within agx_g17p_compression_color_format() and reallocates
- * them uncompressed via agx_decompress() if a framebuffer spills them or a
- * feedback loop/shader image binds them, while imported compressed images
- * stay sample-only (external) there.
+ * private images within agx_g17p_compression_color_format() and
+ * agx_g17p_compression_color_format_16b() and reallocates them uncompressed
+ * via agx_decompress() if a framebuffer spills them or a feedback loop/shader
+ * image binds them, while imported compressed images stay sample-only
+ * (external) there.
  */
 static inline bool
 agx_gallium_shared_compression_supported(

@@ -41,6 +41,7 @@
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 #include "util/u_inlines.h"
+#include "util/format/u_format.h"
 #include "util/format/u_formats.h"
 #include "util/u_memory.h"
 #include "util/driconf.h"
@@ -1718,6 +1719,463 @@ check_discard_main_sample_key(struct pipe_context *pctx)
    return ok;
 }
 
+static bool
+check_rgba32_pixels(struct pipe_context *pctx, struct pipe_resource *res,
+                    unsigned width, unsigned height, const uint32_t want[4],
+                    const char *label)
+{
+   struct pipe_transfer *xfer = NULL;
+   uint8_t *map = pipe_texture_map(pctx, res, 0, 0, PIPE_MAP_READ, 0, 0, width,
+                                   height, &xfer);
+   if (!map || !xfer) {
+      fprintf(stderr, "%s: transfer_map failed\n", label);
+      return false;
+   }
+
+   for (unsigned y = 0; y < height; ++y) {
+      const uint32_t *row = (const uint32_t *)(map + y * xfer->stride);
+      for (unsigned x = 0; x < width; ++x) {
+         const uint32_t *px = row + x * 4;
+         if (memcmp(px, want, 16) != 0) {
+            fprintf(stderr,
+                    "%s: mismatch at (%u,%u): got (%#x,%#x,%#x,%#x) want "
+                    "(%#x,%#x,%#x,%#x)\n",
+                    label, x, y, px[0], px[1], px[2], px[3], want[0], want[1],
+                    want[2], want[3]);
+            pipe_texture_unmap(pctx, xfer);
+            return false;
+         }
+      }
+   }
+
+   pipe_texture_unmap(pctx, xfer);
+   return true;
+}
+
+static bool
+check_g17p_rgba32_compression(struct pipe_screen *screen,
+                              struct pipe_context *pctx, bool check_pixels)
+{
+   struct agx_device *dev = agx_device(screen);
+   const bool agx2 =
+      agx_chip_command_stream_generation(dev->chip) == AGX_CS_GENERATION_AGX2;
+   const bool g17p = dev->chip == AGX_CHIP_G17P;
+
+   static const enum pipe_format formats[] = {
+      PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_UINT,
+      PIPE_FORMAT_R32G32B32A32_SINT,  PIPE_FORMAT_R32G32B32X32_FLOAT,
+      PIPE_FORMAT_R32G32B32X32_UINT,  PIPE_FORMAT_R32G32B32X32_SINT,
+   };
+
+   if (!agx2) {
+      for (unsigned i = 0; i < ARRAY_SIZE(formats); ++i) {
+         struct pipe_resource *r64 =
+            make_2d(screen, formats[i], 64, 64,
+                    PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+         struct pipe_resource *r16 =
+            make_2d(screen, formats[i], 16, 16,
+                    PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+         struct pipe_resource *r15 =
+            make_2d(screen, formats[i], 15, 16,
+                    PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+         if (!r64 || !r16 || !r15) {
+            fprintf(stderr, "16B resource_create failed for %s\n",
+                    util_format_name(formats[i]));
+            pipe_resource_reference(&r64, NULL);
+            pipe_resource_reference(&r16, NULL);
+            pipe_resource_reference(&r15, NULL);
+            return false;
+         }
+
+         const bool ok = agx_resource(r64)->layout.compressed == g17p &&
+                         agx_resource(r16)->layout.compressed == g17p &&
+                         !agx_resource(r15)->layout.compressed;
+         pipe_resource_reference(&r64, NULL);
+         pipe_resource_reference(&r16, NULL);
+         pipe_resource_reference(&r15, NULL);
+         if (!ok) {
+            fprintf(stderr, "16B compression policy mismatch for %s on %s\n",
+                    util_format_name(formats[i]), agx_chip_name(dev->chip));
+            return false;
+         }
+      }
+
+      /* 2x/4x MSAA, arrays, mipmaps, shader-image and shared 16B targets must
+       * remain uncompressed on AGX3. */
+      const struct pipe_resource non_eligible[] = {
+         {
+            .target = PIPE_TEXTURE_2D,
+            .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+            .width0 = 64,
+            .height0 = 64,
+            .depth0 = 1,
+            .array_size = 1,
+            .nr_samples = 2,
+            .nr_storage_samples = 2,
+            .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
+         },
+         {
+            .target = PIPE_TEXTURE_2D,
+            .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+            .width0 = 64,
+            .height0 = 64,
+            .depth0 = 1,
+            .array_size = 1,
+            .nr_samples = 4,
+            .nr_storage_samples = 4,
+            .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
+         },
+         {
+            .target = PIPE_TEXTURE_2D_ARRAY,
+            .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+            .width0 = 64,
+            .height0 = 64,
+            .depth0 = 1,
+            .array_size = 2,
+            .nr_samples = 1,
+            .nr_storage_samples = 1,
+            .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
+         },
+         {
+            .target = PIPE_TEXTURE_2D,
+            .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+            .width0 = 64,
+            .height0 = 64,
+            .depth0 = 1,
+            .array_size = 1,
+            .last_level = 1,
+            .nr_samples = 1,
+            .nr_storage_samples = 1,
+            .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
+         },
+         {
+            .target = PIPE_TEXTURE_2D,
+            .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+            .width0 = 64,
+            .height0 = 64,
+            .depth0 = 1,
+            .array_size = 1,
+            .nr_samples = 1,
+            .nr_storage_samples = 1,
+            .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW |
+                    PIPE_BIND_SHADER_IMAGE,
+         },
+         {
+            .target = PIPE_TEXTURE_2D,
+            .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+            .width0 = 64,
+            .height0 = 64,
+            .depth0 = 1,
+            .array_size = 1,
+            .nr_samples = 1,
+            .nr_storage_samples = 1,
+            .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW |
+                    PIPE_BIND_SHARED,
+         },
+      };
+
+      for (unsigned i = 0; i < ARRAY_SIZE(non_eligible); ++i) {
+         struct pipe_resource *r =
+            screen->resource_create(screen, &non_eligible[i]);
+         if (!r) {
+            fprintf(stderr, "16B non-eligible case %u create failed\n", i);
+            return false;
+         }
+         const bool comp = agx_resource(r)->layout.compressed;
+         pipe_resource_reference(&r, NULL);
+         if (comp) {
+            fprintf(stderr, "16B non-eligible case %u unexpectedly compressed\n",
+                    i);
+            return false;
+         }
+      }
+   }
+
+   if (!g17p)
+      return true;
+
+   const struct pipe_framebuffer_state empty_fb = {0};
+
+   /* 1. Single-RT compressed RGBA32UI clear + compressed->compressed blit. */
+   struct pipe_resource *src =
+      make_2d(screen, PIPE_FORMAT_R32G32B32A32_UINT, 64, 64,
+              PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+   struct pipe_resource *dst =
+      make_2d(screen, PIPE_FORMAT_R32G32B32A32_UINT, 64, 64,
+              PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+   if (!src || !dst || !agx_resource(src)->layout.compressed ||
+       !agx_resource(dst)->layout.compressed) {
+      fprintf(stderr, "16B single-RT compressed setup failed\n");
+      pipe_resource_reference(&src, NULL);
+      pipe_resource_reference(&dst, NULL);
+      return false;
+   }
+
+   struct pipe_framebuffer_state sfb = {
+      .width = 64,
+      .height = 64,
+      .layers = 1,
+      .samples = 1,
+      .nr_cbufs = 1,
+   };
+   sfb.cbufs[0] = (struct pipe_surface){
+      .texture = src,
+      .format = PIPE_FORMAT_R32G32B32A32_UINT,
+   };
+   pctx->set_framebuffer_state(pctx, &sfb);
+   const union pipe_color_union ui_pat = {
+      .ui = {0xdeadbeefu, 0x12345678u, 0x80000001u, 0x7fc01234u},
+   };
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &ui_pat, 0.0, 0);
+
+   struct pipe_blit_info binfo = {
+      .src = {
+         .resource = src,
+         .format = PIPE_FORMAT_R32G32B32A32_UINT,
+         .box = {.width = 64, .height = 64, .depth = 1},
+      },
+      .dst = {
+         .resource = dst,
+         .format = PIPE_FORMAT_R32G32B32A32_UINT,
+         .box = {.width = 64, .height = 64, .depth = 1},
+      },
+      .mask = PIPE_MASK_RGBA,
+      .filter = PIPE_TEX_FILTER_NEAREST,
+   };
+   pctx->blit(pctx, &binfo);
+   pctx->flush(pctx, NULL, 0);
+
+   if (check_pixels &&
+       !check_rgba32_pixels(pctx, dst, 64, 64, ui_pat.ui, "RGBA32UI blit")) {
+      pctx->set_framebuffer_state(pctx, &empty_fb);
+      pipe_resource_reference(&src, NULL);
+      pipe_resource_reference(&dst, NULL);
+      return false;
+   }
+   pctx->set_framebuffer_state(pctx, &empty_fb);
+   pipe_resource_reference(&src, NULL);
+   pipe_resource_reference(&dst, NULL);
+
+   /* 2. 8-MRT RGBA32F framebuffer: RT0..RT6 stay compressed while RT7 spills
+    * and is pre-decompressed in agx_set_framebuffer_state(). Seed RT7 before
+    * binding so transition_resource() must preserve its compressed contents. */
+   struct pipe_resource *rts[8] = {NULL};
+   for (unsigned i = 0; i < 8; ++i) {
+      rts[i] = make_2d(screen, PIPE_FORMAT_R32G32B32A32_FLOAT, 64, 64,
+                       PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+      if (!rts[i] || !agx_resource(rts[i])->layout.compressed) {
+         fprintf(stderr, "16B 8-MRT RT%u compressed alloc failed\n", i);
+         for (unsigned j = 0; j < 8; ++j)
+            pipe_resource_reference(&rts[j], NULL);
+         return false;
+      }
+   }
+
+   const union pipe_color_union c_init = {
+      .f = {1.25f, -2.5f, 3.75f, -4.5f},
+   };
+   const union pipe_color_union c_mrt = {
+      .f = {0.5f, -1.25f, 2.75f, 8.0f},
+   };
+   const union pipe_color_union c_all = {
+      .f = {-0.75f, 4.25f, -9.5f, 16.0f},
+   };
+
+   struct pipe_framebuffer_state fb1 = {
+      .width = 64,
+      .height = 64,
+      .layers = 1,
+      .samples = 1,
+      .nr_cbufs = 1,
+   };
+   fb1.cbufs[0] = (struct pipe_surface){
+      .texture = rts[7],
+      .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+   };
+   pctx->set_framebuffer_state(pctx, &fb1);
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &c_init, 0.0, 0);
+   pctx->flush(pctx, NULL, 0);
+
+   struct pipe_framebuffer_state fb8 = {
+      .width = 64,
+      .height = 64,
+      .layers = 1,
+      .samples = 1,
+      .nr_cbufs = 8,
+   };
+   for (unsigned i = 0; i < 8; ++i) {
+      fb8.cbufs[i] = (struct pipe_surface){
+         .texture = rts[i],
+         .format = PIPE_FORMAT_R32G32B32A32_FLOAT,
+      };
+   }
+   pctx->set_framebuffer_state(pctx, &fb8);
+
+   bool spill_ok = !agx_resource(rts[7])->layout.compressed;
+   for (unsigned i = 0; i < 7; ++i)
+      spill_ok &= agx_resource(rts[i])->layout.compressed;
+   if (!spill_ok) {
+      fprintf(stderr, "16B 8-MRT spill pre-decompression state wrong\n");
+      pctx->set_framebuffer_state(pctx, &empty_fb);
+      for (unsigned i = 0; i < 8; ++i)
+         pipe_resource_reference(&rts[i], NULL);
+      return false;
+   }
+
+   /* Clear RT0..RT6 only; RT7 must retain c_init across decompression. */
+   pctx->clear(pctx, PIPE_CLEAR_COLOR & ~PIPE_CLEAR_COLOR7, 0x7f, 0, NULL,
+               &c_mrt, 0.0, 0);
+   pctx->flush(pctx, NULL, 0);
+
+   bool pixels_ok = true;
+   if (check_pixels) {
+      for (unsigned i = 0; i < 7 && pixels_ok; ++i)
+         pixels_ok &= check_rgba32_pixels(pctx, rts[i], 64, 64, c_mrt.ui,
+                                          "8-MRT resident RT");
+      if (pixels_ok)
+         pixels_ok &= check_rgba32_pixels(pctx, rts[7], 64, 64, c_init.ui,
+                                          "8-MRT spilled RT preserved");
+   }
+
+   /* Clear all 8 RTs (fast clear on RT0..RT6, slow clear on spilled RT7). */
+   if (pixels_ok) {
+      pctx->clear(pctx, PIPE_CLEAR_COLOR, 0xff, 0, NULL, &c_all, 0.0, 0);
+      pctx->flush(pctx, NULL, 0);
+      if (check_pixels) {
+         for (unsigned i = 0; i < 8 && pixels_ok; ++i)
+            pixels_ok &= check_rgba32_pixels(pctx, rts[i], 64, 64, c_all.ui,
+                                             "8-MRT all-clear RT");
+      }
+   }
+
+   pctx->set_framebuffer_state(pctx, &empty_fb);
+   for (unsigned i = 0; i < 8; ++i)
+      pipe_resource_reference(&rts[i], NULL);
+
+   if (!pixels_ok)
+      return false;
+
+   /* 3. Mixed-MRT budget boundary: 6x RGBA32F + 2x RGBA16F (112 B) and
+    * 7x RGBA32F + 1x RGBA16F (120 B, exact budget) keep all 8 targets
+    * compressed; 4x MSAA (64 B/sample) with RT0=RGBA32F + RT1=RGBA8 +
+    * RT2..RT7=RGBA16F spills non-RT7 RT1 and pre-decompresses only RT1. */
+   const enum pipe_format mixed_fit[2][8] = {
+      {
+         PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+         PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+         PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+         PIPE_FORMAT_R16G16B16A16_FLOAT, PIPE_FORMAT_R16G16B16A16_FLOAT,
+      },
+      {
+         PIPE_FORMAT_R16G16B16A16_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+         PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+         PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+         PIPE_FORMAT_R32G32B32A32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT,
+      },
+   };
+   for (unsigned c = 0; c < 2; ++c) {
+      struct pipe_framebuffer_state mfb = {
+         .width = 64,
+         .height = 64,
+         .layers = 1,
+         .samples = 1,
+         .nr_cbufs = 8,
+      };
+      for (unsigned i = 0; i < 8; ++i) {
+         rts[i] = make_2d(screen, mixed_fit[c][i], 64, 64,
+                          PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW);
+         if (!rts[i] || !agx_resource(rts[i])->layout.compressed) {
+            fprintf(stderr, "mixed-MRT case %u RT%u compressed alloc failed\n",
+                    c, i);
+            for (unsigned j = 0; j < 8; ++j)
+               pipe_resource_reference(&rts[j], NULL);
+            return false;
+         }
+         mfb.cbufs[i] = (struct pipe_surface){
+            .texture = rts[i],
+            .format = mixed_fit[c][i],
+         };
+      }
+      pctx->set_framebuffer_state(pctx, &mfb);
+      bool all_comp = true;
+      for (unsigned i = 0; i < 8; ++i)
+         all_comp &= agx_resource(rts[i])->layout.compressed;
+      if (all_comp) {
+         pctx->clear(pctx, PIPE_CLEAR_COLOR, 0xff, 0, NULL, &c_mrt, 0.0, 0);
+         pctx->flush(pctx, NULL, 0);
+      }
+      pctx->set_framebuffer_state(pctx, &empty_fb);
+      for (unsigned i = 0; i < 8; ++i)
+         pipe_resource_reference(&rts[i], NULL);
+      if (!all_comp) {
+         fprintf(stderr, "mixed-MRT case %u unexpectedly decompressed\n", c);
+         return false;
+      }
+   }
+
+   /* 4x MSAA non-RT7 spill (32 KiB tile = 32 B/sample at 4x): align-4
+    * RT1 (RGBA32F, uncompressed, 16 B) + align-2 RT2..RT3 (RGBA16F,
+    * compressed, 2x8 = 16 B) consume 32 B, spilling align-1 compressed
+    * RT0 (RGBA8, 4 B) while leaving RT2..RT3 compressed. */
+   const enum pipe_format ms4_fmts[4] = {
+      PIPE_FORMAT_R8G8B8A8_UNORM,     PIPE_FORMAT_R32G32B32A32_FLOAT,
+      PIPE_FORMAT_R16G16B16A16_FLOAT, PIPE_FORMAT_R16G16B16A16_FLOAT,
+   };
+   struct pipe_framebuffer_state ms4_fb = {
+      .width = 64,
+      .height = 64,
+      .layers = 1,
+      .samples = 4,
+      .nr_cbufs = 4,
+   };
+   for (unsigned i = 0; i < 4; ++i) {
+      struct pipe_resource tmpl = {
+         .target = PIPE_TEXTURE_2D,
+         .format = ms4_fmts[i],
+         .width0 = 64,
+         .height0 = 64,
+         .depth0 = 1,
+         .array_size = 1,
+         .nr_samples = 4,
+         .nr_storage_samples = 4,
+         .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
+      };
+      rts[i] = screen->resource_create(screen, &tmpl);
+      const bool want_comp = (i != 1);
+      if (!rts[i] || agx_resource(rts[i])->layout.compressed != want_comp) {
+         fprintf(stderr, "4x MSAA non-RT7 spill RT%u initial state wrong\n", i);
+         for (unsigned j = 0; j < 4; ++j)
+            pipe_resource_reference(&rts[j], NULL);
+         return false;
+      }
+      ms4_fb.cbufs[i] = (struct pipe_surface){
+         .texture = rts[i],
+         .format = ms4_fmts[i],
+      };
+   }
+   pctx->set_framebuffer_state(pctx, &ms4_fb);
+   bool non_rt7_ok = !agx_resource(rts[0])->layout.compressed &&
+                     !agx_resource(rts[1])->layout.compressed &&
+                     agx_resource(rts[2])->layout.compressed &&
+                     agx_resource(rts[3])->layout.compressed;
+   if (non_rt7_ok) {
+      pctx->clear(pctx, PIPE_CLEAR_COLOR & 0xf, 0xf, 0, NULL, &c_mrt, 0.0, 0);
+      pctx->flush(pctx, NULL, 0);
+   }
+   pctx->set_framebuffer_state(pctx, &empty_fb);
+   for (unsigned i = 0; i < 4; ++i)
+      pipe_resource_reference(&rts[i], NULL);
+   if (!non_rt7_ok) {
+      fprintf(stderr, "4x MSAA non-RT7 spill pre-decompression state wrong\n");
+      return false;
+   }
+
+   printf("G17P 16-byte compression + mixed/8-MRT spill check passed "
+          "(check_pixels=%d)\n",
+          check_pixels);
+   return true;
+}
+
 int
 main(void)
 {
@@ -1780,6 +2238,14 @@ main(void)
       return ok ? 0 : 1;
    }
 
+   if (getenv("AGX_TEST_RGBA32_COMP_HW")) {
+      const bool ok = check_g17p_rgba32_compression(screen, pctx, true);
+      pctx->destroy(pctx);
+      screen->destroy(screen);
+      close(fd);
+      return ok ? 0 : 1;
+   }
+
    if (getenv("AGX_TEST_XFB_COPY_PROGRAM")) {
       glsl_type_singleton_init_or_ref();
       /* A triangle capture shades one of three candidate vertices, so its
@@ -1812,6 +2278,9 @@ main(void)
       return 1;
 
    if (!check_staged_resolve_shapes())
+      return 1;
+
+   if (!check_g17p_rgba32_compression(screen, pctx, false))
       return 1;
 
    if (!check_es3_compile_contract(pctx))

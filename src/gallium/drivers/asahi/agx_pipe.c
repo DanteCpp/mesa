@@ -467,8 +467,9 @@ agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
           !(templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DEPTH_STENCIL));
 }
 
-/* G17P compresses a private, single-level, single-layer 1x/2x/4x 2D colour
- * image of agx_g17p_compression_color_format(): written by the compressed
+/* G17P compresses a private, single-level, single-layer 2D colour image of
+ * agx_g17p_compression_color_format() (1x/2x/4x) or
+ * agx_g17p_compression_color_format_16b() (1x only): written by the compressed
  * Gen9 2D or 2x/4x multisample PBE (end-of-tile stores, blits, staging
  * uploads) and read by the compressed texture descriptor. Nothing
  * decompresses such an image in place: it is neither shared nor scanned out,
@@ -482,14 +483,17 @@ static bool
 agx_g17p_private_compression_allowed(const struct agx_device *dev,
                                      const struct pipe_resource *templ)
 {
-   return dev->chip == AGX_CHIP_G17P && templ->target == PIPE_TEXTURE_2D &&
-          templ->depth0 == 1 && templ->array_size <= 1 &&
-          templ->last_level == 0 &&
-          (templ->nr_samples <= 1 || templ->nr_samples == 2 ||
-           templ->nr_samples == 4) &&
-          templ->width0 >= 16 && templ->height0 >= 16 &&
-          !(templ->bind &
-            ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET)) &&
+   if (dev->chip != AGX_CHIP_G17P || templ->target != PIPE_TEXTURE_2D ||
+       templ->depth0 != 1 || templ->array_size > 1 || templ->last_level != 0 ||
+       templ->width0 < 16 || templ->height0 < 16 ||
+       (templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET)))
+      return false;
+
+   if (templ->nr_samples <= 1)
+      return agx_g17p_compression_color_format(templ->format) ||
+             agx_g17p_compression_color_format_16b(templ->format);
+
+   return (templ->nr_samples == 2 || templ->nr_samples == 4) &&
           agx_g17p_compression_color_format(templ->format);
 }
 

@@ -980,3 +980,73 @@ TEST(Tilebuffer, G17PCompressedColourNeverSpills)
       EXPECT_FALSE(agx_g17p_compression_color_format(format))
          << util_format_name(format);
 }
+
+TEST(Tilebuffer, G17PCompressedColour16B)
+{
+   unsigned admitted = 0;
+   for (unsigned f = 1; f < PIPE_FORMAT_COUNT; ++f) {
+      const enum pipe_format format = (enum pipe_format)f;
+      if (!agx_g17p_compression_color_format_16b(format))
+         continue;
+
+      ++admitted;
+      const char *name = util_format_name(format);
+      EXPECT_FALSE(agx_g17p_compression_color_format(format)) << name;
+      EXPECT_NE(ail_pixel_format[format].renderable, PIPE_FORMAT_NONE) << name;
+      EXPECT_FALSE(util_format_is_depth_or_stencil(format)) << name;
+      EXPECT_EQ(util_format_get_blocksize(format), 16u) << name;
+      EXPECT_TRUE(ail_can_compress(format, 16, 16, 1)) << name;
+      EXPECT_FALSE(ail_can_compress(format, 15, 16, 1)) << name;
+
+      EXPECT_TRUE(ail_formats_compatible(
+         format, agx_g17p_rt0_pbe_format(util_format_linear(format))))
+         << name;
+      EXPECT_TRUE(ail_formats_compatible(format, PIPE_FORMAT_R32G32B32A32_UINT))
+         << name;
+
+      enum pipe_format one[AGX_MAX_RENDER_TARGETS] = {format};
+      const auto tib1 = g17p_single_sample_layout(one, 1, false);
+      EXPECT_FALSE(tib1.spilled[0]) << name;
+      EXPECT_EQ(tib1.sample_size_B, 16u) << name;
+
+      /* Seven 16-byte targets fit inside 120 B/sample; the eighth spills and
+       * relies on agx_set_framebuffer_state() pre-decompression. */
+      enum pipe_format all8[AGX_MAX_RENDER_TARGETS];
+      for (unsigned rt = 0; rt < AGX_MAX_RENDER_TARGETS; ++rt)
+         all8[rt] = format;
+
+      const auto tib7 = g17p_single_sample_layout(all8, 7, false);
+      for (unsigned rt = 0; rt < 7; ++rt)
+         EXPECT_FALSE(tib7.spilled[rt]) << name << " rt=" << rt;
+
+      const auto tib8 = g17p_single_sample_layout(all8, 8, false);
+      for (unsigned rt = 0; rt < 7; ++rt)
+         EXPECT_FALSE(tib8.spilled[rt]) << name << " rt=" << rt;
+      EXPECT_TRUE(tib8.spilled[7]) << name;
+   }
+
+   /* Three RGBA32 formats (UINT/SINT/FLOAT) plus their three RGBX32 variants. */
+   EXPECT_EQ(admitted, 6u);
+
+   static const enum pipe_format x_variants[][2] = {
+      {PIPE_FORMAT_R32G32B32X32_UINT, PIPE_FORMAT_R32G32B32A32_UINT},
+      {PIPE_FORMAT_R32G32B32X32_SINT, PIPE_FORMAT_R32G32B32A32_SINT},
+      {PIPE_FORMAT_R32G32B32X32_FLOAT, PIPE_FORMAT_R32G32B32A32_FLOAT},
+   };
+   for (const auto &pair : x_variants) {
+      const char *name = util_format_name(pair[0]);
+      EXPECT_TRUE(agx_g17p_compression_color_format_16b(pair[0])) << name;
+      EXPECT_TRUE(agx_g17p_compression_color_format_16b(pair[1])) << name;
+      EXPECT_EQ(ail_pixel_format[pair[0]].channels,
+                ail_pixel_format[pair[1]].channels)
+         << name;
+      EXPECT_EQ(ail_pixel_format[pair[0]].type, ail_pixel_format[pair[1]].type)
+         << name;
+      EXPECT_EQ(ail_pixel_format[pair[0]].renderable,
+                ail_pixel_format[pair[1]].renderable)
+         << name;
+      EXPECT_EQ(util_format_get_blocksize(pair[0]),
+                util_format_get_blocksize(pair[1]))
+         << name;
+   }
+}
