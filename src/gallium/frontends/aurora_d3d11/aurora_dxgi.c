@@ -362,8 +362,12 @@ aurora_DxgiResolveSharedResource(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE *args)
    struct aurora_device *dev = (struct aurora_device *)(uintptr_t)args->hDevice;
    if (!dev)
       return E_INVALIDARG;
+   /* Flush GPU commands so WDDM monitored fences / KMD write-sets order the
+    * shared-surface consumer (e.g. DWM minimize thumbnails) without stalling
+    * the CPU thread on a full GPU retirement wait. */
    aurora_lock(dev);
-   aurora_flush_and_wait(dev);
+   if (dev->pctx)
+      dev->pctx->flush(dev->pctx, NULL, 0);
    aurora_unlock(dev);
    return S_OK;
 }
