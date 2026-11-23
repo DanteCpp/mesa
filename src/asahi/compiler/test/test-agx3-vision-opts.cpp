@@ -3268,6 +3268,75 @@ TEST(AGX3VisionOpts, Agx3bComputeDeviceLoadIlpSchedule)
    EXPECT_EQ(run_sched(AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, 0), 1u);
 }
 
+TEST(AGX3VisionOpts, Agx3bComputeDeviceLoadIlpWideWindow)
+{
+   auto run_sched = [](enum agx_isa_encoding enc, enum agx_chip chip,
+                       unsigned extra_live_32) -> unsigned {
+      void *mem = ralloc_context(NULL);
+      struct agx_shader_key key = {};
+      key.dev.encoding = enc;
+      key.dev.chip = chip;
+
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->nir = rzalloc(mem, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *body = agx_test_block(b->shader);
+      agx_block *exit = agx_test_block(b->shader);
+      body->loop_header = true;
+      agx_block_add_successor(entry, body);
+      agx_block_add_successor(body, body);
+      agx_block_add_successor(body, exit);
+
+      agx_index base = agx_uniform(4, AGX_SIZE_64);
+      agx_index off = agx_preload(b, agx_register(2, AGX_SIZE_32));
+      agx_index acc = agx_preload(b, agx_register(4, AGX_SIZE_32));
+      agx_index held[100];
+      assert(extra_live_32 <= 100);
+      for (unsigned i = 0; i < extra_live_32; ++i)
+         held[i] = agx_mov_imm(b, 32, 100 + i);
+
+      /* Emit 8 independent device_loads in pressure order (load, immediate use). */
+      b->cursor = agx_after_block(body);
+      for (unsigned i = 0; i < 8; ++i) {
+         agx_index addr_off = agx_iadd(b, off, agx_immediate(i * 4), 0);
+         agx_index val = agx_temp(b->shader, AGX_SIZE_32);
+         agx_instr *ld = agx_device_load_to(
+            b, val, base, addr_off, AGX_FORMAT_I32, 0x1, 0, 0);
+         ld->memory_can_reorder = true;
+         acc = agx_fadd(b, acc, val);
+      }
+      for (unsigned i = 0; i < extra_live_32; ++i)
+         acc = agx_iadd(b, acc, held[i], 0);
+      agx_device_store(b, acc, agx_uniform(8, AGX_SIZE_64), off, AGX_FORMAT_I32,
+                       0x1, 0, 0);
+
+      agx_ilp_schedule(b->shader);
+
+      unsigned loads_before_first_fadd = 0;
+      agx_foreach_instr_in_block(body, I) {
+         if (I->op == AGX_OPCODE_FADD)
+            break;
+         if (I->op == AGX_OPCODE_DEVICE_LOAD)
+            loads_before_first_fadd++;
+      }
+      ralloc_free(mem);
+      return loads_before_first_fadd;
+   };
+
+   /* AGX3B compute with headroom issues all 8 loads ahead of first consumer. */
+   EXPECT_EQ(run_sched(AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, 0), 8u);
+   /* AGX3B high register pressure still falls back cleanly inside the step. */
+   EXPECT_EQ(run_sched(AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, 45), 1u);
+   /* M5 (AGX3C) keeps its existing {4, 2, 1} window untouched. */
+   unsigned m5_loads = run_sched(AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, 0);
+   EXPECT_GE(m5_loads, 2u);
+   EXPECT_LE(m5_loads, 4u);
+}
+
 static nir_def *
 push_u32(nir_builder *b, unsigned offset)
 {

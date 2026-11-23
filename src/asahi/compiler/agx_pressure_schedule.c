@@ -1500,15 +1500,23 @@ agx_ilp_schedule(agx_context *ctx)
                                         AGX_ILP_FS_SAMPLE_SLACK);
             }
             if (loads && m5_load_cap > 0) {
-               /* Prefer to hoist only a few device loads ahead of the oldest
-                * one no instruction has read yet: four, else two, else one,
-                * whichever first fits the program's occupancy step. This
-                * ranks candidates; register pressure and scoreboard waits
-                * remain what keeps the schedule safe. */
-               static const unsigned windows[] = {4, 2, 1};
+               /* Prefer to hoist a bounded window of device loads ahead of the
+                * oldest unread one, whichever first fits the program's
+                * occupancy step. M5 stays within {4, 2, 1}; AGX3B compute
+                * tries {8, 6, 4, 2, 1} so unrolled 8-tap stencil and feature
+                * kernels can issue a full row/column batch in flight when
+                * occupancy headroom allows. Register pressure and scoreboard
+                * waits remain what keeps the schedule safe. */
+               static const unsigned m5_windows[] = {4, 2, 1};
+               static const unsigned agx3b_windows[] = {8, 6, 4, 2, 1};
+               const unsigned *windows =
+                  agx3b_compute ? agx3b_windows : m5_windows;
+               const unsigned nr_windows = agx3b_compute
+                                              ? ARRAY_SIZE(agx3b_windows)
+                                              : ARRAY_SIZE(m5_windows);
                const signed load_growth =
                   m5_load_cap > peak ? m5_load_cap - peak : 0;
-               for (unsigned w = 0; w < ARRAY_SIZE(windows); ++w) {
+               for (unsigned w = 0; w < nr_windows; ++w) {
                   if (ilp_schedule_block(ctx, block, memctx, native_uniforms,
                                          alu_latency, 16 * alu_latency,
                                          load_growth, 0, false, true,
