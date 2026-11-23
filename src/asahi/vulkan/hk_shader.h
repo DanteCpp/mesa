@@ -237,6 +237,10 @@ struct hk_shader {
     * with position and up to two ordinary varying slots populate the exact
     * no-preamble fields; other AGX3 layouts remain zero. */
    struct agx_vdm_state_update_program_info agx3_vdm_state_update;
+   /* Matching VertexProgramVariant state with its per-draw constant program
+    * stripped, used when the vertex preamble is hoisted into a PREGFX compute
+    * dispatch for multi-draw batches. */
+   struct agx_vdm_state_update_program_info agx3_vdm_state_update_no_cprog;
 
    const void *code_ptr;
    uint32_t code_size;
@@ -293,6 +297,13 @@ struct hk_shader {
    size_t g17p_mono_nir_size;
    struct agx_shader_key g17p_mono_key;
    bool g17p_mono_preoptimized;
+
+   /* Extracted 1-thread compute NIR for a hoistable AGX3 vertex preamble, and
+    * the lazily compiled compute shader built from it under linked.lock. */
+   void *preamble_nir;
+   size_t preamble_nir_size;
+   struct hk_shader *preamble_cs;
+   bool preamble_cs_attempted;
 };
 
 static inline uint64_t
@@ -835,3 +846,9 @@ bool hk_tes_ray_queries_in_compute(const struct hk_device *dev);
 /* Lower a G17P task shader, after hk_lower_nir(), to the compute kernel of
  * the software task stage. */
 void hk_g17p_lower_task_kernel(nir_shader *nir);
+
+/* Lazily compile and cache the 1-thread compute shader for a hoistable AGX3
+ * vertex preamble. Returns NULL if the vertex shader has no hoistable preamble
+ * or compilation fails. */
+struct hk_shader *hk_shader_get_preamble_cs(struct hk_device *dev,
+                                            struct hk_shader *vs);

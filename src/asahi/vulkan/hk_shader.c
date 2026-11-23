@@ -4279,6 +4279,141 @@ hk_g17p_vertex_compile_info_init(const struct hk_shader *shader,
    };
 }
 
+static void
+hk_shader_init_vdm_no_cprog(enum agx_chip chip, struct hk_shader *shader)
+{
+   memset(&shader->agx3_vdm_state_update_no_cprog, 0,
+          sizeof(shader->agx3_vdm_state_update_no_cprog));
+   if (!agx_chip_agx3_path(chip) || chip == AGX_CHIP_G18G ||
+       shader->b.info.stage != MESA_SHADER_VERTEX ||
+       !shader->b.info.agx3_preamble_hoistable)
+      return;
+
+   struct hk_agx3_g17p_vertex_compile_info compiler_info;
+   hk_g17p_vertex_compile_info_init(shader, false, &compiler_info);
+   compiler_info.has_preamble = false;
+   compiler_info.nr_preamble_gprs = 0;
+   compiler_info.preamble_scratch_size = 0;
+   compiler_info.preamble_staging_known = false;
+   compiler_info.preamble_staging_halfs = 0;
+   hk_agx3_g17p_vertex_program_info(chip, &compiler_info,
+                                    &shader->agx3_vdm_state_update_no_cprog);
+}
+
+static void
+hk_shader_save_preamble_nir(struct hk_shader *shader, nir_shader *vs_nir)
+{
+   nir_function_impl *src_preamble = nir_shader_get_preamble(vs_nir);
+   if (!src_preamble)
+      return;
+
+   const unsigned root_uniform = shader->info.agx3_root_uniform;
+   const unsigned out_start = shader->b.info.agx3_preamble_out_start_half;
+   const unsigned out_size = shader->b.info.agx3_preamble_out_size_halfs;
+   if (!out_size)
+      return;
+
+   nir_shader *pre =
+      nir_shader_create(NULL, MESA_SHADER_COMPUTE, &agx_nir_options);
+   if (!pre)
+      return;
+
+   pre->info.internal = true;
+   pre->info.io_lowered = true;
+   pre->info.workgroup_size[0] = 1;
+   pre->info.workgroup_size[1] = 1;
+   pre->info.workgroup_size[2] = 1;
+
+   nir_function *entry = nir_function_create(pre, "main");
+   entry->is_entrypoint = true;
+   nir_function_impl *impl = nir_function_impl_clone(pre, src_preamble);
+   nir_function_set_impl(entry, impl);
+
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *root_ptr =
+      nir_load_preamble(&b, 1, 64, .base = AGX_ABI_AGX3_PRECOMP_ARG_HALFS);
+   nir_def *out_ptr =
+      nir_load_preamble(&b, 1, 64, .base = AGX_ABI_AGX3_PRECOMP_ARG_HALFS + 4);
+   nir_instr *root_instr = nir_def_instr(root_ptr);
+   nir_instr *out_instr = nir_def_instr(out_ptr);
+
+   bool ok = true;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr == root_instr || instr == out_instr ||
+             instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_preamble) {
+            unsigned base = nir_intrinsic_base(intr);
+            unsigned bit_size = intr->def.bit_size;
+            unsigned comps = intr->def.num_components;
+            if (!shader->info.agx3_uses_root || base < root_uniform) {
+               ok = false;
+               break;
+            }
+            unsigned off = base - root_uniform;
+            b.cursor = nir_before_instr(instr);
+            nir_def *repl = NULL;
+            if (off == 0 && bit_size == 64 && comps == 1) {
+               repl = root_ptr;
+            } else if (off == 0 && bit_size == 32 && comps == 1) {
+               repl = nir_unpack_64_2x32_split_x(&b, root_ptr);
+            } else if (off == 2 && bit_size == 32 && comps == 1) {
+               repl = nir_unpack_64_2x32_split_y(&b, root_ptr);
+            } else if (off == 0 && bit_size == 32 && comps == 2) {
+               repl = nir_unpack_64_2x32(&b, root_ptr);
+            } else {
+               ok = false;
+               break;
+            }
+            nir_def_rewrite_uses(&intr->def, repl);
+            nir_instr_remove(instr);
+         } else if (intr->intrinsic == nir_intrinsic_store_preamble) {
+            unsigned base = nir_intrinsic_base(intr);
+            nir_def *val = intr->src[0].ssa;
+            unsigned halves =
+               val->num_components * DIV_ROUND_UP(val->bit_size, 16);
+            if (base < out_start || base - out_start + halves > out_size) {
+               ok = false;
+               break;
+            }
+            b.cursor = nir_before_instr(instr);
+            unsigned off_B = (base - out_start) * 2u;
+            nir_def *addr = off_B ? nir_iadd_imm(&b, out_ptr, off_B) : out_ptr;
+            unsigned align_mul = (val->bit_size == 64 && (off_B % 8u) == 0) ? 8u
+                               : ((off_B % 4u) == 0) ? 4u : 2u;
+            nir_store_global(&b, val, addr,
+                             .write_mask =
+                                nir_component_mask(val->num_components),
+                             .align_mul = align_mul);
+            nir_instr_remove(instr);
+         }
+      }
+      if (!ok)
+         break;
+   }
+
+   if (ok) {
+      nir_progress(true, impl, nir_metadata_control_flow);
+      nir_shader_gather_info(pre, impl);
+      nir_validate_shader(pre, "hoisted AGX3 vertex preamble");
+      struct blob blob;
+      blob_init(&blob);
+      nir_serialize(&blob, pre, false);
+      if (!blob.out_of_memory && blob.size > 0) {
+         shader->preamble_nir = malloc(blob.size);
+         if (shader->preamble_nir) {
+            memcpy(shader->preamble_nir, blob.data, blob.size);
+            shader->preamble_nir_size = blob.size;
+         }
+      }
+      blob_finish(&blob);
+   }
+
+   ralloc_free(pre);
+}
+
 /*
  * Compile a G17P hardware vertex program with its native constant program.
  * The compiler hoists uniform-only work into the preamble (nothing, for a
@@ -5922,6 +6057,25 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       else
          hk_agx3_g17p_vertex_program_info(dev->dev.chip, &compiler_info,
                                           &shader->agx3_vdm_state_update);
+
+      const bool hoist_in_ok =
+         shader->b.info.agx3_preamble_in_size_halfs == 0 ||
+         (shader->info.agx3_uses_root &&
+          shader->b.info.agx3_preamble_in_base_half >=
+             shader->info.agx3_root_uniform &&
+          shader->b.info.agx3_preamble_in_base_half +
+             shader->b.info.agx3_preamble_in_size_halfs <=
+             shader->info.agx3_root_uniform + 4u);
+      if (vs_cprog && dev->dev.chip != AGX_CHIP_G18G &&
+          shader->b.info.has_preamble &&
+          shader->b.info.agx3_preamble_hoistable && hoist_in_ok &&
+          shader->agx3_vdm_state_update.source_layout ==
+             AGX_VDM_STATE_UPDATE_SOURCE_LAYOUT_AGX3_VERTEX_PROGRAM_VARIANT) {
+         hk_shader_init_vdm_no_cprog(dev->dev.chip, shader);
+         if (shader->agx3_vdm_state_update_no_cprog.source_layout ==
+             AGX_VDM_STATE_UPDATE_SOURCE_LAYOUT_AGX3_VERTEX_PROGRAM_VARIANT)
+            hk_shader_save_preamble_nir(shader, nir);
+      }
    }
 
    if (nir->constant_data_size > 0) {
@@ -5984,6 +6138,10 @@ hk_g17p_layout_shader_create(struct hk_device *dev, const struct hk_shader *api,
    s->g17p_mono_nir = NULL;
    s->g17p_mono_nir_size = 0;
    s->g17p_mono_preoptimized = false;
+   s->preamble_nir = NULL;
+   s->preamble_nir_size = 0;
+   s->preamble_cs = NULL;
+   s->preamble_cs_attempted = false;
 
    if (s->b.info.has_preamble || s->b.info.rodata.size_16) {
       const size_t size = s->b.info.binary_size;
@@ -6032,6 +6190,15 @@ hk_shader_destroy(struct hk_device *dev, struct hk_shader *s,
    free(s->g17p_mono_nir);
    s->g17p_mono_nir = NULL;
    s->g17p_mono_preoptimized = false;
+   free(s->preamble_nir);
+   s->preamble_nir = NULL;
+   s->preamble_nir_size = 0;
+   if (s->preamble_cs) {
+      hk_shader_destroy(dev, s->preamble_cs, true);
+      free(s->preamble_cs);
+      s->preamble_cs = NULL;
+   }
+   s->preamble_cs_attempted = false;
 
    if (s->only_linked)
       hk_destroy_linked_shader(dev, s->only_linked);
@@ -8842,6 +9009,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
    memcpy(shader->g17p_mesh_primitive_comps, mesh_primitive_comps,
           sizeof(mesh_primitive_comps));
    shader->agx3_vdm_state_update = agx3_vdm_state_update;
+   hk_shader_init_vdm_no_cprog(dev->dev.chip, shader);
    shader->code_size = code_size;
    shader->data_size = data_size;
    shader->b.info.binary_size = code_size;
@@ -8962,14 +9130,17 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    const bool clip_z = variant_flags & 128;
    const unsigned variant_flags2 = blob_read_uint8(blob);
    const bool has_fbl_source = variant_flags2 & 1;
+   const bool has_preamble_nir = (variant_flags2 & 2) != 0;
    /* Graphics, compute, task and mesh stages. */
    if (blob->overrun || stage >= MESA_SHADER_MESH_STAGES ||
        (clip_z ? !dev->vk.physical->supported_features.depthClipControl
                : dev->vk.enabled_features.depthClipControl) ||
        (has_mesh_source &&
         (stage != MESA_SHADER_FRAGMENT || dev->dev.chip != AGX_CHIP_G17P)) ||
-       (variant_flags2 & ~1u) ||
+       (variant_flags2 & ~3u) ||
        (has_fbl_source && stage != MESA_SHADER_FRAGMENT) ||
+       (has_preamble_nir && (stage != MESA_SHADER_VERTEX ||
+                             !agx_chip_native_or_m5(dev->dev.chip))) ||
        (has_source && !sample_variants) ||
        (m5_sample_variants &&
         (!sample_variants || !agx_chip_g17_m5(dev->dev.chip))) ||
@@ -9085,6 +9256,24 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
       }
    }
 
+   if (has_preamble_nir) {
+      hk_foreach_variant(obj, shader) {
+         const uint32_t pre_size = blob_read_uint32(blob);
+         if (!pre_size)
+            continue;
+         const void *pre_nir = blob_read_bytes(blob, pre_size);
+         shader->preamble_nir = blob->overrun ? NULL : malloc(pre_size);
+         if (!shader->preamble_nir) {
+            const VkResult result = blob->overrun
+               ? VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT
+               : VK_ERROR_OUT_OF_HOST_MEMORY;
+            hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+            return vk_error(dev, result);
+         }
+         memcpy(shader->preamble_nir, pre_nir, pre_size);
+         shader->preamble_nir_size = pre_size;
+      }
+   }
    VkResult result = hk_shader_prepare_device_for_stage(dev, stage);
    if (result != VK_SUCCESS) {
       hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
@@ -9246,6 +9435,18 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
                    src->g17p_mono_nir_size);
             dst->g17p_mono_nir_size = src->g17p_mono_nir_size;
             dst->g17p_mono_preoptimized = src->g17p_mono_preoptimized;
+         }
+      }
+      dst->preamble_nir = NULL;
+      dst->preamble_nir_size = 0;
+      dst->preamble_cs = NULL;
+      dst->preamble_cs_attempted = false;
+      if (src->preamble_nir) {
+         dst->preamble_nir = malloc(src->preamble_nir_size);
+         if (dst->preamble_nir) {
+            memcpy(dst->preamble_nir, src->preamble_nir,
+                   src->preamble_nir_size);
+            dst->preamble_nir_size = src->preamble_nir_size;
          }
       }
       simple_mtx_init(&dst->linked.lock, mtx_plain);
@@ -9419,6 +9620,7 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
 
    const struct hk_fs_sample_source *src = obj->sample_source;
    bool mono = false;
+   bool preamble_nir = false;
    hk_foreach_variant(obj, shader) {
       const unsigned i = shader - obj->variants;
       const bool ready =
@@ -9426,6 +9628,8 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
              : shader->compiled;
       if (ready && shader->g17p_mono_nir)
          mono = true;
+      if (ready && shader->preamble_nir)
+         preamble_nir = true;
    }
    const struct hk_border_source *border = obj->border_source;
    blob_write_uint8(blob, vk_shader->stage);
@@ -9435,7 +9639,7 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
                              (obj->g17p_sample_variants == 4 ? 32 : 0) |
                              (obj->mesh_source ? 64 : 0) |
                              (obj->clip_m1_1 ? 128 : 0));
-   blob_write_uint8(blob, obj->fbl_source ? 1 : 0);
+   blob_write_uint8(blob, (obj->fbl_source ? 1 : 0) | (preamble_nir ? 2 : 0));
 
    hk_foreach_variant(obj, shader) {
       const unsigned i = shader - obj->variants;
@@ -9508,7 +9712,84 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
       blob_write_bytes(blob, sources[i]->nir, sources[i]->nir_size);
    }
 
+   if (preamble_nir) {
+      hk_foreach_variant(obj, shader) {
+         const unsigned i = shader - obj->variants;
+         const bool ready =
+            src ? (p_atomic_read(&src->ready_mask) & BITFIELD_BIT(i))
+                : shader->compiled;
+         const uint32_t size =
+            ready && shader->preamble_nir ? shader->preamble_nir_size : 0;
+         blob_write_uint32(blob, size);
+         if (size)
+            blob_write_bytes(blob, shader->preamble_nir, size);
+      }
+   }
    return !blob->out_of_memory;
+}
+
+struct hk_shader *
+hk_shader_get_preamble_cs(struct hk_device *dev, struct hk_shader *vs)
+{
+   if (!vs || !vs->preamble_nir || !vs->b.info.agx3_preamble_hoistable ||
+       !agx_chip_native_or_m5(dev->dev.chip) || dev->dev.chip == AGX_CHIP_G18G)
+      return NULL;
+
+   if (p_atomic_read(&vs->preamble_cs_attempted))
+      return p_atomic_read(&vs->preamble_cs);
+
+   simple_mtx_lock(&vs->linked.lock);
+   if (vs->preamble_cs_attempted) {
+      struct hk_shader *cached = vs->preamble_cs;
+      simple_mtx_unlock(&vs->linked.lock);
+      return cached;
+   }
+
+   struct hk_shader *cs = NULL;
+   struct blob_reader reader;
+   blob_reader_init(&reader, vs->preamble_nir, vs->preamble_nir_size);
+   nir_shader *nir = nir_deserialize(NULL, &agx_nir_options, &reader);
+   if (nir && !reader.overrun) {
+      cs = calloc(1, sizeof(*cs));
+      if (cs) {
+         struct agx_shader_key cs_key = {
+            .dev = agx_gather_device_key(&dev->dev),
+            .reserved_preamble = AGX_ABI_AGX3_PRECOMP_ARG_HALFS + 8,
+            .no_preamble = true,
+         };
+         if (agx_compile_shader_nir(nir, &cs_key, &cs->b)) {
+            cs->info.stage = MESA_SHADER_COMPUTE;
+            cs->code_ptr = cs->b.binary;
+            cs->code_size = cs->b.info.binary_size;
+            if (hk_init_link_ht(cs, MESA_SHADER_COMPUTE) == VK_SUCCESS) {
+               if (hk_upload_shader(dev, cs) == VK_SUCCESS &&
+                   cs->only_linked && cs->only_linked->b.bo &&
+                   cs->only_linked->b.bo->va && cs->only_linked->b.size > 0 &&
+                   cs->b.info.agx3_staging_known && !cs->b.info.has_preamble &&
+                   (!cs->b.info.rodata.size_16 || (cs->bo && cs->bo->va))) {
+                  cs->compiled = true;
+               } else {
+                  hk_shader_destroy(dev, cs, true);
+                  free(cs);
+                  cs = NULL;
+               }
+            } else {
+               free(cs->b.binary);
+               free(cs);
+               cs = NULL;
+            }
+         } else {
+            free(cs);
+            cs = NULL;
+         }
+      }
+   }
+   ralloc_free(nir);
+
+   p_atomic_set(&vs->preamble_cs, cs);
+   p_atomic_set(&vs->preamble_cs_attempted, true);
+   simple_mtx_unlock(&vs->linked.lock);
+   return cs;
 }
 
 static VkResult

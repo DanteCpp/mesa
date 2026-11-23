@@ -29,9 +29,11 @@ extern "C" {
  * needs_full_quads, to 39 when G17P payloads record the fragment
  * twins of unlinked mesh shaders, to 42 when unlinked G17P vertex
  * shaders over the canonical size carry relocatable varying writes, to 43
- * when agx_shader_info gains launch_size, and to 44 when unlinked G17P vertex
- * shaders drop the canonical layout for the relocatable one. */
-#define HK_AGX3_SHADER_BINARY_VERSION 44u
+ * when agx_shader_info gains launch_size, to 44 when unlinked G17P vertex
+ * shaders drop the canonical layout for the relocatable one, and to 45 when
+ * agx_shader_info gains AGX3 vertex preamble hoist metadata and vertex
+ * binaries may carry extracted preamble NIR. */
+#define HK_AGX3_SHADER_BINARY_VERSION 45u
 #define HK_CLASSIC_SHADER_BINARY_VERSION 34u
 /* AGX2 image-acquire binaries now include memory-to-texture visibility. */
 #define HK_AGX2_SHADER_BINARY_VERSION 36u
