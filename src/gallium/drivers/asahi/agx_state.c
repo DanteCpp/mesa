@@ -2916,7 +2916,37 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
       ralloc_free(attempt);
    }
 
+   /* Retain the post-layout NIR for eligible G17P/M5 single-sample fragment
+    * mains so asahi_fast_link() can compile a monolithic main+epilog blend
+    * program with the native single-transaction pixel protocol. Serialized
+    * after uniform layout so the monolithic variant inherits this shader's
+    * exact push ranges and resource bindings.
+    */
+   if (stage == MESA_SHADER_FRAGMENT && !secondary && !internal_kernel &&
+       !terminal && agx_chip_native_or_m5(dev->chip) && !fs_cprog_done &&
+       key.no_preamble && nr_samples <= 1 && !nir->info.fs.uses_sample_shading &&
+       !nir->info.fs.uses_discard && !nir->info.fs.uses_fbfetch_output &&
+       !nir->info.writes_memory &&
+       !(nir->info.outputs_written &
+         (BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
+          BITFIELD64_BIT(FRAG_RESULT_STENCIL) |
+          BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK)))) {
+      struct blob b;
+      blob_init(&b);
+      nir_serialize(&b, nir, false);
+      if (!b.out_of_memory && b.size) {
+         compiled->inline_blend_nir = b.data;
+         compiled->inline_blend_nir_size = b.size;
+         compiled->inline_blend_key = key;
+      } else {
+         blob_finish(&b);
+      }
+   }
+
    if (!fs_cprog_done && !agx_compile_shader_nir(nir, &key, &compiled->b)) {
+      free(compiled->inline_blend_nir);
+      compiled->inline_blend_nir = NULL;
+      compiled->inline_blend_nir_size = 0;
       /* Fail closed and say so. agx_compile_shader_nir() zeroes its output on
        * refusal, so what comes back here is an empty shader part with no
        * binary and no BO. Record that on the variant: the draw and dispatch
@@ -4667,6 +4697,304 @@ build_g18_msaa4_fs_epilog(nir_builder *b, const void *key_)
    NIR_PASS(_, b->shader, agx_nir_lower_g18_tile_samples, key->nr_samples);
 }
 
+static bool
+agx_inline_blend_func_ok(enum pipe_blend_func func)
+{
+   switch (func) {
+   case PIPE_BLEND_ADD:
+   case PIPE_BLEND_SUBTRACT:
+   case PIPE_BLEND_REVERSE_SUBTRACT:
+   case PIPE_BLEND_MIN:
+   case PIPE_BLEND_MAX:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+agx_inline_blend_factor_ok(enum pipe_blendfactor factor)
+{
+   switch (factor) {
+   case PIPE_BLENDFACTOR_ONE:
+   case PIPE_BLENDFACTOR_SRC_COLOR:
+   case PIPE_BLENDFACTOR_SRC_ALPHA:
+   case PIPE_BLENDFACTOR_DST_ALPHA:
+   case PIPE_BLENDFACTOR_DST_COLOR:
+   case PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE:
+   case PIPE_BLENDFACTOR_ZERO:
+   case PIPE_BLENDFACTOR_INV_SRC_COLOR:
+   case PIPE_BLENDFACTOR_INV_SRC_ALPHA:
+   case PIPE_BLENDFACTOR_INV_DST_ALPHA:
+   case PIPE_BLENDFACTOR_INV_DST_COLOR:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+agx_inline_blend_eligible(const struct agx_fast_link_key *key)
+{
+   const struct agx_fs_prolog_key *pkey = &key->prolog.fs;
+   const struct agx_fs_epilog_key *ekey = &key->epilog.fs;
+
+   if (pkey->statistics || pkey->cull_distance_size || pkey->polygon_stipple ||
+       pkey->api_sample_mask != 0xff || pkey->run_zs_tests)
+      return false;
+
+   if (ekey->nr_samples != 1 || ekey->link.loc_written != 1 ||
+       ekey->link.sample_shading || ekey->link.broadcast_rt0 ||
+       ekey->link.write_z || ekey->link.write_s || ekey->link.already_ran_zs ||
+       ekey->link.sample_mask_after_force_early || ekey->smooth_line_alpha ||
+       ekey->a2c_in_main || ekey->native_spills || ekey->defer_api_sample_mask ||
+       ekey->defer_monolithic_msaa || ekey->preserve_rt || ekey->rt0_resident ||
+       ekey->main_pixel_held || ekey->g18_native_mixed ||
+       ekey->blend.logicop_enable || ekey->blend.alpha_to_coverage ||
+       ekey->blend.alpha_to_one || ekey->remap[0] != 0 ||
+       ekey->rt_formats[0] != PIPE_FORMAT_R8G8B8A8_UNORM ||
+       ekey->blend_formats[0] != PIPE_FORMAT_NONE ||
+       ekey->scaled_formats[0] != PIPE_FORMAT_NONE ||
+       ekey->blend.rt[0].advanced_blend || ekey->blend.rt[0].colormask != 0xf)
+      return false;
+
+   for (unsigned i = 1; i < ARRAY_SIZE(ekey->rt_formats); ++i) {
+      if (ekey->rt_formats[i] != PIPE_FORMAT_NONE)
+         return false;
+   }
+
+   const struct agx_blend_standard b =
+      agx_unpack_blend_standard(ekey->blend.rt[0].mode);
+   return agx_inline_blend_func_ok(b.rgb_func) &&
+          agx_inline_blend_func_ok(b.alpha_func) &&
+          agx_inline_blend_factor_ok(b.rgb_src_factor) &&
+          agx_inline_blend_factor_ok(b.rgb_dst_factor) &&
+          agx_inline_blend_factor_ok(b.alpha_src_factor) &&
+          agx_inline_blend_factor_ok(b.alpha_dst_factor);
+}
+
+static bool
+agx_mono_resolve_exports(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_scalar slot[256];
+   uint8_t slot_bits[256] = {0};
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_export_agx) {
+            nir_def *v = intr->src[0].ssa;
+            if (v->bit_size != 16 && v->bit_size != 32)
+               return false;
+            const unsigned step = v->bit_size / 16;
+            for (unsigned c = 0; c < v->num_components; ++c) {
+               const unsigned h = nir_intrinsic_base(intr) + c * step;
+               if (h >= ARRAY_SIZE(slot) || slot_bits[h])
+                  return false;
+               slot[h] = nir_get_scalar(v, c);
+               slot_bits[h] = v->bit_size;
+            }
+            nir_instr_remove(instr);
+         } else if (intr->intrinsic == nir_intrinsic_load_exported_agx) {
+            nir_def *d = &intr->def;
+            if (d->bit_size != 16 && d->bit_size != 32)
+               return false;
+            const unsigned step = d->bit_size / 16;
+            nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+            nir_builder b = nir_builder_at(nir_before_instr(instr));
+            for (unsigned c = 0; c < d->num_components; ++c) {
+               const unsigned h = nir_intrinsic_base(intr) + c * step;
+               if (h >= ARRAY_SIZE(slot))
+                  return false;
+               if (!slot_bits[h]) {
+                  comps[c] = nir_undef(&b, 1, d->bit_size);
+               } else if (slot_bits[h] != d->bit_size) {
+                  return false;
+               } else {
+                  comps[c] = nir_mov_scalar(&b, slot[h]);
+               }
+            }
+            nir_def_replace(d, nir_vec(&b, comps, d->num_components));
+         }
+      }
+   }
+   return true;
+}
+
+static bool
+agx_g17p_mono_has_pixel_protocol(const struct agx_shader_part *part)
+{
+   static const uint8_t gate[6] = {0x87, 0x02, 0x54, 0x00, 0x06, 0x00};
+   const uint8_t *code = (const uint8_t *)part->binary + part->info.main_offset;
+   const size_t n = part->info.main_size;
+   bool has_gate = false;
+   for (size_t o = 0; o + sizeof(gate) <= n && !has_gate; o += 2)
+      has_gate = !memcmp(code + o, gate, sizeof(gate));
+   const bool final_release = n >= 10 && code[n - 4] == 0x0e &&
+      code[n - 10] == 0x07 && code[n - 9] == 0x02 && code[n - 8] == 0x54 &&
+      (code[n - 6] & 0x02) && code[n - 5] == 0x00;
+   return has_gate && final_release;
+}
+
+static struct agx_linked_shader *
+agx_try_link_inline_blend(struct agx_context *ctx,
+                          struct agx_uncompiled_shader *so,
+                          const struct agx_fast_link_key *key)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   if (!agx_chip_native_or_m5(dev->chip) || key->nr_samples_shaded ||
+       !key->main->inline_blend_nir || !key->main->inline_blend_nir_size ||
+       key->main->b.info.has_preamble ||
+       key->main->b.info.preamble_scratch_size ||
+       key->main->b.info.writes_sample_mask ||
+       key->main->b.info.rodata.size_16 ||
+       !agx_inline_blend_eligible(key))
+      return NULL;
+
+   void *mem = ralloc_context(NULL);
+   if (!mem)
+      return NULL;
+
+   struct agx_shader_part mono_part = {0};
+   nir_builder eb = {0};
+   struct agx_linked_shader *linked = NULL;
+
+   struct blob_reader reader;
+   blob_reader_init(&reader, key->main->inline_blend_nir,
+                    key->main->inline_blend_nir_size);
+   nir_shader *nir = nir_deserialize(mem, &agx_nir_options, &reader);
+   if (!nir || reader.overrun)
+      goto fail;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic ==
+                nir_intrinsic_load_exported_agx)
+            goto fail;
+      }
+   }
+
+   eb = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, &agx_nir_options,
+                                       NULL);
+   if (agx_chip_native_agx3(dev->chip))
+      build_g17p_fs_epilog(&eb, &key->epilog.fs);
+   else
+      agx_nir_fs_epilog(&eb, &key->epilog.fs);
+   agx_preprocess_nir(eb.shader);
+   if (agx_chip_native_agx3(dev->chip))
+      NIR_PASS(_, eb.shader, agx_nir_lower_g17p_tile_samples,
+               key->epilog.fs.nr_samples);
+
+   unsigned epilog_loads = 0, epilog_stores = 0;
+   nir_foreach_block(block, eb.impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         const nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+         if (op == nir_intrinsic_load_local_pixel_agx) {
+            epilog_loads++;
+         } else if (op == nir_intrinsic_store_local_pixel_agx) {
+            epilog_stores++;
+         } else if (op != nir_intrinsic_load_exported_agx) {
+            goto fail;
+         }
+      }
+   }
+   if (epilog_loads != 1 || epilog_stores != 1)
+      goto fail;
+
+   {
+      struct hash_table *remap = _mesa_pointer_hash_table_create(mem);
+      nir_builder b = nir_builder_at(nir_after_impl(impl));
+      nir_inline_function_impl(&b, eb.impl, NULL, remap);
+      nir_index_ssa_defs(impl);
+      nir_progress(true, impl, nir_metadata_none);
+   }
+   nir->info.outputs_read |= eb.shader->info.outputs_read;
+   nir->info.outputs_written |= eb.shader->info.outputs_written;
+   nir->info.fs.uses_fbfetch_output |= eb.shader->info.fs.uses_fbfetch_output;
+   nir->info.fs.uses_sample_shading |= eb.shader->info.fs.uses_sample_shading;
+   nir->info.writes_memory |= eb.shader->info.writes_memory;
+   ralloc_free(eb.shader);
+   eb.shader = NULL;
+
+   if (!agx_mono_resolve_exports(nir))
+      goto fail;
+
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_dce);
+
+   struct agx_shader_key ckey = key->main->inline_blend_key;
+   ckey.no_stop = false;
+   ckey.secondary = false;
+   ckey.no_preamble = true;
+   ckey.m5_uniform_blend = agx_chip_g17_m5(dev->chip);
+   ckey.fs.nr_samples = 1;
+   BITSET_ZERO(ckey.g17p_tile_partitions);
+   BITSET_SET(ckey.g17p_tile_partitions, 0);
+
+   if (!agx_compile_shader_nir(nir, &ckey, &mono_part) || !mono_part.binary ||
+       !mono_part.info.binary_size)
+      goto fail;
+
+   const struct agx_shader_info *mi = &mono_part.info;
+   const struct agx_shader_info *bi = &key->main->b.info;
+   if (mi->has_preamble || mi->preamble_scratch_size || mi->rodata.size_16 ||
+       mi->push_count > bi->push_count ||
+       mi->texture_state_count != bi->texture_state_count ||
+       mi->sampler_state_count != bi->sampler_state_count ||
+       mi->uses_txf != bi->uses_txf ||
+       mi->uses_sampler_heap != bi->uses_sampler_heap ||
+       mi->uses_draw_id != bi->uses_draw_id ||
+       mi->uses_base_param != bi->uses_base_param ||
+       mi->early_fragment_tests != bi->early_fragment_tests ||
+       mi->needs_quad_derivatives != bi->needs_quad_derivatives ||
+       mi->depth_layout != bi->depth_layout ||
+       mi->writes_sample_mask ||
+       mi->g17p_sampled_fragment != bi->g17p_sampled_fragment ||
+       memcmp(&mi->varyings.fs, &bi->varyings.fs, sizeof(mi->varyings.fs)) ||
+       !mi->agx3_colour_link.entry_emitted ||
+       mi->agx3_colour_link.colour_classes != 1 ||
+       mi->agx3_colour_link.rt_query_write_acquired)
+      goto fail;
+
+   if (agx_chip_native_agx3(dev->chip) &&
+       !agx_g17p_mono_has_pixel_protocol(&mono_part))
+      goto fail;
+
+   mono_part.info.reads_tib |= bi->reads_tib;
+
+   linked = rzalloc(so->linked_shaders, struct agx_linked_shader);
+   if (!linked ||
+       !agx_fast_link(linked, dev, true, &mono_part, NULL, NULL, 0, NULL)) {
+      ralloc_free(linked);
+      linked = NULL;
+      goto fail;
+   }
+
+   free(mono_part.binary);
+   ralloc_free(mem);
+
+   union asahi_shader_key *cloned_key =
+      ralloc_memdup(so->linked_shaders, key, sizeof(*key));
+   _mesa_hash_table_insert(so->linked_shaders, cloned_key, linked);
+   return linked;
+
+fail:
+   if (eb.shader)
+      ralloc_free(eb.shader);
+   free(mono_part.binary);
+   ralloc_free(mem);
+   return NULL;
+}
+
 static struct agx_linked_shader *
 asahi_fast_link(struct agx_context *ctx, struct agx_uncompiled_shader *so,
                 struct agx_fast_link_key *key)
@@ -4683,6 +5011,12 @@ asahi_fast_link(struct agx_context *ctx, struct agx_uncompiled_shader *so,
     */
    if (key->main == NULL || key->main->failed)
       return NULL;
+
+   if (so->type == MESA_SHADER_FRAGMENT) {
+      struct agx_linked_shader *mono = agx_try_link_inline_blend(ctx, so, key);
+      if (mono)
+         return mono;
+   }
 
    struct agx_compiled_shader *prolog = NULL, *epilog = NULL;
 
@@ -5396,6 +5730,7 @@ agx_delete_compiled_shader(struct agx_device *dev,
    if (so->gs_copy)
       agx_delete_compiled_shader(dev, so->gs_copy);
 
+   free(so->inline_blend_nir);
    free(so->b.binary);
    agx_bo_unreference(dev, so->bo);
    FREE(so);

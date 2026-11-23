@@ -323,6 +323,14 @@ struct agx_compiled_shader {
 
    struct agx_fs_epilog_link_info epilog_key;
 
+   /* Serialized post-layout fragment NIR and compile key retained on G17P/M5
+    * so single-RT RGBA8 blended draws can compile a monolithic main+epilog
+    * program using the native single-transaction blend protocol.
+    */
+   void *inline_blend_nir;
+   size_t inline_blend_nir_size;
+   struct agx_shader_key inline_blend_key;
+
    /* Auxiliary programs, or NULL if not used */
    struct agx_compiled_shader *gs_count, *pre_gs;
    struct agx_compiled_shader *gs_copy;
