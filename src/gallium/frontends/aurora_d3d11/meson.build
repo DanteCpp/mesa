@@ -23,6 +23,7 @@ libaurora_d3d11 = static_library(
     'aurora_state.c',
     'aurora_view_shader_query.c',
     'aurora_dxgi.c',
+    'aurora_video.c',
   ),
   c_args : aurora_d3d11_c_args,
   include_directories : [

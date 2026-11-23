@@ -431,10 +431,16 @@ struct aurora_device {
  * Diagnostics & Driver-Key Gate (aurora_adapter.c)
  * ========================================================================= */
 void aurora_log(const char *fmt, ...);
+void aurora_log_err(const char *fmt, ...);
 bool aurora_gate_present_real(void);
-void aurora_set_error(struct aurora_device *dev, HRESULT hr);
+void aurora_set_error_at(struct aurora_device *dev, HRESULT hr,
+                         const char *func, int line);
+#define aurora_set_error(dev, hr) aurora_set_error_at((dev), (hr), __func__, __LINE__)
 void aurora_flush_and_wait(struct aurora_device *dev);
 void aurora_ensure_present_context(struct aurora_device *dev);
+HRESULT APIENTRY aurora_RetrieveSubObject(
+   D3D10DDI_HDEVICE hDevice, UINT32 SubDeviceID, SIZE_T ParamSize,
+   void *pParams, SIZE_T OutputParamSize, void *pOutputParamsBuffer);
 
 static inline void
 aurora_lock(struct aurora_device *dev)

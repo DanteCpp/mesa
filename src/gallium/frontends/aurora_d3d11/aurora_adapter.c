@@ -34,7 +34,9 @@ static bool g_sw_present = false;
 static WCHAR g_log_path[MAX_PATH];
 static SRWLOCK g_log_lock = SRWLOCK_INIT;
 static volatile LONG g_log_lines = 0;
+static volatile LONG g_err_log_lines = 0;
 #define AURORA_LOG_LINE_CAP 4000
+#define AURORA_ERR_LOG_CAP  500
 
 static bool
 read_reg_switch(HKEY key, const WCHAR *name)
@@ -140,14 +142,19 @@ aurora_gate_present_real(void)
    return g_sw_present;
 }
 
-void
-aurora_log(const char *fmt, ...)
+static void
+aurora_log_v(bool is_err, const char *fmt, va_list ap)
 {
    gate_ensure_loaded();
    if (g_log_path[0] == L'\0')
       return;
-   if (InterlockedIncrement(&g_log_lines) > AURORA_LOG_LINE_CAP)
-      return;
+   if (is_err) {
+      if (InterlockedIncrement(&g_err_log_lines) > AURORA_ERR_LOG_CAP)
+         return;
+   } else {
+      if (InterlockedIncrement(&g_log_lines) > AURORA_LOG_LINE_CAP)
+         return;
+   }
 
    char buf[1024];
    DWORD pid = GetCurrentProcessId();
@@ -157,10 +164,7 @@ aurora_log(const char *fmt, ...)
    if (prefix < 0 || (size_t)prefix >= sizeof(buf))
       return;
 
-   va_list ap;
-   va_start(ap, fmt);
    int n = vsnprintf(buf + prefix, sizeof(buf) - (size_t)prefix - 2u, fmt, ap);
-   va_end(ap);
    if (n < 0)
       return;
    size_t total = (size_t)prefix + (size_t)n;
@@ -182,8 +186,31 @@ aurora_log(const char *fmt, ...)
 }
 
 void
-aurora_set_error(struct aurora_device *dev, HRESULT hr)
+aurora_log(const char *fmt, ...)
 {
+   va_list ap;
+   va_start(ap, fmt);
+   aurora_log_v(false, fmt, ap);
+   va_end(ap);
+}
+
+void
+aurora_log_err(const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   aurora_log_v(true, fmt, ap);
+   va_end(ap);
+}
+
+void
+aurora_set_error_at(struct aurora_device *dev, HRESULT hr,
+                    const char *func, int line)
+{
+   if (hr != DXGI_DDI_ERR_WASSTILLDRAWING) {
+      aurora_log_err("SetError(%s:%d) hr=0x%08lx",
+                     func ? func : "?", line, (unsigned long)hr);
+   }
    if (dev && dev->um_callbacks && dev->um_callbacks->pfnSetErrorCb)
       dev->um_callbacks->pfnSetErrorCb(dev->hRTCoreLayer, hr);
 }
@@ -386,15 +413,7 @@ static void APIENTRY
 aurora_RelocateWDDM2_1(D3D10DDI_HDEVICE hDevice, D3DWDDM2_1DDI_DEVICEFUNCS *pFuncs)
 { (void)hDevice; (void)pFuncs; }
 
-static HRESULT APIENTRY
-aurora_RetrieveSubObject(D3D10DDI_HDEVICE hDevice, UINT32 SubDeviceID,
-                         SIZE_T ParamSize, void *pParams,
-                         SIZE_T OutputParamSize, void *pOutputParamsBuffer)
-{
-   (void)hDevice; (void)SubDeviceID; (void)ParamSize; (void)pParams;
-   (void)OutputParamSize; (void)pOutputParamsBuffer;
-   return E_NOINTERFACE;
-}
+/* aurora_RetrieveSubObject is implemented in aurora_video.c */
 
 /* =========================================================================
  * Device Teardown

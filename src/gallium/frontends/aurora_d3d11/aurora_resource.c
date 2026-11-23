@@ -302,8 +302,7 @@ aurora_CreateResource(D3D10DDI_HDEVICE hDevice,
       (r->dim == D3D10DDIRESOURCE_TEXTURE3D) ? r->mip_levels
                                              : (r->mip_levels * r->array_size);
 
-   bool is_shared = (pArgs->MiscFlags &
-                     (D3D10_DDI_RESOURCE_MISC_SHARED | 0x00000100u | 0x00000800u)) != 0u;
+   bool is_shared = (pArgs->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) != 0u;
    bool is_primary = (pArgs->pPrimaryDesc != NULL);
    bool direct_scanout = is_direct_scanout_candidate(pArgs, r->width, r->height);
    uint32_t d3d_fmt = aurora_dxgi_to_d3dddi_format(pArgs->Format);
@@ -312,10 +311,10 @@ aurora_CreateResource(D3D10DDI_HDEVICE hDevice,
 
    if (is_primary && !direct_scanout) {
       aurora_unlock(dev);
-      aurora_log("CreateResource: primary refused (not direct-scanout) %ux%u fmt=%u bind=0x%08x misc=0x%08x",
-                 (unsigned)r->width, (unsigned)r->height,
-                 (unsigned)r->dxgi_format, (unsigned)pArgs->BindFlags,
-                 (unsigned)pArgs->MiscFlags);
+      aurora_log_err("CreateResource: primary refused (not direct-scanout) %ux%u fmt=%u bind=0x%08x misc=0x%08x",
+                     (unsigned)r->width, (unsigned)r->height,
+                     (unsigned)r->dxgi_format, (unsigned)pArgs->BindFlags,
+                     (unsigned)pArgs->MiscFlags);
       aurora_set_error(dev, DXGI_ERROR_UNSUPPORTED);
       return;
    }
@@ -389,14 +388,21 @@ aurora_CreateResource(D3D10DDI_HDEVICE hDevice,
                        (unsigned)row_bytes, (unsigned long long)alloc_size);
          } else {
             aurora_unlock(dev);
-            aurora_log("CreateResource: runtime AllocateCb FAILED hr=0x%08lx %ux%u primary=%u direct=%u flags=0x%x fmt=%u",
-                       (unsigned long)hr, (unsigned)r->width, (unsigned)r->height,
-                       is_primary ? 1u : 0u, direct_scanout ? 1u : 0u,
-                       (unsigned)alloc_flags, (unsigned)r->dxgi_format);
+            aurora_log_err("CreateResource: runtime AllocateCb FAILED hr=0x%08lx %ux%u primary=%u direct=%u flags=0x%x fmt=%u",
+                           (unsigned long)hr, (unsigned)r->width, (unsigned)r->height,
+                           is_primary ? 1u : 0u, direct_scanout ? 1u : 0u,
+                           (unsigned)alloc_flags, (unsigned)r->dxgi_format);
             aurora_set_error(dev, FAILED(hr) ? hr : E_OUTOFMEMORY);
             return;
          }
       }
+   } else if (is_shared) {
+      aurora_log_err("CreateResource: SHARED fallthrough (no AllocateCb) dim=%u %ux%u fmt=%u mips=%u arr=%u smp=%u misc=0x%x bind=0x%x usage=%u hRT=%p",
+                     (unsigned)r->dim, (unsigned)r->width, (unsigned)r->height,
+                     (unsigned)r->dxgi_format, (unsigned)r->mip_levels,
+                     (unsigned)r->array_size, (unsigned)r->sample_count,
+                     (unsigned)pArgs->MiscFlags, (unsigned)pArgs->BindFlags,
+                     (unsigned)pArgs->Usage, hRTResource.handle);
    }
 
    if (!r->prsrc) {
@@ -443,6 +449,11 @@ aurora_OpenResource(D3D10DDI_HDEVICE hDevice,
        priv->struct_size < sizeof(*priv) ||
        (priv->flags & AURORA_AGXW_ALLOC_SHAREABLE) == 0u ||
        aurora_agxw_standard_desc_unpack(priv->reserved, &width, &height, &d3d_fmt) != 0) {
+      aurora_log_err("OpenResource: rejected alloc=%u priv=%p psz=%u flags=0x%x resv=0x%llx",
+                     (unsigned)oi->hAllocation, (const void *)priv,
+                     (unsigned)oi->PrivateDriverDataSize,
+                     priv ? (unsigned)priv->flags : 0u,
+                     priv ? (unsigned long long)priv->reserved : 0ull);
       aurora_set_error(dev, DXGI_ERROR_UNSUPPORTED);
       return;
    }
@@ -450,6 +461,8 @@ aurora_OpenResource(D3D10DDI_HDEVICE hDevice,
    DXGI_FORMAT dxgi_fmt = aurora_d3dddi_to_dxgi_format(d3d_fmt);
    enum pipe_format pf = aurora_dxgi_to_pipe_format(dxgi_fmt);
    if (pf == PIPE_FORMAT_NONE) {
+      aurora_log_err("OpenResource: unsupported d3d_fmt=%u dxgi_fmt=%u %ux%u",
+                     (unsigned)d3d_fmt, (unsigned)dxgi_fmt, (unsigned)width, (unsigned)height);
       aurora_set_error(dev, DXGI_ERROR_UNSUPPORTED);
       return;
    }
