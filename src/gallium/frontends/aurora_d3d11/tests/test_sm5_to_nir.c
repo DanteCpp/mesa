@@ -14,6 +14,7 @@
 #include "compiler/glsl_types.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "poly/nir/poly_nir.h"
 #include "sm5_to_nir.h"
 #include "sm5_tokens.h"
 
@@ -364,6 +365,279 @@ test_compute_uav_tgsm(void)
    ralloc_free(cs);
 }
 
+static void
+test_hull_quad_indexed_fork_join(void)
+{
+   /* Real SM5 hs_5_0 quad hull shader:
+    *   - 4 input CPs -> 4 output CPs
+    *   - explicit control_point_phase copying vicp[vOutputControlPointID][0] -> o0
+    *   - 4-instance fork_phase writing o[vForkInstanceID.x + 0].x (SV_TessFactor[0..3])
+    *   - 1-instance fork_phase writing o4.x & o4.y (packed SV_InsideTessFactor[0..1])
+    *   - join_phase reading vpc0.x + vocp[0][0] -> o5.xyzw (user patch constant)
+    */
+   uint32_t tok_cpid = 0u | ((uint32_t)SM5_OPERAND_OUTPUT_CONTROL_POINT_ID << 12);
+   uint32_t tok_forkid = 0u | ((uint32_t)SM5_OPERAND_INPUT_FORK_INSTANCE_ID << 12);
+   uint32_t tok_forkid_x = 1u | ((uint32_t)SM5_OPERAND_INPUT_FORK_INSTANCE_ID << 12);
+   /* vicp[rel=vOutputControlPointID][imm=0].xyzw: index_dim=2, idx0=REL(2), idx1=IMM32(0) */
+   uint32_t tok_vicp_rel =
+      TOK_SWZ(SM5_OPERAND_INPUT_CONTROL_POINT, XYZW, 2) | (SM5_INDEX_REL << 22);
+   /* o[imm32+rel=r0.x].x: index_dim=1, idx0=IMM32_PLUS_REL(3) */
+   uint32_t tok_o_rel =
+      TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1) | (SM5_INDEX_IMM32_PLUS_REL << 22);
+
+   uint32_t hs_code[] = {
+      ((uint32_t)SM5_PROG_HS << 16) | 0x50u, 0,
+      TOK_OP(SM5_OP_HS_DECLS, 1, 0),
+      TOK_OP(SM5_OP_DCL_INPUT_CONTROL_POINT_COUNT, 1, (4u << 11)),
+      TOK_OP(SM5_OP_DCL_OUTPUT_CONTROL_POINT_COUNT, 1, (4u << 11)),
+      TOK_OP(SM5_OP_DCL_TESS_DOMAIN, 1, ((uint32_t)SM5_TESS_DOMAIN_QUAD << 11)),
+      TOK_OP(SM5_OP_DCL_TESS_PARTITIONING, 1, ((uint32_t)SM5_TESS_PART_FRACTIONAL_ODD << 11)),
+      TOK_OP(SM5_OP_DCL_TESS_OUTPUT_PRIMITIVE, 1, ((uint32_t)SM5_TESS_OUT_TRIANGLE_CCW << 11)),
+      TOK_OP(SM5_OP_DCL_HS_MAX_TESSFACTOR, 2, 0), 0x42800000u, /* 64.0f */
+
+      TOK_OP(SM5_OP_HS_CONTROL_POINT_PHASE, 1, 0),
+      TOK_OP(SM5_OP_DCL_INPUT, 2, 0), tok_cpid,
+      TOK_OP(SM5_OP_DCL_INPUT, 4, 0), TOK_MASK(SM5_OPERAND_INPUT_CONTROL_POINT, 0xf, 2), 4, 0,
+      TOK_OP(SM5_OP_DCL_OUTPUT, 3, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0xf, 1), 0,
+      TOK_OP(SM5_OP_MOV, 6, 0),
+         TOK_MASK(SM5_OPERAND_OUTPUT, 0xf, 1), 0,
+         tok_vicp_rel, tok_cpid, 0,
+      TOK_OP(SM5_OP_RET, 1, 0),
+
+      TOK_OP(SM5_OP_HS_FORK_PHASE, 1, 0),
+      TOK_OP(SM5_OP_DCL_HS_FORK_PHASE_INSTANCE_COUNT, 2, 0), 4,
+      TOK_OP(SM5_OP_DCL_INPUT, 2, 0), tok_forkid,
+      TOK_OP(SM5_OP_DCL_OUTPUT_SIV, 4, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1), 0,
+         SM5_NAME_FINAL_QUAD_U_EQ_0_EDGE_TESSFACTOR,
+      TOK_OP(SM5_OP_DCL_OUTPUT_SIV, 4, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1), 1,
+         SM5_NAME_FINAL_QUAD_V_EQ_0_EDGE_TESSFACTOR,
+      TOK_OP(SM5_OP_DCL_OUTPUT_SIV, 4, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1), 2,
+         SM5_NAME_FINAL_QUAD_U_EQ_1_EDGE_TESSFACTOR,
+      TOK_OP(SM5_OP_DCL_OUTPUT_SIV, 4, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1), 3,
+         SM5_NAME_FINAL_QUAD_V_EQ_1_EDGE_TESSFACTOR,
+      TOK_OP(SM5_OP_DCL_TEMPS, 2, 0), 1,
+      TOK_OP(SM5_OP_MOV, 4, 0), TOK_MASK(SM5_OPERAND_TEMP, 0x1, 1), 0, tok_forkid_x,
+      TOK_OP(SM5_OP_MOV, 7, 0),
+         tok_o_rel, 0, TOK_SEL(SM5_OPERAND_TEMP, 0, 1), 0,
+         TOK_IMM(1), 0x40800000u, /* 4.0f */
+      TOK_OP(SM5_OP_RET, 1, 0),
+
+      TOK_OP(SM5_OP_HS_FORK_PHASE, 1, 0),
+      TOK_OP(SM5_OP_DCL_OUTPUT_SIV, 4, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1), 4,
+         SM5_NAME_FINAL_QUAD_U_INSIDE_TESSFACTOR,
+      TOK_OP(SM5_OP_DCL_OUTPUT_SIV, 4, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x2, 1), 4,
+         SM5_NAME_FINAL_QUAD_V_INSIDE_TESSFACTOR,
+      TOK_OP(SM5_OP_MOV, 5, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x3, 1), 4, TOK_IMM(1), 0x40400000u,
+      TOK_OP(SM5_OP_RET, 1, 0),
+
+      TOK_OP(SM5_OP_HS_JOIN_PHASE, 1, 0),
+      TOK_OP(SM5_OP_DCL_INPUT, 3, 0), TOK_MASK(SM5_OPERAND_INPUT_PATCH_CONSTANT, 0x1, 1), 0,
+      TOK_OP(SM5_OP_DCL_INPUT, 4, 0), TOK_MASK(SM5_OPERAND_OUTPUT_CONTROL_POINT, 0xf, 2), 4, 0,
+      TOK_OP(SM5_OP_DCL_OUTPUT, 3, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0xf, 1), 5,
+      TOK_OP(SM5_OP_ADD, 8, 0),
+         TOK_MASK(SM5_OPERAND_OUTPUT, 0xf, 1), 5,
+         TOK_SWZ(SM5_OPERAND_OUTPUT_CONTROL_POINT, XYZW, 2), 0, 0,
+         TOK_SWZ(SM5_OPERAND_INPUT_PATCH_CONSTANT, XXXX, 1), 0,
+      TOK_OP(SM5_OP_RET, 1, 0),
+   };
+   hs_code[1] = (uint32_t)(sizeof(hs_code) / sizeof(hs_code[0]));
+
+   nir_shader *hs = aurora_sm5_to_nir_ex(hs_code, hs_code[1], NULL, 0, NULL, 0,
+                                         NULL, 0, &agx_nir_options, NULL);
+   CHECK(hs != NULL);
+   nir_validate_shader(hs, "hull_quad_indexed");
+   CHECK(hs->info.stage == MESA_SHADER_TESS_CTRL);
+   CHECK(hs->info.tess.tcs_vertices_out == 4);
+   CHECK(hs->info.tess._primitive_mode == TESS_PRIMITIVE_QUADS);
+   CHECK(hs->info.tess.spacing == TESS_SPACING_FRACTIONAL_ODD);
+   CHECK(hs->info.tess.ccw == true);
+   CHECK(hs->info.outputs_written & VARYING_BIT_TESS_LEVEL_OUTER);
+   CHECK(hs->info.outputs_written & VARYING_BIT_TESS_LEVEL_INNER);
+   CHECK(hs->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_VAR0));
+   CHECK(hs->info.patch_outputs_written & (1u << 5));
+
+   /* Lower IO and run Poly TCS lowering to match Gallium Asahi pipeline. */
+   NIR_PASS(_, hs, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
+            type_size_slots, 0);
+   nir_shader_gather_info(hs, nir_shader_get_entrypoint(hs));
+   hs->info.workgroup_size[0] = hs->info.tess.tcs_vertices_out;
+   hs->info.workgroup_size[1] = hs->info.workgroup_size[2] = 1;
+   NIR_PASS(_, hs, poly_nir_lower_tcs, true);
+   nir_validate_shader(hs, "hull_quad_indexed_poly");
+   printf("PASS: hull_quad_indexed -> NIR + poly_nir_lower_tcs validated\n");
+   ralloc_free(hs);
+}
+
+static void
+test_hull_passthrough(void)
+{
+   /* Pass-through hull shader (no hs_control_point_phase!). */
+   struct aurora_sm5_sig_elem io_sig[] = {
+      { .reg = 0, .sysval = SM5_NAME_POSITION, .mask = 0xf },
+      { .reg = 1, .sysval = 0, .mask = 0xf },
+   };
+   uint32_t hs_code[] = {
+      ((uint32_t)SM5_PROG_HS << 16) | 0x50u, 0,
+      TOK_OP(SM5_OP_HS_DECLS, 1, 0),
+      TOK_OP(SM5_OP_DCL_INPUT_CONTROL_POINT_COUNT, 1, (3u << 11)),
+      TOK_OP(SM5_OP_DCL_OUTPUT_CONTROL_POINT_COUNT, 1, (3u << 11)),
+      TOK_OP(SM5_OP_DCL_TESS_DOMAIN, 1, ((uint32_t)SM5_TESS_DOMAIN_TRI << 11)),
+      TOK_OP(SM5_OP_DCL_TESS_PARTITIONING, 1, ((uint32_t)SM5_TESS_PART_INTEGER << 11)),
+      TOK_OP(SM5_OP_DCL_TESS_OUTPUT_PRIMITIVE, 1, ((uint32_t)SM5_TESS_OUT_TRIANGLE_CW << 11)),
+      TOK_OP(SM5_OP_HS_FORK_PHASE, 1, 0),
+      TOK_OP(SM5_OP_DCL_OUTPUT_SIV, 4, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1), 0,
+         SM5_NAME_FINAL_TRI_U_EQ_0_EDGE_TESSFACTOR,
+      TOK_OP(SM5_OP_DCL_OUTPUT_SIV, 4, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1), 1,
+         SM5_NAME_FINAL_TRI_V_EQ_0_EDGE_TESSFACTOR,
+      TOK_OP(SM5_OP_DCL_OUTPUT_SIV, 4, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1), 2,
+         SM5_NAME_FINAL_TRI_W_EQ_0_EDGE_TESSFACTOR,
+      TOK_OP(SM5_OP_DCL_OUTPUT_SIV, 4, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1), 3,
+         SM5_NAME_FINAL_TRI_INSIDE_TESSFACTOR,
+      TOK_OP(SM5_OP_MOV, 5, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1), 0, TOK_IMM(1), F_ONE,
+      TOK_OP(SM5_OP_MOV, 5, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1), 1, TOK_IMM(1), F_ONE,
+      TOK_OP(SM5_OP_MOV, 5, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1), 2, TOK_IMM(1), F_ONE,
+      TOK_OP(SM5_OP_MOV, 5, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0x1, 1), 3, TOK_IMM(1), F_ONE,
+      TOK_OP(SM5_OP_RET, 1, 0),
+   };
+   hs_code[1] = (uint32_t)(sizeof(hs_code) / sizeof(hs_code[0]));
+
+   nir_shader *hs = aurora_sm5_to_nir_ex(hs_code, hs_code[1], io_sig, 2, io_sig, 2,
+                                         NULL, 0, &agx_nir_options, NULL);
+   CHECK(hs != NULL);
+   nir_validate_shader(hs, "hull_passthrough");
+   CHECK(hs->info.outputs_written & VARYING_BIT_POS);
+   CHECK(hs->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_VAR1));
+   CHECK(hs->info.outputs_written & VARYING_BIT_TESS_LEVEL_OUTER);
+   CHECK(hs->info.outputs_written & VARYING_BIT_TESS_LEVEL_INNER);
+   NIR_PASS(_, hs, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
+            type_size_slots, 0);
+   nir_shader_gather_info(hs, nir_shader_get_entrypoint(hs));
+   hs->info.workgroup_size[0] = hs->info.tess.tcs_vertices_out;
+   hs->info.workgroup_size[1] = hs->info.workgroup_size[2] = 1;
+   NIR_PASS(_, hs, poly_nir_lower_tcs, true);
+   nir_validate_shader(hs, "hull_passthrough_poly");
+   printf("PASS: hull_passthrough -> NIR + poly_nir_lower_tcs validated\n");
+   ralloc_free(hs);
+}
+
+static void
+test_domain_tri(void)
+{
+   /* Real SM5 ds_5_0 triangle domain shader:
+    *   barycentric interpolation of vicp[0..2][0] using vDomain.xyz + vpc0
+    */
+   uint32_t tok_vdom_mask = TOK_MASK(SM5_OPERAND_INPUT_DOMAIN_POINT, 0x7, 0);
+   uint32_t tok_vdom_x = TOK_SWZ(SM5_OPERAND_INPUT_DOMAIN_POINT, XXXX, 0);
+   uint32_t tok_vdom_y = TOK_SWZ(SM5_OPERAND_INPUT_DOMAIN_POINT, SWZ(1,1,1,1), 0);
+   uint32_t tok_vdom_z = TOK_SWZ(SM5_OPERAND_INPUT_DOMAIN_POINT, SWZ(2,2,2,2), 0);
+
+   uint32_t ds_code[] = {
+      ((uint32_t)SM5_PROG_DS << 16) | 0x50u, 0,
+      TOK_OP(SM5_OP_DCL_INPUT_CONTROL_POINT_COUNT, 1, (3u << 11)),
+      TOK_OP(SM5_OP_DCL_TESS_DOMAIN, 1, ((uint32_t)SM5_TESS_DOMAIN_TRI << 11)),
+      TOK_OP(SM5_OP_DCL_INPUT, 2, 0), tok_vdom_mask,
+      TOK_OP(SM5_OP_DCL_INPUT, 4, 0), TOK_MASK(SM5_OPERAND_INPUT_CONTROL_POINT, 0xf, 2), 3, 0,
+      TOK_OP(SM5_OP_DCL_INPUT, 3, 0), TOK_MASK(SM5_OPERAND_INPUT_PATCH_CONSTANT, 0xf, 1), 0,
+      TOK_OP(SM5_OP_DCL_OUTPUT_SIV, 4, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0xf, 1), 0, SM5_NAME_POSITION,
+      TOK_OP(SM5_OP_DCL_OUTPUT, 3, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0xf, 1), 1,
+      TOK_OP(SM5_OP_DCL_TEMPS, 2, 0), 1,
+      TOK_OP(SM5_OP_MUL, 7, 0),
+         TOK_MASK(SM5_OPERAND_TEMP, 0xf, 1), 0,
+         TOK_SWZ(SM5_OPERAND_INPUT_CONTROL_POINT, XYZW, 2), 0, 0,
+         tok_vdom_x,
+      TOK_OP(SM5_OP_MAD, 9, 0),
+         TOK_MASK(SM5_OPERAND_TEMP, 0xf, 1), 0,
+         TOK_SWZ(SM5_OPERAND_INPUT_CONTROL_POINT, XYZW, 2), 1, 0,
+         tok_vdom_y,
+         TOK_SWZ(SM5_OPERAND_TEMP, XYZW, 1), 0,
+      TOK_OP(SM5_OP_MAD, 9, 0),
+         TOK_MASK(SM5_OPERAND_OUTPUT, 0xf, 1), 0,
+         TOK_SWZ(SM5_OPERAND_INPUT_CONTROL_POINT, XYZW, 2), 2, 0,
+         tok_vdom_z,
+         TOK_SWZ(SM5_OPERAND_TEMP, XYZW, 1), 0,
+      TOK_OP(SM5_OP_MOV, 5, 0),
+         TOK_MASK(SM5_OPERAND_OUTPUT, 0xf, 1), 1,
+         TOK_SWZ(SM5_OPERAND_INPUT_PATCH_CONSTANT, XYZW, 1), 0,
+      TOK_OP(SM5_OP_RET, 1, 0),
+   };
+   ds_code[1] = (uint32_t)(sizeof(ds_code) / sizeof(ds_code[0]));
+
+   nir_shader *ds = aurora_sm5_to_nir_ex(ds_code, ds_code[1], NULL, 0, NULL, 0,
+                                         NULL, 0, &agx_nir_options, NULL);
+   CHECK(ds != NULL);
+   nir_validate_shader(ds, "domain_tri");
+   CHECK(ds->info.stage == MESA_SHADER_TESS_EVAL);
+   CHECK(ds->info.tess._primitive_mode == TESS_PRIMITIVE_TRIANGLES);
+   CHECK(ds->info.outputs_written & VARYING_BIT_POS);
+   CHECK(ds->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_VAR1));
+
+   NIR_PASS(_, ds, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
+            type_size_slots, 0);
+   nir_shader_gather_info(ds, nir_shader_get_entrypoint(ds));
+   NIR_PASS(_, ds, poly_nir_lower_tes, true);
+   nir_validate_shader(ds, "domain_tri_poly");
+   printf("PASS: domain_tri -> NIR + poly_nir_lower_tes validated\n");
+   ralloc_free(ds);
+}
+
+static void
+test_geometry_emit_cut(void)
+{
+   /* Real SM5 gs_5_0 triangle passthrough GS with emit + cut. */
+   uint32_t tok_primid = 0u | ((uint32_t)SM5_OPERAND_INPUT_PRIMITIVEID << 12);
+   uint32_t gs_code[] = {
+      ((uint32_t)SM5_PROG_GS << 16) | 0x50u, 0,
+      TOK_OP(SM5_OP_DCL_GS_INPUT_PRIMITIVE, 1, ((uint32_t)SM5_PRIM_TRIANGLE << 11)),
+      TOK_OP(SM5_OP_DCL_GS_OUTPUT_PRIMITIVE_TOPOLOGY, 1, ((uint32_t)SM5_PRIM_TOPO_TRIANGLESTRIP << 11)),
+      TOK_OP(SM5_OP_DCL_MAX_OUTPUT_VERTEX_COUNT, 2, 0), 3,
+      TOK_OP(SM5_OP_DCL_INPUT_SIV, 5, 0), TOK_MASK(SM5_OPERAND_INPUT, 0xf, 2), 3, 0, SM5_NAME_POSITION,
+      TOK_OP(SM5_OP_DCL_INPUT, 2, 0), tok_primid,
+      TOK_OP(SM5_OP_DCL_OUTPUT_SIV, 4, 0), TOK_MASK(SM5_OPERAND_OUTPUT, 0xf, 1), 0, SM5_NAME_POSITION,
+      TOK_OP(SM5_OP_MOV, 6, 0),
+         TOK_MASK(SM5_OPERAND_OUTPUT, 0xf, 1), 0,
+         TOK_SWZ(SM5_OPERAND_INPUT, XYZW, 2), 0, 0,
+      TOK_OP(SM5_OP_EMIT, 1, 0),
+      TOK_OP(SM5_OP_MOV, 6, 0),
+         TOK_MASK(SM5_OPERAND_OUTPUT, 0xf, 1), 0,
+         TOK_SWZ(SM5_OPERAND_INPUT, XYZW, 2), 1, 0,
+      TOK_OP(SM5_OP_EMIT, 1, 0),
+      TOK_OP(SM5_OP_MOV, 6, 0),
+         TOK_MASK(SM5_OPERAND_OUTPUT, 0xf, 1), 0,
+         TOK_SWZ(SM5_OPERAND_INPUT, XYZW, 2), 2, 0,
+      TOK_OP(SM5_OP_EMITTHENCUT, 1, 0),
+      TOK_OP(SM5_OP_RET, 1, 0),
+   };
+   gs_code[1] = (uint32_t)(sizeof(gs_code) / sizeof(gs_code[0]));
+
+   nir_shader *gs = aurora_sm5_to_nir_ex(gs_code, gs_code[1], NULL, 0, NULL, 0,
+                                         NULL, 0, &agx_nir_options, NULL);
+   CHECK(gs != NULL);
+   nir_validate_shader(gs, "geometry_tri");
+   CHECK(gs->info.stage == MESA_SHADER_GEOMETRY);
+   CHECK(gs->info.gs.input_primitive == MESA_PRIM_TRIANGLES);
+   CHECK(gs->info.gs.output_primitive == MESA_PRIM_TRIANGLE_STRIP);
+   CHECK(gs->info.gs.vertices_in == 3);
+   CHECK(gs->info.gs.vertices_out == 3);
+   CHECK(gs->info.gs.invocations == 1);
+
+   NIR_PASS(_, gs, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
+            type_size_slots, 0);
+   nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
+   nir_shader *gs_count = NULL, *gs_copy = NULL, *pre_gs = NULL;
+   struct poly_gs_info ginfo = {0};
+   poly_nir_lower_gs(gs, &gs_count, &gs_copy, &pre_gs, &ginfo);
+   CHECK(gs_copy && pre_gs);
+   if (gs_count)
+      nir_validate_shader(gs_count, "gs_count");
+   nir_validate_shader(gs_copy, "gs_copy");
+   nir_validate_shader(pre_gs, "pre_gs");
+   ralloc_free(gs);
+   ralloc_free(gs_count);
+   ralloc_free(gs_copy);
+   ralloc_free(pre_gs);
+   printf("PASS: geometry_tri -> NIR + poly_nir_lower_gs validated\n");
+}
+
 int
 main(void)
 {
@@ -372,6 +646,10 @@ main(void)
    test_cleartype_textured_ps();
    test_control_flow_and_discard();
    test_compute_uav_tgsm();
+   test_hull_quad_indexed_fork_join();
+   test_hull_passthrough();
+   test_domain_tri();
+   test_geometry_emit_cut();
    glsl_type_singleton_decref();
    printf("ALL SM5-TO-NIR + AGX G17G HOST TESTS PASSED!\n");
    return 0;

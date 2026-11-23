@@ -53,13 +53,29 @@ struct aurora_sm5_info {
  * compiler tests). `info_out` is optional and receives resource binding metadata.
  * Returns NULL on malformed bytecode or unsupported shader stage/instruction.
  */
-nir_shader *aurora_sm5_to_nir(const uint32_t *code, size_t max_dwords,
-                              const struct aurora_sm5_sig_elem *in_sig,
-                              unsigned num_in_sig,
-                              const struct aurora_sm5_sig_elem *out_sig,
-                              unsigned num_out_sig,
-                              const nir_shader_compiler_options *options,
-                              struct aurora_sm5_info *info_out);
+nir_shader *aurora_sm5_to_nir_ex(const uint32_t *code, size_t max_dwords,
+                                 const struct aurora_sm5_sig_elem *in_sig,
+                                 unsigned num_in_sig,
+                                 const struct aurora_sm5_sig_elem *out_sig,
+                                 unsigned num_out_sig,
+                                 const struct aurora_sm5_sig_elem *patch_sig,
+                                 unsigned num_patch_sig,
+                                 const nir_shader_compiler_options *options,
+                                 struct aurora_sm5_info *info_out);
+
+static inline nir_shader *
+aurora_sm5_to_nir(const uint32_t *code, size_t max_dwords,
+                  const struct aurora_sm5_sig_elem *in_sig,
+                  unsigned num_in_sig,
+                  const struct aurora_sm5_sig_elem *out_sig,
+                  unsigned num_out_sig,
+                  const nir_shader_compiler_options *options,
+                  struct aurora_sm5_info *info_out)
+{
+   return aurora_sm5_to_nir_ex(code, max_dwords, in_sig, num_in_sig,
+                               out_sig, num_out_sig, NULL, 0,
+                               options, info_out);
+}
 
 #ifdef __cplusplus
 }

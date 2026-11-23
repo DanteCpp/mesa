@@ -132,8 +132,15 @@ d3d_tex_wrap(D3D10_DDI_TEXTURE_ADDRESS_MODE m)
 }
 
 static enum mesa_prim
-d3d_topology(D3D10_DDI_PRIMITIVE_TOPOLOGY t)
+d3d_topology(D3D10_DDI_PRIMITIVE_TOPOLOGY t, uint8_t *patch_verts_out)
 {
+   *patch_verts_out = 0;
+   if (t >= D3D11_DDI_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST &&
+       t <= D3D11_DDI_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST) {
+      *patch_verts_out =
+         (uint8_t)(t - D3D11_DDI_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST + 1);
+      return MESA_PRIM_PATCHES;
+   }
    switch (t) {
    case D3D10_DDI_PRIMITIVE_TOPOLOGY_POINTLIST:         return MESA_PRIM_POINTS;
    case D3D10_DDI_PRIMITIVE_TOPOLOGY_LINELIST:          return MESA_PRIM_LINES;
@@ -782,7 +789,13 @@ aurora_IaSetTopology(D3D10DDI_HDEVICE hDevice, D3D10_DDI_PRIMITIVE_TOPOLOGY Topo
       return;
    aurora_lock(dev);
    dev->topology = Topo;
-   dev->pipe_prim = d3d_topology(Topo);
+   uint8_t pv = 0;
+   dev->pipe_prim = d3d_topology(Topo, &pv);
+   if (pv > 0 && pv != dev->patch_vertices) {
+      dev->patch_vertices = pv;
+      if (dev->pctx && dev->pctx->set_patch_vertices)
+         dev->pctx->set_patch_vertices(dev->pctx, pv);
+   }
    aurora_unlock(dev);
 }
 
@@ -1194,6 +1207,12 @@ aurora_sync_draw_state(struct aurora_device *dev)
       dev->pctx->bind_rasterizer_state(dev->pctx, dev->default_rast_cso);
 
    aurora_sync_stage_resources(dev, AURORA_STAGE_VS);
+   if (dev->hs)
+      aurora_sync_stage_resources(dev, AURORA_STAGE_HS);
+   if (dev->ds)
+      aurora_sync_stage_resources(dev, AURORA_STAGE_DS);
+   if (dev->gs)
+      aurora_sync_stage_resources(dev, AURORA_STAGE_GS);
    aurora_sync_stage_resources(dev, AURORA_STAGE_PS);
 }
 

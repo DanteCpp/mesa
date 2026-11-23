@@ -1126,49 +1126,106 @@ aurora_CalcPrivateGSWithSOSize(D3D10DDI_HDEVICE d, const VOID *p)
 { (void)d; (void)p; return sizeof(struct aurora_shader); }
 
 static void
-extract_signatures(const struct aurora_device *dev, const VOID *pSigs,
+extract_signatures(const struct aurora_device *dev, mesa_shader_stage stage,
+                   const VOID *pSigs,
                    struct aurora_sm5_sig_elem *in_elems, unsigned *num_in,
-                   struct aurora_sm5_sig_elem *out_elems, unsigned *num_out)
+                   struct aurora_sm5_sig_elem *out_elems, unsigned *num_out,
+                   struct aurora_sm5_sig_elem *patch_elems, unsigned *num_patch)
 {
    *num_in = 0;
    *num_out = 0;
+   *num_patch = 0;
    if (!pSigs)
       return;
 
+   bool is_tess = (stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_TESS_EVAL);
+
    if (dev->interface_version >= D3D11_1_DDI_INTERFACE_VERSION) {
-      const D3D11_1DDIARG_STAGE_IO_SIGNATURES *s =
-         (const D3D11_1DDIARG_STAGE_IO_SIGNATURES *)pSigs;
-      UINT ni = MIN2(s->NumInputSignatureEntries, 32u);
-      for (UINT i = 0; i < ni; ++i) {
-         in_elems[i].reg = s->pInputSignature[i].Register;
-         in_elems[i].sysval = (uint32_t)s->pInputSignature[i].SystemValue;
-         in_elems[i].mask = s->pInputSignature[i].Mask;
+      if (is_tess) {
+         const D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES *s =
+            (const D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES *)pSigs;
+         UINT ni = MIN2(s->NumInputSignatureEntries, 32u);
+         for (UINT i = 0; i < ni; ++i) {
+            in_elems[i].reg = s->pInputSignature[i].Register;
+            in_elems[i].sysval = (uint32_t)s->pInputSignature[i].SystemValue;
+            in_elems[i].mask = s->pInputSignature[i].Mask;
+         }
+         *num_in = ni;
+         UINT no = MIN2(s->NumOutputSignatureEntries, 32u);
+         for (UINT i = 0; i < no; ++i) {
+            out_elems[i].reg = s->pOutputSignature[i].Register;
+            out_elems[i].sysval = (uint32_t)s->pOutputSignature[i].SystemValue;
+            out_elems[i].mask = s->pOutputSignature[i].Mask;
+         }
+         *num_out = no;
+         UINT np = MIN2(s->NumPatchConstantSignatureEntries, 32u);
+         for (UINT i = 0; i < np; ++i) {
+            patch_elems[i].reg = s->pPatchConstantSignature[i].Register;
+            patch_elems[i].sysval = (uint32_t)s->pPatchConstantSignature[i].SystemValue;
+            patch_elems[i].mask = s->pPatchConstantSignature[i].Mask;
+         }
+         *num_patch = np;
+      } else {
+         const D3D11_1DDIARG_STAGE_IO_SIGNATURES *s =
+            (const D3D11_1DDIARG_STAGE_IO_SIGNATURES *)pSigs;
+         UINT ni = MIN2(s->NumInputSignatureEntries, 32u);
+         for (UINT i = 0; i < ni; ++i) {
+            in_elems[i].reg = s->pInputSignature[i].Register;
+            in_elems[i].sysval = (uint32_t)s->pInputSignature[i].SystemValue;
+            in_elems[i].mask = s->pInputSignature[i].Mask;
+         }
+         *num_in = ni;
+         UINT no = MIN2(s->NumOutputSignatureEntries, 32u);
+         for (UINT i = 0; i < no; ++i) {
+            out_elems[i].reg = s->pOutputSignature[i].Register;
+            out_elems[i].sysval = (uint32_t)s->pOutputSignature[i].SystemValue;
+            out_elems[i].mask = s->pOutputSignature[i].Mask;
+         }
+         *num_out = no;
       }
-      *num_in = ni;
-      UINT no = MIN2(s->NumOutputSignatureEntries, 32u);
-      for (UINT i = 0; i < no; ++i) {
-         out_elems[i].reg = s->pOutputSignature[i].Register;
-         out_elems[i].sysval = (uint32_t)s->pOutputSignature[i].SystemValue;
-         out_elems[i].mask = s->pOutputSignature[i].Mask;
-      }
-      *num_out = no;
    } else {
-      const D3D10DDIARG_STAGE_IO_SIGNATURES *s =
-         (const D3D10DDIARG_STAGE_IO_SIGNATURES *)pSigs;
-      UINT ni = MIN2(s->NumInputSignatureEntries, 32u);
-      for (UINT i = 0; i < ni; ++i) {
-         in_elems[i].reg = s->pInputSignature[i].Register;
-         in_elems[i].sysval = (uint32_t)s->pInputSignature[i].SystemValue;
-         in_elems[i].mask = s->pInputSignature[i].Mask;
+      if (is_tess) {
+         const D3D11DDIARG_TESSELLATION_IO_SIGNATURES *s =
+            (const D3D11DDIARG_TESSELLATION_IO_SIGNATURES *)pSigs;
+         UINT ni = MIN2(s->NumInputSignatureEntries, 32u);
+         for (UINT i = 0; i < ni; ++i) {
+            in_elems[i].reg = s->pInputSignature[i].Register;
+            in_elems[i].sysval = (uint32_t)s->pInputSignature[i].SystemValue;
+            in_elems[i].mask = s->pInputSignature[i].Mask;
+         }
+         *num_in = ni;
+         UINT no = MIN2(s->NumOutputSignatureEntries, 32u);
+         for (UINT i = 0; i < no; ++i) {
+            out_elems[i].reg = s->pOutputSignature[i].Register;
+            out_elems[i].sysval = (uint32_t)s->pOutputSignature[i].SystemValue;
+            out_elems[i].mask = s->pOutputSignature[i].Mask;
+         }
+         *num_out = no;
+         UINT np = MIN2(s->NumPatchConstantSignatureEntries, 32u);
+         for (UINT i = 0; i < np; ++i) {
+            patch_elems[i].reg = s->pPatchConstantSignature[i].Register;
+            patch_elems[i].sysval = (uint32_t)s->pPatchConstantSignature[i].SystemValue;
+            patch_elems[i].mask = s->pPatchConstantSignature[i].Mask;
+         }
+         *num_patch = np;
+      } else {
+         const D3D10DDIARG_STAGE_IO_SIGNATURES *s =
+            (const D3D10DDIARG_STAGE_IO_SIGNATURES *)pSigs;
+         UINT ni = MIN2(s->NumInputSignatureEntries, 32u);
+         for (UINT i = 0; i < ni; ++i) {
+            in_elems[i].reg = s->pInputSignature[i].Register;
+            in_elems[i].sysval = (uint32_t)s->pInputSignature[i].SystemValue;
+            in_elems[i].mask = s->pInputSignature[i].Mask;
+         }
+         *num_in = ni;
+         UINT no = MIN2(s->NumOutputSignatureEntries, 32u);
+         for (UINT i = 0; i < no; ++i) {
+            out_elems[i].reg = s->pOutputSignature[i].Register;
+            out_elems[i].sysval = (uint32_t)s->pOutputSignature[i].SystemValue;
+            out_elems[i].mask = s->pOutputSignature[i].Mask;
+         }
+         *num_out = no;
       }
-      *num_in = ni;
-      UINT no = MIN2(s->NumOutputSignatureEntries, 32u);
-      for (UINT i = 0; i < no; ++i) {
-         out_elems[i].reg = s->pOutputSignature[i].Register;
-         out_elems[i].sysval = (uint32_t)s->pOutputSignature[i].SystemValue;
-         out_elems[i].mask = s->pOutputSignature[i].Mask;
-      }
-      *num_out = no;
    }
 }
 
@@ -1184,25 +1241,27 @@ create_shader_common(struct aurora_device *dev, mesa_shader_stage stage,
       return;
    }
 
-   struct aurora_sm5_sig_elem in_sig[32], out_sig[32];
-   unsigned num_in = 0, num_out = 0;
-   extract_signatures(dev, pSigs, in_sig, &num_in, out_sig, &num_out);
+   struct aurora_sm5_sig_elem in_sig[32], out_sig[32], patch_sig[32];
+   unsigned num_in = 0, num_out = 0, num_patch = 0;
+   extract_signatures(dev, stage, pSigs, in_sig, &num_in,
+                      out_sig, &num_out, patch_sig, &num_patch);
 
    const nir_shader_compiler_options *opts =
       dev->screen->nir_options[stage];
    if (!opts) {
-      aurora_log("CreateShader(stage=%d): missing nir_options", (int)stage);
+      aurora_log_err("CreateShader(stage=%d): missing nir_options", (int)stage);
       aurora_set_error(dev, E_FAIL);
       return;
    }
 
    /* DDI shader token streams start with [VerTok, LenTok, ...]. */
    size_t num_dwords = pCode[1];
-   nir_shader *nir = aurora_sm5_to_nir(pCode, num_dwords, in_sig, num_in,
-                                       out_sig, num_out, opts, &sh->info);
+   nir_shader *nir = aurora_sm5_to_nir_ex(pCode, num_dwords, in_sig, num_in,
+                                          out_sig, num_out, patch_sig, num_patch,
+                                          opts, &sh->info);
    if (!nir) {
-      aurora_log("CreateShader(stage=%d): SM5->NIR failed ver=0x%08x len=%u err=%s",
-                 (int)stage, pCode[0], pCode[1], sh->info.err);
+      aurora_log_err("CreateShader(stage=%d): SM5->NIR failed ver=0x%08x len=%u err=%s",
+                     (int)stage, pCode[0], pCode[1], sh->info.err);
       aurora_set_error(dev, E_FAIL);
       return;
    }
@@ -1224,11 +1283,19 @@ create_shader_common(struct aurora_device *dev, mesa_shader_stage stage,
          sh->cso = dev->pctx->create_vs_state(dev->pctx, &cso);
       else if (stage == MESA_SHADER_FRAGMENT)
          sh->cso = dev->pctx->create_fs_state(dev->pctx, &cso);
+      else if (stage == MESA_SHADER_GEOMETRY && dev->pctx->create_gs_state)
+         sh->cso = dev->pctx->create_gs_state(dev->pctx, &cso);
+      else if (stage == MESA_SHADER_TESS_CTRL && dev->pctx->create_tcs_state)
+         sh->cso = dev->pctx->create_tcs_state(dev->pctx, &cso);
+      else if (stage == MESA_SHADER_TESS_EVAL && dev->pctx->create_tes_state)
+         sh->cso = dev->pctx->create_tes_state(dev->pctx, &cso);
+      else
+         ralloc_free(nir);
    }
    aurora_unlock(dev);
 
    if (!sh->cso) {
-      aurora_log("CreateShader(stage=%d): Gallium Asahi create state FAILED", (int)stage);
+      aurora_log_err("CreateShader(stage=%d): Gallium Asahi create state FAILED", (int)stage);
       aurora_set_error(dev, E_FAIL);
    }
 }
@@ -1270,10 +1337,10 @@ aurora_CreateGeometryShader(D3D10DDI_HDEVICE hDevice, const UINT *pCode,
                             D3D10DDI_HSHADER hShader, D3D10DDI_HRTSHADER hRT,
                             const VOID *pSigs)
 {
-   (void)pCode; (void)hRT; (void)pSigs;
-   struct aurora_shader *sh = (struct aurora_shader *)hShader.pDrvPrivate;
-   if (sh) { memset(sh, 0, sizeof(*sh)); sh->stage = MESA_SHADER_GEOMETRY; }
-   aurora_set_error((struct aurora_device *)hDevice.pDrvPrivate, E_NOTIMPL);
+   (void)hRT;
+   create_shader_common((struct aurora_device *)hDevice.pDrvPrivate,
+                        MESA_SHADER_GEOMETRY, pCode,
+                        (struct aurora_shader *)hShader.pDrvPrivate, pSigs);
 }
 
 void APIENTRY
@@ -1282,10 +1349,17 @@ aurora_CreateGSWithSO(D3D10DDI_HDEVICE hDevice,
                       D3D10DDI_HSHADER hShader, D3D10DDI_HRTSHADER hRT,
                       const VOID *pSigs)
 {
-   (void)pArgs; (void)hRT; (void)pSigs;
+   (void)hRT;
    struct aurora_shader *sh = (struct aurora_shader *)hShader.pDrvPrivate;
-   if (sh) { memset(sh, 0, sizeof(*sh)); sh->stage = MESA_SHADER_GEOMETRY; }
-   aurora_set_error((struct aurora_device *)hDevice.pDrvPrivate, E_NOTIMPL);
+   if (!pArgs || !pArgs->pShaderCode) {
+      if (sh) {
+         memset(sh, 0, sizeof(*sh));
+         sh->stage = MESA_SHADER_GEOMETRY;
+      }
+      return;
+   }
+   create_shader_common((struct aurora_device *)hDevice.pDrvPrivate,
+                        MESA_SHADER_GEOMETRY, pArgs->pShaderCode, sh, pSigs);
 }
 
 void APIENTRY
@@ -1293,10 +1367,10 @@ aurora_CreateHullShader(D3D10DDI_HDEVICE hDevice, const UINT *pCode,
                         D3D10DDI_HSHADER hShader, D3D10DDI_HRTSHADER hRT,
                         const VOID *pSigs)
 {
-   (void)pCode; (void)hRT; (void)pSigs;
-   struct aurora_shader *sh = (struct aurora_shader *)hShader.pDrvPrivate;
-   if (sh) { memset(sh, 0, sizeof(*sh)); sh->stage = MESA_SHADER_TESS_CTRL; }
-   aurora_set_error((struct aurora_device *)hDevice.pDrvPrivate, E_NOTIMPL);
+   (void)hRT;
+   create_shader_common((struct aurora_device *)hDevice.pDrvPrivate,
+                        MESA_SHADER_TESS_CTRL, pCode,
+                        (struct aurora_shader *)hShader.pDrvPrivate, pSigs);
 }
 
 void APIENTRY
@@ -1304,10 +1378,10 @@ aurora_CreateDomainShader(D3D10DDI_HDEVICE hDevice, const UINT *pCode,
                           D3D10DDI_HSHADER hShader, D3D10DDI_HRTSHADER hRT,
                           const VOID *pSigs)
 {
-   (void)pCode; (void)hRT; (void)pSigs;
-   struct aurora_shader *sh = (struct aurora_shader *)hShader.pDrvPrivate;
-   if (sh) { memset(sh, 0, sizeof(*sh)); sh->stage = MESA_SHADER_TESS_EVAL; }
-   aurora_set_error((struct aurora_device *)hDevice.pDrvPrivate, E_NOTIMPL);
+   (void)hRT;
+   create_shader_common((struct aurora_device *)hDevice.pDrvPrivate,
+                        MESA_SHADER_TESS_EVAL, pCode,
+                        (struct aurora_shader *)hShader.pDrvPrivate, pSigs);
 }
 
 void APIENTRY
@@ -1332,6 +1406,30 @@ aurora_DestroyShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
             dev->ps = NULL;
          }
          dev->pctx->delete_fs_state(dev->pctx, sh->cso);
+      } else if (sh->stage == MESA_SHADER_GEOMETRY) {
+         if (dev->gs == sh) {
+            if (dev->pctx->bind_gs_state)
+               dev->pctx->bind_gs_state(dev->pctx, NULL);
+            dev->gs = NULL;
+         }
+         if (dev->pctx->delete_gs_state)
+            dev->pctx->delete_gs_state(dev->pctx, sh->cso);
+      } else if (sh->stage == MESA_SHADER_TESS_CTRL) {
+         if (dev->hs == sh) {
+            if (dev->pctx->bind_tcs_state)
+               dev->pctx->bind_tcs_state(dev->pctx, NULL);
+            dev->hs = NULL;
+         }
+         if (dev->pctx->delete_tcs_state)
+            dev->pctx->delete_tcs_state(dev->pctx, sh->cso);
+      } else if (sh->stage == MESA_SHADER_TESS_EVAL) {
+         if (dev->ds == sh) {
+            if (dev->pctx->bind_tes_state)
+               dev->pctx->bind_tes_state(dev->pctx, NULL);
+            dev->ds = NULL;
+         }
+         if (dev->pctx->delete_tes_state)
+            dev->pctx->delete_tes_state(dev->pctx, sh->cso);
       } else if (sh->stage == MESA_SHADER_COMPUTE) {
          if (dev->cs == sh) {
             dev->pctx->bind_compute_state(dev->pctx, NULL);
@@ -1383,9 +1481,47 @@ aurora_CsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
    aurora_unlock(dev);
 }
 
-void APIENTRY aurora_GsSetShader(D3D10DDI_HDEVICE d, D3D10DDI_HSHADER s) { (void)d; (void)s; }
-void APIENTRY aurora_HsSetShader(D3D10DDI_HDEVICE d, D3D10DDI_HSHADER s) { (void)d; (void)s; }
-void APIENTRY aurora_DsSetShader(D3D10DDI_HDEVICE d, D3D10DDI_HSHADER s) { (void)d; (void)s; }
+void APIENTRY
+aurora_GsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
+{
+   struct aurora_device *dev = (struct aurora_device *)hDevice.pDrvPrivate;
+   struct aurora_shader *sh = (struct aurora_shader *)hShader.pDrvPrivate;
+   if (!dev || !dev->pctx)
+      return;
+   aurora_lock(dev);
+   dev->gs = sh;
+   if (dev->pctx->bind_gs_state)
+      dev->pctx->bind_gs_state(dev->pctx, sh ? sh->cso : NULL);
+   aurora_unlock(dev);
+}
+
+void APIENTRY
+aurora_HsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
+{
+   struct aurora_device *dev = (struct aurora_device *)hDevice.pDrvPrivate;
+   struct aurora_shader *sh = (struct aurora_shader *)hShader.pDrvPrivate;
+   if (!dev || !dev->pctx)
+      return;
+   aurora_lock(dev);
+   dev->hs = sh;
+   if (dev->pctx->bind_tcs_state)
+      dev->pctx->bind_tcs_state(dev->pctx, sh ? sh->cso : NULL);
+   aurora_unlock(dev);
+}
+
+void APIENTRY
+aurora_DsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
+{
+   struct aurora_device *dev = (struct aurora_device *)hDevice.pDrvPrivate;
+   struct aurora_shader *sh = (struct aurora_shader *)hShader.pDrvPrivate;
+   if (!dev || !dev->pctx)
+      return;
+   aurora_lock(dev);
+   dev->ds = sh;
+   if (dev->pctx->bind_tes_state)
+      dev->pctx->bind_tes_state(dev->pctx, sh ? sh->cso : NULL);
+   aurora_unlock(dev);
+}
 
 HRESULT APIENTRY
 aurora_RetrieveShaderComment(D3D10DDI_HDEVICE d, D3D10DDI_HSHADER s,

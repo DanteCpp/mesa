@@ -359,6 +359,9 @@ struct aurora_device {
    /* Bound pipeline state */
    struct aurora_shader *vs;
    struct aurora_shader *ps;
+   struct aurora_shader *gs;
+   struct aurora_shader *hs;
+   struct aurora_shader *ds;
    struct aurora_shader *cs;
    struct aurora_velems *velems;
    struct aurora_blend *blend;
@@ -402,6 +405,7 @@ struct aurora_device {
 
    D3D10_DDI_PRIMITIVE_TOPOLOGY topology;
    enum mesa_prim pipe_prim;
+   uint8_t patch_vertices;
 
    struct pipe_viewport_state viewports[AURORA_MAX_VIEWPORTS];
    UINT num_viewports;

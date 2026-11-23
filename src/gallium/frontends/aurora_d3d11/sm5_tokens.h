@@ -392,6 +392,65 @@ enum sm5_sysval_name {
    SM5_NAME_INSTANCE_ID = 8,
    SM5_NAME_IS_FRONT_FACE = 9,
    SM5_NAME_SAMPLE_INDEX = 10,
+   SM5_NAME_FINAL_QUAD_U_EQ_0_EDGE_TESSFACTOR = 11,
+   SM5_NAME_FINAL_QUAD_V_EQ_0_EDGE_TESSFACTOR = 12,
+   SM5_NAME_FINAL_QUAD_U_EQ_1_EDGE_TESSFACTOR = 13,
+   SM5_NAME_FINAL_QUAD_V_EQ_1_EDGE_TESSFACTOR = 14,
+   SM5_NAME_FINAL_QUAD_U_INSIDE_TESSFACTOR = 15,
+   SM5_NAME_FINAL_QUAD_V_INSIDE_TESSFACTOR = 16,
+   SM5_NAME_FINAL_TRI_U_EQ_0_EDGE_TESSFACTOR = 17,
+   SM5_NAME_FINAL_TRI_V_EQ_0_EDGE_TESSFACTOR = 18,
+   SM5_NAME_FINAL_TRI_W_EQ_0_EDGE_TESSFACTOR = 19,
+   SM5_NAME_FINAL_TRI_INSIDE_TESSFACTOR = 20,
+   SM5_NAME_FINAL_LINE_DETAIL_TESSFACTOR = 21,
+   SM5_NAME_FINAL_LINE_DENSITY_TESSFACTOR = 22,
+};
+
+enum sm5_tess_domain {
+   SM5_TESS_DOMAIN_UNDEFINED = 0,
+   SM5_TESS_DOMAIN_ISOLINE = 1,
+   SM5_TESS_DOMAIN_TRI = 2,
+   SM5_TESS_DOMAIN_QUAD = 3,
+};
+
+enum sm5_tess_partitioning {
+   SM5_TESS_PART_UNDEFINED = 0,
+   SM5_TESS_PART_INTEGER = 1,
+   SM5_TESS_PART_POW2 = 2,
+   SM5_TESS_PART_FRACTIONAL_ODD = 3,
+   SM5_TESS_PART_FRACTIONAL_EVEN = 4,
+};
+
+enum sm5_tess_output_primitive {
+   SM5_TESS_OUT_UNDEFINED = 0,
+   SM5_TESS_OUT_POINT = 1,
+   SM5_TESS_OUT_LINE = 2,
+   SM5_TESS_OUT_TRIANGLE_CW = 3,
+   SM5_TESS_OUT_TRIANGLE_CCW = 4,
+};
+
+enum sm5_primitive {
+   SM5_PRIM_UNDEFINED = 0,
+   SM5_PRIM_POINT = 1,
+   SM5_PRIM_LINE = 2,
+   SM5_PRIM_TRIANGLE = 3,
+   SM5_PRIM_LINE_ADJ = 6,
+   SM5_PRIM_TRIANGLE_ADJ = 7,
+   SM5_PRIM_1_CP_PATCH = 8,
+   SM5_PRIM_32_CP_PATCH = 39,
+};
+
+enum sm5_primitive_topology {
+   SM5_PRIM_TOPO_UNDEFINED = 0,
+   SM5_PRIM_TOPO_POINTLIST = 1,
+   SM5_PRIM_TOPO_LINELIST = 2,
+   SM5_PRIM_TOPO_LINESTRIP = 3,
+   SM5_PRIM_TOPO_TRIANGLELIST = 4,
+   SM5_PRIM_TOPO_TRIANGLESTRIP = 5,
+   SM5_PRIM_TOPO_LINELIST_ADJ = 10,
+   SM5_PRIM_TOPO_LINESTRIP_ADJ = 11,
+   SM5_PRIM_TOPO_TRIANGLELIST_ADJ = 12,
+   SM5_PRIM_TOPO_TRIANGLESTRIP_ADJ = 13,
 };
 
 enum sm5_resource_dim {
@@ -484,4 +543,40 @@ sm5_sign_extend_4(uint32_t v)
 {
    v &= 0xfu;
    return (v & 0x8u) ? (int)(v | ~0xfu) : (int)v;
+}
+
+static inline uint32_t
+sm5_decode_cp_count(uint32_t tok)
+{
+   return (tok >> 11) & 0x3fu;
+}
+
+static inline enum sm5_tess_domain
+sm5_decode_tess_domain(uint32_t tok)
+{
+   return (enum sm5_tess_domain)((tok >> 11) & 0x3u);
+}
+
+static inline enum sm5_tess_partitioning
+sm5_decode_tess_partitioning(uint32_t tok)
+{
+   return (enum sm5_tess_partitioning)((tok >> 11) & 0x7u);
+}
+
+static inline enum sm5_tess_output_primitive
+sm5_decode_tess_output_prim(uint32_t tok)
+{
+   return (enum sm5_tess_output_primitive)((tok >> 11) & 0x7u);
+}
+
+static inline enum sm5_primitive
+sm5_decode_gs_input_prim(uint32_t tok)
+{
+   return (enum sm5_primitive)((tok >> 11) & 0x3fu);
+}
+
+static inline enum sm5_primitive_topology
+sm5_decode_gs_output_topo(uint32_t tok)
+{
+   return (enum sm5_primitive_topology)((tok >> 11) & 0x7fu);
 }

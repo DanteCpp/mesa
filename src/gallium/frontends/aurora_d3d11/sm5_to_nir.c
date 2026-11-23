@@ -69,6 +69,24 @@ struct sm5_io_decl {
    uint8_t num_comps;
 };
 
+struct sm5_patch_decl {
+   bool declared;
+   uint8_t mask;
+   enum sm5_sysval_name comp_sysval[4];
+   nir_variable *var;
+   nir_variable *shadow;
+};
+
+enum sm5_hs_phase {
+   SM5_HS_PHASE_NONE = 0,
+   SM5_HS_PHASE_DECLS,
+   SM5_HS_PHASE_CP,
+   SM5_HS_PHASE_FORK,
+   SM5_HS_PHASE_JOIN,
+};
+
+#define SM5_MAX_HS_PHASES 64u
+
 struct sm5_tgsm_decl {
    bool declared;
    uint32_t size_bytes;
@@ -116,10 +134,30 @@ struct sm5_ctx {
 
    struct sm5_io_decl inputs[SM5_MAX_IO_REGS];
    struct sm5_io_decl outputs[SM5_MAX_IO_REGS];
+   struct sm5_patch_decl patch_io[SM5_MAX_IO_REGS];
+   nir_variable *tess_outer_var;
+   nir_variable *tess_inner_var;
    nir_variable *odepth_var;
    nir_variable *odepth_shadow;
    nir_variable *omask_var;
    nir_variable *omask_shadow;
+
+   /* Hull / Domain / Geometry shader metadata & phase state */
+   enum sm5_hs_phase hs_phase;
+   uint32_t hs_in_cp_count;
+   uint32_t hs_out_cp_count;
+   bool hs_had_cp_phase;
+   bool hs_emitted_cp_barrier;
+   nir_if *hs_patch_if;
+   nir_loop *hs_outer_loop;
+   nir_loop *hs_phase_loop;
+   nir_variable *hs_inst_id_var;
+   unsigned hs_phase_idx;
+   unsigned hs_prescan_phases;
+   uint32_t hs_phase_inst_counts[SM5_MAX_HS_PHASES];
+
+   uint32_t gs_vertices_in;
+   uint32_t gs_cur_stream;
 
    struct sm5_res_decl srvs[AURORA_MAX_SRV_SLOTS];
    struct sm5_res_decl uavs[AURORA_MAX_UAV_SLOTS];
@@ -267,9 +305,10 @@ sm5_parse_operand(struct sm5_ctx *c, struct sm5_operand *op)
    return true;
 }
 
-/* Forward declaration for recursive relative index evaluation. */
+/* Forward declarations for recursive relative index & padding helpers. */
 static nir_def *sm5_load_src(struct sm5_ctx *c, const struct sm5_operand *op,
                              bool is_int);
+static nir_def *sm5_pad_to_4(nir_builder *b, nir_def *v);
 
 static nir_def *
 sm5_eval_index(struct sm5_ctx *c, const struct sm5_index *idx)
@@ -328,6 +367,115 @@ sm5_ensure_temp_count(struct sm5_ctx *c, unsigned needed)
    c->num_temps = needed;
 }
 
+static bool
+sm5_tess_factor_slot(enum sm5_sysval_name sv, bool *is_inner, unsigned *lane)
+{
+   switch (sv) {
+   case SM5_NAME_FINAL_QUAD_U_EQ_0_EDGE_TESSFACTOR:
+   case SM5_NAME_FINAL_TRI_U_EQ_0_EDGE_TESSFACTOR:
+   case SM5_NAME_FINAL_LINE_DENSITY_TESSFACTOR:
+      *is_inner = false; *lane = 0; return true;
+   case SM5_NAME_FINAL_QUAD_V_EQ_0_EDGE_TESSFACTOR:
+   case SM5_NAME_FINAL_TRI_V_EQ_0_EDGE_TESSFACTOR:
+   case SM5_NAME_FINAL_LINE_DETAIL_TESSFACTOR:
+      *is_inner = false; *lane = 1; return true;
+   case SM5_NAME_FINAL_QUAD_U_EQ_1_EDGE_TESSFACTOR:
+   case SM5_NAME_FINAL_TRI_W_EQ_0_EDGE_TESSFACTOR:
+      *is_inner = false; *lane = 2; return true;
+   case SM5_NAME_FINAL_QUAD_V_EQ_1_EDGE_TESSFACTOR:
+      *is_inner = false; *lane = 3; return true;
+   case SM5_NAME_FINAL_QUAD_U_INSIDE_TESSFACTOR:
+   case SM5_NAME_FINAL_TRI_INSIDE_TESSFACTOR:
+      *is_inner = true; *lane = 0; return true;
+   case SM5_NAME_FINAL_QUAD_V_INSIDE_TESSFACTOR:
+      *is_inner = true; *lane = 1; return true;
+   default:
+      return false;
+   }
+}
+
+static int
+sm5_varying_loc_for_sysval(enum sm5_sysval_name sv, uint32_t reg,
+                           unsigned *comps_io, bool *is_int_io)
+{
+   *is_int_io = false;
+   switch (sv) {
+   case SM5_NAME_POSITION:
+      *comps_io = 4;
+      return VARYING_SLOT_POS;
+   case SM5_NAME_CLIP_DISTANCE:
+      return VARYING_SLOT_CLIP_DIST0;
+   case SM5_NAME_CULL_DISTANCE:
+      return VARYING_SLOT_CULL_DIST0;
+   case SM5_NAME_RENDER_TARGET_ARRAY_INDEX:
+      *comps_io = 1;
+      *is_int_io = true;
+      return VARYING_SLOT_LAYER;
+   case SM5_NAME_VIEWPORT_ARRAY_INDEX:
+      *comps_io = 1;
+      *is_int_io = true;
+      return VARYING_SLOT_VIEWPORT;
+   default:
+      return VARYING_SLOT_VAR0 + (int)reg;
+   }
+}
+
+static nir_variable *
+sm5_get_tess_level_var(struct sm5_ctx *c, bool is_inner, bool is_output)
+{
+   nir_variable **slot = is_inner ? &c->tess_inner_var : &c->tess_outer_var;
+   if (*slot)
+      return *slot;
+   nir_variable *v = nir_variable_create(
+      c->nir, is_output ? nir_var_shader_out : nir_var_shader_in,
+      is_inner ? glsl_vec_type(2) : glsl_vec4_type(),
+      is_inner ? "tess_level_inner" : "tess_level_outer");
+   v->data.location =
+      is_inner ? VARYING_SLOT_TESS_LEVEL_INNER : VARYING_SLOT_TESS_LEVEL_OUTER;
+   v->data.patch = true;
+   *slot = v;
+   return v;
+}
+
+static nir_variable *
+sm5_get_patch_var(struct sm5_ctx *c, uint32_t reg, bool is_output)
+{
+   if (reg >= SM5_MAX_IO_REGS) {
+      sm5_fail(c, "patch constant register index out of range");
+      return NULL;
+   }
+   struct sm5_patch_decl *p = &c->patch_io[reg];
+   if (!p->var) {
+      char name[24];
+      snprintf(name, sizeof(name), "patch_%u", reg);
+      nir_variable *v = nir_variable_create(
+         c->nir, is_output ? nir_var_shader_out : nir_var_shader_in,
+         glsl_vec4_type(), name);
+      v->data.location = VARYING_SLOT_PATCH0 + (int)reg;
+      v->data.driver_location = reg;
+      v->data.patch = true;
+      p->var = v;
+   }
+   return p->var;
+}
+
+static nir_variable *
+sm5_get_patch_shadow(struct sm5_ctx *c, uint32_t reg)
+{
+   if (reg >= SM5_MAX_IO_REGS) {
+      sm5_fail(c, "patch constant register index out of range");
+      return NULL;
+   }
+   struct sm5_patch_decl *p = &c->patch_io[reg];
+   if (!p->shadow) {
+      char sname[24];
+      snprintf(sname, sizeof(sname), "patch_tmp_%u", reg);
+      p->shadow =
+         nir_local_variable_create(c->b.impl, glsl_uvec4_type(), sname);
+   }
+   return p->shadow;
+}
+
 static nir_variable *
 sm5_get_input_var(struct sm5_ctx *c, uint32_t reg)
 {
@@ -361,9 +509,30 @@ sm5_get_input_var(struct sm5_ctx *c, uint32_t reg)
          d->num_comps = 4;
       } else if (d->sysval == SM5_NAME_CLIP_DISTANCE) {
          loc = VARYING_SLOT_CLIP_DIST0;
+      } else if (d->sysval == SM5_NAME_RENDER_TARGET_ARRAY_INDEX) {
+         loc = VARYING_SLOT_LAYER;
+         type = glsl_int_type();
+         d->num_comps = 1;
+      } else if (d->sysval == SM5_NAME_VIEWPORT_ARRAY_INDEX) {
+         loc = VARYING_SLOT_VIEWPORT;
+         type = glsl_int_type();
+         d->num_comps = 1;
       } else {
          loc = VARYING_SLOT_VAR0 + (int)reg;
       }
+   } else if (c->stage == MESA_SHADER_TESS_CTRL ||
+              c->stage == MESA_SHADER_TESS_EVAL ||
+              c->stage == MESA_SHADER_GEOMETRY) {
+      bool is_int = false;
+      unsigned c_ov = 4;
+      loc = sm5_varying_loc_for_sysval(d->sysval, reg, &c_ov, &is_int);
+      const struct glsl_type *elem_t =
+         is_int ? glsl_int_type() : glsl_vec4_type();
+      unsigned arr_len = (c->stage == MESA_SHADER_GEOMETRY)
+                            ? MAX2(c->gs_vertices_in, 1u)
+                            : MAX2(c->hs_in_cp_count, 32u);
+      type = glsl_array_type(elem_t, arr_len, 0);
+      d->num_comps = is_int ? 1 : 4;
    }
 
    nir_variable *var =
@@ -384,11 +553,49 @@ sm5_get_input_var(struct sm5_ctx *c, uint32_t reg)
 }
 
 static nir_variable *
+sm5_get_output_var_tcs_cp(struct sm5_ctx *c, uint32_t reg)
+{
+   if (reg >= SM5_MAX_IO_REGS) {
+      sm5_fail(c, "output control point register out of range");
+      return NULL;
+   }
+   struct sm5_io_decl *d = &c->outputs[reg];
+   if (!d->shadow) {
+      char sname[24];
+      snprintf(sname, sizeof(sname), "cp_out_tmp_%u", reg);
+      d->shadow =
+         nir_local_variable_create(c->b.impl, glsl_uvec4_type(), sname);
+   }
+   if (!d->var) {
+      char vname[24];
+      snprintf(vname, sizeof(vname), "cp_out_%u", reg);
+      bool is_int = false;
+      unsigned c_ov = 4;
+      int loc = sm5_varying_loc_for_sysval(d->sysval, reg, &c_ov, &is_int);
+      unsigned cp_out = MAX2(c->hs_out_cp_count, 1u);
+      const struct glsl_type *type =
+         glsl_array_type(glsl_vec4_type(), cp_out, 0);
+      nir_variable *var =
+         nir_variable_create(c->nir, nir_var_shader_out, type, vname);
+      var->data.location = loc;
+      var->data.driver_location = reg;
+      d->num_comps = 4;
+      d->var = var;
+   }
+   return d->var;
+}
+
+static nir_variable *
 sm5_get_output_shadow(struct sm5_ctx *c, uint32_t reg)
 {
    if (reg >= SM5_MAX_IO_REGS) {
       sm5_fail(c, "output register index out of range");
       return NULL;
+   }
+   if (c->stage == MESA_SHADER_TESS_CTRL) {
+      if (!sm5_get_output_var_tcs_cp(c, reg))
+         return NULL;
+      return c->outputs[reg].shadow;
    }
    struct sm5_io_decl *d = &c->outputs[reg];
    if (!d->shadow) {
@@ -406,21 +613,19 @@ sm5_get_output_shadow(struct sm5_ctx *c, uint32_t reg)
       snprintf(vname, sizeof(vname), "out_%u", reg);
 
       int loc = 0;
-      if (c->stage == MESA_SHADER_VERTEX) {
-         if (d->sysval == SM5_NAME_POSITION) {
-            loc = VARYING_SLOT_POS;
-            comps = 4;
-         } else if (d->sysval == SM5_NAME_CLIP_DISTANCE) {
-            loc = VARYING_SLOT_CLIP_DIST0;
-         } else {
-            loc = VARYING_SLOT_VAR0 + (int)reg;
-         }
+      bool is_int = false;
+      if (c->stage == MESA_SHADER_VERTEX ||
+          c->stage == MESA_SHADER_TESS_EVAL ||
+          c->stage == MESA_SHADER_GEOMETRY) {
+         loc = sm5_varying_loc_for_sysval(d->sysval, reg, &comps, &is_int);
       } else if (c->stage == MESA_SHADER_FRAGMENT) {
          loc = FRAG_RESULT_DATA0 + (int)reg;
          comps = 4;
       }
       d->num_comps = (uint8_t)comps;
-      const struct glsl_type *type = glsl_vector_type(GLSL_TYPE_FLOAT, comps);
+      const struct glsl_type *type =
+         is_int ? glsl_vector_type(GLSL_TYPE_INT, comps)
+                : glsl_vector_type(GLSL_TYPE_FLOAT, comps);
       nir_variable *var =
          nir_variable_create(c->nir, nir_var_shader_out, type, vname);
       var->data.location = loc;
@@ -428,6 +633,207 @@ sm5_get_output_shadow(struct sm5_ctx *c, uint32_t reg)
       d->var = var;
    }
    return d->shadow;
+}
+
+static nir_def *
+sm5_load_ds_patch_reg(struct sm5_ctx *c, uint32_t reg)
+{
+   nir_builder *b = &c->b;
+   if (reg >= SM5_MAX_IO_REGS) {
+      sm5_fail(c, "patch constant input register out of range");
+      return nir_imm_ivec4(b, 0, 0, 0, 0);
+   }
+   struct sm5_patch_decl *p = &c->patch_io[reg];
+   bool any_tf = false;
+   bool is_in = false;
+   unsigned lane = 0;
+   for (unsigned k = 0; k < 4; ++k) {
+      if (sm5_tess_factor_slot(p->comp_sysval[k], &is_in, &lane))
+         any_tf = true;
+   }
+   if (!any_tf) {
+      nir_variable *v = sm5_get_patch_var(c, reg, false);
+      return v ? nir_load_var(b, v) : nir_imm_ivec4(b, 0, 0, 0, 0);
+   }
+
+   nir_def *patch_vec = NULL;
+   nir_def *outer_vec = NULL;
+   nir_def *inner_vec = NULL;
+   nir_def *ch[4];
+   for (unsigned k = 0; k < 4; ++k) {
+      if (sm5_tess_factor_slot(p->comp_sysval[k], &is_in, &lane)) {
+         if (is_in) {
+            if (!inner_vec)
+               inner_vec = nir_load_var(b, sm5_get_tess_level_var(c, true, false));
+            ch[k] = nir_channel(b, inner_vec, lane);
+         } else {
+            if (!outer_vec)
+               outer_vec = nir_load_var(b, sm5_get_tess_level_var(c, false, false));
+            ch[k] = nir_channel(b, outer_vec, lane);
+         }
+      } else if (p->mask & (1u << k)) {
+         if (!patch_vec) {
+            nir_variable *v = sm5_get_patch_var(c, reg, false);
+            patch_vec = v ? nir_load_var(b, v) : nir_imm_ivec4(b, 0, 0, 0, 0);
+         }
+         ch[k] = nir_channel(b, patch_vec, k);
+      } else {
+         ch[k] = nir_imm_int(b, 0);
+      }
+   }
+   return nir_vec(b, ch, 4);
+}
+
+static void
+sm5_flush_normal_outputs(struct sm5_ctx *c)
+{
+   nir_builder *b = &c->b;
+   for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
+      if (c->outputs[r].shadow && c->outputs[r].var) {
+         nir_def *v = nir_load_var(b, c->outputs[r].shadow);
+         nir_store_var(b, c->outputs[r].var,
+                       nir_trim_vector(b, v, c->outputs[r].num_comps),
+                       BITFIELD_MASK(c->outputs[r].num_comps));
+      }
+   }
+   if (c->odepth_shadow && c->odepth_var)
+      nir_store_var(b, c->odepth_var, nir_load_var(b, c->odepth_shadow), 1);
+   if (c->omask_shadow && c->omask_var)
+      nir_store_var(b, c->omask_var, nir_load_var(b, c->omask_shadow), 1);
+}
+
+static void
+sm5_hs_flush_cp_outputs(struct sm5_ctx *c)
+{
+   nir_builder *b = &c->b;
+   nir_def *inv_id = nir_load_invocation_id(b);
+   for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
+      if (c->outputs[r].shadow && c->outputs[r].var) {
+         nir_def *v = nir_load_var(b, c->outputs[r].shadow);
+         nir_deref_instr *deref = nir_build_deref_array(
+            b, nir_build_deref_var(b, c->outputs[r].var), inv_id);
+         nir_store_deref(b, deref, v, 0xf);
+      }
+   }
+}
+
+static void
+sm5_hs_emit_cp_barrier(struct sm5_ctx *c)
+{
+   if (c->hs_emitted_cp_barrier)
+      return;
+   nir_builder *b = &c->b;
+   if (!c->hs_had_cp_phase) {
+      /* Pass-through hull shader: copy input control points directly to output. */
+      nir_def *inv_id = nir_load_invocation_id(b);
+      for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
+         if (c->outputs[r].mask || c->outputs[r].declared) {
+            nir_variable *in_v = sm5_get_input_var(c, r);
+            nir_variable *out_v = sm5_get_output_var_tcs_cp(c, r);
+            if (in_v && out_v) {
+               nir_deref_instr *in_d = nir_build_deref_array(
+                  b, nir_build_deref_var(b, in_v), inv_id);
+               nir_deref_instr *out_d = nir_build_deref_array(
+                  b, nir_build_deref_var(b, out_v), inv_id);
+               nir_def *val = sm5_pad_to_4(b, nir_load_deref(b, in_d));
+               nir_store_deref(b, out_d, val, 0xf);
+            }
+         }
+      }
+   }
+   nir_barrier(b,
+               .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL |
+                                   NIR_MEMORY_MAKE_AVAILABLE |
+                                   NIR_MEMORY_MAKE_VISIBLE,
+               .memory_modes = nir_var_shader_out);
+   c->hs_emitted_cp_barrier = true;
+}
+
+static void
+sm5_hs_close_current_phase(struct sm5_ctx *c)
+{
+   nir_builder *b = &c->b;
+   if (c->hs_phase == SM5_HS_PHASE_CP) {
+      if (c->hs_phase_loop) {
+         if (!nir_block_ends_in_jump(nir_cursor_current_block(b->cursor))) {
+            sm5_hs_flush_cp_outputs(c);
+            nir_jump(b, nir_jump_break);
+         }
+         nir_pop_loop(b, c->hs_phase_loop);
+         c->hs_phase_loop = NULL;
+      }
+      sm5_hs_emit_cp_barrier(c);
+   } else if (c->hs_phase == SM5_HS_PHASE_FORK ||
+              c->hs_phase == SM5_HS_PHASE_JOIN) {
+      if (c->hs_phase_loop) {
+         if (!nir_block_ends_in_jump(nir_cursor_current_block(b->cursor)))
+            nir_jump(b, nir_jump_break);
+         nir_pop_loop(b, c->hs_phase_loop);
+         c->hs_phase_loop = NULL;
+      }
+      if (c->hs_outer_loop) {
+         nir_def *cur = nir_load_var(b, c->hs_inst_id_var);
+         nir_store_var(b, c->hs_inst_id_var, nir_iadd_imm(b, cur, 1), 0x1);
+         nir_pop_loop(b, c->hs_outer_loop);
+         c->hs_outer_loop = NULL;
+         c->hs_inst_id_var = NULL;
+      }
+   }
+   c->hs_phase = SM5_HS_PHASE_NONE;
+}
+
+static void
+sm5_hs_flush_patch_outputs(struct sm5_ctx *c)
+{
+   nir_builder *b = &c->b;
+   nir_def *outer_ch[4] = {
+      nir_imm_float(b, 0.0f), nir_imm_float(b, 0.0f),
+      nir_imm_float(b, 0.0f), nir_imm_float(b, 0.0f),
+   };
+   nir_def *inner_ch[2] = {
+      nir_imm_float(b, 0.0f), nir_imm_float(b, 0.0f),
+   };
+   uint8_t outer_mask = 0;
+   uint8_t inner_mask = 0;
+
+   for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
+      struct sm5_patch_decl *p = &c->patch_io[r];
+      if (!p->shadow)
+         continue;
+      nir_def *v = nir_load_var(b, p->shadow);
+      uint8_t user_mask = 0;
+      for (unsigned k = 0; k < 4; ++k) {
+         bool is_in = false;
+         unsigned lane = 0;
+         if (sm5_tess_factor_slot(p->comp_sysval[k], &is_in, &lane)) {
+            if (is_in) {
+               inner_ch[lane] = nir_channel(b, v, k);
+               inner_mask |= (uint8_t)(1u << lane);
+            } else {
+               outer_ch[lane] = nir_channel(b, v, k);
+               outer_mask |= (uint8_t)(1u << lane);
+            }
+         } else if (p->mask & (1u << k)) {
+            user_mask |= (uint8_t)(1u << k);
+         }
+      }
+      if (user_mask) {
+         nir_variable *pv = sm5_get_patch_var(c, r, true);
+         if (pv)
+            nir_store_var(b, pv, v, user_mask);
+      }
+   }
+
+   if (outer_mask) {
+      nir_variable *ov = sm5_get_tess_level_var(c, false, true);
+      nir_store_var(b, ov, nir_vec(b, outer_ch, 4), outer_mask);
+   }
+   if (inner_mask) {
+      nir_variable *iv = sm5_get_tess_level_var(c, true, true);
+      nir_store_var(b, iv, nir_vec(b, inner_ch, 2), inner_mask);
+   }
 }
 
 static nir_def *
@@ -534,6 +940,32 @@ sm5_load_src(struct sm5_ctx *c, const struct sm5_operand *op, bool is_int)
       break;
    }
    case SM5_OPERAND_INPUT: {
+      if (op->index_dim == 2 && c->stage == MESA_SHADER_GEOMETRY) {
+         nir_def *vtx = sm5_eval_index(c, &op->idx[0]);
+         if (!op->idx[1].has_rel) {
+            nir_variable *var = sm5_get_input_var(c, op->idx[1].imm);
+            if (!var)
+               return nir_imm_ivec4(b, 0, 0, 0, 0);
+            nir_deref_instr *deref = nir_build_deref_array(
+               b, nir_build_deref_var(b, var), vtx);
+            raw = nir_load_deref(b, deref);
+         } else {
+            nir_def *ridx = sm5_eval_index(c, &op->idx[1]);
+            raw = nir_imm_ivec4(b, 0, 0, 0, 0);
+            for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
+               if (!c->inputs[r].declared && !c->inputs[r].mask)
+                  continue;
+               nir_variable *var = sm5_get_input_var(c, r);
+               if (!var)
+                  continue;
+               nir_deref_instr *deref = nir_build_deref_array(
+                  b, nir_build_deref_var(b, var), vtx);
+               nir_def *val = sm5_pad_to_4(b, nir_load_deref(b, deref));
+               raw = nir_bcsel(b, nir_ieq_imm(b, ridx, (int32_t)r), val, raw);
+            }
+         }
+         break;
+      }
       uint32_t reg = op->idx[0].imm;
       if (reg >= SM5_MAX_IO_REGS) {
          sm5_fail(c, "input register out of range");
@@ -561,6 +993,101 @@ sm5_load_src(struct sm5_ctx *c, const struct sm5_operand *op, bool is_int)
       }
       break;
    }
+   case SM5_OPERAND_INPUT_CONTROL_POINT: {
+      nir_def *cp = sm5_eval_index(c, &op->idx[0]);
+      if (!op->idx[1].has_rel) {
+         nir_variable *var = sm5_get_input_var(c, op->idx[1].imm);
+         if (!var)
+            return nir_imm_ivec4(b, 0, 0, 0, 0);
+         nir_deref_instr *deref = nir_build_deref_array(
+            b, nir_build_deref_var(b, var), cp);
+         raw = nir_load_deref(b, deref);
+      } else {
+         nir_def *ridx = sm5_eval_index(c, &op->idx[1]);
+         raw = nir_imm_ivec4(b, 0, 0, 0, 0);
+         for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
+            if (!c->inputs[r].declared && !c->inputs[r].mask)
+               continue;
+            nir_variable *var = sm5_get_input_var(c, r);
+            if (!var)
+               continue;
+            nir_deref_instr *deref = nir_build_deref_array(
+               b, nir_build_deref_var(b, var), cp);
+            nir_def *val = sm5_pad_to_4(b, nir_load_deref(b, deref));
+            raw = nir_bcsel(b, nir_ieq_imm(b, ridx, (int32_t)r), val, raw);
+         }
+      }
+      break;
+   }
+   case SM5_OPERAND_OUTPUT_CONTROL_POINT: {
+      nir_def *cp = sm5_eval_index(c, &op->idx[0]);
+      if (!op->idx[1].has_rel) {
+         nir_variable *var = sm5_get_output_var_tcs_cp(c, op->idx[1].imm);
+         if (!var)
+            return nir_imm_ivec4(b, 0, 0, 0, 0);
+         nir_deref_instr *deref = nir_build_deref_array(
+            b, nir_build_deref_var(b, var), cp);
+         raw = nir_load_deref(b, deref);
+      } else {
+         nir_def *ridx = sm5_eval_index(c, &op->idx[1]);
+         raw = nir_imm_ivec4(b, 0, 0, 0, 0);
+         for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
+            if (!c->outputs[r].declared && !c->outputs[r].mask)
+               continue;
+            nir_variable *var = sm5_get_output_var_tcs_cp(c, r);
+            if (!var)
+               continue;
+            nir_deref_instr *deref = nir_build_deref_array(
+               b, nir_build_deref_var(b, var), cp);
+            nir_def *val = sm5_pad_to_4(b, nir_load_deref(b, deref));
+            raw = nir_bcsel(b, nir_ieq_imm(b, ridx, (int32_t)r), val, raw);
+         }
+      }
+      break;
+   }
+   case SM5_OPERAND_INPUT_PATCH_CONSTANT: {
+      if (c->stage == MESA_SHADER_TESS_CTRL) {
+         if (!op->idx[0].has_rel) {
+            nir_variable *sh = sm5_get_patch_shadow(c, op->idx[0].imm);
+            raw = sh ? nir_load_var(b, sh) : nir_imm_ivec4(b, 0, 0, 0, 0);
+         } else {
+            nir_def *ridx = sm5_eval_index(c, &op->idx[0]);
+            raw = nir_imm_ivec4(b, 0, 0, 0, 0);
+            for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
+               if (!c->patch_io[r].shadow)
+                  continue;
+               nir_def *val = nir_load_var(b, c->patch_io[r].shadow);
+               raw = nir_bcsel(b, nir_ieq_imm(b, ridx, (int32_t)r), val, raw);
+            }
+         }
+      } else {
+         if (!op->idx[0].has_rel) {
+            raw = sm5_load_ds_patch_reg(c, op->idx[0].imm);
+         } else {
+            nir_def *ridx = sm5_eval_index(c, &op->idx[0]);
+            raw = nir_imm_ivec4(b, 0, 0, 0, 0);
+            for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
+               if (!c->patch_io[r].declared && !c->patch_io[r].mask)
+                  continue;
+               nir_def *val = sm5_load_ds_patch_reg(c, r);
+               raw = nir_bcsel(b, nir_ieq_imm(b, ridx, (int32_t)r), val, raw);
+            }
+         }
+      }
+      break;
+   }
+   case SM5_OPERAND_INPUT_DOMAIN_POINT:
+      raw = nir_load_tess_coord(b);
+      break;
+   case SM5_OPERAND_OUTPUT_CONTROL_POINT_ID:
+   case SM5_OPERAND_INPUT_GS_INSTANCE_ID:
+      raw = nir_load_invocation_id(b);
+      break;
+   case SM5_OPERAND_INPUT_FORK_INSTANCE_ID:
+   case SM5_OPERAND_INPUT_JOIN_INSTANCE_ID:
+      raw = c->hs_inst_id_var ? nir_load_var(b, c->hs_inst_id_var)
+                              : nir_imm_int(b, 0);
+      break;
    case SM5_OPERAND_INPUT_PRIMITIVEID:
       raw = nir_load_primitive_id(b);
       break;
@@ -624,11 +1151,49 @@ sm5_store_dst(struct sm5_ctx *c, const struct sm5_operand *op, nir_def *val,
       break;
    }
    case SM5_OPERAND_OUTPUT: {
-      uint32_t reg = op->idx[0].imm;
-      nir_variable *shadow = sm5_get_output_shadow(c, reg);
-      if (!shadow)
-         return;
-      nir_store_var(b, shadow, v4, mask);
+      bool is_hs_patch = (c->stage == MESA_SHADER_TESS_CTRL &&
+                          (c->hs_phase == SM5_HS_PHASE_FORK ||
+                           c->hs_phase == SM5_HS_PHASE_JOIN));
+      if (is_hs_patch) {
+         if (!op->idx[0].has_rel) {
+            nir_variable *sh = sm5_get_patch_shadow(c, op->idx[0].imm);
+            if (!sh)
+               return;
+            nir_store_var(b, sh, v4, mask);
+         } else {
+            nir_def *ridx = sm5_eval_index(c, &op->idx[0]);
+            for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
+               if (!c->patch_io[r].declared && !c->patch_io[r].mask)
+                  continue;
+               nir_variable *sh = sm5_get_patch_shadow(c, r);
+               if (!sh)
+                  continue;
+               nir_push_if(b, nir_ieq_imm(b, ridx, (int32_t)r));
+               nir_store_var(b, sh, v4, mask);
+               nir_pop_if(b, NULL);
+            }
+         }
+         break;
+      }
+      if (!op->idx[0].has_rel) {
+         uint32_t reg = op->idx[0].imm;
+         nir_variable *shadow = sm5_get_output_shadow(c, reg);
+         if (!shadow)
+            return;
+         nir_store_var(b, shadow, v4, mask);
+      } else {
+         nir_def *ridx = sm5_eval_index(c, &op->idx[0]);
+         for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
+            if (!c->outputs[r].declared && !c->outputs[r].mask)
+               continue;
+            nir_variable *shadow = sm5_get_output_shadow(c, r);
+            if (!shadow)
+               continue;
+            nir_push_if(b, nir_ieq_imm(b, ridx, (int32_t)r));
+            nir_store_var(b, shadow, v4, mask);
+            nir_pop_if(b, NULL);
+         }
+      }
       break;
    }
    case SM5_OPERAND_OUTPUT_DEPTH:
@@ -1265,11 +1830,44 @@ sm5_emit_atomic(struct sm5_ctx *c, enum sm5_opcode opcode, bool has_ret)
       sm5_store_dst(c, &dst_ret, nir_replicate(b, res, 4), false);
 }
 
+static enum mesa_prim
+sm5_gs_in_prim_to_mesa(enum sm5_primitive p, uint32_t *verts_out)
+{
+   switch (p) {
+   case SM5_PRIM_POINT:        *verts_out = 1; return MESA_PRIM_POINTS;
+   case SM5_PRIM_LINE:         *verts_out = 2; return MESA_PRIM_LINES;
+   case SM5_PRIM_TRIANGLE:     *verts_out = 3; return MESA_PRIM_TRIANGLES;
+   case SM5_PRIM_LINE_ADJ:     *verts_out = 4; return MESA_PRIM_LINES_ADJACENCY;
+   case SM5_PRIM_TRIANGLE_ADJ: *verts_out = 6; return MESA_PRIM_TRIANGLES_ADJACENCY;
+   default:
+      if (p >= SM5_PRIM_1_CP_PATCH && p <= SM5_PRIM_32_CP_PATCH) {
+         *verts_out = (uint32_t)(p - SM5_PRIM_1_CP_PATCH + 1);
+         return MESA_PRIM_PATCHES;
+      }
+      *verts_out = 1;
+      return MESA_PRIM_POINTS;
+   }
+}
+
+static enum mesa_prim
+sm5_gs_out_topo_to_mesa(enum sm5_primitive_topology t)
+{
+   switch (t) {
+   case SM5_PRIM_TOPO_POINTLIST:    return MESA_PRIM_POINTS;
+   case SM5_PRIM_TOPO_LINELIST:
+   case SM5_PRIM_TOPO_LINESTRIP:    return MESA_PRIM_LINE_STRIP;
+   case SM5_PRIM_TOPO_TRIANGLELIST:
+   case SM5_PRIM_TOPO_TRIANGLESTRIP:
+   default:                         return MESA_PRIM_TRIANGLE_STRIP;
+   }
+}
+
 /* Pre-scan declarations and detect whether any non-final RET/RETC exists. */
 static bool
 sm5_prescan(struct sm5_ctx *c)
 {
    size_t pos = 2;
+   int cur_hs_phase = -1;
    while (pos < c->num_dwords) {
       uint32_t tok0 = c->code[pos];
       enum sm5_opcode op = sm5_decode_opcode(tok0);
@@ -1304,6 +1902,30 @@ sm5_prescan(struct sm5_ctx *c)
 
       if (op == SM5_OP_RETC || (op == SM5_OP_RET && pos + inst_len < c->num_dwords))
          c->has_early_ret = true;
+
+      if (op == SM5_OP_DCL_INPUT_CONTROL_POINT_COUNT) {
+         c->hs_in_cp_count = sm5_decode_cp_count(tok0);
+      } else if (op == SM5_OP_DCL_OUTPUT_CONTROL_POINT_COUNT) {
+         c->hs_out_cp_count = MAX2(sm5_decode_cp_count(tok0), 1u);
+      } else if (op == SM5_OP_DCL_GS_INPUT_PRIMITIVE) {
+         uint32_t vin = 1;
+         sm5_gs_in_prim_to_mesa(sm5_decode_gs_input_prim(tok0), &vin);
+         c->gs_vertices_in = vin;
+      } else if (op == SM5_OP_HS_FORK_PHASE || op == SM5_OP_HS_JOIN_PHASE) {
+         if (c->hs_prescan_phases < SM5_MAX_HS_PHASES) {
+            cur_hs_phase = (int)c->hs_prescan_phases;
+            c->hs_phase_inst_counts[cur_hs_phase] = 1u;
+            c->hs_prescan_phases++;
+         } else {
+            cur_hs_phase = -1;
+         }
+      } else if (op == SM5_OP_HS_CONTROL_POINT_PHASE || op == SM5_OP_HS_DECLS) {
+         cur_hs_phase = -1;
+      } else if ((op == SM5_OP_DCL_HS_FORK_PHASE_INSTANCE_COUNT ||
+                  op == SM5_OP_DCL_HS_JOIN_PHASE_INSTANCE_COUNT) &&
+                 cur_hs_phase >= 0 && pos + 1 < c->num_dwords) {
+         c->hs_phase_inst_counts[cur_hs_phase] = MAX2(c->code[pos + 1], 1u);
+      }
 
       pos += inst_len;
    }
@@ -1374,10 +1996,170 @@ sm5_translate_inst(struct sm5_ctx *c)
    /* --- Declarations --- */
    case SM5_OP_DCL_GLOBAL_FLAGS:
    case SM5_OP_DCL_INDEX_RANGE:
+   case SM5_OP_DCL_HS_MAX_TESSFACTOR:
+   case SM5_OP_DCL_HS_FORK_PHASE_INSTANCE_COUNT:
+   case SM5_OP_DCL_HS_JOIN_PHASE_INSTANCE_COUNT:
    case SM5_OP_NOP:
    case SM5_OP_ABORT:
    case SM5_OP_DEBUG_BREAK:
       break;
+
+   /* --- Hull / Domain / Geometry Shader Phase & Metadata Declarations --- */
+   case SM5_OP_HS_DECLS:
+      c->hs_phase = SM5_HS_PHASE_DECLS;
+      break;
+
+   case SM5_OP_HS_CONTROL_POINT_PHASE:
+      if (c->cf_depth != 0) {
+         sm5_fail(c, "unclosed control flow before hs_control_point_phase");
+         return false;
+      }
+      sm5_hs_close_current_phase(c);
+      c->hs_had_cp_phase = true;
+      c->hs_phase = SM5_HS_PHASE_CP;
+      c->hs_phase_loop = nir_push_loop(b);
+      break;
+
+   case SM5_OP_HS_FORK_PHASE:
+   case SM5_OP_HS_JOIN_PHASE: {
+      if (c->cf_depth != 0) {
+         sm5_fail(c, "unclosed control flow before hs fork/join phase");
+         return false;
+      }
+      sm5_hs_close_current_phase(c);
+      sm5_hs_emit_cp_barrier(c);
+      if (!c->hs_patch_if) {
+         c->hs_patch_if =
+            nir_push_if(b, nir_ieq_imm(b, nir_load_invocation_id(b), 0));
+      }
+      uint32_t inst_count = (c->hs_phase_idx < SM5_MAX_HS_PHASES)
+                               ? c->hs_phase_inst_counts[c->hs_phase_idx]
+                               : 1u;
+      c->hs_phase_idx++;
+      if (inst_count > 1u) {
+         char lname[32];
+         snprintf(lname, sizeof(lname), "hs_inst_id_%u", c->hs_phase_idx);
+         c->hs_inst_id_var =
+            nir_local_variable_create(b->impl, glsl_uint_type(), lname);
+         nir_store_var(b, c->hs_inst_id_var, nir_imm_int(b, 0), 0x1);
+         c->hs_outer_loop = nir_push_loop(b);
+         nir_def *cur = nir_load_var(b, c->hs_inst_id_var);
+         nir_push_if(b, nir_uge_imm(b, cur, inst_count));
+         nir_jump(b, nir_jump_break);
+         nir_pop_if(b, NULL);
+      } else {
+         c->hs_inst_id_var = NULL;
+      }
+      c->hs_phase_loop = nir_push_loop(b);
+      c->hs_phase = (op == SM5_OP_HS_FORK_PHASE) ? SM5_HS_PHASE_FORK
+                                                 : SM5_HS_PHASE_JOIN;
+      break;
+   }
+
+   case SM5_OP_DCL_INPUT_CONTROL_POINT_COUNT:
+      c->hs_in_cp_count = sm5_decode_cp_count(tok0);
+      break;
+
+   case SM5_OP_DCL_OUTPUT_CONTROL_POINT_COUNT:
+      c->hs_out_cp_count = MAX2(sm5_decode_cp_count(tok0), 1u);
+      c->nir->info.tess.tcs_vertices_out = c->hs_out_cp_count;
+      break;
+
+   case SM5_OP_DCL_TESS_DOMAIN: {
+      switch (sm5_decode_tess_domain(tok0)) {
+      case SM5_TESS_DOMAIN_ISOLINE:
+         c->nir->info.tess._primitive_mode = TESS_PRIMITIVE_ISOLINES;
+         break;
+      case SM5_TESS_DOMAIN_TRI:
+         c->nir->info.tess._primitive_mode = TESS_PRIMITIVE_TRIANGLES;
+         break;
+      case SM5_TESS_DOMAIN_QUAD:
+         c->nir->info.tess._primitive_mode = TESS_PRIMITIVE_QUADS;
+         break;
+      default:
+         break;
+      }
+      break;
+   }
+
+   case SM5_OP_DCL_TESS_PARTITIONING: {
+      switch (sm5_decode_tess_partitioning(tok0)) {
+      case SM5_TESS_PART_INTEGER:
+      case SM5_TESS_PART_POW2:
+         c->nir->info.tess.spacing = TESS_SPACING_EQUAL;
+         break;
+      case SM5_TESS_PART_FRACTIONAL_ODD:
+         c->nir->info.tess.spacing = TESS_SPACING_FRACTIONAL_ODD;
+         break;
+      case SM5_TESS_PART_FRACTIONAL_EVEN:
+         c->nir->info.tess.spacing = TESS_SPACING_FRACTIONAL_EVEN;
+         break;
+      default:
+         break;
+      }
+      break;
+   }
+
+   case SM5_OP_DCL_TESS_OUTPUT_PRIMITIVE: {
+      switch (sm5_decode_tess_output_prim(tok0)) {
+      case SM5_TESS_OUT_POINT:
+         c->nir->info.tess.point_mode = true;
+         break;
+      case SM5_TESS_OUT_LINE:
+         c->nir->info.tess.point_mode = false;
+         break;
+      case SM5_TESS_OUT_TRIANGLE_CW:
+         c->nir->info.tess.point_mode = false;
+         c->nir->info.tess.ccw = false;
+         break;
+      case SM5_TESS_OUT_TRIANGLE_CCW:
+         c->nir->info.tess.point_mode = false;
+         c->nir->info.tess.ccw = true;
+         break;
+      default:
+         break;
+      }
+      break;
+   }
+
+   case SM5_OP_DCL_GS_INPUT_PRIMITIVE: {
+      uint32_t vin = 1;
+      c->nir->info.gs.input_primitive =
+         sm5_gs_in_prim_to_mesa(sm5_decode_gs_input_prim(tok0), &vin);
+      c->nir->info.gs.vertices_in = (uint8_t)vin;
+      c->gs_vertices_in = vin;
+      break;
+   }
+
+   case SM5_OP_DCL_GS_OUTPUT_PRIMITIVE_TOPOLOGY: {
+      c->nir->info.gs.output_primitive =
+         sm5_gs_out_topo_to_mesa(sm5_decode_gs_output_topo(tok0));
+      break;
+   }
+
+   case SM5_OP_DCL_MAX_OUTPUT_VERTEX_COUNT: {
+      uint32_t max_v = 0;
+      if (!sm5_read_u32(c, &max_v))
+         return false;
+      c->nir->info.gs.vertices_out = (uint16_t)max_v;
+      break;
+   }
+
+   case SM5_OP_DCL_GS_INSTANCE_COUNT: {
+      uint32_t invs = 1;
+      if (!sm5_read_u32(c, &invs))
+         return false;
+      c->nir->info.gs.invocations = (uint8_t)MAX2(invs, 1u);
+      break;
+   }
+
+   case SM5_OP_DCL_STREAM: {
+      if (!sm5_parse_operand(c, &s0))
+         return false;
+      c->gs_cur_stream = s0.idx[0].imm & 3u;
+      c->nir->info.gs.active_stream_mask |= (uint8_t)(1u << c->gs_cur_stream);
+      break;
+   }
 
    case SM5_OP_DCL_TEMPS: {
       uint32_t count = 0;
@@ -1575,15 +2357,51 @@ sm5_translate_inst(struct sm5_ctx *c)
          if (!sm5_read_u32(c, &sv_tok))
             return false;
       }
-      if (s0.type == SM5_OPERAND_INPUT && s0.idx[0].imm < SM5_MAX_IO_REGS) {
+      if (s0.type == SM5_OPERAND_INPUT) {
+         uint32_t reg = (s0.index_dim == 2) ? s0.idx[1].imm : s0.idx[0].imm;
+         if (s0.index_dim == 2 && s0.idx[0].imm > 0 && c->gs_vertices_in == 0)
+            c->gs_vertices_in = s0.idx[0].imm;
+         if (reg < SM5_MAX_IO_REGS) {
+            c->inputs[reg].declared = true;
+            c->inputs[reg].mask |= s0.write_mask;
+            if (sv_tok)
+               c->inputs[reg].sysval = (enum sm5_sysval_name)(sv_tok & 0xffffu);
+            if (op == SM5_OP_DCL_INPUT_PS || op == SM5_OP_DCL_INPUT_PS_SGV ||
+                op == SM5_OP_DCL_INPUT_PS_SIV)
+               c->inputs[reg].interp = sm5_decode_interp_mode(tok0);
+         }
+      } else if (s0.type == SM5_OPERAND_INPUT_CONTROL_POINT) {
+         uint32_t reg = (s0.index_dim == 2) ? s0.idx[1].imm : s0.idx[0].imm;
+         if (s0.index_dim == 2 && s0.idx[0].imm > 0 && c->hs_in_cp_count == 0)
+            c->hs_in_cp_count = s0.idx[0].imm;
+         if (reg < SM5_MAX_IO_REGS) {
+            c->inputs[reg].declared = true;
+            c->inputs[reg].mask |= s0.write_mask;
+            if (sv_tok)
+               c->inputs[reg].sysval = (enum sm5_sysval_name)(sv_tok & 0xffffu);
+         }
+      } else if (s0.type == SM5_OPERAND_OUTPUT_CONTROL_POINT) {
+         uint32_t reg = (s0.index_dim == 2) ? s0.idx[1].imm : s0.idx[0].imm;
+         if (reg < SM5_MAX_IO_REGS) {
+            c->outputs[reg].declared = true;
+            c->outputs[reg].mask |= s0.write_mask;
+            if (sv_tok)
+               c->outputs[reg].sysval = (enum sm5_sysval_name)(sv_tok & 0xffffu);
+         }
+      } else if (s0.type == SM5_OPERAND_INPUT_PATCH_CONSTANT) {
          uint32_t reg = s0.idx[0].imm;
-         c->inputs[reg].declared = true;
-         c->inputs[reg].mask |= s0.write_mask;
-         if (sv_tok)
-            c->inputs[reg].sysval = (enum sm5_sysval_name)(sv_tok & 0xffffu);
-         if (op == SM5_OP_DCL_INPUT_PS || op == SM5_OP_DCL_INPUT_PS_SGV ||
-             op == SM5_OP_DCL_INPUT_PS_SIV)
-            c->inputs[reg].interp = sm5_decode_interp_mode(tok0);
+         if (reg < SM5_MAX_IO_REGS) {
+            uint8_t m = s0.write_mask ? s0.write_mask : 0xfu;
+            c->patch_io[reg].declared = true;
+            c->patch_io[reg].mask |= m;
+            if (sv_tok) {
+               enum sm5_sysval_name sv = (enum sm5_sysval_name)(sv_tok & 0xffffu);
+               for (unsigned k = 0; k < 4; ++k) {
+                  if (m & (1u << k))
+                     c->patch_io[reg].comp_sysval[k] = sv;
+               }
+            }
+         }
       }
       break;
    }
@@ -1600,10 +2418,26 @@ sm5_translate_inst(struct sm5_ctx *c)
       }
       if (s0.type == SM5_OPERAND_OUTPUT && s0.idx[0].imm < SM5_MAX_IO_REGS) {
          uint32_t reg = s0.idx[0].imm;
-         c->outputs[reg].declared = true;
-         c->outputs[reg].mask |= s0.write_mask;
-         if (sv_tok)
-            c->outputs[reg].sysval = (enum sm5_sysval_name)(sv_tok & 0xffffu);
+         bool is_hs_patch = (c->stage == MESA_SHADER_TESS_CTRL &&
+                             (c->hs_phase == SM5_HS_PHASE_FORK ||
+                              c->hs_phase == SM5_HS_PHASE_JOIN));
+         if (is_hs_patch) {
+            uint8_t m = s0.write_mask ? s0.write_mask : 0xfu;
+            c->patch_io[reg].declared = true;
+            c->patch_io[reg].mask |= m;
+            if (sv_tok) {
+               enum sm5_sysval_name sv = (enum sm5_sysval_name)(sv_tok & 0xffffu);
+               for (unsigned k = 0; k < 4; ++k) {
+                  if (m & (1u << k))
+                     c->patch_io[reg].comp_sysval[k] = sv;
+               }
+            }
+         } else {
+            c->outputs[reg].declared = true;
+            c->outputs[reg].mask |= s0.write_mask;
+            if (sv_tok)
+               c->outputs[reg].sysval = (enum sm5_sysval_name)(sv_tok & 0xffffu);
+         }
       }
       break;
    }
@@ -2411,22 +3245,57 @@ sm5_translate_inst(struct sm5_ctx *c)
       nir_pop_loop(b, f->loop);
       break;
    }
+   /* --- Geometry Shader Emit / Cut --- */
+   case SM5_OP_EMIT:
+   case SM5_OP_EMIT_STREAM: {
+      unsigned stream = 0;
+      if (op == SM5_OP_EMIT_STREAM) {
+         if (!sm5_parse_operand(c, &s0))
+            return false;
+         stream = s0.idx[0].imm & 3u;
+      }
+      sm5_flush_normal_outputs(c);
+      nir_emit_vertex(b, stream);
+      c->nir->info.gs.active_stream_mask |= (uint8_t)(1u << stream);
+      break;
+   }
+   case SM5_OP_CUT:
+   case SM5_OP_CUT_STREAM: {
+      unsigned stream = 0;
+      if (op == SM5_OP_CUT_STREAM) {
+         if (!sm5_parse_operand(c, &s0))
+            return false;
+         stream = s0.idx[0].imm & 3u;
+      }
+      nir_end_primitive(b, stream);
+      c->nir->info.gs.active_stream_mask |= (uint8_t)(1u << stream);
+      break;
+   }
+   case SM5_OP_EMITTHENCUT:
+   case SM5_OP_EMITTHENCUT_STREAM: {
+      unsigned stream = 0;
+      if (op == SM5_OP_EMITTHENCUT_STREAM) {
+         if (!sm5_parse_operand(c, &s0))
+            return false;
+         stream = s0.idx[0].imm & 3u;
+      }
+      sm5_flush_normal_outputs(c);
+      nir_emit_vertex(b, stream);
+      nir_end_primitive(b, stream);
+      c->nir->info.gs.active_stream_mask |= (uint8_t)(1u << stream);
+      break;
+   }
+
    case SM5_OP_RET: {
-      if (inst_end < c->num_dwords) {
-         /* Early return: flush accumulated outputs first, then jump return.
+      if (c->stage == MESA_SHADER_TESS_CTRL && c->hs_phase_loop) {
+         if (c->hs_phase == SM5_HS_PHASE_CP)
+            sm5_hs_flush_cp_outputs(c);
+         nir_jump(b, nir_jump_break);
+      } else if (inst_end < c->num_dwords) {
+         /* Early return: flush accumulated outputs first (except GS), then jump return.
           * nir_lower_returns() lowers this cleanly at the end of translation. */
-         for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
-            if (c->outputs[r].shadow && c->outputs[r].var) {
-               nir_def *v = nir_load_var(b, c->outputs[r].shadow);
-               nir_store_var(b, c->outputs[r].var,
-                             nir_trim_vector(b, v, c->outputs[r].num_comps),
-                             BITFIELD_MASK(c->outputs[r].num_comps));
-            }
-         }
-         if (c->odepth_shadow && c->odepth_var)
-            nir_store_var(b, c->odepth_var, nir_load_var(b, c->odepth_shadow), 1);
-         if (c->omask_shadow && c->omask_var)
-            nir_store_var(b, c->omask_var, nir_load_var(b, c->omask_shadow), 1);
+         if (c->stage != MESA_SHADER_GEOMETRY)
+            sm5_flush_normal_outputs(c);
          nir_jump(b, nir_jump_return);
       }
       break;
@@ -2438,19 +3307,15 @@ sm5_translate_inst(struct sm5_ctx *c)
       nir_def *cond = sm5_decode_test_nz(tok0) ? nir_ine_imm(b, v, 0)
                                                : nir_ieq_imm(b, v, 0);
       nir_push_if(b, cond);
-      for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
-         if (c->outputs[r].shadow && c->outputs[r].var) {
-            nir_def *ov = nir_load_var(b, c->outputs[r].shadow);
-            nir_store_var(b, c->outputs[r].var,
-                          nir_trim_vector(b, ov, c->outputs[r].num_comps),
-                          BITFIELD_MASK(c->outputs[r].num_comps));
-         }
+      if (c->stage == MESA_SHADER_TESS_CTRL && c->hs_phase_loop) {
+         if (c->hs_phase == SM5_HS_PHASE_CP)
+            sm5_hs_flush_cp_outputs(c);
+         nir_jump(b, nir_jump_break);
+      } else {
+         if (c->stage != MESA_SHADER_GEOMETRY)
+            sm5_flush_normal_outputs(c);
+         nir_jump(b, nir_jump_return);
       }
-      if (c->odepth_shadow && c->odepth_var)
-         nir_store_var(b, c->odepth_var, nir_load_var(b, c->odepth_shadow), 1);
-      if (c->omask_shadow && c->omask_var)
-         nir_store_var(b, c->omask_var, nir_load_var(b, c->omask_shadow), 1);
-      nir_jump(b, nir_jump_return);
       nir_pop_if(b, NULL);
       break;
    }
@@ -2469,13 +3334,15 @@ sm5_translate_inst(struct sm5_ctx *c)
 }
 
 nir_shader *
-aurora_sm5_to_nir(const uint32_t *code, size_t max_dwords,
-                  const struct aurora_sm5_sig_elem *in_sig,
-                  unsigned num_in_sig,
-                  const struct aurora_sm5_sig_elem *out_sig,
-                  unsigned num_out_sig,
-                  const nir_shader_compiler_options *options,
-                  struct aurora_sm5_info *info_out)
+aurora_sm5_to_nir_ex(const uint32_t *code, size_t max_dwords,
+                     const struct aurora_sm5_sig_elem *in_sig,
+                     unsigned num_in_sig,
+                     const struct aurora_sm5_sig_elem *out_sig,
+                     unsigned num_out_sig,
+                     const struct aurora_sm5_sig_elem *patch_sig,
+                     unsigned num_patch_sig,
+                     const nir_shader_compiler_options *options,
+                     struct aurora_sm5_info *info_out)
 {
    if (!code || max_dwords < 2 || !options)
       return NULL;
@@ -2487,9 +3354,12 @@ aurora_sm5_to_nir(const uint32_t *code, size_t max_dwords,
 
    mesa_shader_stage stage;
    switch (sm5_decode_prog_type(ver_tok)) {
-   case SM5_PROG_VS: stage = MESA_SHADER_VERTEX;   break;
-   case SM5_PROG_PS: stage = MESA_SHADER_FRAGMENT; break;
-   case SM5_PROG_CS: stage = MESA_SHADER_COMPUTE;  break;
+   case SM5_PROG_VS: stage = MESA_SHADER_VERTEX;    break;
+   case SM5_PROG_PS: stage = MESA_SHADER_FRAGMENT;  break;
+   case SM5_PROG_GS: stage = MESA_SHADER_GEOMETRY;  break;
+   case SM5_PROG_HS: stage = MESA_SHADER_TESS_CTRL; break;
+   case SM5_PROG_DS: stage = MESA_SHADER_TESS_EVAL; break;
+   case SM5_PROG_CS: stage = MESA_SHADER_COMPUTE;   break;
    default:
       fprintf(stderr, "aurora_sm5_to_nir: unsupported shader type %u\n",
               (unsigned)sm5_decode_prog_type(ver_tok));
@@ -2512,9 +3382,16 @@ aurora_sm5_to_nir(const uint32_t *code, size_t max_dwords,
    if (stage == MESA_SHADER_FRAGMENT) {
       c->nir->info.fs.origin_upper_left = true;
       c->nir->info.fs.pixel_center_integer = false;
+   } else if (stage == MESA_SHADER_TESS_CTRL) {
+      c->hs_out_cp_count = 1;
+      c->nir->info.tess.tcs_vertices_out = 1;
+   } else if (stage == MESA_SHADER_GEOMETRY) {
+      c->gs_vertices_in = 1;
+      c->nir->info.gs.invocations = 1;
+      c->nir->info.gs.active_stream_mask = 1;
    }
 
-   /* Seed input/output signatures so sysvals & masks are known even before DCLs. */
+   /* Seed input/output/patch signatures so sysvals & masks are known even before DCLs. */
    for (unsigned i = 0; i < num_in_sig; ++i) {
       uint32_t reg = in_sig[i].reg;
       if (reg < SM5_MAX_IO_REGS) {
@@ -2529,6 +3406,20 @@ aurora_sm5_to_nir(const uint32_t *code, size_t max_dwords,
          c->outputs[reg].mask |= out_sig[i].mask;
          if (out_sig[i].sysval)
             c->outputs[reg].sysval = (enum sm5_sysval_name)out_sig[i].sysval;
+      }
+   }
+   for (unsigned i = 0; i < num_patch_sig; ++i) {
+      uint32_t reg = patch_sig[i].reg;
+      if (reg < SM5_MAX_IO_REGS) {
+         uint8_t m = patch_sig[i].mask ? patch_sig[i].mask : 0xfu;
+         c->patch_io[reg].mask |= m;
+         if (patch_sig[i].sysval) {
+            enum sm5_sysval_name sv = (enum sm5_sysval_name)patch_sig[i].sysval;
+            for (unsigned k = 0; k < 4; ++k) {
+               if (m & (1u << k))
+                  c->patch_io[reg].comp_sysval[k] = sv;
+            }
+         }
       }
    }
 
@@ -2561,20 +3452,18 @@ aurora_sm5_to_nir(const uint32_t *code, size_t max_dwords,
       goto fail;
    }
 
-   /* Flush accumulated shadow outputs to shader output variables. */
-   if (!nir_block_ends_in_jump(nir_cursor_current_block(c->b.cursor))) {
-      for (unsigned r = 0; r < SM5_MAX_IO_REGS; ++r) {
-         if (c->outputs[r].shadow && c->outputs[r].var) {
-            nir_def *v = nir_load_var(&c->b, c->outputs[r].shadow);
-            nir_store_var(&c->b, c->outputs[r].var,
-                          nir_trim_vector(&c->b, v, c->outputs[r].num_comps),
-                          BITFIELD_MASK(c->outputs[r].num_comps));
-         }
+   if (stage == MESA_SHADER_TESS_CTRL) {
+      sm5_hs_close_current_phase(c);
+      sm5_hs_emit_cp_barrier(c);
+      if (c->hs_patch_if) {
+         sm5_hs_flush_patch_outputs(c);
+         nir_pop_if(&c->b, c->hs_patch_if);
+         c->hs_patch_if = NULL;
       }
-      if (c->odepth_shadow && c->odepth_var)
-         nir_store_var(&c->b, c->odepth_var, nir_load_var(&c->b, c->odepth_shadow), 1);
-      if (c->omask_shadow && c->omask_var)
-         nir_store_var(&c->b, c->omask_var, nir_load_var(&c->b, c->omask_shadow), 1);
+   } else if (stage != MESA_SHADER_GEOMETRY) {
+      /* Flush accumulated shadow outputs to shader output variables. */
+      if (!nir_block_ends_in_jump(nir_cursor_current_block(c->b.cursor)))
+         sm5_flush_normal_outputs(c);
    }
 
    /* Clean up NIR into SSA ready for Gallium Asahi (agx_shader_initialize runs

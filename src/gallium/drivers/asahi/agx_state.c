@@ -283,8 +283,14 @@ static bool
 agx_front_face_ccw(const struct agx_context *ctx)
 {
    bool ccw = ctx->rast->base.front_ccw;
-   if (ctx->in_tess && !ctx->gs)
-      ccw ^= !ctx->stage[MESA_SHADER_TESS_EVAL].shader->tess.ccw;
+   if (ctx->in_tess && !ctx->gs) {
+      struct agx_uncompiled_shader *tcs =
+         ctx->stage[MESA_SHADER_TESS_CTRL].shader;
+      struct agx_uncompiled_shader *tes =
+         ctx->stage[MESA_SHADER_TESS_EVAL].shader;
+      bool tess_ccw = tes->tess.ccw || (tcs && tcs->tess.ccw);
+      ccw ^= !tess_ccw;
+   }
    return ccw;
 }
 
@@ -14427,8 +14433,8 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
       .first_patch = ctx->tess_split.first_patch,
    };
 
-   if (!point_mode && tes->tess.primitive != TESS_PRIMITIVE_ISOLINES) {
-      params.ccw = !tes->tess.ccw;
+   if (!point_mode && mode != TESS_PRIMITIVE_ISOLINES) {
+      params.ccw = !(tes->tess.ccw || tcs->tess.ccw);
    }
 
    memcpy(&params.tess_level_outer_default, ctx->default_outer_level,
