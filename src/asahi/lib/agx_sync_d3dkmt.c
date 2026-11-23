@@ -611,8 +611,15 @@ d3dkmt_syncobj_transfer(struct util_sync_provider *p, uint32_t dst_handle,
    }
 
    uint64_t src_value, dst_value;
-   agx_d3dkmt_sync_transfer_values(src, dst, src_point, dst_point,
-                                   &src_value, &dst_value);
+   if (dst_point == 0) {
+      /* Compute src_value before advancing dst->base (handles src == dst). */
+      src_value = src_point ? src_point : agx_d3dkmt_binary_wait_value(src);
+      dst->base = agx_d3dkmt_binary_reset_base(dst);
+      dst_value = agx_d3dkmt_binary_signal_value(dst, NULL);
+   } else {
+      agx_d3dkmt_sync_transfer_values(src, dst, src_point, dst_point,
+                                      &src_value, &dst_value);
+   }
    src_kmt = src->kmt;
    dst_kmt = dst->kmt;
    ctx = xfer_context(ws);

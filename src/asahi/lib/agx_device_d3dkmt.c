@@ -555,6 +555,8 @@ d3dkmt_adopt_allocation(
    }
 
    assert(!memcmp(bo, &((struct agx_bo){}), sizeof(*bo)));
+   if (record->cpu_mapping_forbidden)
+      flags |= AGX_BO_NO_CPU_MAP;
    bo->dev = dev;
    bo->size = size;
    bo->align = align;
@@ -2104,9 +2106,17 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
          goto out;
       }
 
-      uint64_t v = src->sync_type == DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ
-                      ? src->timeline_value
-                      : agx_d3dkmt_binary_signal_value(e, NULL);
+      uint64_t v;
+      if (src->sync_type == DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ) {
+         v = src->timeline_value;
+      } else {
+         /* DRM binary out_sync replaces any prior fence without requiring an
+          * explicit reset (drm_syncobj_replace_fence). Advance the epoch past
+          * any signaled or in-flight value so reused batch syncobjs block
+          * until this submission retires. */
+         e->base = agx_d3dkmt_binary_reset_base(e);
+         v = agx_d3dkmt_binary_signal_value(e, NULL);
+      }
 
       signals[n_sig] = e->kmt;
       signal_values[n_sig] = v;

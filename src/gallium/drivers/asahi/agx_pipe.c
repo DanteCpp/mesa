@@ -1183,19 +1183,23 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
       }
    }
 
-   /* Can't map tiled/compressed directly */
-   if ((usage & PIPE_MAP_DIRECTLY) && rsrc->modifier != DRM_FORMAT_MOD_LINEAR)
+   /* Can't map tiled/compressed or non-CPU-visible BOs directly */
+   if ((usage & PIPE_MAP_DIRECTLY) &&
+       (rsrc->modifier != DRM_FORMAT_MOD_LINEAR ||
+        (rsrc->bo && (rsrc->bo->flags & AGX_BO_NO_CPU_MAP))))
       return NULL;
 
    /* Can't transfer out of bounds mip levels */
    if (level >= rsrc->layout.levels)
       return NULL;
 
-   /* For compression, we use a staging blit as we do not implement AGX
-    * compression in software. In some cases, we could use this path for
-    * twiddled too, but we don't have a use case for that yet.
+   /* For compression (and non-CPU-visible D3DKMT Local-Segment shared/primary
+    * textures), use a CPU-visible staging BO + GPU blit.
     */
-   bool staging_blit = ail_is_level_logically_compressed(&rsrc->layout, level);
+   bool staging_blit =
+      ail_is_level_logically_compressed(&rsrc->layout, level) ||
+      (resource->target != PIPE_BUFFER && rsrc->bo &&
+       (rsrc->bo->flags & AGX_BO_NO_CPU_MAP) != 0);
 
    agx_prepare_for_map(ctx, rsrc, level, usage, box, staging_blit);
 
@@ -1323,7 +1327,8 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
       uint32_t offset =
          ail_get_linear_pixel_B(&rsrc->layout, level, box->x, box->y, box->z);
 
-      return ((uint8_t *)agx_bo_map(rsrc->bo)) + offset;
+      uint8_t *base = (uint8_t *)agx_bo_map(rsrc->bo);
+      return base ? (base + offset) : NULL;
    }
 }
 
@@ -1342,6 +1347,7 @@ agx_texture_subdata(struct pipe_context *pctx, struct pipe_resource *prsrc,
    if (prsrc->target == PIPE_BUFFER || level >= rsrc->layout.levels ||
        prsrc->nr_samples > 1 ||
        util_format_is_depth_or_stencil(prsrc->format) ||
+       (rsrc->bo && (rsrc->bo->flags & AGX_BO_NO_CPU_MAP)) ||
        !ail_is_level_twiddled_uncompressed(&rsrc->layout, level)) {
       u_default_texture_subdata(pctx, prsrc, level, usage, box, data, stride,
                                 layer_stride);

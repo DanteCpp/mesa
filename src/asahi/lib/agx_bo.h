@@ -65,6 +65,11 @@ enum agx_bo_flags {
     * read/write range caps on non-primary shared surfaces.
     */
    AGX_BO_PRIMARY = 1 << 10,
+
+   /* Windows D3DKMT only: allocation is in a non-CPU-visible segment
+    * (AGXW_ALLOC_NO_CPU_MAP), so CPU maps/subdata must stage via GPU blit.
+    */
+   AGX_BO_NO_CPU_MAP = 1 << 11,
 };
 
 enum agx_va_flags {

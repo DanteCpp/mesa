@@ -221,16 +221,19 @@ agx_bridge_vma_register(struct agx_device *dev, uint64_t main_start,
                         uint64_t main_size, uint64_t usc_start,
                         uint64_t usc_size)
 {
-   if (dev == NULL || !agx_d3dkmt_bridge_enabled())
+   if (dev == NULL)
       return true;
    /* Only d3dkmt devices carry a bridge winsys; never cast another backend's
     * hdev. */
    if (dev->ops.simple_ioctl != agx_device_d3dkmt_ops.simple_ioctl)
       return true;
+   /* Direct-installed native bridge devices (AuroraD3D11) have rt != NULL
+    * without requiring HONEYKRISP_RT_DEVICE in the environment, and still
+    * share the process TTBR0 across every D3D11 device in the process. */
    const void *rt =
       agx_d3dkmt_bridge_rtdevice((const struct agx_d3dkmt_winsys *)dev->hdev);
    if (rt == NULL)
-      return false;
+      return !agx_d3dkmt_bridge_enabled();
    const uint64_t vm_key = agx_d3dkmt_bridge_vm_key(
       (const struct agx_d3dkmt_winsys *)dev->hdev);
    if (vm_key == 0 || main_size == 0 || usc_size == 0) {
