@@ -55,6 +55,23 @@ create_nir_fs(struct pipe_context *pipe, nir_shader *nir)
 }
 
 static nir_shader *
+make_uniform_color_fs(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+                                                  &agx_nir_options,
+                                                  "uniform_color_fs");
+   b.shader->info.num_ubos = 1;
+   nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                           glsl_vec4_type(), "out_color");
+   out->data.location = FRAG_RESULT_DATA0;
+   nir_def *c = nir_load_ubo(&b, 4, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                             .align_mul = 16, .align_offset = 0,
+                             .range_base = 0, .range = 16);
+   nir_store_var(&b, out, c, 0xf);
+   return b.shader;
+}
+
+static nir_shader *
 make_discard_fs(void)
 {
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
@@ -237,10 +254,11 @@ main(void)
    void *fs_tex = util_make_fragment_tex_shader(
       pipe, TGSI_TEXTURE_2D, TGSI_RETURN_TYPE_FLOAT, TGSI_RETURN_TYPE_FLOAT,
       false, false);
+   void *fs_unif = create_nir_fs(pipe, make_uniform_color_fs());
    void *fs_discard = create_nir_fs(pipe, make_discard_fs());
    void *fs_dual = create_nir_fs(pipe, make_dual_src_fs());
    void *fs_mrt = create_nir_fs(pipe, make_mrt_fs());
-   CHECK(vs && fs_pass && fs_tex && fs_discard && fs_dual && fs_mrt);
+   CHECK(vs && fs_pass && fs_tex && fs_unif && fs_discard && fs_dual && fs_mrt);
 
    struct pipe_sampler_state sampler_tmpl = {
       .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
@@ -323,14 +341,44 @@ main(void)
    else if (is_g17p)
       check_g17p_blend_bytes(l_add, true);
 
-   /* 3. Textured RGBA8 alpha blend: must also inline cleanly. */
+   /* 3. Textured RGBA8 alpha blend: must also inline cleanly without a CProg. */
    pipe->bind_blend_state(pipe, bs_alpha);
    pipe->bind_fs_state(pipe, fs_tex);
    struct agx_linked_shader *l_tex = draw_once(pipe);
-   if (is_m5)
+   if (is_m5) {
       check_m5_blend_bytes("tex", l_tex, true);
-   else if (is_g17p)
+      CHECK(l_tex->cprog_bo == NULL && l_tex->cprog_size == 0);
+      CHECK(l_alpha->cprog_bo == NULL && l_alpha->cprog_size == 0);
+   } else if (is_g17p) {
       check_g17p_blend_bytes(l_tex, true);
+   }
+
+   /* 3b. Uniform-color RGBA8 alpha blend: on M5, must hoist uniform blend setup
+    * into a non-empty constant program and emit it through the M5 graphics
+    * program builder across consecutive UBO updates. */
+   float ubo_color_a[4] = {0.25f, 0.5f, 0.75f, 0.5f};
+   float ubo_color_b[4] = {0.8f, 0.2f, 0.1f, 0.4f};
+   struct pipe_constant_buffer cb = {
+      .user_buffer = ubo_color_a,
+      .buffer_size = sizeof(ubo_color_a),
+   };
+   pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, 0, &cb);
+   pipe->bind_fs_state(pipe, fs_unif);
+   struct agx_linked_shader *l_unif_a = draw_once(pipe);
+   cb.user_buffer = ubo_color_b;
+   pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, 0, &cb);
+   struct agx_linked_shader *l_unif_b = draw_once(pipe);
+   CHECK(l_unif_a == l_unif_b);
+   if (is_m5) {
+      check_m5_blend_bytes("uniform", l_unif_a, true);
+      CHECK(l_unif_a->cprog_bo != NULL && l_unif_a->cprog_size > 0);
+      CHECK(l_unif_a->m5_graphics_templates != NULL);
+      printf("g17s uniform inline blend: main=%zu B, cprog=%u B\n",
+             l_unif_a->size, l_unif_a->cprog_size);
+   } else if (is_g17p) {
+      check_g17p_blend_bytes(l_unif_a, true);
+   }
+   pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, 0, NULL);
 
    /* 4. Edge cases that MUST fall back cleanly to the split epilog path: */
    pipe->bind_fs_state(pipe, fs_pass);
@@ -468,6 +516,7 @@ main(void)
    pipe->delete_vs_state(pipe, vs);
    pipe->delete_fs_state(pipe, fs_pass);
    pipe->delete_fs_state(pipe, fs_tex);
+   pipe->delete_fs_state(pipe, fs_unif);
    pipe->delete_fs_state(pipe, fs_discard);
    pipe->delete_fs_state(pipe, fs_dual);
    pipe->delete_fs_state(pipe, fs_mrt);

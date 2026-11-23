@@ -4839,6 +4839,112 @@ agx_g17p_mono_has_pixel_protocol(const struct agx_shader_part *part)
    return has_gate && final_release;
 }
 
+static bool
+agx_cprog_inputs_covered_by_ranges(const struct agx3_cprog_inputs *inputs,
+                                   const struct agx3_ioto_uniform_range *ranges,
+                                   size_t count)
+{
+   for (unsigned half = 0; half < AGX3_CPROG_INPUT_HALVES; ++half) {
+      if (!(inputs->halves[half / 64] & BITFIELD64_BIT(half % 64)))
+         continue;
+      bool covered = false;
+      for (size_t i = 0; i < count; ++i) {
+         if (half >= ranges[i].start_halfs &&
+             half - ranges[i].start_halfs < ranges[i].size_halfs) {
+            covered = true;
+            break;
+         }
+      }
+      if (!covered)
+         return false;
+   }
+   return true;
+}
+
+static bool
+agx_m5_inline_blend_cprog_preflight(struct agx_device *dev,
+                                    const struct agx_compiled_shader *main_cs,
+                                    const struct agx_shader_part *mono_part,
+                                    const struct agx_fs_epilog_key *ekey)
+{
+   const struct agx_shader_info *mi = &mono_part->info;
+   if (!agx_g17p_fs_cprog_qualified(mi) ||
+       mi->preamble_offset > mi->binary_size ||
+       mi->preamble_size > mi->binary_size - mi->preamble_offset ||
+       (mi->agx3_preamble_tps_inputs &&
+        mi->preamble_scratch_size < mi->agx3_preamble_inputs.storage_bytes) ||
+       mi->push_count > 512)
+      return false;
+
+   struct agx3_ioto_uniform_range ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
+   size_t count = 0;
+   for (unsigned i = 0; i < main_cs->push_range_count; ++i) {
+      const struct agx_push_range *push = &main_cs->push[i];
+      if (push->table == AGX_SYSVAL_TABLE_PARAMS)
+         continue;
+      unsigned start = push->uniform;
+      unsigned length = push->length;
+      if ((length & 1) && (push->table == AGX_SYSVAL_STAGE(main_cs->stage) ||
+                           push->table == AGX_SYSVAL_TABLE_ROOT))
+         ++length;
+      if ((start & 1) || (length & 1) || count == ARRAY_SIZE(ranges))
+         return false;
+      ranges[count++] = (struct agx3_ioto_uniform_range){
+         .start_halfs = start,
+         .size_halfs = length,
+         .address = dev->shader_base + 0x10000,
+      };
+   }
+
+   if (!agx_cprog_inputs_covered_by_ranges(&mi->agx3_preamble_inputs, ranges,
+                                           count))
+      return false;
+
+   const struct agx_tilebuffer_layout tib =
+      agx_build_tilebuffer_layout_with_limits(
+         ekey->rt_formats, ARRAY_SIZE(ekey->rt_formats), 1, true,
+         ekey->max_sample_size_B, ekey->max_bytes_per_tile,
+         ekey->max_samples_per_tile);
+
+   struct agx3_g17p_graphics_program_desc desc = {
+      .program_va = dev->shader_base + 0x20000,
+      .shader_va = dev->shader_base + 0x30000,
+      .uniform_ranges = ranges,
+      .uniform_range_count = count,
+      .shader_binary_size = mi->main_size,
+      .scratch_size = MAX2(mi->scratch_size, mi->agx3_spectpr_scratch_size),
+      .nr_gprs = mi->nr_gprs,
+      .compiler_d_valid = mi->agx3_staging_known,
+      .compiler_d = mi->agx3_staging_halfs * 2,
+      .fragment = true,
+      .colour_classes = mi->agx3_colour_link.colour_classes,
+      .imageblock = {
+         .sample_size_B = tib.sample_size_B,
+         .nr_samples = 1,
+         .tile_size_px = tib.tile_size,
+      },
+      .patchable = true,
+      .constant_program = {
+         .code = (const uint8_t *)mono_part->binary + mi->preamble_offset,
+         .code_size = mi->preamble_size,
+         .code_va = dev->shader_base + 0x40000,
+         .absolute_branch = true,
+         .request_prelude = mi->agx3_preamble_uniform_inputs,
+      },
+      .cprog_inputs =
+         mi->agx3_preamble_tps_inputs ? &mi->agx3_preamble_inputs : NULL,
+   };
+
+   struct agx3_g17p_graphics_program_template *composed =
+      malloc(sizeof(*composed));
+   if (!composed)
+      return false;
+   const bool ok =
+      agx3_g17g_graphics_program_template_generate(dev->chip, &desc, composed);
+   free(composed);
+   return ok;
+}
+
 static struct agx_linked_shader *
 agx_try_link_inline_blend(struct agx_context *ctx,
                           struct agx_uncompiled_shader *so,
@@ -4870,14 +4976,30 @@ agx_try_link_inline_blend(struct agx_context *ctx,
       goto fail;
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   const struct agx_shader_info *bi = &key->main->b.info;
+   bool try_m5_cprog = agx_chip_g17_m5(dev->chip) &&
+                       !nir->info.num_textures && !nir->info.num_images &&
+                       !bi->texture_state_count && !bi->sampler_state_count &&
+                       !bi->uses_txf && !bi->uses_sampler_heap &&
+                       !bi->uses_draw_id && !bi->uses_base_param;
+   if (try_m5_cprog)
+      nir_divergence_analysis(nir);
+   bool saw_export = false;
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
-         if (instr->type == nir_instr_type_intrinsic &&
-             nir_instr_as_intrinsic(instr)->intrinsic ==
-                nir_intrinsic_load_exported_agx)
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_exported_agx)
             goto fail;
+         if (try_m5_cprog && intr->intrinsic == nir_intrinsic_export_agx) {
+            saw_export = true;
+            if (intr->src[0].ssa->divergent)
+               try_m5_cprog = false;
+         }
       }
    }
+   try_m5_cprog &= saw_export;
 
    eb = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, &agx_nir_options,
                                        NULL);
@@ -4940,34 +5062,67 @@ agx_try_link_inline_blend(struct agx_context *ctx,
    BITSET_ZERO(ckey.g17p_tile_partitions);
    BITSET_SET(ckey.g17p_tile_partitions, 0);
 
-   if (!agx_compile_shader_nir(nir, &ckey, &mono_part) || !mono_part.binary ||
-       !mono_part.info.binary_size)
-      goto fail;
+   nir_shader *without_cprog = NULL;
+   if (try_m5_cprog) {
+      without_cprog = nir_shader_clone(mem, nir);
+      if (without_cprog) {
+         ckey.no_preamble = false;
+         ckey.g17p_native_uniforms = true;
+         ckey.g17p_uniform_dma = false;
+      }
+   }
 
-   const struct agx_shader_info *mi = &mono_part.info;
-   const struct agx_shader_info *bi = &key->main->b.info;
-   if (mi->has_preamble || mi->preamble_scratch_size || mi->rodata.size_16 ||
-       mi->push_count > bi->push_count ||
-       mi->texture_state_count != bi->texture_state_count ||
-       mi->sampler_state_count != bi->sampler_state_count ||
-       mi->uses_txf != bi->uses_txf ||
-       mi->uses_sampler_heap != bi->uses_sampler_heap ||
-       mi->uses_draw_id != bi->uses_draw_id ||
-       mi->uses_base_param != bi->uses_base_param ||
-       mi->early_fragment_tests != bi->early_fragment_tests ||
-       mi->needs_quad_derivatives != bi->needs_quad_derivatives ||
-       mi->depth_layout != bi->depth_layout ||
-       mi->writes_sample_mask ||
-       mi->g17p_sampled_fragment != bi->g17p_sampled_fragment ||
-       memcmp(&mi->varyings.fs, &bi->varyings.fs, sizeof(mi->varyings.fs)) ||
-       !mi->agx3_colour_link.entry_emitted ||
-       mi->agx3_colour_link.colour_classes != 1 ||
-       mi->agx3_colour_link.rt_query_write_acquired)
-      goto fail;
+   for (;;) {
+      bool ok = agx_compile_shader_nir(nir, &ckey, &mono_part) &&
+                mono_part.binary && mono_part.info.binary_size;
+      const struct agx_shader_info *mi = &mono_part.info;
+      if (ok) {
+         const bool has_cprog = mi->has_preamble;
+         ok = !mi->rodata.size_16 &&
+              mi->texture_state_count == bi->texture_state_count &&
+              mi->sampler_state_count == bi->sampler_state_count &&
+              mi->uses_txf == bi->uses_txf &&
+              mi->uses_sampler_heap == bi->uses_sampler_heap &&
+              mi->uses_draw_id == bi->uses_draw_id &&
+              mi->uses_base_param == bi->uses_base_param &&
+              mi->early_fragment_tests == bi->early_fragment_tests &&
+              mi->needs_quad_derivatives == bi->needs_quad_derivatives &&
+              mi->depth_layout == bi->depth_layout &&
+              !mi->writes_sample_mask &&
+              mi->g17p_sampled_fragment == bi->g17p_sampled_fragment &&
+              !memcmp(&mi->varyings.fs, &bi->varyings.fs,
+                      sizeof(mi->varyings.fs)) &&
+              mi->agx3_colour_link.entry_emitted &&
+              mi->agx3_colour_link.colour_classes == 1 &&
+              !mi->agx3_colour_link.rt_query_write_acquired;
+         if (ok) {
+            if (has_cprog) {
+               ok = !ckey.no_preamble && agx_chip_g17_m5(dev->chip) &&
+                    agx_m5_inline_blend_cprog_preflight(dev, key->main,
+                                                        &mono_part,
+                                                        &key->epilog.fs);
+            } else {
+               ok = !mi->preamble_scratch_size &&
+                    mi->push_count <= bi->push_count;
+            }
+         }
+         if (ok && agx_chip_native_agx3(dev->chip))
+            ok = agx_g17p_mono_has_pixel_protocol(&mono_part);
+      }
 
-   if (agx_chip_native_agx3(dev->chip) &&
-       !agx_g17p_mono_has_pixel_protocol(&mono_part))
-      goto fail;
+      if (ok)
+         break;
+
+      free(mono_part.binary);
+      memset(&mono_part, 0, sizeof(mono_part));
+      if (!without_cprog)
+         goto fail;
+      nir = without_cprog;
+      without_cprog = NULL;
+      ckey.no_preamble = true;
+      ckey.g17p_native_uniforms = key->main->inline_blend_key.g17p_native_uniforms;
+      ckey.g17p_uniform_dma = key->main->inline_blend_key.g17p_uniform_dma;
+   }
 
    mono_part.info.reads_tib |= bi->reads_tib;
 
@@ -4977,6 +5132,30 @@ agx_try_link_inline_blend(struct agx_context *ctx,
       ralloc_free(linked);
       linked = NULL;
       goto fail;
+   }
+
+   if (mono_part.info.has_preamble) {
+      struct agx_bo *cprog_bo = agx_bo_create(
+         dev, mono_part.info.preamble_size, 0, AGX_BO_EXEC | AGX_BO_LOW_VA,
+         "Fragment constant program");
+      void *cprog_map = cprog_bo ? agx_bo_map(cprog_bo) : NULL;
+      if (!cprog_bo || !cprog_bo->va || !cprog_map) {
+         agx_bo_unreference(dev, cprog_bo);
+         agx_bo_unreference(dev, linked->bo);
+         ralloc_free(linked);
+         linked = NULL;
+         goto fail;
+      }
+      memcpy(cprog_map,
+             (const uint8_t *)mono_part.binary + mono_part.info.preamble_offset,
+             mono_part.info.preamble_size);
+      linked->cprog_bo = cprog_bo;
+      linked->cprog_size = mono_part.info.preamble_size;
+      linked->cprog_scratch_size = mono_part.info.preamble_scratch_size;
+      linked->cprog_uniform_inputs =
+         mono_part.info.agx3_preamble_uniform_inputs;
+      linked->cprog_tps_inputs = mono_part.info.agx3_preamble_tps_inputs;
+      linked->cprog_inputs = mono_part.info.agx3_preamble_inputs;
    }
 
    free(mono_part.binary);
@@ -5653,8 +5832,11 @@ agx_update_fs(struct agx_batch *batch)
    if (ctx->fs->bo)
       agx_batch_add_bo(batch, ctx->fs->bo);
 
-   if (ctx->linked.fs)
+   if (ctx->linked.fs) {
       agx_batch_add_bo(batch, ctx->linked.fs->bo);
+      if (ctx->linked.fs->cprog_bo)
+         agx_batch_add_bo(batch, ctx->linked.fs->cprog_bo);
+   }
 
    return old != ctx->linked.fs;
 }
@@ -5750,6 +5932,7 @@ agx_delete_uncompiled_shader(struct agx_device *dev,
       hash_table_foreach(so->linked_shaders, ent) {
          struct agx_linked_shader *link = ent->data;
          agx_bo_unreference(dev, link->bo);
+         agx_bo_unreference(dev, link->cprog_bo);
       }
 
       _mesa_hash_table_destroy(so->linked_shaders, NULL);
@@ -8034,7 +8217,8 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
       .uniform_ranges = ranges,
       .uniform_range_count = count,
       .shader_binary_size = linked->size,
-      .scratch_size = linked->scratch_size,
+      .scratch_size =
+         MAX2(linked->scratch_size, linked->agx3_spectpr_scratch_size),
       .nr_gprs = linked->nr_gprs,
       .compiler_d_valid = linked->g17p_compiler_d_valid,
       .compiler_d = linked->g17p_compiler_d,
@@ -8048,6 +8232,26 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
          .tile_size_px = batch->tilebuffer_layout.tile_size,
       },
    };
+   if (cs->stage == MESA_SHADER_FRAGMENT && linked->cprog_bo &&
+       linked->cprog_size) {
+      void *cprog_map = agx_bo_map(linked->cprog_bo);
+      if (!linked->cprog_bo->va || !cprog_map ||
+          (linked->cprog_tps_inputs &&
+           linked->cprog_scratch_size < linked->cprog_inputs.storage_bytes) ||
+          !agx_cprog_inputs_covered_by_ranges(&linked->cprog_inputs, ranges,
+                                              count))
+         AGX3_PROGRAM_REFUSE("fragment constant program");
+      agx_batch_add_bo(batch, linked->cprog_bo);
+      desc.constant_program = (struct agx_ioto_constant_program){
+         .code = cprog_map,
+         .code_size = linked->cprog_size,
+         .code_va = linked->cprog_bo->va->addr,
+         .absolute_branch = true,
+         .request_prelude = linked->cprog_uniform_inputs,
+      };
+      if (linked->cprog_tps_inputs)
+         desc.cprog_inputs = &linked->cprog_inputs;
+   }
 
    struct agx3_g17p_graphics_program program;
    const bool cached =
@@ -8061,6 +8265,8 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
          : agx3_g17p_graphics_program_bound(dev->chip, ranges, count, &capacity);
       if (!bounded)
          AGX3_PROGRAM_REFUSE("program size bound");
+      if (desc.constant_program.code_size)
+         capacity = AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE;
    }
 
    struct agx_bo *program_bo = NULL;

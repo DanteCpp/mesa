@@ -24,6 +24,15 @@ struct agx_linked_shader {
    /* Mapped executable memory */
    struct agx_bo *bo;
 
+   /* Optional native constant program owned by a monolithic linked variant
+    * (M5 inline RGBA8 blend with hoisted uniform blend setup). */
+   struct agx_bo *cprog_bo;
+   uint32_t cprog_size;
+   uint32_t cprog_scratch_size;
+   bool cprog_uniform_inputs;
+   bool cprog_tps_inputs;
+   struct agx3_cprog_inputs cprog_inputs;
+
    /* Gallium-owned, bounded Ioto template cache. Entries are ralloc children
     * of this linked shader and contain no live batch allocations. */
    struct agx_g17p_graphics_template *g17p_graphics_templates;
