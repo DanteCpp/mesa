@@ -678,6 +678,11 @@ agx_get_batch_for_framebuffer(struct agx_context *ctx,
       }
    }
 
+   /* Reclaim any already-retired batches first (non-blocking) so their
+    * encoder/pool/pipeline BOs return to the BO cache before agx_batch_init
+    * requests new allocations. */
+   while (agx_cleanup_batches(ctx) >= 0) {}
+
    /* Look for a free batch */
    for (i = 0; i < AGX_MAX_BATCHES; ++i) {
       if (!BITSET_TEST(ctx->batches.active, i) &&
@@ -2445,9 +2450,8 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    if (ctx->batch == batch)
       ctx->batch = NULL;
 
-   /* Try to clean up up to two batches, to keep memory usage down */
-   if (agx_cleanup_batches(ctx) >= 0)
-      agx_cleanup_batches(ctx);
+   /* Reclaim all completed batches immediately so BO cache stays warm */
+   while (agx_cleanup_batches(ctx) >= 0) {}
 }
 
 bool

@@ -711,6 +711,14 @@ update_subresource_common(struct aurora_device *dev, struct aurora_resource *r,
       UINT offset = pDstBox ? pDstBox->left : 0u;
       UINT size = pDstBox ? (pDstBox->right - pDstBox->left) : r->width;
       if (size > 0u) {
+         if (!(CopyFlags & D3D11_1DDI_COPY_NO_OVERWRITE) &&
+             offset == 0u && size == r->width) {
+            /* Whole-buffer UpdateSubresource replaces every byte: mark
+             * DISCARD_WHOLE_RESOURCE so agx_shadow skips uncached readback
+             * copies, avoids promoting WC buffers to AGX_BO_WRITEBACK, and
+             * never trips MAX_TOTAL_SHADOW_BYTES sync stalls. */
+            map_flags |= PIPE_MAP_DISCARD_WHOLE_RESOURCE;
+         }
          dev->pctx->buffer_subdata(dev->pctx, r->prsrc, map_flags,
                                    offset, size, pSysMemUP);
       }
@@ -735,6 +743,9 @@ update_subresource_common(struct aurora_device *dev, struct aurora_resource *r,
          box.height = (int)u_minify(r->height, level);
          box.depth = (r->dim == D3D10DDIRESOURCE_TEXTURE3D)
                         ? (int)u_minify(r->depth, level) : 1;
+         if (!(CopyFlags & D3D11_1DDI_COPY_NO_OVERWRITE) &&
+             mips == 1u && r->array_size <= 1u)
+            map_flags |= PIPE_MAP_DISCARD_WHOLE_RESOURCE;
       }
       if (box.width > 0 && box.height > 0 && box.depth > 0) {
          dev->pctx->texture_subdata(dev->pctx, r->prsrc, level, map_flags,
