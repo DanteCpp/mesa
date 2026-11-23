@@ -391,6 +391,8 @@ struct agx_d3dkmt_sync {
    uint64_t base;         /* binary epoch */
    uint64_t last_request; /* highest raw value we have asked anyone to signal */
    uint64_t timeline_offset; /* raw offset when recycling a pooled monitored fence */
+   agx_kmt_handle last_signal_ctx; /* WDDM context that queued last_signal_val */
+   uint64_t last_signal_val;       /* raw value queued by last_signal_ctx */
    /* CONTRACT.md SS6.3: guaranteed non-NULL by the miniport. Kept optional
     * here so the degradation is explicit rather than a crash if it ever
     * isn't. */

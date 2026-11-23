@@ -25,11 +25,11 @@
  * util_dynarray of plain host memory and hands the winsys a userspace pointer
  * (hk_queue.c:864-872). D3DKMTSubmitCommand instead takes a GPU virtual
  * address, so the winsys copies the stream into a GPU-mapped BO. Two buffers
- * per context are enough to keep the CPU one submission ahead of the GPU
- * without unbounded memory; the ring slot is not reused until the context
- * fence proves the previous submission that used it has retired.
+ * buffer per context keeps the CPU well ahead of the GPU without unbounded
+ * memory; the ring slot is not reused until the context fence proves the
+ * previous submission that used it has retired.
  */
-#define AGX_D3DKMT_STAGING_RING 2
+#define AGX_D3DKMT_STAGING_RING 16
 
 /* The process VA lease: the M5 plan's windows plus, on G17, the
  * driver-window guard reserved ahead of them. */
@@ -59,6 +59,10 @@ struct agx_d3dkmt_ctx {
    struct agx_bo *staging[AGX_D3DKMT_STAGING_RING];
    uint64_t staging_retire[AGX_D3DKMT_STAGING_RING];
    unsigned staging_slot;
+
+   /* Reusable submit private-data buffer (avoids per-submit ~8 KB calloc/free). */
+   void *priv_scratch;
+   size_t priv_scratch_cap;
 };
 
 struct agx_d3dkmt_winsys {

@@ -1906,10 +1906,14 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    }
    const struct drm_asahi_sync *syncs =
       (const struct drm_asahi_sync *)(uintptr_t)submit->syncs;
-   agx_kmt_handle *waits = NULL;
-   uint64_t *wait_values = NULL;
-   agx_kmt_handle *signals = NULL;
-   uint64_t *signal_values = NULL;
+   agx_kmt_handle stack_waits[8];
+   uint64_t stack_wait_values[8];
+   agx_kmt_handle stack_signals[8];
+   uint64_t stack_signal_values[8];
+   agx_kmt_handle *waits = stack_waits;
+   uint64_t *wait_values = stack_wait_values;
+   agx_kmt_handle *signals = stack_signals;
+   uint64_t *signal_values = stack_signal_values;
    struct agxw_submit_private_v3 *priv = NULL;
    uint32_t priv_size = 0;
    int ret = -1;
@@ -1987,16 +1991,21 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    const unsigned staging_slot = ctx->staging_slot;
    simple_mtx_unlock(&ws->lock);
 
-   signals = malloc((size_t)(n_out + 1) * sizeof(*signals));
-   signal_values = malloc((size_t)(n_out + 1) * sizeof(*signal_values));
-   if (n_in > 0) {
+   if (n_out + 1 > ARRAY_SIZE(stack_signals)) {
+      signals = malloc((size_t)(n_out + 1) * sizeof(*signals));
+      signal_values = malloc((size_t)(n_out + 1) * sizeof(*signal_values));
+      if (signals == NULL || signal_values == NULL) {
+         errno = ENOMEM;
+         goto out;
+      }
+   }
+   if (n_in > ARRAY_SIZE(stack_waits)) {
       waits = malloc((size_t)n_in * sizeof(*waits));
       wait_values = malloc((size_t)n_in * sizeof(*wait_values));
-   }
-   if (signals == NULL || signal_values == NULL ||
-       (n_in > 0 && (waits == NULL || wait_values == NULL))) {
-      errno = ENOMEM;
-      goto out;
+      if (waits == NULL || wait_values == NULL) {
+         errno = ENOMEM;
+         goto out;
+      }
    }
 
    /* The DMA buffer: header + verbatim AGX command stream, in a BO this
@@ -2029,11 +2038,18 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
       (AGXW_MAX_READ_RANGES_PER_SUBMIT +
        (dev->primary_write_contract ? AGXW_MAX_PRIMARY_WRITE_RANGES : 0)) *
          sizeof(struct agxw_submit_read_range);
-   priv = calloc(1, priv_capacity);
-   if (priv == NULL) {
-      errno = ENOMEM;
-      goto out;
+   if (ctx->priv_scratch_cap < priv_capacity) {
+      void *buf = malloc(priv_capacity);
+      if (buf == NULL) {
+         errno = ENOMEM;
+         goto out;
+      }
+      free(ctx->priv_scratch);
+      ctx->priv_scratch = buf;
+      ctx->priv_scratch_cap = priv_capacity;
    }
+   priv = (struct agxw_submit_private_v3 *)ctx->priv_scratch;
+   memset(priv, 0, sizeof(*priv));
    struct agxw_submit_read_range *read_ranges =
       (struct agxw_submit_read_range *)(priv + 1);
    uint32_t named_bos = 0;
@@ -2099,6 +2115,7 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
       goto out;
 
    /* Resolve every syncobj handle before the first D3DKMT call. */
+   uint32_t n_wait = 0;
    uint32_t n_sig = 0;
    uint64_t retire;
 
@@ -2111,10 +2128,18 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
          errno = EINVAL;
          goto out;
       }
-      waits[i] = s->kmt;
-      wait_values[i] = syncs[i].sync_type == DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ
-                          ? (s->timeline_offset + syncs[i].timeline_value)
-                          : agx_d3dkmt_binary_wait_value(s);
+      uint64_t wval = syncs[i].sync_type == DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ
+                         ? (s->timeline_offset + syncs[i].timeline_value)
+                         : agx_d3dkmt_binary_wait_value(s);
+      /* Elide redundant GPU waits: already signaled on CPU, or queued on this
+       * exact strictly-FIFO WDDM context (avoids VidSch wait-queue stalls). */
+      if (s->cpu_va != NULL && *s->cpu_va >= wval)
+         continue;
+      if (s->last_signal_ctx == ctx->hContext && wval <= s->last_signal_val)
+         continue;
+      waits[n_wait] = s->kmt;
+      wait_values[n_wait] = wval;
+      n_wait++;
    }
 
    for (uint32_t i = 0; i < n_out; ++i) {
@@ -2143,6 +2168,8 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
       signal_values[n_sig] = v;
       if (v > e->last_request)
          e->last_request = v;
+      e->last_signal_ctx = ctx->hContext;
+      e->last_signal_val = v;
       n_sig++;
    }
 
@@ -2152,10 +2179,10 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    n_sig++;
    simple_mtx_unlock(&ws->lock);
 
-   if (n_in > 0) {
+   if (n_wait > 0) {
       struct agx_kmt_waitsyncfromgpu wait = {
          .hContext = ctx->hContext,
-         .ObjectCount = n_in,
+         .ObjectCount = n_wait,
          .ObjectHandleArray = waits,
          .MonitoredFenceValueArray = wait_values,
       };
@@ -2163,7 +2190,7 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
       if (!AGX_KMT_SUCCESS(st)) {
          if (agx_d3dkmt_v6_first(ws, AGX_D3DKMT_V6_GPU_WAIT))
             d3dkmt_log_flushed("agxw-v6: refused kind=gpu-wait status=0x%08x objects=%u\n",
-                               (unsigned)st, n_in);
+                               (unsigned)st, n_wait);
          ret = agx_d3dkmt_fail(st);
          agx_d3dkmt_mark_device_lost(ws, ctx);
          goto out;
@@ -2243,11 +2270,14 @@ out:
    ctx->submit_refs = 0;
    ws->active_submits--;
    simple_mtx_unlock(&ws->lock);
-   free(waits);
-   free(wait_values);
-   free(signals);
-   free(signal_values);
-   free(priv);
+   if (waits != stack_waits)
+      free(waits);
+   if (wait_values != stack_wait_values)
+      free(wait_values);
+   if (signals != stack_signals)
+      free(signals);
+   if (signal_values != stack_signal_values)
+      free(signal_values);
    return ret;
 }
 
@@ -2809,6 +2839,7 @@ d3dkmt_queue_destroy(struct agx_device *dev, struct drm_asahi_queue_destroy *q)
       if (local.staging[i] != NULL)
          agx_bo_unreference(dev, local.staging[i]);
    }
+   free(local.priv_scratch);
 
    struct agx_kmt_destroysyncobj d = {.hSyncObject = local.fence};
    ws->fns.DestroySynchronizationObject(&d);
@@ -3401,6 +3432,7 @@ agx_d3dkmt_close_device(struct agx_device *dev)
          if (ws->ctxs[i].staging[slot] != NULL)
             agx_bo_unreference(dev, ws->ctxs[i].staging[slot]);
       }
+      free(ws->ctxs[i].priv_scratch);
 
       struct agx_kmt_destroysyncobj ds = {.hSyncObject = ws->ctxs[i].fence};
       ws->fns.DestroySynchronizationObject(&ds);

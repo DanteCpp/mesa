@@ -134,6 +134,8 @@ d3dkmt_syncobj_create(struct util_sync_provider *p, uint32_t flags,
             s->timeline_offset = cur;
          }
          s->last_request = cur;
+         s->last_signal_ctx = 0;
+         s->last_signal_val = 0;
          simple_mtx_unlock(&ws->lock);
          *handle = h;
          return 0;
@@ -428,6 +430,8 @@ d3dkmt_syncobj_reset(struct util_sync_provider *p, const uint32_t *handles,
          return -1;
       }
       s->base = agx_d3dkmt_binary_reset_base(s);
+      s->last_signal_ctx = 0;
+      s->last_signal_val = 0;
    }
    simple_mtx_unlock(&ws->lock);
 
@@ -439,19 +443,23 @@ d3dkmt_syncobj_signal(struct util_sync_provider *p, const uint32_t *handles,
                       uint32_t handle_count)
 {
    struct agx_d3dkmt_winsys *ws = ws_of(p);
-   agx_kmt_handle *kmt = NULL;
-   uint64_t *values = NULL;
+   agx_kmt_handle stack_kmt[8];
+   uint64_t stack_values[8];
+   agx_kmt_handle *kmt = stack_kmt;
+   uint64_t *values = stack_values;
    uint32_t n = 0;
    int ret = -1;
 
    if (handle_count == 0)
       return 0;
 
-   kmt = malloc((size_t)handle_count * sizeof(*kmt));
-   values = malloc((size_t)handle_count * sizeof(*values));
-   if (kmt == NULL || values == NULL) {
-      errno = ENOMEM;
-      goto out;
+   if (handle_count > ARRAY_SIZE(stack_kmt)) {
+      kmt = malloc((size_t)handle_count * sizeof(*kmt));
+      values = malloc((size_t)handle_count * sizeof(*values));
+      if (kmt == NULL || values == NULL) {
+         errno = ENOMEM;
+         goto out;
+      }
    }
 
    simple_mtx_lock(&ws->lock);
@@ -479,6 +487,8 @@ d3dkmt_syncobj_signal(struct util_sync_provider *p, const uint32_t *handles,
       kmt[n] = s->kmt;
       values[n] = v;
       s->last_request = v;
+      s->last_signal_ctx = 0;
+      s->last_signal_val = 0;
       n++;
    }
    simple_mtx_unlock(&ws->lock);
@@ -504,8 +514,10 @@ d3dkmt_syncobj_signal(struct util_sync_provider *p, const uint32_t *handles,
    }
 
 out:
-   free(kmt);
-   free(values);
+   if (kmt != stack_kmt)
+      free(kmt);
+   if (values != stack_values)
+      free(values);
    return ret;
 }
 
@@ -552,6 +564,8 @@ d3dkmt_syncobj_timeline_signal(struct util_sync_provider *p,
       vals[i] = raw;
       if (raw > s->last_request)
          s->last_request = raw;
+      s->last_signal_ctx = 0;
+      s->last_signal_val = 0;
    }
    simple_mtx_unlock(&ws->lock);
 
@@ -701,6 +715,10 @@ d3dkmt_syncobj_transfer(struct util_sync_provider *p, uint32_t dst_handle,
    ctx = xfer_context(ws);
    if (ctx != 0 && dst_value > dst->last_request)
       dst->last_request = dst_value;
+   if (ctx != 0) {
+      dst->last_signal_ctx = ctx;
+      dst->last_signal_val = dst_value;
+   }
    simple_mtx_unlock(&ws->lock);
 
    if (ctx == 0) {
