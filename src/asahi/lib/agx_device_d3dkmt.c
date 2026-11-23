@@ -192,6 +192,15 @@ agx_d3dkmt_poll_cpu_fences(const volatile uint64_t *const *current,
    }
 
    ULONGLONG start = GetTickCount64();
+   LARGE_INTEGER qpc_freq = {0}, spin_start = {0};
+   bool spin_active = false;
+   LONGLONG spin_budget = 0;
+   if (timeout_ms > 0 && QueryPerformanceFrequency(&qpc_freq) &&
+       qpc_freq.QuadPart > 0) {
+      QueryPerformanceCounter(&spin_start);
+      spin_budget = (qpc_freq.QuadPart * 150ll) / 1000000ll;
+      spin_active = spin_budget > 0;
+   }
    for (;;) {
       enum agx_d3dkmt_cpu_wait_state state = agx_d3dkmt_cpu_wait_probe(
          current, wanted, count, wait_any, first_signaled);
@@ -204,9 +213,19 @@ agx_d3dkmt_poll_cpu_fences(const volatile uint64_t *const *current,
          return -1;
       }
 
-      if (GetTickCount64() - start >= timeout_ms) {
+      if (timeout_ms == 0 || GetTickCount64() - start >= timeout_ms) {
          errno = ETIME;
          return -1;
+      }
+
+      if (spin_active) {
+         LARGE_INTEGER now_qpc;
+         QueryPerformanceCounter(&now_qpc);
+         if (now_qpc.QuadPart - spin_start.QuadPart < spin_budget) {
+            YieldProcessor();
+            continue;
+         }
+         spin_active = false;
       }
 
       if (!SwitchToThread())

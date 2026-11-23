@@ -234,14 +234,11 @@ agx_bo_cache_evict_stale_bos(struct agx_device *dev, int64_t now_sec)
 {
    list_for_each_entry_safe(struct agx_bo, entry, &dev->bo_cache.lru,
                             lru_link) {
-      /* We want all entries that have been used more than 1 sec ago to be
-       * dropped, others can be kept.  Note the <= 2 check and not <= 1. It's
-       * here to account for the fact that we're only testing ->tv_sec, not
-       * ->tv_nsec.  That means we might keep entries that are between 1 and 2
-       * seconds old, but we don't really care, as long as unused BOs are
-       * dropped at some point.
+      /* Retain cached BOs across normal desktop pauses (up to 15 s, still
+       * capped by AGX_BO_CACHE_MAX_SIZE = 256 MiB) so idle frames do not
+       * churn D3DKMT allocation + VidMm paging tables.
        */
-      if (now_sec - entry->last_used <= 2)
+      if (now_sec - entry->last_used <= 15)
          break;
 
       agx_bo_cache_remove_locked(dev, entry);

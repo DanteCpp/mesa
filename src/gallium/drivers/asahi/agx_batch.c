@@ -127,7 +127,13 @@ struct agx_encoder
 agx_encoder_allocate(struct agx_batch *batch, struct agx_device *dev)
 {
    struct agx_bo *bo = agx_bo_create(dev, 0x80000, 0, 0, "Encoder");
+   if (!bo)
+      return (struct agx_encoder){0};
    uint8_t *map = agx_bo_map(bo);
+   if (!map) {
+      agx_bo_unreference(dev, bo);
+      return (struct agx_encoder){0};
+   }
    return (struct agx_encoder){.bo = bo, .current = map, .end = map + bo->size};
 }
 
@@ -171,7 +177,7 @@ agx_batch_get_g17p_vdm_alias(struct agx_batch *batch, struct agx_bo *bo,
 static void
 agx_encoder_bind_vdm_alias(struct agx_device *dev, struct agx_encoder *encoder)
 {
-   if (!agx_native_graphics(dev))
+   if (!agx_native_graphics(dev) || !encoder->bo)
       return;
 
    encoder->g17p_vdm_alias = agx_bo_get_g17p_vdm_alias(dev, encoder->bo);

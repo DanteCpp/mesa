@@ -16110,6 +16110,8 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
               AGX_INDEX_LIST_LENGTH + AGX_INDEX_LIST_BUFFER_LO_LENGTH +
               AGX_INDEX_LIST_COUNT_LENGTH + AGX_INDEX_LIST_INSTANCES_LENGTH +
               AGX_INDEX_LIST_START_LENGTH + AGX_INDEX_LIST_BUFFER_SIZE_LENGTH;
+   if (unlikely(!batch->vdm.bo || !batch->vdm.current))
+      return;
    agx_ensure_cmdbuf_has_space(batch, &batch->vdm, command_space);
 
    uint32_t draw_state_offset = 0;

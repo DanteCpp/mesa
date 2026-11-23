@@ -8,6 +8,7 @@
  */
 #include "aurora_d3d11.h"
 #include "compiler/glsl_types.h"
+#include "util/os_time.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -223,7 +224,7 @@ aurora_flush_and_wait(struct aurora_device *dev)
    struct pipe_fence_handle *fence = NULL;
    dev->pctx->flush(dev->pctx, &fence, 0);
    if (fence) {
-      dev->screen->fence_finish(dev->screen, NULL, fence, 5000000000ULL);
+      dev->screen->fence_finish(dev->screen, NULL, fence, OS_TIMEOUT_INFINITE);
       dev->screen->fence_reference(dev->screen, &fence, NULL);
    }
 }
