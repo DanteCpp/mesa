@@ -6,21 +6,27 @@
  * gating on AGX3B (G17P), AGX3C (M5), and AGX2 control under the compiler-only
  * DRM shim.
  */
+#include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
+#include "util/disk_cache.h"
 #include "util/driconf.h"
+#include "util/hash_table.h"
 #include "util/u_inlines.h"
 #include "util/u_simple_shaders.h"
 #include "util/xmlconfig.h"
 #include "compiler/nir/nir_builder.h"
 #include "agx_bo.h"
+#include "agx_disk_cache.h"
 #include "agx_public.h"
 #include "agx_state.h"
 
@@ -186,6 +192,393 @@ check_g17p_blend_bytes(struct agx_linked_shader *linked, bool expect_inline)
       CHECK(linked->g17p_colour_classes == 1);
       CHECK(has_gate);
    }
+}
+
+static void
+remove_tree(const char *path)
+{
+   struct stat st;
+   if (lstat(path, &st) != 0)
+      return;
+   if (S_ISDIR(st.st_mode)) {
+      DIR *dir = opendir(path);
+      if (dir) {
+         struct dirent *ent;
+         while ((ent = readdir(dir)) != NULL) {
+            if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))
+               continue;
+            char child[PATH_MAX];
+            snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
+            remove_tree(child);
+         }
+         closedir(dir);
+      }
+      rmdir(path);
+   } else {
+      unlink(path);
+   }
+}
+
+static void
+test_warm_disk_cache(bool is_m5, bool is_g17p)
+{
+#ifdef ENABLE_SHADER_CACHE
+   char cache_dir[] = "/tmp/agx-inline-blend-cache-XXXXXX";
+   CHECK(mkdtemp(cache_dir) != NULL);
+
+   unsetenv("MESA_SHADER_CACHE_DISABLE");
+   setenv("MESA_SHADER_CACHE_DIR", cache_dir, 1);
+
+   static const driOptionDescription descriptions[] = {
+#include "driinfo_asahi.h"
+   };
+   const float vertices[3][8] = {
+      {-1, -1, 0, 1, 0.25f, 0.5f, 0.75f, 0.5f},
+      { 1, -1, 0, 1, 0.5f, 0.25f, 0.75f, 0.5f},
+      { 0,  1, 0, 1, 0.75f, 0.5f, 0.25f, 0.5f},
+   };
+   const enum tgsi_semantic semantics[] = {TGSI_SEMANTIC_POSITION, TGSI_SEMANTIC_GENERIC};
+   const unsigned indices[] = {0, 0};
+   float ubo_color[4] = {0.25f, 0.5f, 0.75f, 0.5f};
+
+   void *orig_pass_nir = NULL;
+   size_t orig_pass_nir_size = 0;
+   union asahi_shader_key pass_variant_key = {0};
+   void *orig_unif_nir = NULL;
+   size_t orig_unif_nir_size = 0;
+   union asahi_shader_key unif_variant_key = {0};
+   size_t cold_unif_size = 0;
+   uint32_t cold_cprog_size = 0;
+
+   /* Pass 1 (cold cache): compile and populate the on-disk shader cache. */
+   {
+      int fd1 = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+      CHECK(fd1 >= 0);
+      driOptionCache info, options;
+      driParseOptionInfo(&info, descriptions, ARRAY_SIZE(descriptions));
+      struct pipe_screen_config config = {.options = &options, .options_info = &info};
+      struct pipe_screen *screen = agx_screen_create(fd1, NULL, &config);
+      CHECK(screen && agx_screen(screen)->disk_cache != NULL);
+      struct pipe_context *pipe = screen->context_create(screen, NULL, 0);
+      CHECK(pipe);
+
+      struct pipe_resource tex_tmpl = {
+         .target = PIPE_TEXTURE_2D,
+         .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+         .width0 = 64, .height0 = 64, .depth0 = 1, .array_size = 1,
+         .bind = PIPE_BIND_RENDER_TARGET,
+      };
+      struct pipe_resource *rt = screen->resource_create(screen, &tex_tmpl);
+      struct pipe_resource *vbuf = pipe_buffer_create(
+         screen, PIPE_BIND_VERTEX_BUFFER, PIPE_USAGE_DEFAULT, sizeof(vertices));
+      CHECK(rt && vbuf);
+      pipe_buffer_write(pipe, vbuf, 0, sizeof(vertices), vertices);
+      struct pipe_vertex_buffer vb = {.buffer.resource = vbuf};
+      pipe->set_vertex_buffers(pipe, 1, &vb);
+      struct pipe_vertex_element elems[2] = {
+         {.src_format = PIPE_FORMAT_R32G32B32A32_FLOAT, .src_stride = 32},
+         {.src_offset = 16, .src_format = PIPE_FORMAT_R32G32B32A32_FLOAT, .src_stride = 32},
+      };
+      void *velems = pipe->create_vertex_elements_state(pipe, 2, elems);
+      pipe->bind_vertex_elements_state(pipe, velems);
+
+      void *vs = util_make_vertex_passthrough_shader(pipe, 2, semantics, indices, false);
+      void *fs_pass = util_make_fragment_passthrough_shader(
+         pipe, TGSI_SEMANTIC_GENERIC, TGSI_INTERPOLATE_PERSPECTIVE, false);
+      void *fs_unif = create_nir_fs(pipe, make_uniform_color_fs());
+      CHECK(vs && fs_pass && fs_unif);
+
+      struct pipe_depth_stencil_alpha_state zs = {0};
+      void *zs_state = pipe->create_depth_stencil_alpha_state(pipe, &zs);
+      struct pipe_rasterizer_state rast = {
+         .front_ccw = true, .depth_clip_near = true, .depth_clip_far = true,
+         .clip_halfz = true,
+      };
+      void *rast_state = pipe->create_rasterizer_state(pipe, &rast);
+      struct pipe_blend_state b_alpha = {
+         .rt[0] = {
+            .blend_enable = true,
+            .rgb_func = PIPE_BLEND_ADD,
+            .rgb_src_factor = PIPE_BLENDFACTOR_SRC_ALPHA,
+            .rgb_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA,
+            .alpha_func = PIPE_BLEND_ADD,
+            .alpha_src_factor = PIPE_BLENDFACTOR_ONE,
+            .alpha_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA,
+            .colormask = PIPE_MASK_RGBA,
+         },
+      };
+      void *bs_alpha = pipe->create_blend_state(pipe, &b_alpha);
+      pipe->bind_depth_stencil_alpha_state(pipe, zs_state);
+      pipe->bind_rasterizer_state(pipe, rast_state);
+      pipe->bind_blend_state(pipe, bs_alpha);
+
+      struct pipe_viewport_state vp = {.scale = {32, 32, 1}, .translate = {32, 32, 0}};
+      pipe->set_viewport_states(pipe, 0, 1, &vp);
+      struct pipe_framebuffer_state fb = {
+         .width = 64, .height = 64, .layers = 1, .nr_cbufs = 1,
+         .cbufs[0] = {.texture = rt, .format = PIPE_FORMAT_R8G8B8A8_UNORM},
+      };
+      pipe->set_framebuffer_state(pipe, &fb);
+      pipe->bind_vs_state(pipe, vs);
+
+      pipe->bind_fs_state(pipe, fs_pass);
+      struct agx_linked_shader *l_pass = draw_once(pipe);
+      struct agx_compiled_shader *compiled_pass = agx_context(pipe)->fs;
+      CHECK(compiled_pass != NULL);
+      struct agx_uncompiled_shader *so_pass = fs_pass;
+      bool found_pass_key = false;
+      hash_table_foreach(so_pass->variants, ent) {
+         if (ent->data == compiled_pass) {
+            memcpy(&pass_variant_key, ent->key, sizeof(pass_variant_key.fs));
+            found_pass_key = true;
+            break;
+         }
+      }
+      CHECK(found_pass_key);
+      if (is_m5 || is_g17p) {
+         CHECK(compiled_pass->inline_blend_nir != NULL &&
+               compiled_pass->inline_blend_nir_size > 0);
+         orig_pass_nir_size = compiled_pass->inline_blend_nir_size;
+         orig_pass_nir = malloc(orig_pass_nir_size);
+         CHECK(orig_pass_nir != NULL);
+         memcpy(orig_pass_nir, compiled_pass->inline_blend_nir, orig_pass_nir_size);
+      } else {
+         CHECK(compiled_pass->inline_blend_nir == NULL &&
+               compiled_pass->inline_blend_nir_size == 0);
+      }
+      if (is_m5)
+         check_m5_blend_bytes("cold_cache_alpha", l_pass, true);
+      else if (is_g17p)
+         check_g17p_blend_bytes(l_pass, true);
+
+      struct pipe_constant_buffer cb = {
+         .user_buffer = ubo_color,
+         .buffer_size = sizeof(ubo_color),
+      };
+      pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, 0, &cb);
+      pipe->bind_fs_state(pipe, fs_unif);
+      struct agx_linked_shader *l_unif = draw_once(pipe);
+      struct agx_compiled_shader *compiled_unif = agx_context(pipe)->fs;
+      CHECK(compiled_unif != NULL);
+
+      struct agx_uncompiled_shader *so_unif = fs_unif;
+      bool found_key = false;
+      hash_table_foreach(so_unif->variants, ent) {
+         if (ent->data == compiled_unif) {
+            memcpy(&unif_variant_key, ent->key, sizeof(unif_variant_key.fs));
+            found_key = true;
+            break;
+         }
+      }
+      CHECK(found_key);
+
+      if (is_m5) {
+         CHECK(compiled_unif->inline_blend_nir != NULL &&
+               compiled_unif->inline_blend_nir_size > 0);
+         orig_unif_nir_size = compiled_unif->inline_blend_nir_size;
+         orig_unif_nir = malloc(orig_unif_nir_size);
+         CHECK(orig_unif_nir != NULL);
+         memcpy(orig_unif_nir, compiled_unif->inline_blend_nir, orig_unif_nir_size);
+         check_m5_blend_bytes("cold_cache_uniform", l_unif, true);
+         CHECK(l_unif->cprog_bo != NULL && l_unif->cprog_size > 0);
+         cold_unif_size = l_unif->size;
+         cold_cprog_size = l_unif->cprog_size;
+      } else if (!is_g17p) {
+         CHECK(compiled_unif->inline_blend_nir == NULL &&
+               compiled_unif->inline_blend_nir_size == 0);
+      }
+
+      disk_cache_wait_for_idle(agx_screen(screen)->disk_cache);
+
+      pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, 0, NULL);
+      pipe->bind_vs_state(pipe, NULL);
+      pipe->bind_fs_state(pipe, NULL);
+      pipe->delete_vs_state(pipe, vs);
+      pipe->delete_fs_state(pipe, fs_pass);
+      pipe->delete_fs_state(pipe, fs_unif);
+      pipe->bind_vertex_elements_state(pipe, NULL);
+      pipe->delete_vertex_elements_state(pipe, velems);
+      pipe->bind_blend_state(pipe, NULL);
+      pipe->delete_blend_state(pipe, bs_alpha);
+      pipe->bind_depth_stencil_alpha_state(pipe, NULL);
+      pipe->delete_depth_stencil_alpha_state(pipe, zs_state);
+      pipe->bind_rasterizer_state(pipe, NULL);
+      pipe->delete_rasterizer_state(pipe, rast_state);
+      pipe_resource_reference(&rt, NULL);
+      pipe_resource_reference(&vbuf, NULL);
+      pipe->destroy(pipe);
+      screen->destroy(screen);
+      driDestroyOptionInfo(&info);
+   }
+
+   /* Pass 2 (warm cache): fresh screen/context/shaders must hit disk cache,
+    * restore inline_blend_nir + inline_blend_key, and emit inline blend + M5
+    * constant program instead of falling back to the split epilog. */
+   {
+      int fd2 = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+      CHECK(fd2 >= 0);
+      driOptionCache info, options;
+      driParseOptionInfo(&info, descriptions, ARRAY_SIZE(descriptions));
+      struct pipe_screen_config config = {.options = &options, .options_info = &info};
+      struct pipe_screen *screen = agx_screen_create(fd2, NULL, &config);
+      CHECK(screen && agx_screen(screen)->disk_cache != NULL);
+      struct pipe_context *pipe = screen->context_create(screen, NULL, 0);
+      CHECK(pipe);
+
+      struct pipe_resource tex_tmpl = {
+         .target = PIPE_TEXTURE_2D,
+         .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+         .width0 = 64, .height0 = 64, .depth0 = 1, .array_size = 1,
+         .bind = PIPE_BIND_RENDER_TARGET,
+      };
+      struct pipe_resource *rt = screen->resource_create(screen, &tex_tmpl);
+      struct pipe_resource *vbuf = pipe_buffer_create(
+         screen, PIPE_BIND_VERTEX_BUFFER, PIPE_USAGE_DEFAULT, sizeof(vertices));
+      CHECK(rt && vbuf);
+      pipe_buffer_write(pipe, vbuf, 0, sizeof(vertices), vertices);
+      struct pipe_vertex_buffer vb = {.buffer.resource = vbuf};
+      pipe->set_vertex_buffers(pipe, 1, &vb);
+      struct pipe_vertex_element elems[2] = {
+         {.src_format = PIPE_FORMAT_R32G32B32A32_FLOAT, .src_stride = 32},
+         {.src_offset = 16, .src_format = PIPE_FORMAT_R32G32B32A32_FLOAT, .src_stride = 32},
+      };
+      void *velems = pipe->create_vertex_elements_state(pipe, 2, elems);
+      pipe->bind_vertex_elements_state(pipe, velems);
+
+      void *vs = util_make_vertex_passthrough_shader(pipe, 2, semantics, indices, false);
+      void *fs_pass = util_make_fragment_passthrough_shader(
+         pipe, TGSI_SEMANTIC_GENERIC, TGSI_INTERPOLATE_PERSPECTIVE, false);
+      void *fs_unif = create_nir_fs(pipe, make_uniform_color_fs());
+      CHECK(vs && fs_pass && fs_unif);
+
+      /* Directly verify disk-cache retrieval restores inline_blend_nir + key. */
+      struct agx_compiled_shader *reloaded_pass =
+         agx_disk_cache_retrieve(agx_screen(screen), fs_pass, &pass_variant_key);
+      CHECK(reloaded_pass != NULL);
+      if (is_m5 || is_g17p) {
+         CHECK(reloaded_pass->inline_blend_nir != NULL);
+         CHECK(reloaded_pass->inline_blend_nir_size == orig_pass_nir_size);
+         CHECK(memcmp(reloaded_pass->inline_blend_nir, orig_pass_nir,
+                      orig_pass_nir_size) == 0);
+         CHECK(reloaded_pass->inline_blend_key.g17p_rodata_hint == NULL);
+      } else {
+         CHECK(reloaded_pass->inline_blend_nir == NULL &&
+               reloaded_pass->inline_blend_nir_size == 0);
+      }
+      free(reloaded_pass->inline_blend_nir);
+      free(reloaded_pass->b.binary);
+      agx_bo_unreference(&agx_screen(screen)->dev, reloaded_pass->bo);
+      FREE(reloaded_pass);
+
+      struct agx_compiled_shader *reloaded =
+         agx_disk_cache_retrieve(agx_screen(screen), fs_unif, &unif_variant_key);
+      CHECK(reloaded != NULL);
+      if (is_m5) {
+         CHECK(reloaded->inline_blend_nir != NULL);
+         CHECK(reloaded->inline_blend_nir_size == orig_unif_nir_size);
+         CHECK(memcmp(reloaded->inline_blend_nir, orig_unif_nir,
+                      orig_unif_nir_size) == 0);
+         CHECK(reloaded->inline_blend_key.g17p_rodata_hint == NULL);
+      } else if (!is_g17p) {
+         CHECK(reloaded->inline_blend_nir == NULL &&
+               reloaded->inline_blend_nir_size == 0);
+      }
+      free(reloaded->inline_blend_nir);
+      free(reloaded->b.binary);
+      agx_bo_unreference(&agx_screen(screen)->dev, reloaded->bo);
+      FREE(reloaded);
+
+      struct pipe_depth_stencil_alpha_state zs = {0};
+      void *zs_state = pipe->create_depth_stencil_alpha_state(pipe, &zs);
+      struct pipe_rasterizer_state rast = {
+         .front_ccw = true, .depth_clip_near = true, .depth_clip_far = true,
+         .clip_halfz = true,
+      };
+      void *rast_state = pipe->create_rasterizer_state(pipe, &rast);
+      struct pipe_blend_state b_alpha = {
+         .rt[0] = {
+            .blend_enable = true,
+            .rgb_func = PIPE_BLEND_ADD,
+            .rgb_src_factor = PIPE_BLENDFACTOR_SRC_ALPHA,
+            .rgb_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA,
+            .alpha_func = PIPE_BLEND_ADD,
+            .alpha_src_factor = PIPE_BLENDFACTOR_ONE,
+            .alpha_dst_factor = PIPE_BLENDFACTOR_INV_SRC_ALPHA,
+            .colormask = PIPE_MASK_RGBA,
+         },
+      };
+      void *bs_alpha = pipe->create_blend_state(pipe, &b_alpha);
+      pipe->bind_depth_stencil_alpha_state(pipe, zs_state);
+      pipe->bind_rasterizer_state(pipe, rast_state);
+      pipe->bind_blend_state(pipe, bs_alpha);
+
+      struct pipe_viewport_state vp = {.scale = {32, 32, 1}, .translate = {32, 32, 0}};
+      pipe->set_viewport_states(pipe, 0, 1, &vp);
+      struct pipe_framebuffer_state fb = {
+         .width = 64, .height = 64, .layers = 1, .nr_cbufs = 1,
+         .cbufs[0] = {.texture = rt, .format = PIPE_FORMAT_R8G8B8A8_UNORM},
+      };
+      pipe->set_framebuffer_state(pipe, &fb);
+      pipe->bind_vs_state(pipe, vs);
+
+      pipe->bind_fs_state(pipe, fs_pass);
+      struct agx_linked_shader *l_warm_pass = draw_once(pipe);
+      if (is_m5) {
+         CHECK(agx_context(pipe)->fs->inline_blend_nir != NULL);
+         check_m5_blend_bytes("warm_cache_alpha", l_warm_pass, true);
+      } else if (is_g17p) {
+         CHECK(agx_context(pipe)->fs->inline_blend_nir != NULL);
+         check_g17p_blend_bytes(l_warm_pass, true);
+      }
+
+      struct pipe_constant_buffer cb = {
+         .user_buffer = ubo_color,
+         .buffer_size = sizeof(ubo_color),
+      };
+      pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, 0, &cb);
+      pipe->bind_fs_state(pipe, fs_unif);
+      struct agx_linked_shader *l_warm_unif = draw_once(pipe);
+      if (is_m5) {
+         CHECK(agx_context(pipe)->fs->inline_blend_nir != NULL);
+         check_m5_blend_bytes("warm_cache_uniform", l_warm_unif, true);
+         CHECK(l_warm_unif->cprog_bo != NULL &&
+               l_warm_unif->cprog_size == cold_cprog_size);
+         CHECK(l_warm_unif->size == cold_unif_size);
+         CHECK(l_warm_unif->m5_graphics_templates != NULL);
+         printf("g17s warm-cache uniform inline blend: main=%zu B, cprog=%u B\n",
+                l_warm_unif->size, l_warm_unif->cprog_size);
+      } else if (is_g17p) {
+         check_g17p_blend_bytes(l_warm_unif, true);
+      }
+
+      pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, 0, NULL);
+      pipe->bind_vs_state(pipe, NULL);
+      pipe->bind_fs_state(pipe, NULL);
+      pipe->delete_vs_state(pipe, vs);
+      pipe->delete_fs_state(pipe, fs_pass);
+      pipe->delete_fs_state(pipe, fs_unif);
+      pipe->bind_vertex_elements_state(pipe, NULL);
+      pipe->delete_vertex_elements_state(pipe, velems);
+      pipe->bind_blend_state(pipe, NULL);
+      pipe->delete_blend_state(pipe, bs_alpha);
+      pipe->bind_depth_stencil_alpha_state(pipe, NULL);
+      pipe->delete_depth_stencil_alpha_state(pipe, zs_state);
+      pipe->bind_rasterizer_state(pipe, NULL);
+      pipe->delete_rasterizer_state(pipe, rast_state);
+      pipe_resource_reference(&rt, NULL);
+      pipe_resource_reference(&vbuf, NULL);
+      pipe->destroy(pipe);
+      screen->destroy(screen);
+      driDestroyOptionInfo(&info);
+   }
+
+   free(orig_pass_nir);
+   free(orig_unif_nir);
+   remove_tree(cache_dir);
+#else
+   (void)is_m5;
+   (void)is_g17p;
+#endif
 }
 
 int
@@ -547,6 +940,7 @@ main(void)
    pipe->destroy(pipe);
    screen->destroy(screen);
    driDestroyOptionInfo(&info);
+   test_warm_disk_cache(is_m5, is_g17p);
    close(fd);
    printf("%s: inline blend checks passed\n", chip_env);
    return 0;

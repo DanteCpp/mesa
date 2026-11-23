@@ -22,6 +22,11 @@
 /* Flags that are allowed and do not disable the disk cache */
 #define ALLOWED_FLAGS (AGX_DBG_NO16)
 
+/* Explicit blob header so cache entries from mismatched formats or truncated
+ * writes are rejected cleanly instead of misparsed. */
+#define AGX_DISK_CACHE_MAGIC   0x41475833u
+#define AGX_DISK_CACHE_VERSION 1u
+
 /**
  * Compute a disk cache key for the given uncompiled shader and shader key.
  */
@@ -80,6 +85,21 @@ write_shader(struct blob *blob, const struct agx_compiled_shader *binary,
    blob_write_bytes(blob, binary->push,
                     sizeof(binary->push[0]) * binary->push_range_count);
 
+   const uint32_t inline_blend_nir_size =
+      (binary->inline_blend_nir && binary->inline_blend_nir_size &&
+       binary->inline_blend_nir_size <= UINT32_MAX)
+         ? (uint32_t)binary->inline_blend_nir_size
+         : 0;
+   blob_write_uint32(blob, inline_blend_nir_size);
+   if (inline_blend_nir_size) {
+      blob_write_bytes(blob, binary->inline_blend_nir, inline_blend_nir_size);
+      struct agx_shader_key inline_key = binary->inline_blend_key;
+      inline_key.g17p_rodata_hint = NULL;
+      inline_key.g17p_rodata_hint_base = 0;
+      inline_key.g17p_rodata_hint_size_16 = 0;
+      blob_write_bytes(blob, &inline_key, sizeof(inline_key));
+   }
+
    if (is_root_gs) {
       blob_write_bytes(blob, &binary->gs, sizeof(binary->gs));
       write_shader(blob, binary->pre_gs, false);
@@ -94,27 +114,68 @@ write_shader(struct blob *blob, const struct agx_compiled_shader *binary,
    }
 }
 
+static void
+destroy_cached_shader(struct agx_device *dev, struct agx_compiled_shader *so)
+{
+   if (!so)
+      return;
+
+   destroy_cached_shader(dev, so->gs_count);
+   destroy_cached_shader(dev, so->pre_gs);
+   destroy_cached_shader(dev, so->gs_copy);
+
+   free(so->inline_blend_nir);
+   free(so->b.binary);
+   agx_bo_unreference(dev, so->bo);
+   FREE(so);
+}
+
 static struct agx_compiled_shader *
 read_shader(struct agx_screen *screen, struct blob_reader *blob,
             const struct agx_uncompiled_shader *uncompiled, bool is_root)
 {
    struct agx_compiled_shader *binary = CALLOC_STRUCT(agx_compiled_shader);
+   if (!binary) {
+      blob->overrun = true;
+      return NULL;
+   }
+
    binary->stage = blob_read_uint8(blob);
    binary->so = blob_read_uint8(blob) ? uncompiled : NULL;
 
    blob_copy_bytes(blob, &binary->b.info, sizeof(binary->b.info));
+   if (blob->overrun) {
+      destroy_cached_shader(&screen->dev, binary);
+      return NULL;
+   }
+
    size_t size = binary->b.info.binary_size;
+   if (size > (size_t)(blob->end - blob->current)) {
+      blob->overrun = true;
+      destroy_cached_shader(&screen->dev, binary);
+      return NULL;
+   }
 
    if (uncompiled->type == MESA_SHADER_VERTEX ||
        uncompiled->type == MESA_SHADER_TESS_EVAL ||
        uncompiled->type == MESA_SHADER_FRAGMENT) {
 
       binary->b.binary = malloc(size);
+      if (size && !binary->b.binary) {
+         blob->overrun = true;
+         destroy_cached_shader(&screen->dev, binary);
+         return NULL;
+      }
       blob_copy_bytes(blob, binary->b.binary, size);
 
       if (size) {
          binary->bo = agx_bo_create(&screen->dev, size, 0,
                                     AGX_BO_EXEC | AGX_BO_LOW_VA, "Executable");
+         if (!binary->bo || !agx_bo_map(binary->bo)) {
+            blob->overrun = true;
+            destroy_cached_shader(&screen->dev, binary);
+            return NULL;
+         }
          memcpy(agx_bo_map(binary->bo), binary->b.binary, size);
       }
    } else if (size) {
@@ -124,9 +185,19 @@ read_shader(struct agx_screen *screen, struct blob_reader *blob,
        * work and the identical cached dispatch fail descriptor validation. */
       binary->bo = agx_bo_create(&screen->dev, size, 0,
                                  AGX_BO_EXEC | AGX_BO_LOW_VA, "Executable");
+      if (!binary->bo || !agx_bo_map(binary->bo)) {
+         blob->overrun = true;
+         destroy_cached_shader(&screen->dev, binary);
+         return NULL;
+      }
       if (agx_chip_native_or_m5(screen->dev.chip)) {
          /* Native compute Ioto programs need the cached CPU shader bytes. */
          binary->b.binary = malloc(size);
+         if (!binary->b.binary) {
+            blob->overrun = true;
+            destroy_cached_shader(&screen->dev, binary);
+            return NULL;
+         }
          blob_copy_bytes(blob, binary->b.binary, size);
          memcpy(agx_bo_map(binary->bo), binary->b.binary, size);
       } else {
@@ -142,18 +213,67 @@ read_shader(struct agx_screen *screen, struct blob_reader *blob,
    binary->g17p_custom_border_emulation = blob_read_uint8(blob);
    binary->g17g_samples_unrolled = blob_read_uint8(blob);
    binary->push_range_count = blob_read_uint32(blob);
+   if (blob->overrun || binary->push_range_count > ARRAY_SIZE(binary->push)) {
+      blob->overrun = true;
+      destroy_cached_shader(&screen->dev, binary);
+      return NULL;
+   }
    blob_copy_bytes(blob, binary->push,
                    sizeof(binary->push[0]) * binary->push_range_count);
+
+   const uint32_t inline_blend_nir_size = blob_read_uint32(blob);
+   if (inline_blend_nir_size) {
+      const size_t remaining = (size_t)(blob->end - blob->current);
+      if (blob->overrun || inline_blend_nir_size > remaining ||
+          remaining - inline_blend_nir_size < sizeof(binary->inline_blend_key)) {
+         blob->overrun = true;
+         destroy_cached_shader(&screen->dev, binary);
+         return NULL;
+      }
+
+      binary->inline_blend_nir = malloc(inline_blend_nir_size);
+      if (!binary->inline_blend_nir) {
+         blob->overrun = true;
+         destroy_cached_shader(&screen->dev, binary);
+         return NULL;
+      }
+      blob_copy_bytes(blob, binary->inline_blend_nir, inline_blend_nir_size);
+      binary->inline_blend_nir_size = inline_blend_nir_size;
+      blob_copy_bytes(blob, &binary->inline_blend_key,
+                      sizeof(binary->inline_blend_key));
+      binary->inline_blend_key.g17p_rodata_hint = NULL;
+      binary->inline_blend_key.g17p_rodata_hint_base = 0;
+      binary->inline_blend_key.g17p_rodata_hint_size_16 = 0;
+   }
 
    if (is_root && uncompiled->type == MESA_SHADER_GEOMETRY) {
       blob_copy_bytes(blob, &binary->gs, sizeof(binary->gs));
       binary->pre_gs = read_shader(screen, blob, uncompiled, false);
+      if (!binary->pre_gs) {
+         destroy_cached_shader(&screen->dev, binary);
+         return NULL;
+      }
 
-      if (blob_read_uint8(blob))
+      if (blob_read_uint8(blob)) {
          binary->gs_copy = read_shader(screen, blob, uncompiled, false);
+         if (!binary->gs_copy) {
+            destroy_cached_shader(&screen->dev, binary);
+            return NULL;
+         }
+      }
 
-      if (blob_read_uint8(blob))
+      if (blob_read_uint8(blob)) {
          binary->gs_count = read_shader(screen, blob, uncompiled, false);
+         if (!binary->gs_count) {
+            destroy_cached_shader(&screen->dev, binary);
+            return NULL;
+         }
+      }
+   }
+
+   if (blob->overrun) {
+      destroy_cached_shader(&screen->dev, binary);
+      return NULL;
    }
 
    return binary;
@@ -181,9 +301,12 @@ agx_disk_cache_store(struct disk_cache *cache,
    struct blob blob;
    blob_init(&blob);
 
+   blob_write_uint32(&blob, AGX_DISK_CACHE_MAGIC);
+   blob_write_uint32(&blob, AGX_DISK_CACHE_VERSION);
    write_shader(&blob, binary, uncompiled->type == MESA_SHADER_GEOMETRY);
 
-   disk_cache_put(cache, cache_key, blob.data, blob.size, NULL);
+   if (!blob.out_of_memory)
+      disk_cache_put(cache, cache_key, blob.data, blob.size, NULL);
    blob_finish(&blob);
 #endif
 }
@@ -212,8 +335,20 @@ agx_disk_cache_retrieve(struct agx_screen *screen,
    struct blob_reader blob;
    blob_reader_init(&blob, buffer, size);
 
+   const uint32_t magic = blob_read_uint32(&blob);
+   const uint32_t version = blob_read_uint32(&blob);
+   if (blob.overrun || magic != AGX_DISK_CACHE_MAGIC ||
+       version != AGX_DISK_CACHE_VERSION) {
+      free(buffer);
+      return NULL;
+   }
+
    struct agx_compiled_shader *binary =
       read_shader(screen, &blob, uncompiled, true);
+   if (binary && (blob.overrun || blob.current != blob.end)) {
+      destroy_cached_shader(&screen->dev, binary);
+      binary = NULL;
+   }
 
    free(buffer);
    return binary;
