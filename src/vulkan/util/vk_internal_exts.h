@@ -39,6 +39,9 @@ struct wsi_image_create_info {
 
     /* if true, the image is a blit source */
     bool blit_src;
+
+    /* Optional explicit linear row pitch in bytes for shared Win32 linear WSI images. */
+    uint32_t explicit_linear_stride_B;
 };
 
 struct wsi_memory_allocate_info {

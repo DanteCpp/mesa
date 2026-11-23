@@ -1654,6 +1654,17 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
                "invalid linear DRM plane %u row pitch 0x%" PRIx64, plane,
                mod_explicit_info->pPlaneLayouts[plane].rowPitch);
          }
+      } else if (pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR) {
+         const struct wsi_image_create_info *wsi_info =
+            vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
+         if (wsi_info && wsi_info->explicit_linear_stride_B != 0) {
+            const uint64_t minimum_stride_B = util_format_get_stride(
+               p_format, DIV_ROUND_UP(pCreateInfo->extent.width, width_scale));
+            if (wsi_info->explicit_linear_stride_B >= minimum_stride_B &&
+                (wsi_info->explicit_linear_stride_B % 16) == 0) {
+               linear_stride_B = wsi_info->explicit_linear_stride_B;
+            }
+         }
       }
 
       bool compressed =

@@ -109,6 +109,7 @@ wsi_device_init(struct wsi_device *wsi,
    wsi->pdevice = pdevice;
    wsi->supports_scanout = true;
    wsi->sw = device_options->sw_device || (WSI_DEBUG & WSI_DEBUG_SW);
+   wsi->win32.use_d3d11_dxgi = device_options->win32_d3d11_dxgi && !wsi->sw;
    wsi->wants_linear = (WSI_DEBUG & WSI_DEBUG_LINEAR) != 0;
    wsi->x11.extra_xwayland_image = device_options->extra_xwayland_image;
    wsi->wayland.disable_timestamps = (WSI_DEBUG & WSI_DEBUG_NOWLTS) != 0;

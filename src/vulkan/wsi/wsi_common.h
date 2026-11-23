@@ -147,6 +147,9 @@ struct wsi_device {
       VkResult (*create_image_memory)(VkDevice device, void *resource,
                                       const VkAllocationCallbacks *alloc,
                                       VkDeviceMemory *out);
+      /* Use zero-CPU-copy D3D11/DXGI FLIP_DISCARD swapchain presentation via
+       * KMT-shared linear staging textures imported with VK_KHR_external_memory_win32. */
+      bool use_d3d11_dxgi;
    } win32;
 
    struct {
@@ -269,6 +272,7 @@ struct wsi_device_options {
    bool sw_device;
    bool extra_xwayland_image;
    bool emulate_24as32;
+   bool win32_d3d11_dxgi;
 };
 
 VkResult

@@ -37,6 +37,8 @@
 #include "wsi_common_private.h"
 
 #include <dxgi1_4.h>
+#include <dxgi1_5.h>
+#include <d3d11.h>
 #include <directx/d3d12.h>
 #include <dxguids/dxguids.h>
 
@@ -59,6 +61,16 @@ struct wsi_win32 {
       IDXGIFactory4 *factory;
       IDCompositionDevice *dcomp;
    } dxgi;
+   struct {
+      mtx_t lock;
+      bool lock_init;
+      bool init_failed;
+      bool allow_tearing;
+      HMODULE d3d11_mod;
+      ID3D11Device *dev;
+      ID3D11DeviceContext *ctx;
+      IDXGIFactory4 *factory;
+   } d3d11;
 };
 
 enum wsi_win32_image_state {
@@ -74,6 +86,11 @@ struct wsi_win32_image {
    struct {
       ID3D12Resource *swapchain_res;
    } dxgi;
+   struct {
+      ID3D11Texture2D *shared_tex;
+      ID3D11Query *copy_query;
+      bool copy_pending;
+   } d3d11;
    struct {
       HDC dc;
       HBITMAP bmp;
@@ -100,10 +117,18 @@ struct wsi_win32_surface {
 struct wsi_win32_swapchain {
    struct wsi_swapchain         base;
    IDXGISwapChain3            *dxgi;
+   struct {
+      bool active;
+      bool allow_tearing;
+      DXGI_FORMAT format;
+      IDXGISwapChain1 *swapchain;
+      ID3D11Texture2D *headless_target;
+   } d3d11;
    struct wsi_win32           *wsi;
    wsi_win32_surface          *surface;
    mtx_t                      acquire_mutex;
    struct u_cnd_monotonic     acquire_cond;
+   uint32_t                   next_acquire_idx;
    uint64_t                     flip_sequence;
    VkResult                     status;
    VkExtent2D                 extent;
@@ -191,6 +216,13 @@ wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
        * expose more than two image per swapchain.
        */
       caps->surfaceCapabilities.minImageCount = caps->surfaceCapabilities.maxImageCount = 2;
+   } else if (!wsi_device->sw && wsi_device->win32.use_d3d11_dxgi) {
+      /* D3D11/DXGI hardware presentation copies per-image shared staging
+       * textures into the FLIP_DISCARD swapchain, so 2..8 images (including
+       * triple-buffered MAILBOX) are supported with zero CPU readback.
+       */
+      caps->surfaceCapabilities.minImageCount = 2;
+      caps->surfaceCapabilities.maxImageCount = 8;
    } else {
       caps->surfaceCapabilities.minImageCount = 1;
       /* Software callbacke, there is no real maximum */
@@ -336,6 +368,7 @@ static const struct {
    { VK_FORMAT_B8G8R8A8_UNORM },
    { VK_FORMAT_R8G8B8A8_UNORM },
    { VK_FORMAT_B8G8R8A8_SRGB },
+   { VK_FORMAT_R8G8B8A8_SRGB },
 };
 
 
@@ -417,7 +450,9 @@ wsi_win32_surface_get_present_modes(VkIcdSurfaceBase *surface,
 {
    const VkPresentModeKHR *array;
    size_t array_size;
-   if (wsi_device->sw || !wsi_device->win32.get_d3d12_command_queue) {
+   if (wsi_device->sw ||
+       (!wsi_device->win32.get_d3d12_command_queue &&
+        !wsi_device->win32.use_d3d11_dxgi)) {
       array = present_modes_gdi;
       array_size = ARRAY_SIZE(present_modes_gdi);
    } else {
@@ -456,6 +491,253 @@ wsi_win32_surface_get_present_rectangles(VkIcdSurfaceBase *surface,
    }
 
    return vk_outarray_status(&out);
+}
+
+static DXGI_FORMAT
+wsi_win32_vk_to_dxgi_format(VkFormat fmt)
+{
+   switch (fmt) {
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      return DXGI_FORMAT_B8G8R8A8_UNORM;
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+      return DXGI_FORMAT_R8G8B8A8_UNORM;
+   case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+      return DXGI_FORMAT_R10G10B10A2_UNORM;
+   case VK_FORMAT_R16G16B16A16_SFLOAT:
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
+   default:
+      return DXGI_FORMAT_B8G8R8A8_UNORM;
+   }
+}
+
+static bool
+wsi_win32_d3d11_ensure_device(struct wsi_win32 *wsi)
+{
+   if (!wsi || !wsi->d3d11.lock_init)
+      return false;
+
+   mtx_lock(&wsi->d3d11.lock);
+   if (wsi->d3d11.dev && wsi->d3d11.ctx && wsi->d3d11.factory) {
+      mtx_unlock(&wsi->d3d11.lock);
+      return true;
+   }
+   if (wsi->d3d11.init_failed) {
+      mtx_unlock(&wsi->d3d11.lock);
+      return false;
+   }
+
+   HMODULE d3d11_mod = LoadLibraryA("d3d11.dll");
+   if (!d3d11_mod) {
+      wsi->d3d11.init_failed = true;
+      mtx_unlock(&wsi->d3d11.lock);
+      return false;
+   }
+
+   typedef HRESULT (WINAPI *PFN_D3D11_CREATE_DEVICE)(
+      IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT,
+      const D3D_FEATURE_LEVEL *, UINT, UINT,
+      ID3D11Device **, D3D_FEATURE_LEVEL *, ID3D11DeviceContext **);
+   PFN_D3D11_CREATE_DEVICE create_device =
+      (PFN_D3D11_CREATE_DEVICE)GetProcAddress(d3d11_mod, "D3D11CreateDevice");
+   if (!create_device) {
+      FreeLibrary(d3d11_mod);
+      wsi->d3d11.init_failed = true;
+      mtx_unlock(&wsi->d3d11.lock);
+      return false;
+   }
+
+   static const D3D_FEATURE_LEVEL fls[] = {
+      D3D_FEATURE_LEVEL_11_1,
+      D3D_FEATURE_LEVEL_11_0,
+      D3D_FEATURE_LEVEL_10_1,
+      D3D_FEATURE_LEVEL_10_0,
+   };
+   ID3D11Device *dev = NULL;
+   ID3D11DeviceContext *ctx = NULL;
+   HRESULT hr = create_device(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                              D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                              fls, ARRAY_SIZE(fls), D3D11_SDK_VERSION,
+                              &dev, NULL, &ctx);
+   if (FAILED(hr) || !dev || !ctx) {
+      if (ctx) ctx->Release();
+      if (dev) dev->Release();
+      FreeLibrary(d3d11_mod);
+      wsi->d3d11.init_failed = true;
+      mtx_unlock(&wsi->d3d11.lock);
+      return false;
+   }
+
+   IDXGIDevice *dxgi_dev = NULL;
+   IDXGIAdapter *adapter = NULL;
+   IDXGIFactory4 *factory = NULL;
+   BOOL allow_tearing = FALSE;
+
+   if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dxgi_dev))) &&
+       SUCCEEDED(dxgi_dev->GetAdapter(&adapter)) &&
+       SUCCEEDED(adapter->GetParent(IID_PPV_ARGS(&factory)))) {
+      IDXGIFactory5 *factory5 = NULL;
+      if (SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&factory5)))) {
+         BOOL tearing = FALSE;
+         if (SUCCEEDED(factory5->CheckFeatureSupport(
+                DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing)))) {
+            allow_tearing = tearing;
+         }
+         factory5->Release();
+      }
+   }
+
+   if (adapter) adapter->Release();
+   if (dxgi_dev) dxgi_dev->Release();
+
+   if (!factory) {
+      ctx->Release();
+      dev->Release();
+      FreeLibrary(d3d11_mod);
+      wsi->d3d11.init_failed = true;
+      mtx_unlock(&wsi->d3d11.lock);
+      return false;
+   }
+
+   wsi->d3d11.d3d11_mod = d3d11_mod;
+   wsi->d3d11.dev = dev;
+   wsi->d3d11.ctx = ctx;
+   wsi->d3d11.factory = factory;
+   wsi->d3d11.allow_tearing = (allow_tearing != FALSE);
+   mtx_unlock(&wsi->d3d11.lock);
+   return true;
+}
+
+static VkResult
+wsi_create_d3d11_image_mem(const struct wsi_swapchain *drv_chain,
+                           const struct wsi_image_info *info,
+                           struct wsi_image *image)
+{
+   struct wsi_win32_swapchain *chain = (struct wsi_win32_swapchain *)drv_chain;
+   const struct wsi_device *wsi = chain->base.wsi;
+   struct wsi_win32 *wsi_win = chain->wsi;
+   struct wsi_win32_image *win32_image =
+      container_of(image, struct wsi_win32_image, base);
+
+   assert(chain->base.blit.type == WSI_SWAPCHAIN_IMAGE_BLIT);
+
+   const uint32_t width = info->create.extent.width;
+   const uint32_t height = info->create.extent.height;
+   const uint32_t bpp = vk_format_get_blocksize(info->create.format);
+   const uint32_t raw_pitch = width * bpp;
+   const uint32_t row_pitch =
+      (bpp == 4u && (raw_pitch & 15u) != 0u) ? ((raw_pitch + 127u) & ~127u) : raw_pitch;
+
+   D3D11_TEXTURE2D_DESC td = {};
+   td.Width = width;
+   td.Height = height;
+   td.MipLevels = 1;
+   td.ArraySize = 1;
+   td.Format = chain->d3d11.format;
+   td.SampleDesc.Count = 1;
+   td.Usage = D3D11_USAGE_DEFAULT;
+   td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+   td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+   HANDLE kmt_handle = NULL;
+   mtx_lock(&wsi_win->d3d11.lock);
+   HRESULT hr = wsi_win->d3d11.dev->CreateTexture2D(
+      &td, NULL, &win32_image->d3d11.shared_tex);
+   if (SUCCEEDED(hr) && win32_image->d3d11.shared_tex) {
+      IDXGIResource *dxgi_res = NULL;
+      hr = win32_image->d3d11.shared_tex->QueryInterface(IID_PPV_ARGS(&dxgi_res));
+      if (SUCCEEDED(hr) && dxgi_res) {
+         hr = dxgi_res->GetSharedHandle(&kmt_handle);
+         dxgi_res->Release();
+      }
+      if (SUCCEEDED(hr)) {
+         D3D11_QUERY_DESC qd = {};
+         qd.Query = D3D11_QUERY_EVENT;
+         wsi_win->d3d11.dev->CreateQuery(&qd, &win32_image->d3d11.copy_query);
+      }
+   }
+   mtx_unlock(&wsi_win->d3d11.lock);
+
+   if (FAILED(hr) || !win32_image->d3d11.shared_tex || !kmt_handle)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   VkExternalMemoryImageCreateInfo ext_mem = {
+      VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+      nullptr,
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT,
+   };
+   struct wsi_image_create_info blit_wsi = {
+      VK_STRUCTURE_TYPE_WSI_IMAGE_CREATE_INFO_MESA,
+      &ext_mem,
+      false,
+      false,
+      row_pitch,
+   };
+   VkImageCreateInfo blit_create = info->create;
+   blit_create.pNext = &blit_wsi;
+   blit_create.flags &= ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                          VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
+   blit_create.tiling = VK_IMAGE_TILING_LINEAR;
+   blit_create.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   blit_create.initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+   VkResult result = wsi->CreateImage(chain->base.device, &blit_create,
+                                      &chain->base.alloc, &image->blit.image);
+   if (result != VK_SUCCESS)
+      return result;
+
+   VkMemoryRequirements blit_reqs = {};
+   wsi->GetImageMemoryRequirements(chain->base.device, image->blit.image, &blit_reqs);
+
+   VkImportMemoryWin32HandleInfoKHR import_info = {
+      VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+      nullptr,
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT,
+      kmt_handle,
+      nullptr,
+   };
+   VkMemoryDedicatedAllocateInfo blit_dedicated = {
+      VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+      &import_info,
+      image->blit.image,
+      VK_NULL_HANDLE,
+   };
+   VkMemoryAllocateInfo blit_alloc = {
+      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      &blit_dedicated,
+      blit_reqs.size,
+      info->select_blit_dst_memory_type(wsi, blit_reqs.memoryTypeBits),
+   };
+
+   result = wsi->AllocateMemory(chain->base.device, &blit_alloc,
+                                &chain->base.alloc, &image->blit.memory);
+   if (result != VK_SUCCESS)
+      return result;
+
+   result = wsi->BindImageMemory(chain->base.device, image->blit.image,
+                                 image->blit.memory, 0);
+   if (result != VK_SUCCESS)
+      return result;
+
+   VkMemoryRequirements reqs = {};
+   wsi->GetImageMemoryRequirements(chain->base.device, image->image, &reqs);
+
+   const VkMemoryDedicatedAllocateInfo memory_dedicated_info = {
+      VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+      nullptr,
+      image->image,
+      VK_NULL_HANDLE,
+   };
+   const VkMemoryAllocateInfo memory_info = {
+      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      &memory_dedicated_info,
+      reqs.size,
+      info->select_image_memory_type(wsi, reqs.memoryTypeBits),
+   };
+
+   return wsi->AllocateMemory(chain->base.device, &memory_info,
+                              &chain->base.alloc, &image->memory);
 }
 
 static VkResult
@@ -529,6 +811,8 @@ wsi_dxgi_image_needs_blit(const struct wsi_device *wsi,
                           const struct wsi_dxgi_image_params *params,
                           VkDevice device)
 {
+   if (wsi->win32.use_d3d11_dxgi)
+      return WSI_SWAPCHAIN_IMAGE_BLIT;
    if (wsi->win32.requires_blits && wsi->win32.requires_blits(device))
       return WSI_SWAPCHAIN_IMAGE_BLIT;
    else if (params->storage_image)
@@ -547,7 +831,8 @@ wsi_dxgi_configure_image(const struct wsi_swapchain *chain,
    if (result != VK_SUCCESS)
       return result;
 
-   info->create_mem = wsi_create_dxgi_image_mem;
+   info->create_mem = chain->wsi->win32.use_d3d11_dxgi ?
+      wsi_create_d3d11_image_mem : wsi_create_dxgi_image_mem;
 
    if (chain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
       wsi_configure_image_blit_image(chain, info);
@@ -574,7 +859,7 @@ wsi_win32_image_init(VkDevice device_h,
    chain->wnd = win32_surface->hwnd;
    image->chain = chain;
 
-   if (chain->dxgi)
+   if (chain->dxgi || chain->d3d11.active)
       return VK_SUCCESS;
 
    chain->chain_dc = GetDC(chain->wnd);
@@ -616,6 +901,23 @@ wsi_win32_image_finish(struct wsi_win32_swapchain *chain,
    if(image->sw.bmp)
       DeleteObject(image->sw.bmp);
    wsi_destroy_image(&chain->base, &image->base);
+
+   if (image->d3d11.copy_query || image->d3d11.shared_tex) {
+      struct wsi_win32 *wsi_win = chain->wsi;
+      if (wsi_win && wsi_win->d3d11.lock_init)
+         mtx_lock(&wsi_win->d3d11.lock);
+      if (image->d3d11.copy_query) {
+         image->d3d11.copy_query->Release();
+         image->d3d11.copy_query = NULL;
+      }
+      if (image->d3d11.shared_tex) {
+         image->d3d11.shared_tex->Release();
+         image->d3d11.shared_tex = NULL;
+      }
+      image->d3d11.copy_pending = false;
+      if (wsi_win && wsi_win->d3d11.lock_init)
+         mtx_unlock(&wsi_win->d3d11.lock);
+   }
 }
 
 static VkResult
@@ -628,13 +930,32 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
    for (uint32_t i = 0; i < chain->base.image_count; i++)
       wsi_win32_image_finish(chain, allocator, &chain->images[i]);
 
-   DeleteDC(chain->chain_dc);
+   if (chain->chain_dc) {
+      ReleaseDC(chain->wnd, chain->chain_dc);
+      chain->chain_dc = NULL;
+   }
 
    if (chain->surface->current_swapchain == chain)
       chain->surface->current_swapchain = NULL;
 
    if (chain->dxgi)
       chain->dxgi->Release();
+
+   if (chain->d3d11.swapchain || chain->d3d11.headless_target) {
+      struct wsi_win32 *wsi_win = chain->wsi;
+      if (wsi_win && wsi_win->d3d11.lock_init)
+         mtx_lock(&wsi_win->d3d11.lock);
+      if (chain->d3d11.swapchain) {
+         chain->d3d11.swapchain->Release();
+         chain->d3d11.swapchain = NULL;
+      }
+      if (chain->d3d11.headless_target) {
+         chain->d3d11.headless_target->Release();
+         chain->d3d11.headless_target = NULL;
+      }
+      if (wsi_win && wsi_win->d3d11.lock_init)
+         mtx_unlock(&wsi_win->d3d11.lock);
+   }
 
    wsi_swapchain_finish(&chain->base);
 
@@ -694,10 +1015,17 @@ static bool
 wsi_win32_find_idle_image(struct wsi_win32_swapchain *chain,
                           uint32_t *out_image_index)
 {
-   for (uint32_t i = 0; i < chain->base.image_count; i++) {
+   const uint32_t count = chain->base.image_count;
+   if (count == 0)
+      return false;
+
+   uint32_t start = chain->next_acquire_idx % count;
+   for (uint32_t k = 0; k < count; k++) {
+      uint32_t i = (start + k) % count;
       if (chain->images[i].state == WSI_IMAGE_IDLE) {
          *out_image_index = i;
          chain->images[i].state = WSI_IMAGE_DRAWING;
+         chain->next_acquire_idx = (i + 1) % count;
          return true;
       }
    }
@@ -754,9 +1082,34 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
    if (chain->status != VK_SUCCESS)
       return chain->status;
 
-   /* acquire timeout has to be explicitly handled for sw wsi */
-   if (!chain->dxgi)
-      return wsi_win32_acquire_idle_cpu_image(chain, info, image_index);
+   /* acquire timeout has to be explicitly handled for sw / d3d11 wsi */
+   if (!chain->dxgi) {
+      VkResult res = wsi_win32_acquire_idle_cpu_image(chain, info, image_index);
+      if (res == VK_SUCCESS && chain->d3d11.active) {
+         struct wsi_win32_image *img = &chain->images[*image_index];
+         if (img->d3d11.copy_pending && img->d3d11.copy_query) {
+            struct wsi_win32 *wsi_win = chain->wsi;
+            mtx_lock(&wsi_win->d3d11.lock);
+            BOOL done = FALSE;
+            HRESULT qhr = wsi_win->d3d11.ctx->GetData(
+               img->d3d11.copy_query, &done, sizeof(done),
+               D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            if (qhr == S_FALSE) {
+               wsi_win->d3d11.ctx->Flush();
+               for (unsigned spin = 0; spin < 200000u && qhr == S_FALSE; spin++) {
+                  if (spin > 64u)
+                     SwitchToThread();
+                  qhr = wsi_win->d3d11.ctx->GetData(
+                     img->d3d11.copy_query, &done, sizeof(done),
+                     D3D11_ASYNC_GETDATA_DONOTFLUSH);
+               }
+            }
+            img->d3d11.copy_pending = false;
+            mtx_unlock(&wsi_win->d3d11.lock);
+         }
+      }
+      return res;
+   }
 
    if (wsi_win32_find_idle_image(chain, image_index))
       return VK_SUCCESS;
@@ -824,6 +1177,84 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
 }
 
 static VkResult
+wsi_win32_queue_present_d3d11(struct wsi_win32_swapchain *chain,
+                              uint32_t image_index,
+                              struct wsi_win32_image *image,
+                              const VkPresentRegionKHR *damage)
+{
+   const struct wsi_device *wsi = chain->base.wsi;
+   VkResult wait_res = wsi->WaitForFences(chain->base.device, 1,
+                                          &chain->base.fences[image_index],
+                                          VK_TRUE, UINT64_MAX);
+   if (wait_res != VK_SUCCESS) {
+      wsi_win32_set_image_idle(chain, image);
+      if (wait_res == VK_ERROR_DEVICE_LOST)
+         chain->status = wait_res;
+      return wait_res;
+   }
+
+   struct wsi_win32 *wsi_win = chain->wsi;
+   VkResult ret = VK_SUCCESS;
+
+   mtx_lock(&wsi_win->d3d11.lock);
+
+   ID3D11Texture2D *dst = NULL;
+   HRESULT hr = S_OK;
+   if (chain->d3d11.swapchain) {
+      hr = chain->d3d11.swapchain->GetBuffer(0, IID_PPV_ARGS(&dst));
+   } else if (chain->d3d11.headless_target) {
+      dst = chain->d3d11.headless_target;
+      dst->AddRef();
+   }
+
+   if (SUCCEEDED(hr) && dst && image->d3d11.shared_tex) {
+      wsi_win->d3d11.ctx->CopyResource(dst, image->d3d11.shared_tex);
+      if (image->d3d11.copy_query) {
+         wsi_win->d3d11.ctx->End(image->d3d11.copy_query);
+         image->d3d11.copy_pending = true;
+      }
+      dst->Release();
+   } else if (dst) {
+      dst->Release();
+   }
+
+   if (chain->d3d11.swapchain) {
+      UINT sync_interval =
+         chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR ? 1u : 0u;
+      UINT present_flags = 0u;
+      if (chain->base.present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR &&
+          chain->d3d11.allow_tearing) {
+         present_flags |= DXGI_PRESENT_ALLOW_TEARING;
+      }
+      hr = chain->d3d11.swapchain->Present(sync_interval, present_flags);
+      if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+         ret = VK_ERROR_DEVICE_LOST;
+      else if (FAILED(hr))
+         ret = VK_SUBOPTIMAL_KHR;
+   } else {
+      wsi_win->d3d11.ctx->Flush();
+   }
+
+   mtx_unlock(&wsi_win->d3d11.lock);
+
+   if (ret == VK_SUCCESS && chain->d3d11.swapchain && chain->wnd) {
+      RECT rc = {};
+      if (GetClientRect(chain->wnd, &rc)) {
+         uint32_t w = (uint32_t)(rc.right - rc.left);
+         uint32_t h = (uint32_t)(rc.bottom - rc.top);
+         if (w > 0 && h > 0 &&
+             (w != chain->extent.width || h != chain->extent.height)) {
+            ret = VK_SUBOPTIMAL_KHR;
+         }
+      }
+   }
+
+   wsi_win32_set_image_idle(chain, image);
+   chain->status = (ret == VK_ERROR_DEVICE_LOST) ? ret : VK_SUCCESS;
+   return ret;
+}
+
+static VkResult
 wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
                         uint32_t image_index,
                         uint64_t present_id,
@@ -838,6 +1269,9 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
    if (chain->dxgi)
       return wsi_win32_queue_present_dxgi(chain, image, damage);
 
+   if (chain->d3d11.active)
+      return wsi_win32_queue_present_d3d11(chain, image_index, image, damage);
+
    char *ptr = (char *)image->base.cpu_map;
    char *dptr = (char *)image->sw.ppvBits;
 
@@ -846,8 +1280,10 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
       dptr += image->sw.bmp_row_pitch;
       ptr += image->base.row_pitches[0];
    }
-   if (!StretchBlt(chain->chain_dc, 0, 0, chain->extent.width, chain->extent.height, image->sw.dc, 0, 0, chain->extent.width, chain->extent.height, SRCCOPY))
-      chain->status = VK_ERROR_MEMORY_MAP_FAILED;
+   if (chain->chain_dc && image->sw.dc) {
+      StretchBlt(chain->chain_dc, 0, 0, chain->extent.width, chain->extent.height,
+                 image->sw.dc, 0, 0, chain->extent.width, chain->extent.height, SRCCOPY);
+   }
 
    wsi_win32_set_image_idle(chain, image);
 
@@ -928,6 +1364,86 @@ wsi_win32_surface_create_swapchain_dxgi(
    return VK_SUCCESS;
 }
 
+static void
+wsi_win32_d3d11_set_present_mode(struct wsi_swapchain *drv_chain,
+                                 VkPresentModeKHR mode)
+{
+   drv_chain->present_mode = mode;
+}
+
+static VkResult
+wsi_win32_surface_create_swapchain_d3d11(
+   wsi_win32_surface *surface,
+   VkDevice device,
+   struct wsi_win32 *wsi,
+   const VkSwapchainCreateInfoKHR *create_info,
+   struct wsi_win32_swapchain *chain)
+{
+   chain->d3d11.active = true;
+   chain->d3d11.format = wsi_win32_vk_to_dxgi_format(create_info->imageFormat);
+   chain->d3d11.allow_tearing = wsi->d3d11.allow_tearing;
+   chain->base.set_present_mode = wsi_win32_d3d11_set_present_mode;
+
+   DXGI_SWAP_CHAIN_DESC1 scd = {};
+   scd.Width = create_info->imageExtent.width;
+   scd.Height = create_info->imageExtent.height;
+   scd.Format = chain->d3d11.format;
+   scd.Stereo = FALSE;
+   scd.SampleDesc.Count = 1;
+   scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+   scd.BufferCount = MAX2(MIN2(create_info->minImageCount, 4u), 2u);
+   scd.Scaling = DXGI_SCALING_STRETCH;
+   scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+   scd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+   scd.Flags = chain->d3d11.allow_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u;
+
+   mtx_lock(&wsi->d3d11.lock);
+   /* DXGI allows only one flip-model IDXGISwapChain1 per HWND at a time.
+    * When a Vulkan app recreates a swapchain (e.g. window resize), it passes
+    * oldSwapchain before destroying it; detach the retired swapchain first. */
+   if (create_info->oldSwapchain != VK_NULL_HANDLE) {
+      VK_FROM_HANDLE(wsi_swapchain, old_base, create_info->oldSwapchain);
+      struct wsi_win32_swapchain *old_chain = (struct wsi_win32_swapchain *)old_base;
+      if (old_chain && old_chain->d3d11.swapchain) {
+         old_chain->d3d11.swapchain->Release();
+         old_chain->d3d11.swapchain = NULL;
+         wsi->d3d11.ctx->ClearState();
+         wsi->d3d11.ctx->Flush();
+      }
+   }
+   HRESULT hr = wsi->d3d11.factory->CreateSwapChainForHwnd(
+      wsi->d3d11.dev, surface->base.hwnd, &scd, NULL, NULL,
+      &chain->d3d11.swapchain);
+   if (FAILED(hr) && (scd.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)) {
+      scd.Flags = 0u;
+      chain->d3d11.allow_tearing = false;
+      hr = wsi->d3d11.factory->CreateSwapChainForHwnd(
+         wsi->d3d11.dev, surface->base.hwnd, &scd, NULL, NULL,
+         &chain->d3d11.swapchain);
+   }
+   if (SUCCEEDED(hr) && chain->d3d11.swapchain) {
+      wsi->d3d11.factory->MakeWindowAssociation(
+         surface->base.hwnd, DXGI_MWA_NO_ALT_ENTER);
+   } else {
+      /* Headless / Session 0 fallback: keep full hardware GPU Vulkan -> KMT
+       * shared texture -> D3D11 CopyResource pipeline into an offscreen target. */
+      chain->d3d11.swapchain = NULL;
+      D3D11_TEXTURE2D_DESC td = {};
+      td.Width = create_info->imageExtent.width;
+      td.Height = create_info->imageExtent.height;
+      td.MipLevels = 1;
+      td.ArraySize = 1;
+      td.Format = chain->d3d11.format;
+      td.SampleDesc.Count = 1;
+      td.Usage = D3D11_USAGE_DEFAULT;
+      td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+      wsi->d3d11.dev->CreateTexture2D(&td, NULL, &chain->d3d11.headless_target);
+   }
+   mtx_unlock(&wsi->d3d11.lock);
+
+   return VK_SUCCESS;
+}
+
 static VkResult
 wsi_win32_surface_create_swapchain(
    VkIcdSurfaceBase *icd_surface,
@@ -980,7 +1496,11 @@ wsi_win32_surface_create_swapchain(
    bool supports_dxgi = wsi->dxgi.factory &&
                         wsi->dxgi.dcomp &&
                         wsi->wsi->win32.get_d3d12_command_queue;
-   struct wsi_base_image_params *image_params = supports_dxgi ?
+   bool supports_d3d11 = !supports_dxgi &&
+                         !wsi_device->sw &&
+                         wsi_device->win32.use_d3d11_dxgi &&
+                         wsi_win32_d3d11_ensure_device(wsi);
+   struct wsi_base_image_params *image_params = (supports_dxgi || supports_d3d11) ?
       &dxgi_image_params.base : &cpu_image_params.base;
 
    VkResult result = wsi_swapchain_init(wsi_device, &chain->base, device,
@@ -1006,8 +1526,12 @@ wsi_win32_surface_create_swapchain(
 
    chain->surface = surface;
 
-   if (image_params->image_type == WSI_IMAGE_TYPE_DXGI) {
+   if (supports_dxgi) {
       result = wsi_win32_surface_create_swapchain_dxgi(surface, device, wsi, create_info, chain);
+      if (result != VK_SUCCESS)
+         goto fail;
+   } else if (supports_d3d11) {
+      result = wsi_win32_surface_create_swapchain_d3d11(surface, device, wsi, create_info, chain);
       if (result != VK_SUCCESS)
          goto fail;
    }
@@ -1109,9 +1633,14 @@ wsi_win32_init_wsi(struct wsi_device *wsi_device,
    wsi->alloc = alloc;
    wsi->wsi = wsi_device;
 
-   if (!wsi_device->sw) {
+   if (mtx_init(&wsi->d3d11.lock, mtx_plain) == thrd_success)
+      wsi->d3d11.lock_init = true;
+
+   if (!wsi_device->sw && !wsi_device->win32.use_d3d11_dxgi) {
       wsi->dxgi.factory = dxgi_get_factory(WSI_DEBUG & WSI_DEBUG_DXGI);
       if (!wsi->dxgi.factory) {
+         if (wsi->d3d11.lock_init)
+            mtx_destroy(&wsi->d3d11.lock);
          vk_free(alloc, wsi);
          result = VK_ERROR_INITIALIZATION_FAILED;
          goto fail;
@@ -1119,6 +1648,8 @@ wsi_win32_init_wsi(struct wsi_device *wsi_device,
       wsi->dxgi.dcomp = dcomp_get_device();
       if (!wsi->dxgi.dcomp) {
          wsi->dxgi.factory->Release();
+         if (wsi->d3d11.lock_init)
+            mtx_destroy(&wsi->d3d11.lock);
          vk_free(alloc, wsi);
          result = VK_ERROR_INITIALIZATION_FAILED;
          goto fail;
@@ -1151,6 +1682,17 @@ wsi_win32_finish_wsi(struct wsi_device *wsi_device,
       (struct wsi_win32 *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WIN32];
    if (!wsi)
       return;
+
+   if (wsi->d3d11.factory)
+      wsi->d3d11.factory->Release();
+   if (wsi->d3d11.ctx)
+      wsi->d3d11.ctx->Release();
+   if (wsi->d3d11.dev)
+      wsi->d3d11.dev->Release();
+   if (wsi->d3d11.d3d11_mod)
+      FreeLibrary(wsi->d3d11.d3d11_mod);
+   if (wsi->d3d11.lock_init)
+      mtx_destroy(&wsi->d3d11.lock);
 
    if (wsi->dxgi.factory)
       wsi->dxgi.factory->Release();

@@ -102,9 +102,12 @@ hk_init_wsi(struct hk_physical_device *pdev)
    VkResult result;
 
 #ifdef _WIN32
-   /* Honeykrisp has no D3D12 resource/queue interop.  Use Mesa's Win32
-    * GDI copy-present backend, which is also valid in headless sessions. */
-   struct wsi_device_options wsi_options = {.sw_device = true};
+   /* Use native hardware D3D11/DXGI FLIP_DISCARD + ALLOW_TEARING presentation
+    * over KMT-shared linear GPU surfaces (zero CPU readbacks / zero GDI). */
+   struct wsi_device_options wsi_options = {
+      .sw_device = false,
+      .win32_d3d11_dxgi = true,
+   };
 #else
    struct wsi_device_options wsi_options = {.sw_device = false};
 #endif
