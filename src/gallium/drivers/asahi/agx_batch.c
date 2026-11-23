@@ -1591,10 +1591,13 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    struct agx_submit_virt virt = {.ring_idx = ctx->virt_ring_idx};
 #ifdef _WIN32
    struct agx_primary_write_set primary_writes = {0};
+   struct agx_primary_write_set primary_reads = {0};
    if (dev->primary_write_contract) {
       primary_writes.observed = true;
+      primary_reads.observed = true;
       if (compute || batch->incoherent_writes || batch->m5_shader_writes) {
          primary_writes.conservative_primaries = true;
+         primary_reads.conservative_primaries = true;
       } else if (render) {
          const struct pipe_framebuffer_state *fb = &batch->key;
          for (unsigned i = 0; i < fb->nr_cbufs; ++i) {
@@ -1620,8 +1623,36 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
                                      rsrc->separate_stencil->bo->va->addr,
                                      rsrc->separate_stencil->bo->size);
          }
+         /* Declare only primary BOs actually referenced by this render batch
+          * and not already covered by primary_writes. KMD pins and copies in
+          * both read_ranges and primary_write_ranges, so omitting untouched
+          * primaries (e.g. DWM's 3x 16 MiB swapchain buffers during offscreen
+          * blur/shadow passes) avoids ~20,000 wasted page walks per frame. */
+         AGX_BATCH_FOREACH_BO(batch, entry) {
+            struct agx_bo *bo = *entry;
+            if (!bo || !bo->va || bo->size == 0 || !(bo->flags & AGX_BO_PRIMARY))
+               continue;
+            uint64_t bo_start = bo->va->addr;
+            uint64_t bo_end = bo_start + bo->size;
+            bool in_writes = false;
+            for (unsigned wi = 0; wi < primary_writes.count; ++wi) {
+               uint64_t ws = primary_writes.ranges[wi].address;
+               uint64_t we = ws + primary_writes.ranges[wi].size;
+               if (bo_start >= ws && bo_end <= we) {
+                  in_writes = true;
+                  break;
+               }
+            }
+            if (!in_writes)
+               agx_primary_write_add(&primary_reads, bo_start, bo->size);
+         }
+         if (primary_reads.incomplete) {
+            primary_reads.conservative_primaries = true;
+            primary_reads.incomplete = false;
+         }
       }
       virt.primary_writes = &primary_writes;
+      virt.primary_reads = &primary_reads;
    }
 #endif
 

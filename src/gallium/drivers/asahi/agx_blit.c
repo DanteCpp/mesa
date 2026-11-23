@@ -878,8 +878,9 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
       UNREACHABLE("Unsupported blit");
    }
 
-   /* Handle self-blits */
-   agx_flush_writer(ctx, agx_resource(info->dst.resource), "Blit");
+   /* Handle self-blits without splitting non-self-blit batches onto the same target. */
+   if (info->dst.resource == info->src.resource)
+      agx_flush_writer(ctx, agx_resource(info->dst.resource), "Blit");
 
    agx_blitter_save(
       ctx, ctx->blitter,

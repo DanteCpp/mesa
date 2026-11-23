@@ -120,6 +120,7 @@ struct agx_submit_virt {
    struct asahi_ccmd_submit_res *extres;
    uint32_t ring_idx;
    const struct agx_primary_write_set *primary_writes;
+   const struct agx_primary_write_set *primary_reads;
 };
 
 typedef struct {

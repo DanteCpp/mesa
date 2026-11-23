@@ -1611,6 +1611,7 @@ d3dkmt_bo_sync_for_device(struct agx_device *dev, struct agx_bo *bo,
  * list is exactly what it was. *named_bos counts the BOs named. */
 static int
 d3dkmt_build_read_set(struct agx_device *dev, struct agx_bo *staging,
+                      const struct agx_primary_write_set *primary_reads,
                       struct agxw_submit_read_range *ranges,
                       uint32_t *range_count, uint32_t *named_bos)
 {
@@ -1624,6 +1625,25 @@ d3dkmt_build_read_set(struct agx_device *dev, struct agx_bo *staging,
       *range_count = 0;
       if (named_bos)
          *named_bos = 0;
+      return 0;
+   }
+
+   if (v6 && primary_reads && primary_reads->observed &&
+       !primary_reads->conservative_primaries && !primary_reads->incomplete) {
+      for (uint32_t i = 0; i < primary_reads->count; i++) {
+         if (agx_d3dkmt_read_range_add_layout(
+                &agx_d3dkmt_ws(dev)->policy.layout, ranges, &count,
+                AGXW_MAX_READ_RANGES_PER_SUBMIT,
+                primary_reads->ranges[i].address,
+                primary_reads->ranges[i].size) != AGX_D3DKMT_OK) {
+            errno = ENOSPC;
+            return -1;
+         }
+         named++;
+      }
+      *range_count = count;
+      if (named_bos)
+         *named_bos = named;
       return 0;
    }
 
@@ -2116,7 +2136,7 @@ d3dkmt_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
       (struct agxw_submit_read_range *)(priv + 1);
    uint32_t named_bos = 0;
    if (d3dkmt_build_read_set(
-          dev, staging,
+          dev, staging, virt ? virt->primary_reads : NULL,
           read_ranges, &priv->read_range_count, &named_bos) != 0) {
       if (agx_d3dkmt_v6_first(ws, AGX_D3DKMT_V6_READ_SET))
          d3dkmt_log_flushed("agxw-v6: refused kind=read-set errno=%d (more than %u ranges, "

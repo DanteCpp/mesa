@@ -2442,19 +2442,33 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    agx_scratch_init(agx_device(screen), &ctx->scratch_cs);
 
 #ifdef _WIN32
-   /* Pre-warm 4 sets of batch BOs (Encoder 512 KiB, Batch pool 256 KiB,
-    * executable pipeline pool 256 KiB) into bo_cache while the GPU is idle so
-    * pipelined multi-frame rendering never stalls mid-frame on WDDM VidMm
-    * UpdateGpuVirtualAddress address-space idle drains. */
+   /* Pre-warm 8 sets of batch BOs (Encoder 512 KiB + G17 VDM alias + CPU map,
+    * Batch pool 256 KiB + CPU map, executable pipeline pool 256 KiB + CPU map)
+    * into bo_cache while the GPU is idle so pipelined multi-frame rendering
+    * never stalls mid-frame on WDDM VidMm UpdateGpuVirtualAddress drains. */
    {
-      struct agx_bo *warm[12] = {0};
+      struct agx_bo *warm[24] = {0};
       unsigned nwarm = 0;
-      for (unsigned k = 0; k < 4; ++k) {
-         warm[nwarm++] = agx_bo_create(dev, 0x80000, 0, 0, "Encoder warm");
-         warm[nwarm++] = agx_bo_create(dev, 256 * 1024, 0, 0, "Batch pool warm");
-         warm[nwarm++] = agx_bo_create(dev, 256 * 1024, 0,
-                                       AGX_BO_LOW_VA | AGX_BO_EXEC,
-                                       "Pipeline pool warm");
+      for (unsigned k = 0; k < 8; ++k) {
+         struct agx_bo *enc = agx_bo_create(dev, 0x80000, 0, 0, "Encoder warm");
+         if (enc) {
+            (void)agx_bo_map(enc);
+            if (agx_native_graphics(dev))
+               (void)agx_bo_get_g17p_vdm_alias(dev, enc);
+            warm[nwarm++] = enc;
+         }
+         struct agx_bo *bp = agx_bo_create(dev, 256 * 1024, 0, 0, "Batch pool warm");
+         if (bp) {
+            (void)agx_bo_map(bp);
+            warm[nwarm++] = bp;
+         }
+         struct agx_bo *pp = agx_bo_create(dev, 256 * 1024, 0,
+                                           AGX_BO_LOW_VA | AGX_BO_EXEC,
+                                           "Pipeline pool warm");
+         if (pp) {
+            (void)agx_bo_map(pp);
+            warm[nwarm++] = pp;
+         }
       }
       for (unsigned k = 0; k < nwarm; ++k)
          agx_bo_unreference(dev, warm[k]);
