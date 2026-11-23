@@ -903,12 +903,22 @@ check_g16g(void)
    d.format = VK_FORMAT_D16_UNORM;
    CHECK(ELIGIBLE(d) && !G16G(d));
 
-   /* Mip chains and the small-texture rule follow G17P. */
+   /* Sampled-only textures use the classic-submission crossover
+    * (HK_CLASSIC_MIP_PBE_MIN_TEXELS = 2^20) on G16G rather than G17P's 2^17;
+    * attachments still compress at any size. */
    VkImageCreateInfo m = image(VK_FORMAT_R8G8B8A8_UNORM, 2048, 2048, 12,
                                transfer);
-   CHECK(G16G(m) == ELIGIBLE(m));
+   CHECK(G16G(m) && ELIGIBLE(m));
+   m = image(VK_FORMAT_R8G8B8A8_UNORM, 1024, 1024, 11, transfer);
+   CHECK(G16G(m) && ELIGIBLE(m));
+   m = image(VK_FORMAT_R8G8B8A8_UNORM, 1280, 720, 11, transfer);
+   CHECK(!G16G(m) && ELIGIBLE(m));
+   m = image(VK_FORMAT_R8G8B8A8_UNORM, 512, 512, 10, transfer);
+   CHECK(!G16G(m) && ELIGIBLE(m));
+   m.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   CHECK(G16G(m) && ELIGIBLE(m));
    m = image(VK_FORMAT_R8G8B8A8_UNORM, 128, 128, 1, transfer);
-   CHECK(G16G(m) == ELIGIBLE(m));
+   CHECK(!G16G(m) && !ELIGIBLE(m));
    m.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
    CHECK(G16G(m) && ELIGIBLE(m));
 

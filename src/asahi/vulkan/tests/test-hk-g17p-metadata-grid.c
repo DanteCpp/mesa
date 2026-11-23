@@ -135,6 +135,28 @@ check_mip_split(void)
    EXPECT(!hk_g17p_mip_level_through_pbe(256, 256),
           "512x512 level 1 should take compute");
    EXPECT(!hk_g17p_mip_level_through_pbe(1, 1), "1x1 should take compute");
+
+   /* Dual-submission chips (G17P) use the 128 Ki-texel crossover. */
+   EXPECT(hk_mip_level_through_pbe(AGX_CHIP_G17P, 640, 360),
+          "G17P 640x360 should take a render pass");
+   EXPECT(!hk_mip_level_through_pbe(AGX_CHIP_G17P, 480, 270),
+          "G17P 480x270 should take compute");
+
+   /* Classic-submission chips (G16G) keep levels under 1 Mi texels on compute. */
+   EXPECT(hk_mip_level_through_pbe(AGX_CHIP_G16G, 1920, 1080),
+          "G16G 1920x1080 should take a render pass");
+   EXPECT(hk_mip_level_through_pbe(AGX_CHIP_G16G, 1024, 1024),
+          "G16G 1024x1024 should take a render pass");
+   EXPECT(!hk_mip_level_through_pbe(AGX_CHIP_G16G, 1280, 720),
+          "G16G 1280x720 should take compute");
+   EXPECT(!hk_mip_level_through_pbe(AGX_CHIP_G16G, 768, 768),
+          "G16G 768x768 should take compute");
+   EXPECT(!hk_mip_level_through_pbe(AGX_CHIP_G16G, 960, 540),
+          "G16G 960x540 should take compute");
+   EXPECT(!hk_mip_level_through_pbe(AGX_CHIP_G16G, 640, 360),
+          "G16G 640x360 should take compute");
+   EXPECT(!hk_mip_level_through_pbe(AGX_CHIP_G16G, 480, 270),
+          "G16G 480x270 should take compute");
 }
 
 /* A layer owns a complete metadata miptree, including 3D Z slots whose
