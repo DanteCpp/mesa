@@ -5292,23 +5292,19 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
     */
    const bool native_eot = agx_chip_native_or_m5(dev->dev.chip);
    const bool output_only_through_eot =
-      native_eot && render->g17p_direct_color_resolve;
-
-   /* A timestamp rides on this exact command; replacing the render with
-    * image clears would drop it. Keep the render. */
-   if (cs->timestamp.start.handle || cs->timestamp.end.handle)
-      return false;
+      (native_eot && render->g17p_direct_color_resolve) ||
+      render->agx2_resolve_mask;
 
    /* M5: a multisample clear-only pass stays a render. As compute it is a
     * separate job that every later render's vertex half must wait for; as a
     * render that writes only its attachments it is not. */
    const bool m5_ms_clear = agx_chip_g17_m5(dev->dev.chip) &&
                             cs->cr.process_empty_tiles && cs->tib.nr_samples > 1;
-   if (native_eot &&
-       (continuation ||
-        (cs->cr.process_empty_tiles &&
-         (output_only_through_eot || m5_ms_clear ||
-          !agx_get_precompiled(&dev->bg_eot, LIBAGX_FILL_UINT4))))) {
+   if ((cs->cr.process_empty_tiles && output_only_through_eot) ||
+       (native_eot &&
+        (continuation || (cs->cr.process_empty_tiles &&
+                          (m5_ms_clear ||
+                           !agx_get_precompiled(&dev->bg_eot, LIBAGX_FILL_UINT4)))))) {
       /* Normally supplied by the first draw. A clear has no application
        * sample-location state; use the attachment sample count and leave
        * has_sample_locations uncommitted, just like other meta operations.
@@ -5341,6 +5337,10 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
 
       return false;
    }
+
+   /* A timestamp rides on this exact command. Keep the render. */
+   if (cs->timestamp.start.handle || cs->timestamp.end.handle)
+      return false;
 
    /* The clears stand in for the render: they are graphics work for every
     * later dependency, and they were recorded under the same requirements
