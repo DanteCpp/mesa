@@ -4748,7 +4748,7 @@ hk_hal200_decompress_attachment(struct hk_cmd_buffer *cmd,
    return true;
 }
 
-/* A 2D block store resolves four RGBA8 tile samples through the destination
+/* A 2D block store resolves four tile samples through the destination
  * PBE. A partial render still needs a multisample store to the source for
  * reload, and a subrect resolve must preserve destination pixels outside it.
  */
@@ -4767,13 +4767,15 @@ hk_agx2_color_resolve_mask(const struct hk_device *dev,
    for (unsigned i = 0; i < render->color_att_count; ++i) {
       const struct hk_attachment *att = &render->color_att[i];
       const struct hk_image_view *dst = att->resolve_iview;
+      enum pipe_format format = render->tilebuffer.logical_format[i];
       if (att->iview && dst && !render->tilebuffer.spilled[i] &&
           att->store_op == VK_ATTACHMENT_STORE_OP_DONT_CARE &&
           att->resolve_mode == VK_RESOLVE_MODE_AVERAGE_BIT &&
           att->iview->vk.image->samples == VK_SAMPLE_COUNT_4_BIT &&
-          render->tilebuffer.logical_format[i] == PIPE_FORMAT_R8G8B8A8_UNORM &&
+          (format == PIPE_FORMAT_R8G8B8A8_UNORM ||
+           format == PIPE_FORMAT_R16G16B16A16_FLOAT) &&
           dst->vk.view_type == VK_IMAGE_VIEW_TYPE_2D &&
-          dst->vk.format == VK_FORMAT_R8G8B8A8_UNORM &&
+          vk_format_to_pipe_format(dst->vk.format) == format &&
           dst->planes[0].eot_pbe_valid)
          mask |= BITFIELD_BIT(i);
    }
