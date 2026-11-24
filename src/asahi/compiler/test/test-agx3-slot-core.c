@@ -6,6 +6,7 @@
  */
 #include "agx3_slot_core.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static unsigned checks, failures;
@@ -151,6 +152,755 @@ check_live_inputs(void)
    CHECK(memcmp(r, before, sizeof(r)) == 0);
    CHECK(!agx3_slot_assign_with_live(&p, 1, 6, NULL, 1, r));
    CHECK(memcmp(r, before, sizeof(r)) == 0);
+}
+
+/* Self-contained reference slot allocator matching the pre-generation,
+ * pre-reader-list full-scan semantics. */
+static bool
+ref_slot_generation_live(const uint8_t *reg_slot, const uint16_t *reader_slots,
+                         unsigned slot, unsigned token_count)
+{
+   for (unsigned r = 0; r < token_count; ++r) {
+      if (reg_slot[r] == slot || (reader_slots[r] & (1u << (slot - 1))))
+         return true;
+   }
+   return false;
+}
+
+static unsigned
+ref_slot_token_count(const struct agx3_slot_instr *instrs, unsigned n)
+{
+   unsigned count = 1;
+   for (unsigned i = 0; i < n; ++i) {
+      const struct agx3_slot_instr *I = &instrs[i];
+      if (I->nr_srcs > AGX3_SLOT_MAX_REGS || I->nr_dsts > AGX3_SLOT_MAX_REGS)
+         return AGX3_SLOT_NUM_TOKENS;
+      for (unsigned s = 0; s < I->nr_srcs; ++s) {
+         if (I->src[s] >= AGX3_SLOT_NUM_TOKENS)
+            return AGX3_SLOT_NUM_TOKENS;
+         if (I->src[s] >= count)
+            count = I->src[s] + 1u;
+      }
+      for (unsigned d = 0; d < I->nr_dsts; ++d) {
+         if (I->dst[d] >= AGX3_SLOT_NUM_TOKENS)
+            return AGX3_SLOT_NUM_TOKENS;
+         if (I->dst[d] >= count)
+            count = I->dst[d] + 1u;
+      }
+   }
+   return count;
+}
+
+static bool
+ref_slot_assign_initial(const struct agx3_slot_instr *instrs, unsigned n,
+                        unsigned nslots, const struct agx3_slot_entry *entry,
+                        unsigned entry_count,
+                        const struct agx3_slot_live_range *live,
+                        unsigned live_count, struct agx3_slot_result *out)
+{
+   if (instrs == NULL || out == NULL || nslots < 1 || nslots > 8 ||
+       (entry_count && entry == NULL) || entry_count > AGX3_SLOT_NUM_TOKENS ||
+       (live_count && !live))
+      return false;
+
+   unsigned token_count = ref_slot_token_count(instrs, n);
+   for (unsigned i = 0; i < entry_count; ++i) {
+      if (entry[i].token >= AGX3_SLOT_NUM_TOKENS ||
+          entry[i].slot < 1 || entry[i].slot > nslots)
+         return false;
+      if (entry[i].token >= token_count)
+         token_count = entry[i].token + 1u;
+   }
+   for (unsigned i = 0; i < live_count; ++i) {
+      const struct agx3_slot_live_range *range = &live[i];
+      if (!range->count || !range->slot || range->slot > nslots ||
+          range->first >= AGX3_SLOT_NUM_TOKENS ||
+          range->count > AGX3_SLOT_NUM_TOKENS - range->first)
+         return false;
+      if (range->first + range->count > token_count)
+         token_count = range->first + range->count;
+   }
+
+   uint8_t *reg_slot = calloc(token_count, sizeof(*reg_slot));
+   uint16_t *reader_slots = calloc(token_count, sizeof(*reader_slots));
+   if (!reg_slot || !reader_slots) {
+      free(reg_slot);
+      free(reader_slots);
+      return false;
+   }
+
+   bool ok = true;
+   uint16_t pending = 0;
+   for (unsigned i = 0; i < entry_count; ++i) {
+      if (reg_slot[entry[i].token]) {
+         ok = false;
+         goto done;
+      }
+      reg_slot[entry[i].token] = entry[i].slot;
+      pending |= (uint16_t)(1u << (entry[i].slot - 1));
+   }
+   for (unsigned i = 0; i < live_count; ++i) {
+      const struct agx3_slot_live_range *range = &live[i];
+      for (unsigned r = range->first; r < range->first + range->count; ++r) {
+         if (reg_slot[r]) {
+            ok = false;
+            goto done;
+         }
+         reg_slot[r] = range->slot;
+      }
+      pending |= (uint16_t)(1u << (range->slot - 1));
+   }
+   uint16_t entry_pending = pending;
+   uint16_t active_reader_slots = 0;
+
+   bool slot_waited[9] = {false};
+   bool slot_reissuable[9] = {false};
+   uint8_t slot_join_class[9] = {0};
+   uint8_t slot_join_count[9] = {0};
+   unsigned next = 0;
+
+   for (unsigned i = 0; i < n; ++i) {
+      const struct agx3_slot_instr *I = &instrs[i];
+      if (I->nr_srcs > AGX3_SLOT_MAX_REGS || I->nr_dsts > AGX3_SLOT_MAX_REGS ||
+          I->preferred_slot > nslots || (!I->is_async && I->preferred_slot) ||
+          I->coalesce_src > I->nr_srcs || (!I->is_async && I->coalesce_src) ||
+          (I->join_class && (!I->is_async || !I->join_limit || I->join_limit > 8)) ||
+          (!I->join_class && (I->join_limit || I->prefer_join))) {
+         ok = false;
+         goto done;
+      }
+      const uint16_t valid_slots = (uint16_t)((1u << nslots) - 1u);
+      if ((I->nr_srcs < 32 && (I->late_src_mask >> I->nr_srcs)) ||
+          (!I->is_async && I->late_src_mask) ||
+          (I->transient_slots & ~valid_slots) ||
+          (I->preferred_slot &&
+           (I->transient_slots & (1u << (I->preferred_slot - 1))))) {
+         ok = false;
+         goto done;
+      }
+
+      uint16_t wait_mask = 0;
+      if (I->drain) {
+         wait_mask = pending;
+         for (unsigned slot = 1; slot <= nslots; ++slot)
+            if (pending & (1u << (slot - 1)))
+               slot_waited[slot] = true;
+      }
+      for (unsigned s = 0; s < I->nr_srcs; ++s) {
+         const uint16_t r = I->src[s];
+         if (r >= AGX3_SLOT_NUM_TOKENS) {
+            ok = false;
+            goto done;
+         }
+         const uint8_t slot = reg_slot[r];
+         if (slot != 0 && !slot_waited[slot]) {
+            wait_mask |= (uint16_t)(1u << (slot - 1));
+            slot_waited[slot] = true;
+         }
+      }
+      for (unsigned d = 0; d < I->nr_dsts; ++d) {
+         const uint16_t r = I->dst[d];
+         if (r >= AGX3_SLOT_NUM_TOKENS) {
+            ok = false;
+            goto done;
+         }
+         const uint8_t slot = reg_slot[r];
+         if (slot != 0 && !slot_waited[slot]) {
+            wait_mask |= (uint16_t)(1u << (slot - 1));
+            slot_waited[slot] = true;
+         }
+         uint16_t readers = reader_slots[r];
+         while (readers) {
+            const unsigned bit = (unsigned)(readers & (~readers + 1u));
+            const uint8_t reader = (uint8_t)(__builtin_ctz(bit) + 1);
+            readers &= (uint16_t)~bit;
+            if (!slot_waited[reader]) {
+               wait_mask |= (uint16_t)bit;
+               slot_waited[reader] = true;
+            }
+         }
+      }
+      for (unsigned slot = 1; slot <= nslots; ++slot) {
+         const uint16_t bit = (uint16_t)(1u << (slot - 1));
+         if (!(I->transient_slots & bit))
+            continue;
+         bool is_live = false;
+         for (unsigned r = 0; r < token_count; ++r) {
+            is_live |= (reader_slots[r] & bit) != 0;
+            if (reg_slot[r] == slot) {
+               is_live = true;
+               reg_slot[r] = 0;
+            }
+         }
+         if (is_live && !slot_waited[slot])
+            wait_mask |= bit;
+         slot_waited[slot] = true;
+         pending &= (uint16_t)~bit;
+      }
+      if (wait_mask & active_reader_slots) {
+         for (unsigned r = 0; r < token_count; ++r)
+            reader_slots[r] &= (uint16_t)~wait_mask;
+         active_reader_slots &= (uint16_t)~wait_mask;
+      }
+
+      if (I->is_async) {
+         uint8_t slot = I->preferred_slot;
+         const unsigned cap =
+            I->max_slot && I->max_slot < nslots ? I->max_slot : nslots;
+         if (!slot) {
+            if (I->coalesce_src) {
+               const unsigned source = I->src[I->coalesce_src - 1];
+               const uint8_t producer_slot = reg_slot[source];
+               if (producer_slot && producer_slot <= cap &&
+                   slot_waited[producer_slot] &&
+                   !(I->transient_slots & (1u << (producer_slot - 1))))
+                  slot = producer_slot;
+            }
+            if (I->prefer_join && !slot) {
+               for (unsigned t = 0; t < nslots && !slot; ++t) {
+                  const uint8_t candidate = (uint8_t)((next + t) % nslots + 1);
+                  if (candidate <= cap && !slot_waited[candidate] &&
+                      slot_join_class[candidate] == I->join_class &&
+                      slot_join_count[candidate] < I->join_limit)
+                     slot = candidate;
+               }
+            }
+            for (unsigned t = 0; t < nslots && !slot; ++t) {
+               const uint8_t candidate = (uint8_t)((next + t) % nslots + 1);
+               if (candidate > cap)
+                  continue;
+               if (slot_waited[candidate] ||
+                   !ref_slot_generation_live(reg_slot, reader_slots, candidate,
+                                             token_count) ||
+                   (I->reissues_live_slot && slot_reissuable[candidate]) ||
+                   (I->join_class && slot_join_class[candidate] == I->join_class &&
+                    slot_join_count[candidate] < I->join_limit))
+                  slot = candidate;
+            }
+            if (!slot) {
+               slot = (uint8_t)(next + 1);
+               if (slot > cap)
+                  slot = 1;
+               if (!I->reissues_live_slot) {
+                  wait_mask |= (uint16_t)(1u << (slot - 1));
+                  slot_waited[slot] = true;
+               }
+            }
+            next = slot % nslots;
+         }
+         if ((entry_pending & (1u << (slot - 1))) && !slot_waited[slot]) {
+            wait_mask |= (uint16_t)(1u << (slot - 1));
+            slot_waited[slot] = true;
+         }
+         if (!slot_waited[slot] && slot_join_count[slot] &&
+             ((slot_join_class[slot] != I->join_class) ||
+              (I->join_class && slot_join_count[slot] >= I->join_limit))) {
+            wait_mask |= (uint16_t)(1u << (slot - 1));
+            slot_waited[slot] = true;
+         }
+
+         out[i].wait_mask = wait_mask;
+         out[i].slot = slot;
+         entry_pending &= (uint16_t)~wait_mask;
+         pending &= (uint16_t)~wait_mask;
+         pending |= (uint16_t)(1u << (slot - 1));
+
+         if (wait_mask & active_reader_slots) {
+            for (unsigned r = 0; r < token_count; ++r)
+               reader_slots[r] &= (uint16_t)~wait_mask;
+            active_reader_slots &= (uint16_t)~wait_mask;
+         }
+
+         const bool new_join = slot_waited[slot] ||
+                               slot_join_class[slot] != I->join_class;
+         if (slot_waited[slot]) {
+            for (unsigned r = 0; r < token_count; ++r) {
+               if (reg_slot[r] == slot)
+                  reg_slot[r] = 0;
+            }
+         }
+         slot_waited[slot] = false;
+         slot_reissuable[slot] = I->reissues_live_slot;
+         slot_join_count[slot] = I->join_class ?
+            (new_join ? 1 : slot_join_count[slot] + 1) : 0;
+         slot_join_class[slot] = I->join_class;
+         for (unsigned d = 0; d < I->nr_dsts; ++d) {
+            if (I->dst[d] >= AGX3_SLOT_NUM_TOKENS) {
+               ok = false;
+               goto done;
+            }
+            reg_slot[I->dst[d]] = slot;
+         }
+         if ((I->latches_srcs || I->late_src_mask) && I->nr_srcs) {
+            active_reader_slots |= (uint16_t)(1u << (slot - 1));
+            for (unsigned s = 0; s < I->nr_srcs; ++s) {
+               if (I->latches_srcs || (I->late_src_mask & (UINT32_C(1) << s)))
+                  reader_slots[I->src[s]] |= (uint16_t)(1u << (slot - 1));
+            }
+         }
+      } else {
+         out[i].wait_mask = wait_mask;
+         out[i].slot = 0;
+         entry_pending &= (uint16_t)~wait_mask;
+         pending &= (uint16_t)~wait_mask;
+         for (unsigned d = 0; d < I->nr_dsts; ++d) {
+            if (I->dst[d] >= AGX3_SLOT_NUM_TOKENS) {
+               ok = false;
+               goto done;
+            }
+            reg_slot[I->dst[d]] = 0;
+         }
+      }
+   }
+
+done:
+   free(reg_slot);
+   free(reader_slots);
+   return ok;
+}
+
+static void
+check_diff_compare(const char *label, const struct agx3_slot_instr *instrs,
+                   unsigned n, unsigned nslots,
+                   const struct agx3_slot_entry *entry, unsigned entry_count,
+                   const struct agx3_slot_live_range *live, unsigned live_count,
+                   struct agx3_slot_result *got_out)
+{
+   struct agx3_slot_result *got =
+      got_out ? got_out : calloc(n ? n : 1, sizeof(*got));
+   struct agx3_slot_result *ref = calloc(n ? n : 1, sizeof(*ref));
+   CHECK(got != NULL && ref != NULL);
+   if (!got || !ref) {
+      if (!got_out)
+         free(got);
+      free(ref);
+      return;
+   }
+
+   bool ok_got = false;
+   if (live_count)
+      ok_got = agx3_slot_assign_with_live(instrs, n, nslots, live, live_count, got);
+   else if (entry_count)
+      ok_got = agx3_slot_assign_with_entry(instrs, n, nslots, entry, entry_count, got);
+   else
+      ok_got = agx3_slot_assign(instrs, n, nslots, got);
+
+   const bool ok_ref = ref_slot_assign_initial(instrs, n, nslots, entry,
+                                               entry_count, live, live_count,
+                                               ref);
+   CHECK(ok_got == ok_ref);
+   if (ok_got && ok_ref) {
+      unsigned mismatches = 0;
+      for (unsigned i = 0; i < n; ++i) {
+         if (got[i].slot != ref[i].slot ||
+             got[i].wait_mask != ref[i].wait_mask) {
+            if (mismatches < 4) {
+               fprintf(stderr,
+                       "DIFF %s[%u]: got=(slot=%u wait=0x%x) ref=(slot=%u wait=0x%x)\n",
+                       label, i, got[i].slot, got[i].wait_mask,
+                       ref[i].slot, ref[i].wait_mask);
+            }
+            mismatches++;
+         }
+      }
+      CHECK(mismatches == 0);
+   }
+
+   if (!got_out)
+      free(got);
+   free(ref);
+}
+
+/* Force the 65,535-generation uint16_t wraparound reset in slot_retire_writers()
+ * via both slot-reuse retirement and transient-slot retirement, with stale
+ * aliases left untouched from generations 1, 2, and 65,535 plus live writers
+ * and readers on other slots. */
+static void
+check_differential_gen_wraparound(void)
+{
+   /* Subtest A: wraparound triggered on waited-slot reuse. */
+   {
+      const unsigned cap = 2u * 65540u + 64u;
+      struct agx3_slot_instr *p = calloc(cap, sizeof(*p));
+      struct agx3_slot_result *r = calloc(cap, sizeof(*r));
+      CHECK(p != NULL && r != NULL);
+      if (p && r) {
+         const struct agx3_slot_entry entry[] = {
+            {.token = 10, .slot = 2},
+         };
+         unsigned n = 0;
+
+         /* Generation 1 on slot 1: leave reg 0 untouched as a stale gen-1 alias. */
+         struct agx3_slot_instr ld1 = ld(0);
+         ld1.preferred_slot = 1;
+         p[n++] = ld1;
+         p[n++] = st(0);
+
+         /* Keep an active reader on slot 3 across the entire wraparound. */
+         struct agx3_slot_instr reader3 = stdev(12);
+         reader3.preferred_slot = 3;
+         p[n++] = reader3;
+
+         /* Generation 2 on slot 1: leave reg 2 untouched as a stale gen-2 alias. */
+         struct agx3_slot_instr ld2 = ld(2);
+         ld2.preferred_slot = 1;
+         p[n++] = ld2;
+         p[n++] = st(2);
+
+         /* Advance slot 1 from gen 3 through gen 65,534 (65,532 retirements). */
+         struct agx3_slot_instr ldc = ld(4);
+         ldc.preferred_slot = 1;
+         for (unsigned k = 0; k < 65532u; ++k) {
+            p[n++] = ldc;
+            p[n++] = st(4);
+         }
+
+         /* Generation 65,535 (UINT16_MAX): leave reg 6 untouched as a stale alias. */
+         struct agx3_slot_instr ldmax = ld(6);
+         ldmax.preferred_slot = 1;
+         p[n++] = ldmax;
+         p[n++] = st(6);
+
+         /* 65,535th retirement wraps slot_gen[1] 65535 -> 0 -> reset -> 1.
+          * Reg 8 is now freshly outstanding on slot 1 at post-wrap gen 1. */
+         struct agx3_slot_instr ldwrap = ld(8);
+         ldwrap.preferred_slot = 1;
+         const unsigned idx_wrap = n;
+         p[n++] = ldwrap;
+
+         /* Stale gen-1 and gen-65535 aliases must NOT resurrect or steal slot 1's wait. */
+         const unsigned idx_stale1_r = n;
+         p[n++] = st(0);
+         const unsigned idx_stale1_w = n;
+         p[n++] = mov(0);
+         const unsigned idx_stalemax_r = n;
+         p[n++] = st(6);
+         const unsigned idx_live_wrap = n;
+         p[n++] = st(8);
+
+         /* Advance to post-wrap gen 2: stale gen-2 alias (reg 2) must stay dead. */
+         struct agx3_slot_instr ldwrap2 = ld(14);
+         ldwrap2.preferred_slot = 1;
+         p[n++] = ldwrap2;
+         const unsigned idx_stale2_r = n;
+         p[n++] = st(2);
+         const unsigned idx_stale2_w = n;
+         p[n++] = mov(2);
+         const unsigned idx_live_wrap2 = n;
+         p[n++] = st(14);
+
+         /* Unrelated live writer on slot 2 and live reader on slot 3 survive intact. */
+         const unsigned idx_other_w = n;
+         p[n++] = st(10);
+         const unsigned idx_other_r = n;
+         p[n++] = mov(12);
+
+         /* Continued post-wraparound round-robin, coalesce, and join traffic. */
+         for (unsigned k = 0; k < 8; ++k)
+            p[n++] = ld((uint16_t)(20 + k));
+         struct agx3_slot_instr coal = ld(40);
+         coal.nr_srcs = 1;
+         coal.src[0] = 20;
+         coal.coalesce_src = 1;
+         p[n++] = coal;
+         p[n++] = st(20);
+         p[n++] = st(40);
+         p[n++] = (struct agx3_slot_instr){.drain = true};
+
+         check_diff_compare("gen-wrap-reuse", p, n, 6, entry, 1, NULL, 0, r);
+         CHECK(r[idx_wrap].slot == 1 && r[idx_wrap].wait_mask == 0);
+         CHECK(r[idx_stale1_r].wait_mask == 0);
+         CHECK(r[idx_stale1_w].wait_mask == 0);
+         CHECK(r[idx_stalemax_r].wait_mask == 0);
+         CHECK(r[idx_live_wrap].wait_mask == 1);
+         CHECK(r[idx_stale2_r].wait_mask == 0);
+         CHECK(r[idx_stale2_w].wait_mask == 0);
+         CHECK(r[idx_live_wrap2].wait_mask == 1);
+         CHECK(r[idx_other_w].wait_mask == 2);
+         CHECK(r[idx_other_r].wait_mask == 4);
+      }
+      free(p);
+      free(r);
+   }
+
+   /* Subtest B: wraparound triggered on transient_slots retirement. */
+   {
+      const unsigned cap = 2u * 65540u + 32u;
+      struct agx3_slot_instr *p = calloc(cap, sizeof(*p));
+      struct agx3_slot_result *r = calloc(cap, sizeof(*r));
+      CHECK(p != NULL && r != NULL);
+      if (p && r) {
+         const struct agx3_slot_entry entry[] = {
+            {.token = 10, .slot = 3},
+         };
+         unsigned n = 0;
+
+         /* Gen 1 on slot 1: stale alias reg 0. */
+         struct agx3_slot_instr ld1 = ld(0);
+         ld1.preferred_slot = 1;
+         p[n++] = ld1;
+         p[n++] = st(0);
+
+         /* Advance slot 1 from gen 2 through gen 65,534 (65,533 retirements). */
+         struct agx3_slot_instr ldc = ld(4);
+         ldc.preferred_slot = 1;
+         for (unsigned k = 0; k < 65533u; ++k) {
+            p[n++] = ldc;
+            p[n++] = st(4);
+         }
+
+         /* Gen 65,535 (UINT16_MAX) on slot 1, left unwaited for transient_slots. */
+         struct agx3_slot_instr ldmax = ld(6);
+         ldmax.preferred_slot = 1;
+         p[n++] = ldmax;
+
+         /* Transient slot 1 triggers the 65,535th retirement wraparound. */
+         struct agx3_slot_instr compound = ld(16);
+         compound.preferred_slot = 2;
+         compound.transient_slots = 1;
+         const unsigned idx_trans = n;
+         p[n++] = compound;
+
+         /* Fresh post-wrap gen-1 writer on slot 1; stale reg 0/6 stay dead. */
+         struct agx3_slot_instr ldwrap = ld(8);
+         ldwrap.preferred_slot = 1;
+         p[n++] = ldwrap;
+         const unsigned idx_stale1 = n;
+         p[n++] = st(0);
+         const unsigned idx_stalemax = n;
+         p[n++] = st(6);
+         const unsigned idx_live1 = n;
+         p[n++] = st(8);
+         const unsigned idx_live2 = n;
+         p[n++] = st(16);
+         const unsigned idx_live3 = n;
+         p[n++] = st(10);
+
+         check_diff_compare("gen-wrap-transient", p, n, 6, entry, 1, NULL, 0, r);
+         CHECK(r[idx_trans].slot == 2 && r[idx_trans].wait_mask == 1);
+         CHECK(r[idx_stale1].wait_mask == 0);
+         CHECK(r[idx_stalemax].wait_mask == 0);
+         CHECK(r[idx_live1].wait_mask == 1);
+         CHECK(r[idx_live2].wait_mask == 2);
+         CHECK(r[idx_live3].wait_mask == 4);
+      }
+      free(p);
+      free(r);
+   }
+}
+
+/* Force reader_list[] overflow (>64 distinct latched tokens) across multiple
+ * slots with shared payload tokens, partial retirements (WAR, transient_slots,
+ * forced round-robin eviction, drain), recovery back to the compact reader
+ * list, and a second overflow cycle — differentially verified against the
+ * reference allocator. */
+static void
+check_differential_reader_overflow(void)
+{
+   struct agx3_slot_instr p[64];
+   struct agx3_slot_result r[64];
+   memset(p, 0, sizeof(p));
+   unsigned n = 0;
+
+   /* Cycle 1: latch 72 distinct GPR tokens on slot 1 (overflows 64-entry list). */
+   for (unsigned b = 0; b < 3; ++b) {
+      p[n].is_async = true;
+      p[n].latches_srcs = true;
+      p[n].preferred_slot = 1;
+      p[n].nr_srcs = 24;
+      for (unsigned k = 0; k < 24; ++k)
+         p[n].src[k] = (uint16_t)(b * 24 + k);
+      n++;
+   }
+
+   /* Slot 2 latches 20 tokens via late_src_mask: 8 overlap slot 1, 12 new
+    * (including staging, TPS, and dynamic-TPS tokens). */
+   p[n].is_async = true;
+   p[n].preferred_slot = 2;
+   p[n].nr_srcs = 22;
+   p[n].late_src_mask = 0x3ffffcu; /* bits 2..21 (20 late sources, 2 early) */
+   p[n].src[0] = 200;
+   p[n].src[1] = 201;
+   for (unsigned k = 0; k < 8; ++k)
+      p[n].src[2 + k] = (uint16_t)(k * 9); /* overlaps slot 1 */
+   for (unsigned k = 0; k < 8; ++k)
+      p[n].src[10 + k] = (uint16_t)(AGX3_SLOT_STAGING_TOKEN_BASE + k);
+   p[n].src[18] = AGX3_SLOT_TPS_TOKEN_BASE + 16;
+   p[n].src[19] = AGX3_SLOT_TPS_TOKEN_BASE + 32;
+   p[n].src[20] = AGX3_SLOT_TEX_COORD_TOKEN;
+   p[n].src[21] = AGX3_SLOT_DYNAMIC_TPS_TOKEN;
+   n++;
+
+   /* Slot 3 latches 16 more distinct tokens; slot 4 holds a writer. */
+   p[n].is_async = true;
+   p[n].latches_srcs = true;
+   p[n].preferred_slot = 3;
+   p[n].nr_srcs = 16;
+   for (unsigned k = 0; k < 16; ++k)
+      p[n].src[k] = (uint16_t)(120 + k);
+   n++;
+
+   struct agx3_slot_instr ld4 = ld(220);
+   ld4.preferred_slot = 4;
+   p[n++] = ld4;
+
+   /* Redefining non-latched src[0] of slot 2 needs no wait. */
+   p[n++] = mov(200);
+   /* Redefining a slot-1-only token retires slot 1 while keeping slots 2 and 3. */
+   p[n++] = mov(71);
+   p[n++] = mov(1); /* slot 1 already retired */
+   /* Reissue slot 1 with a fresh unwaited load while still in overflow mode:
+    * touching overflowed token 70 (>64th reader) must NOT falsely wait slot 1
+    * or steal the wait from the fresh load's consumer. */
+   struct agx3_slot_instr ld1_fresh = ld(240);
+   ld1_fresh.preferred_slot = 1;
+   p[n++] = ld1_fresh;
+   p[n++] = mov(70);
+   p[n++] = st(240);
+   /* Token 0 was shared by slots 1 and 2: now must wait ONLY slot 2. */
+   p[n++] = mov(0);
+   p[n++] = mov(AGX3_SLOT_DYNAMIC_TPS_TOKEN); /* slot 2 already retired */
+
+   /* Round-robin loads fill remaining slots, then force slot-3 eviction or skip. */
+   p[n++] = ld(222);
+   p[n++] = ld(224);
+   p[n++] = ld(226);
+
+   /* Transient slot 3 retires remaining reader slot -> active_reader_slots == 0,
+    * resetting reader_list_overflow back to false. */
+   struct agx3_slot_instr trans3 = ld(228);
+   trans3.preferred_slot = 1;
+   trans3.transient_slots = 1u << 2;
+   p[n++] = trans3;
+   p[n++] = mov(135); /* slot 3 already retired by transient */
+
+   /* Fast-path check after overflow recovery. */
+   p[n++] = stdev(150);
+   p[n++] = mov(150);
+   p[n++] = mov(150);
+
+   /* Cycle 2: trigger overflow a second time (>64 tokens), then retire via drain
+    * and verify forced eviction on nslots=4. */
+   for (unsigned b = 0; b < 3; ++b) {
+      p[n].is_async = true;
+      p[n].latches_srcs = true;
+      p[n].nr_srcs = 24;
+      for (unsigned k = 0; k < 24; ++k)
+         p[n].src[k] = (uint16_t)(b * 24 + k);
+      n++;
+   }
+   p[n++] = stdev(180);
+   p[n++] = ld(230); /* all 4 slots occupied: forces eviction wait & reader retire */
+   p[n++] = mov(0);
+   p[n++] = (struct agx3_slot_instr){.drain = true};
+   p[n++] = mov(180);
+   p[n++] = st(230);
+
+   check_diff_compare("reader-overflow", p, n, 4, NULL, 0, NULL, 0, r);
+}
+
+static uint32_t
+xorshift32(uint32_t *state)
+{
+   uint32_t x = *state;
+   x ^= x << 13;
+   x ^= x >> 17;
+   x ^= x << 5;
+   *state = x;
+   return x;
+}
+
+/* Randomized differential stress across nslots={1,2,6,8} exercising entry
+ * ranges, preferred/max slots, coalescing, reissuable loads, join classes,
+ * transient slots, drains, synchronous overwrites, and reader-list overflow. */
+static void
+check_differential_random_stress(void)
+{
+   const unsigned slot_counts[] = {1, 2, 6, 8};
+   const unsigned n = 1500;
+   struct agx3_slot_instr *p = calloc(n, sizeof(*p));
+   CHECK(p != NULL);
+   if (!p)
+      return;
+
+   uint32_t rng = 0x800a3b5du;
+   for (unsigned sc = 0; sc < sizeof(slot_counts) / sizeof(slot_counts[0]); ++sc) {
+      const unsigned nslots = slot_counts[sc];
+      const struct agx3_slot_live_range live[] = {
+         {.first = 0, .count = 4, .slot = 1},
+         {.first = AGX3_SLOT_TPS_TOKEN_BASE + 8, .count = 4, .slot = (uint8_t)nslots},
+      };
+      const unsigned live_count = nslots >= 2 ? 2 : 1;
+
+      for (unsigned i = 0; i < n; ++i) {
+         struct agx3_slot_instr I = {0};
+         const uint32_t kind = xorshift32(&rng) % 100u;
+
+         if (kind < 4u) {
+            I.drain = true;
+         } else if (kind < 14u) {
+            /* Burst of wide latched stores to push reader_list over 64 entries. */
+            I.is_async = true;
+            I.nr_srcs = 16 + (uint8_t)(xorshift32(&rng) % 17u); /* 16..32 */
+            const uint16_t base = (uint16_t)((xorshift32(&rng) % 5u) * 24u);
+            for (unsigned s = 0; s < I.nr_srcs; ++s)
+               I.src[s] = (uint16_t)(base + s);
+            if (xorshift32(&rng) & 1u) {
+               I.latches_srcs = true;
+            } else {
+               I.late_src_mask =
+                  I.nr_srcs == 32 ? 0xffffffffu : ((1u << I.nr_srcs) - 1u);
+               I.late_src_mask &= (xorshift32(&rng) | 1u);
+            }
+            if ((xorshift32(&rng) % 4u) == 0)
+               I.preferred_slot = (uint8_t)(1u + (xorshift32(&rng) % nslots));
+         } else if (kind < 62u) {
+            I.is_async = true;
+            I.nr_dsts = (uint8_t)(1u + (xorshift32(&rng) % 4u));
+            I.nr_srcs = (uint8_t)(xorshift32(&rng) % 5u);
+            for (unsigned d = 0; d < I.nr_dsts; ++d)
+               I.dst[d] = (uint16_t)(xorshift32(&rng) % 96u);
+            for (unsigned s = 0; s < I.nr_srcs; ++s)
+               I.src[s] = (uint16_t)(xorshift32(&rng) % 96u);
+
+            const uint32_t mode = xorshift32(&rng) % 12u;
+            if (mode == 0) {
+               I.preferred_slot = (uint8_t)(1u + (xorshift32(&rng) % nslots));
+            } else if (mode == 1 && I.nr_srcs > 0) {
+               I.coalesce_src = (uint8_t)(1u + (xorshift32(&rng) % I.nr_srcs));
+            } else if (mode == 2) {
+               I.reissues_live_slot = true;
+            } else if (mode == 3 || mode == 4) {
+               I.join_class = (uint8_t)(1u + (xorshift32(&rng) % 2u));
+               I.join_limit = (uint8_t)(1u + (xorshift32(&rng) % 4u));
+               I.prefer_join = (mode == 4);
+            } else if (mode == 5 && nslots > 1) {
+               I.max_slot = (uint8_t)(1u + (xorshift32(&rng) % (nslots - 1u)));
+            }
+
+            if (nslots > 1 && (xorshift32(&rng) % 10u) == 0) {
+               const unsigned ts = 1u + (xorshift32(&rng) % nslots);
+               if (ts != I.preferred_slot)
+                  I.transient_slots = (uint16_t)(1u << (ts - 1u));
+            }
+         } else {
+            /* Synchronous ALU / mov / store. */
+            I.nr_dsts = (uint8_t)(xorshift32(&rng) % 3u);
+            I.nr_srcs = (uint8_t)(xorshift32(&rng) % 4u);
+            for (unsigned d = 0; d < I.nr_dsts; ++d)
+               I.dst[d] = (uint16_t)(xorshift32(&rng) % 128u);
+            for (unsigned s = 0; s < I.nr_srcs; ++s)
+               I.src[s] = (uint16_t)(xorshift32(&rng) % 128u);
+         }
+         p[i] = I;
+      }
+
+      char label[32];
+      snprintf(label, sizeof(label), "rand-nslots%u", nslots);
+      check_diff_compare(label, p, n, nslots, NULL, 0, live, live_count, NULL);
+   }
+
+   free(p);
 }
 
 int main(void)
@@ -798,6 +1548,10 @@ int main(void)
       CHECK(r[4].wait_mask == 2);
       CHECK(r[5].wait_mask == 1);
    }
+
+   check_differential_gen_wraparound();
+   check_differential_reader_overflow();
+   check_differential_random_stress();
 
    if (failures){ fprintf(stderr,"agx3_slot_core: %u/%u failed\n",failures,checks); return 1; }
    printf("agx3_slot_core: all %u checks passed\n", checks);
