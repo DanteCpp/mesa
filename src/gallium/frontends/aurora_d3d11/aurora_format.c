@@ -110,7 +110,11 @@ aurora_dxgi_to_pipe_format(DXGI_FORMAT fmt)
    case DXGI_FORMAT_R8_UINT:                  return PIPE_FORMAT_R8_UINT;
    case DXGI_FORMAT_R8_SNORM:                 return PIPE_FORMAT_R8_SNORM;
    case DXGI_FORMAT_R8_SINT:                  return PIPE_FORMAT_R8_SINT;
-   case DXGI_FORMAT_A8_UNORM:                 return PIPE_FORMAT_A8_UNORM;
+   /* Apple AGX has no renderable A8_UNORM tilebuffer format (ail_pixel_format
+    * leaves A8_UNORM non-renderable). Back DXGI_FORMAT_A8_UNORM with native
+    * PIPE_FORMAT_R8_UNORM (same 1-byte layout) and apply D3D11 (0,0,0,X) SRV
+    * swizzle + .w-to-.r RTV clear/PS/blend lowering in aurora_d3d11. */
+   case DXGI_FORMAT_A8_UNORM:                 return PIPE_FORMAT_R8_UNORM;
 
    /* Block-compressed (BC1..BC7) */
    case DXGI_FORMAT_BC1_TYPELESS:

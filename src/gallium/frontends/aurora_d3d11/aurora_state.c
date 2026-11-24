@@ -234,6 +234,65 @@ aurora_CreateBlendState_10(D3D10DDI_HDEVICE hDevice,
    aurora_CreateBlendState_11_1(hDevice, &d11, hState, hRTState);
 }
 
+static unsigned
+a8_blend_factor_for_r(unsigned f)
+{
+   switch (f) {
+   case PIPE_BLENDFACTOR_DST_ALPHA:          return PIPE_BLENDFACTOR_DST_COLOR;
+   case PIPE_BLENDFACTOR_INV_DST_ALPHA:      return PIPE_BLENDFACTOR_INV_DST_COLOR;
+   case PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE: return PIPE_BLENDFACTOR_ONE;
+   default:                                  return f;
+   }
+}
+
+static void *
+aurora_get_blend_a8_cso_locked(struct aurora_device *dev,
+                               struct aurora_blend *st, uint8_t a8_mask)
+{
+   if (!dev || !dev->pctx || !st)
+      return NULL;
+   if (!a8_mask)
+      return st->cso;
+   if (st->a8_cso && st->a8_mask == a8_mask)
+      return st->a8_cso;
+
+   if (st->a8_cso) {
+      if (dev->bound_blend_cso == st->a8_cso) {
+         dev->bound_blend_cso = NULL;
+         aurora_bind_blend_locked(dev, dev->default_blend_cso);
+      }
+      dev->pctx->delete_blend_state(dev->pctx, st->a8_cso);
+      st->a8_cso = NULL;
+      st->a8_mask = 0;
+   }
+
+   struct pipe_blend_state b = st->state;
+   if (!b.independent_blend_enable) {
+      b.independent_blend_enable = 1;
+      for (unsigned i = 1; i < AURORA_MAX_RTVS; ++i)
+         b.rt[i] = b.rt[0];
+   }
+
+   for (unsigned i = 0; i < AURORA_MAX_RTVS; ++i) {
+      if (!(a8_mask & (1u << i)))
+         continue;
+      /* DXGI_FORMAT_A8_UNORM is backed by PIPE_FORMAT_R8_UNORM: D3D11 alpha
+       * write mask & alpha blend equations map onto the R channel. */
+      b.rt[i].colormask = (b.rt[i].colormask & PIPE_MASK_A) ? PIPE_MASK_R : 0u;
+      if (b.rt[i].blend_enable) {
+         b.rt[i].rgb_func = b.rt[i].alpha_func;
+         b.rt[i].rgb_src_factor = a8_blend_factor_for_r(b.rt[i].alpha_src_factor);
+         b.rt[i].rgb_dst_factor = a8_blend_factor_for_r(b.rt[i].alpha_dst_factor);
+      }
+   }
+
+   st->a8_cso = dev->pctx->create_blend_state(dev->pctx, &b);
+   if (!st->a8_cso)
+      return st->cso;
+   st->a8_mask = a8_mask;
+   return st->a8_cso;
+}
+
 void APIENTRY
 aurora_DestroyBlendState(D3D10DDI_HDEVICE hDevice, D3D10DDI_HBLENDSTATE hState)
 {
@@ -245,6 +304,15 @@ aurora_DestroyBlendState(D3D10DDI_HDEVICE hDevice, D3D10DDI_HBLENDSTATE hState)
    if (dev->blend == st) {
       dev->blend = NULL;
       aurora_bind_blend_locked(dev, dev->default_blend_cso);
+   }
+   if (st->a8_cso) {
+      if (dev->bound_blend_cso == st->a8_cso) {
+         dev->bound_blend_cso = NULL;
+         aurora_bind_blend_locked(dev, dev->default_blend_cso);
+      }
+      dev->pctx->delete_blend_state(dev->pctx, st->a8_cso);
+      st->a8_cso = NULL;
+      st->a8_mask = 0;
    }
    if (st->cso) {
       if (dev->bound_blend_cso == st->cso) {
@@ -1282,10 +1350,38 @@ aurora_sync_draw_state(struct aurora_device *dev)
       dev->velems_dirty = false;
    }
 
+   /* Lower PS output .a -> .r and alpha blend/write-mask -> R channel whenever
+    * any bound RTV is DXGI_FORMAT_A8_UNORM (backed by PIPE_FORMAT_R8_UNORM). */
+   uint8_t a8_mask = 0u;
+   for (UINT i = 0; i < dev->num_rtvs; ++i) {
+      if (aurora_rtv_is_a8(dev->rtvs[i]))
+         a8_mask |= (uint8_t)(1u << i);
+   }
+
+   if (dev->ps) {
+      void *fs_cso = a8_mask ? aurora_get_ps_a8_cso_locked(dev, dev->ps, a8_mask)
+                             : dev->ps->cso;
+      aurora_bind_fs_locked(dev, fs_cso);
+   } else {
+      aurora_bind_fs_locked(dev, NULL);
+   }
+
    /* Ensure default blend / dsa / rast are bound; when no DSV is bound, ALWAYS
     * bind no_depth_dsa_cso because G17G refuses depth_enabled=1 without zsbuf. */
-   if (!dev->blend && dev->default_blend_cso)
+   if (dev->blend && dev->blend->cso) {
+      void *blend_cso = a8_mask
+         ? aurora_get_blend_a8_cso_locked(dev, dev->blend, a8_mask)
+         : dev->blend->cso;
+      aurora_bind_blend_locked(dev, blend_cso);
+   } else {
+      if (!dev->default_blend_cso) {
+         struct pipe_blend_state def;
+         memset(&def, 0, sizeof(def));
+         def.rt[0].colormask = PIPE_MASK_RGBA;
+         dev->default_blend_cso = dev->pctx->create_blend_state(dev->pctx, &def);
+      }
       aurora_bind_blend_locked(dev, dev->default_blend_cso);
+   }
    if (!dev->dsv) {
       if (dev->no_depth_dsa_cso)
          aurora_bind_dsa_locked(dev, dev->no_depth_dsa_cso);

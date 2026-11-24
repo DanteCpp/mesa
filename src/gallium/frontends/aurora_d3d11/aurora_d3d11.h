@@ -299,11 +299,16 @@ struct aurora_uav {
 struct aurora_shader {
    mesa_shader_stage stage;
    void *cso;
+   void *a8_cso;
+   nir_shader *ps_nir;
+   uint8_t a8_mask;
    struct aurora_sm5_info info;
 };
 
 struct aurora_blend {
    void *cso;
+   void *a8_cso;
+   uint8_t a8_mask;
    struct pipe_blend_state state;
 };
 
@@ -464,6 +469,7 @@ struct aurora_device {
    void *bound_dsa_cso;
    void *bound_rast_cso;
    void *bound_velems_cso;
+   void *bound_fs_cso;
 
    /* Cached per-format CheckFormatSupport results (fast path for D2D/DWM). */
    UINT fmt_caps_cache[192];
@@ -534,6 +540,29 @@ aurora_bind_velems_locked(struct aurora_device *dev, void *cso)
       dev->bound_velems_cso = cso;
    }
 }
+
+static inline void
+aurora_bind_fs_locked(struct aurora_device *dev, void *cso)
+{
+   if (dev->bound_fs_cso != cso) {
+      dev->pctx->bind_fs_state(dev->pctx, cso);
+      dev->bound_fs_cso = cso;
+   }
+}
+
+static inline bool
+aurora_rtv_is_a8(const struct aurora_rtv *rtv)
+{
+   if (!rtv)
+      return false;
+   if (rtv->dxgi_format == DXGI_FORMAT_A8_UNORM)
+      return true;
+   return rtv->dxgi_format == DXGI_FORMAT_UNKNOWN && rtv->res &&
+          rtv->res->dxgi_format == DXGI_FORMAT_A8_UNORM;
+}
+
+void *aurora_get_ps_a8_cso_locked(struct aurora_device *dev,
+                                  struct aurora_shader *sh, uint8_t a8_mask);
 
 static inline mesa_shader_stage
 aurora_stage_to_mesa(enum aurora_stage st)

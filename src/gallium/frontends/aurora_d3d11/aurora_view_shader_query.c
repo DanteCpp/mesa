@@ -296,16 +296,23 @@ create_srv_common(struct aurora_device *dev, struct aurora_srv *srv,
    t->swizzle_b = PIPE_SWIZZLE_Z;
    t->swizzle_a = PIPE_SWIZZLE_W;
 
+   DXGI_FORMAT eff_fmt = (fmt != DXGI_FORMAT_UNKNOWN) ? fmt : res->dxgi_format;
    /* D3D11 depth/stencil view formats replicate depth/stencil into .r / .g properly. */
-   if (fmt == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT ||
-       fmt == DXGI_FORMAT_X24_TYPELESS_G8_UINT) {
+   if (eff_fmt == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT ||
+       eff_fmt == DXGI_FORMAT_X24_TYPELESS_G8_UINT) {
       t->swizzle_r = PIPE_SWIZZLE_0;
       t->swizzle_g = PIPE_SWIZZLE_X;
       t->swizzle_b = PIPE_SWIZZLE_0;
       t->swizzle_a = PIPE_SWIZZLE_1;
-   } else if (fmt == DXGI_FORMAT_B8G8R8X8_UNORM ||
-              fmt == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB) {
+   } else if (eff_fmt == DXGI_FORMAT_B8G8R8X8_UNORM ||
+              eff_fmt == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB) {
       t->swizzle_a = PIPE_SWIZZLE_1;
+   } else if (eff_fmt == DXGI_FORMAT_A8_UNORM) {
+      /* Backed by PIPE_FORMAT_R8_UNORM; expose D3D11 A8_UNORM as (0,0,0,r). */
+      t->swizzle_r = PIPE_SWIZZLE_0;
+      t->swizzle_g = PIPE_SWIZZLE_0;
+      t->swizzle_b = PIPE_SWIZZLE_0;
+      t->swizzle_a = PIPE_SWIZZLE_X;
    }
 
    if (dim == D3D10DDIRESOURCE_BUFFER || dim == D3D11DDIRESOURCE_BUFFEREX) {
@@ -878,8 +885,10 @@ clear_rtv_rects_locked(struct aurora_device *dev, const struct pipe_surface *sur
    dev->pctx->set_viewport_states(dev->pctx, 0, 1, &vp);
 
    void *saved_velems = dev->bound_velems_cso;
+   void *saved_fs = dev->bound_fs_cso;
+   void *saved_blend = dev->bound_blend_cso;
    dev->pctx->bind_vs_state(dev->pctx, dev->clear_vs_cso);
-   dev->pctx->bind_fs_state(dev->pctx, dev->clear_fs_cso);
+   aurora_bind_fs_locked(dev, dev->clear_fs_cso);
    aurora_bind_blend_locked(dev, dev->clear_blend_cso);
    aurora_bind_dsa_locked(dev, dev->clear_dsa_cso);
    aurora_bind_rast_locked(dev, dev->clear_rast_cso);
@@ -915,9 +924,11 @@ clear_rtv_rects_locked(struct aurora_device *dev, const struct pipe_surface *sur
 
    /* Restore caller's pipeline state. */
    dev->pctx->bind_vs_state(dev->pctx, dev->vs ? dev->vs->cso : NULL);
-   dev->pctx->bind_fs_state(dev->pctx, dev->ps ? dev->ps->cso : NULL);
+   aurora_bind_fs_locked(dev, saved_fs);
    aurora_bind_blend_locked(dev,
-      (dev->blend && dev->blend->cso) ? dev->blend->cso : dev->default_blend_cso);
+      saved_blend ? saved_blend
+                  : ((dev->blend && dev->blend->cso) ? dev->blend->cso
+                                                     : dev->default_blend_cso));
    aurora_bind_dsa_locked(dev,
       !dev->dsv ? dev->no_depth_dsa_cso
                 : ((dev->dsa && dev->dsa->cso) ? dev->dsa->cso : dev->default_dsa_cso));
@@ -950,7 +961,14 @@ aurora_ClearRenderTargetView(D3D10DDI_HDEVICE hDevice,
    struct pipe_surface surf;
    if (aurora_rtv_fill_surface(rtv, &surf)) {
       union pipe_color_union c;
-      memcpy(c.f, Color, sizeof(float) * 4u);
+      if (aurora_rtv_is_a8(rtv)) {
+         c.f[0] = Color[3];
+         c.f[1] = Color[3];
+         c.f[2] = Color[3];
+         c.f[3] = Color[3];
+      } else {
+         memcpy(c.f, Color, sizeof(float) * 4u);
+      }
       clear_rtv_full_locked(dev, &surf, &c);
    }
    aurora_unlock(dev);
@@ -996,6 +1014,15 @@ aurora_ClearView(D3D10DDI_HDEVICE hDevice, D3D11DDI_HANDLETYPE ViewType,
       struct aurora_rtv *rtv = (struct aurora_rtv *)hView;
       struct pipe_surface surf;
       if (aurora_rtv_fill_surface(rtv, &surf)) {
+         FLOAT a8_col[4];
+         const FLOAT *clr = Color;
+         if (aurora_rtv_is_a8(rtv)) {
+            a8_col[0] = Color[3];
+            a8_col[1] = Color[3];
+            a8_col[2] = Color[3];
+            a8_col[3] = Color[3];
+            clr = a8_col;
+         }
          UINT sw = u_minify(surf.texture->width0, surf.level);
          UINT sh = u_minify(surf.texture->height0, surf.level);
          bool full = (!pRects || NumRects == 0u ||
@@ -1005,10 +1032,10 @@ aurora_ClearView(D3D10DDI_HDEVICE hDevice, D3D11DDI_HANDLETYPE ViewType,
                        pRects[0].bottom >= (LONG)sh));
          if (full) {
             union pipe_color_union c;
-            memcpy(c.f, Color, sizeof(float) * 4u);
+            memcpy(c.f, clr, sizeof(float) * 4u);
             clear_rtv_full_locked(dev, &surf, &c);
          } else {
-            clear_rtv_rects_locked(dev, &surf, Color, pRects, NumRects);
+            clear_rtv_rects_locked(dev, &surf, clr, pRects, NumRects);
          }
       }
    } else if (ViewType == D3D10DDI_HT_DEPTHSTENCILVIEW) {
@@ -1319,9 +1346,10 @@ create_shader_common(struct aurora_device *dev, mesa_shader_stage stage,
       cso.ir.nir = nir;
       if (stage == MESA_SHADER_VERTEX)
          sh->cso = dev->pctx->create_vs_state(dev->pctx, &cso);
-      else if (stage == MESA_SHADER_FRAGMENT)
+      else if (stage == MESA_SHADER_FRAGMENT) {
+         sh->ps_nir = nir_shader_clone(NULL, nir);
          sh->cso = dev->pctx->create_fs_state(dev->pctx, &cso);
-      else if (stage == MESA_SHADER_GEOMETRY && dev->pctx->create_gs_state)
+      } else if (stage == MESA_SHADER_GEOMETRY && dev->pctx->create_gs_state)
          sh->cso = dev->pctx->create_gs_state(dev->pctx, &cso);
       else if (stage == MESA_SHADER_TESS_CTRL && dev->pctx->create_tcs_state)
          sh->cso = dev->pctx->create_tcs_state(dev->pctx, &cso);
@@ -1333,9 +1361,81 @@ create_shader_common(struct aurora_device *dev, mesa_shader_stage stage,
    aurora_unlock(dev);
 
    if (!sh->cso) {
+      if (sh->ps_nir) {
+         ralloc_free(sh->ps_nir);
+         sh->ps_nir = NULL;
+      }
       aurora_log_err("CreateShader(stage=%d): Gallium Asahi create state FAILED", (int)stage);
       aurora_set_error(dev, E_FAIL);
    }
+}
+
+static bool
+lower_a8_store_deref(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_deref)
+      return false;
+
+   uint8_t a8_mask = *(const uint8_t *)data;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   if (!deref || deref->modes != nir_var_shader_out)
+      return false;
+
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   if (!var || var->data.location < FRAG_RESULT_DATA0 ||
+       var->data.location >= FRAG_RESULT_DATA0 + AURORA_MAX_RTVS)
+      return false;
+
+   unsigned rt = (unsigned)(var->data.location - FRAG_RESULT_DATA0);
+   if (!(a8_mask & (1u << rt)))
+      return false;
+
+   nir_def *val = intr->src[1].ssa;
+   if (!val || val->num_components < 4)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *a = nir_channel(b, val, 3);
+   nir_def *aaaa = nir_vec4(b, a, a, a, a);
+   nir_src_rewrite(&intr->src[1], aaaa);
+   nir_intrinsic_set_write_mask(intr, 0xfu);
+   return true;
+}
+
+void *
+aurora_get_ps_a8_cso_locked(struct aurora_device *dev,
+                            struct aurora_shader *sh, uint8_t a8_mask)
+{
+   if (!dev || !dev->pctx || !sh)
+      return NULL;
+   if (!a8_mask || sh->stage != MESA_SHADER_FRAGMENT || !sh->ps_nir)
+      return sh->cso;
+   if (sh->a8_cso && sh->a8_mask == a8_mask)
+      return sh->a8_cso;
+
+   if (sh->a8_cso) {
+      if (dev->bound_fs_cso == sh->a8_cso)
+         aurora_bind_fs_locked(dev, NULL);
+      dev->pctx->delete_fs_state(dev->pctx, sh->a8_cso);
+      sh->a8_cso = NULL;
+      sh->a8_mask = 0;
+   }
+
+   nir_shader *nir = nir_shader_clone(NULL, sh->ps_nir);
+   if (!nir)
+      return sh->cso;
+   nir_shader_intrinsics_pass(nir, lower_a8_store_deref,
+                              nir_metadata_control_flow, &a8_mask);
+
+   struct pipe_shader_state cso;
+   memset(&cso, 0, sizeof(cso));
+   cso.type = PIPE_SHADER_IR_NIR;
+   cso.ir.nir = nir;
+   sh->a8_cso = dev->pctx->create_fs_state(dev->pctx, &cso);
+   if (!sh->a8_cso)
+      return sh->cso;
+   sh->a8_mask = a8_mask;
+   return sh->a8_cso;
 }
 
 void APIENTRY
@@ -1431,19 +1531,34 @@ aurora_DestroyShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
       return;
 
    aurora_lock(dev);
-   if (sh->cso) {
+   if (sh->stage == MESA_SHADER_FRAGMENT) {
+      if (dev->ps == sh ||
+          (sh->cso && dev->bound_fs_cso == sh->cso) ||
+          (sh->a8_cso && dev->bound_fs_cso == sh->a8_cso)) {
+         aurora_bind_fs_locked(dev, NULL);
+         if (dev->ps == sh)
+            dev->ps = NULL;
+      }
+      if (sh->a8_cso) {
+         dev->pctx->delete_fs_state(dev->pctx, sh->a8_cso);
+         sh->a8_cso = NULL;
+         sh->a8_mask = 0;
+      }
+      if (sh->cso) {
+         dev->pctx->delete_fs_state(dev->pctx, sh->cso);
+         sh->cso = NULL;
+      }
+      if (sh->ps_nir) {
+         ralloc_free(sh->ps_nir);
+         sh->ps_nir = NULL;
+      }
+   } else if (sh->cso) {
       if (sh->stage == MESA_SHADER_VERTEX) {
          if (dev->vs == sh) {
             dev->pctx->bind_vs_state(dev->pctx, NULL);
             dev->vs = NULL;
          }
          dev->pctx->delete_vs_state(dev->pctx, sh->cso);
-      } else if (sh->stage == MESA_SHADER_FRAGMENT) {
-         if (dev->ps == sh) {
-            dev->pctx->bind_fs_state(dev->pctx, NULL);
-            dev->ps = NULL;
-         }
-         dev->pctx->delete_fs_state(dev->pctx, sh->cso);
       } else if (sh->stage == MESA_SHADER_GEOMETRY) {
          if (dev->gs == sh) {
             if (dev->pctx->bind_gs_state)
@@ -1502,7 +1617,7 @@ aurora_PsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader)
       return;
    aurora_lock(dev);
    dev->ps = sh;
-   dev->pctx->bind_fs_state(dev->pctx, sh ? sh->cso : NULL);
+   aurora_bind_fs_locked(dev, sh ? sh->cso : NULL);
    aurora_unlock(dev);
 }
 
