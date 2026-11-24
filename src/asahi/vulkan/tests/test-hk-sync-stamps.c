@@ -469,10 +469,10 @@ test_consecutive_stamps_coalesce(void)
             stamp_all(cmd, i);
          T("first stamp ends the dispatch", is_end(d, 0));
 
-         /* G17P with exact priors orders a stamp on a compute command
-          * through its compute queue alone (stamp_wait()), so the second
-          * stamp takes a carrier, which the rest copy. */
-         const bool own = chips[c] == AGX_CHIP_G17P && exact;
+         /* Native AGX3 and M5 with exact priors order a stamp on a compute
+          * command through its compute queue alone (stamp_wait()), so the
+          * second stamp takes a carrier, which the rest copy. */
+         const bool own = agx_chip_native_or_m5(chips[c]) && exact;
          struct hk_cs *src = own ? last_cs(cmd) : d;
          const unsigned copies = own ? 3 : 4;
          T("a run of stamps records at most one carrier",
@@ -544,7 +544,7 @@ test_stamps_with_work_stay_distinct(void)
            !cmd->sync.stamp_copy_count);
          T("later stamped work follows the earlier stamp",
            d1->sync.dep[HK_SYNC_CDM].cut == d0 ||
-           (chips[c] == AGX_CHIP_G17P && exact));
+           (agx_chip_native_or_m5(chips[c]) && exact));
 
          /* Work in a stream recorded before the latest one: the open
           * compute stream stays open across a render that does not wait
