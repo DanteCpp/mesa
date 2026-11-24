@@ -4722,7 +4722,7 @@ hk_g17p_compile_fs_cprog(nir_shader **nir, struct agx_shader_key *key,
 /* This deliberately accepts only direct constant-offset push loads. The root
  * access set is unchanged when their arithmetic moves into a constant program. */
 static bool
-hk_m5_push_colour_load(const nir_intrinsic_instr *load)
+hk_push_colour_load(const nir_intrinsic_instr *load)
 {
    if (load->intrinsic != nir_intrinsic_load_global_constant ||
        load->def.bit_size != 32 || load->def.num_components > 4)
@@ -4754,7 +4754,7 @@ hk_m5_push_colour_load(const nir_intrinsic_instr *load)
 /* Keep straight-line uniform RT0 exports without descriptors or hidden effects.
  * The clone retains the original clamps and floating-point controls. */
 static bool
-hk_m5_uniform_colour(nir_shader *nir)
+hk_uniform_colour(nir_shader *nir)
 {
    if (nir->info.stage != MESA_SHADER_FRAGMENT || nir->info.internal ||
        nir->info.writes_memory || nir->info.fs.uses_discard ||
@@ -4787,7 +4787,7 @@ hk_m5_uniform_colour(nir_shader *nir)
                return false;
             break;
          case nir_intrinsic_load_global_constant:
-            if (!hk_m5_push_colour_load(intr))
+            if (!hk_push_colour_load(intr))
                return false;
             break;
          default:
@@ -6039,14 +6039,16 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    assert(nir->info.io_lowered);
 
-   /* Preserve NIR for optional native inline blending, M5 uniform-colour
+   /* Preserve NIR for optional native inline blending, uniform-colour
     * blending and mandatory M5 sample shading whose split exports exceed the
     * register file. Native AGX3 inline blending captures the shader's
     * pre-preamble NIR during the standalone compile below so fast-link does
     * not repeat the pre-preamble optimization pipeline. */
    const bool preserve_raw_mono =
-      (agx_chip_g17_m5(dev->dev.chip) && sw_stage == MESA_SHADER_FRAGMENT &&
-       hk_m5_uniform_colour(nir)) ||
+      (sw_stage == MESA_SHADER_FRAGMENT &&
+       (agx_chip_g17_m5(dev->dev.chip) ||
+        agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2) &&
+       hk_uniform_colour(nir)) ||
       (sw_stage == MESA_SHADER_FRAGMENT &&
        shader->info.fs.m5_inline_sample_shading);
    const bool capture_g17p_preopt_mono =
