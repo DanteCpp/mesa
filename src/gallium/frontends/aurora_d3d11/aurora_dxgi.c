@@ -279,11 +279,24 @@ dxgi_blt_common(DXGI_DDI_HDEVICE hDevice, DXGI_DDI_HRESOURCE hDst,
    UINT dst_layer = dstSub / MAX2(dst->mip_levels, 1u);
 
    aurora_lock(dev);
-   bool same_size = (dstRight - dstLeft == srcRight - srcLeft) &&
-                    (dstBottom - dstTop == srcBottom - srcTop);
-   if (!flags.Resolve && !flags.Convert && !flags.Stretch && same_size &&
-       dst->prsrc->format == src->prsrc->format &&
-       dst->prsrc->nr_samples == src->prsrc->nr_samples) {
+   bool can_blit =
+      dev->screen != NULL &&
+      !util_format_is_depth_or_stencil(dst->prsrc->format) &&
+      !util_format_is_depth_or_stencil(src->prsrc->format) &&
+      !util_format_is_compressed(dst->prsrc->format) &&
+      !util_format_is_compressed(src->prsrc->format) &&
+      dev->screen->is_format_supported(dev->screen, dst->prsrc->format,
+                                       dst->prsrc->target, dst->prsrc->nr_samples,
+                                       dst->prsrc->nr_storage_samples,
+                                       PIPE_BIND_RENDER_TARGET) &&
+      dev->screen->is_format_supported(dev->screen, src->prsrc->format,
+                                       src->prsrc->target, src->prsrc->nr_samples,
+                                       src->prsrc->nr_storage_samples,
+                                       PIPE_BIND_SAMPLER_VIEW);
+   if (!can_blit && dst->prsrc->format == src->prsrc->format &&
+       dst->prsrc->nr_samples == src->prsrc->nr_samples &&
+       (dstRight - dstLeft) == (srcRight - srcLeft) &&
+       (dstBottom - dstTop) == (srcBottom - srcTop)) {
       struct pipe_box box = {
          .x = (int)srcLeft, .y = (int)srcTop, .z = (int)src_layer,
          .width = (int)(srcRight - srcLeft),
@@ -293,7 +306,7 @@ dxgi_blt_common(DXGI_DDI_HDEVICE hDevice, DXGI_DDI_HRESOURCE hDst,
       dev->pctx->resource_copy_region(dev->pctx, dst->prsrc, dst_level,
                                       dstLeft, dstTop, dst_layer,
                                       src->prsrc, src_level, &box);
-   } else {
+   } else if (can_blit) {
       struct pipe_blit_info info;
       memset(&info, 0, sizeof(info));
       info.dst.resource = dst->prsrc;

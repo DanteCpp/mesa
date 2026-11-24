@@ -244,10 +244,13 @@ aurora_DestroyBlendState(D3D10DDI_HDEVICE hDevice, D3D10DDI_HBLENDSTATE hState)
    aurora_lock(dev);
    if (dev->blend == st) {
       dev->blend = NULL;
-      if (dev->default_blend_cso)
-         dev->pctx->bind_blend_state(dev->pctx, dev->default_blend_cso);
+      aurora_bind_blend_locked(dev, dev->default_blend_cso);
    }
    if (st->cso) {
+      if (dev->bound_blend_cso == st->cso) {
+         dev->bound_blend_cso = NULL;
+         aurora_bind_blend_locked(dev, dev->default_blend_cso);
+      }
       dev->pctx->delete_blend_state(dev->pctx, st->cso);
       st->cso = NULL;
    }
@@ -269,11 +272,13 @@ aurora_SetBlendState(D3D10DDI_HDEVICE hDevice, D3D10DDI_HBLENDSTATE hState,
       memcpy(dev->blend_color.color, BlendFactor, sizeof(float) * 4u);
       dev->pctx->set_blend_color(dev->pctx, &dev->blend_color);
    }
-   dev->sample_mask = SampleMask;
-   dev->pctx->set_sample_mask(dev->pctx, SampleMask);
+   if (dev->sample_mask != SampleMask) {
+      dev->sample_mask = SampleMask;
+      dev->pctx->set_sample_mask(dev->pctx, SampleMask);
+   }
 
    if (st && st->cso) {
-      dev->pctx->bind_blend_state(dev->pctx, st->cso);
+      aurora_bind_blend_locked(dev, st->cso);
    } else {
       if (!dev->default_blend_cso) {
          struct pipe_blend_state def;
@@ -281,7 +286,7 @@ aurora_SetBlendState(D3D10DDI_HDEVICE hDevice, D3D10DDI_HBLENDSTATE hState,
          def.rt[0].colormask = PIPE_MASK_RGBA;
          dev->default_blend_cso = dev->pctx->create_blend_state(dev->pctx, &def);
       }
-      dev->pctx->bind_blend_state(dev->pctx, dev->default_blend_cso);
+      aurora_bind_blend_locked(dev, dev->default_blend_cso);
    }
    aurora_unlock(dev);
 }
@@ -347,10 +352,13 @@ aurora_DestroyDepthStencilState(D3D10DDI_HDEVICE hDevice,
    aurora_lock(dev);
    if (dev->dsa == st) {
       dev->dsa = NULL;
-      if (dev->default_dsa_cso)
-         dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dev->default_dsa_cso);
+      aurora_bind_dsa_locked(dev, dev->dsv ? dev->default_dsa_cso : dev->no_depth_dsa_cso);
    }
    if (st->cso) {
+      if (dev->bound_dsa_cso == st->cso) {
+         dev->bound_dsa_cso = NULL;
+         aurora_bind_dsa_locked(dev, dev->dsv ? dev->default_dsa_cso : dev->no_depth_dsa_cso);
+      }
       dev->pctx->delete_depth_stencil_alpha_state(dev->pctx, st->cso);
       st->cso = NULL;
    }
@@ -368,12 +376,16 @@ aurora_SetDepthStencilState(D3D10DDI_HDEVICE hDevice,
 
    aurora_lock(dev);
    dev->dsa = st;
-   dev->stencil_ref = StencilRef;
-   struct pipe_stencil_ref sr = { .ref_value = { (uint8_t)StencilRef, (uint8_t)StencilRef } };
-   dev->pctx->set_stencil_ref(dev->pctx, sr);
+   if (dev->stencil_ref != StencilRef) {
+      dev->stencil_ref = StencilRef;
+      struct pipe_stencil_ref sr = { .ref_value = { (uint8_t)StencilRef, (uint8_t)StencilRef } };
+      dev->pctx->set_stencil_ref(dev->pctx, sr);
+   }
 
-   if (st && st->cso) {
-      dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, st->cso);
+   if (!dev->dsv && dev->no_depth_dsa_cso) {
+      aurora_bind_dsa_locked(dev, dev->no_depth_dsa_cso);
+   } else if (st && st->cso) {
+      aurora_bind_dsa_locked(dev, st->cso);
    } else {
       if (!dev->default_dsa_cso) {
          struct pipe_depth_stencil_alpha_state def;
@@ -384,7 +396,7 @@ aurora_SetDepthStencilState(D3D10DDI_HDEVICE hDevice,
          dev->default_dsa_cso =
             dev->pctx->create_depth_stencil_alpha_state(dev->pctx, &def);
       }
-      dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dev->default_dsa_cso);
+      aurora_bind_dsa_locked(dev, dev->default_dsa_cso);
    }
    aurora_unlock(dev);
 }
@@ -522,10 +534,13 @@ aurora_DestroyRasterizerState(D3D10DDI_HDEVICE hDevice,
    aurora_lock(dev);
    if (dev->rast == st) {
       dev->rast = NULL;
-      if (dev->default_rast_cso)
-         dev->pctx->bind_rasterizer_state(dev->pctx, dev->default_rast_cso);
+      aurora_bind_rast_locked(dev, dev->default_rast_cso);
    }
    if (st->cso) {
+      if (dev->bound_rast_cso == st->cso) {
+         dev->bound_rast_cso = NULL;
+         aurora_bind_rast_locked(dev, dev->default_rast_cso);
+      }
       dev->pctx->delete_rasterizer_state(dev->pctx, st->cso);
       st->cso = NULL;
    }
@@ -544,7 +559,7 @@ aurora_SetRasterizerState(D3D10DDI_HDEVICE hDevice,
    aurora_lock(dev);
    dev->rast = st;
    if (st && st->cso) {
-      dev->pctx->bind_rasterizer_state(dev->pctx, st->cso);
+      aurora_bind_rast_locked(dev, st->cso);
    } else {
       if (!dev->default_rast_cso) {
          struct pipe_rasterizer_state def;
@@ -561,7 +576,7 @@ aurora_SetRasterizerState(D3D10DDI_HDEVICE hDevice,
          def.point_size = 1.0f;
          dev->default_rast_cso = dev->pctx->create_rasterizer_state(dev->pctx, &def);
       }
-      dev->pctx->bind_rasterizer_state(dev->pctx, dev->default_rast_cso);
+      aurora_bind_rast_locked(dev, dev->default_rast_cso);
    }
    aurora_unlock(dev);
 }
@@ -706,6 +721,19 @@ aurora_DestroyElementLayout(D3D10DDI_HDEVICE hDevice,
    if (dev->velems == ve) {
       dev->velems = NULL;
       dev->velems_dirty = true;
+   }
+   if (dev->pctx) {
+      for (unsigned i = 0; i < ve->cache_count; ++i) {
+         if (ve->cache[i].cso) {
+            if (dev->bound_velems_cso == ve->cache[i].cso) {
+               dev->bound_velems_cso = NULL;
+               aurora_bind_velems_locked(dev, dev->empty_velems_cso);
+            }
+            dev->pctx->delete_vertex_elements_state(dev->pctx, ve->cache[i].cso);
+            ve->cache[i].cso = NULL;
+         }
+      }
+      ve->cache_count = 0;
    }
    aurora_unlock(dev);
 }
@@ -1146,8 +1174,13 @@ aurora_sync_stage_resources(struct aurora_device *dev, enum aurora_stage stage)
                max_tex = i + 1u;
          }
       }
-      dev->pctx->set_sampler_views(dev->pctx, mst, 0, max_tex,
-                                   PIPE_MAX_SAMPLERS - max_tex, views);
+      UINT prev_bound = dev->bound_srv_count[stage];
+      UINT unbind_cnt = (prev_bound > max_tex) ? (prev_bound - max_tex) : 0u;
+      if (max_tex > 0u || unbind_cnt > 0u) {
+         dev->pctx->set_sampler_views(dev->pctx, mst, 0, max_tex,
+                                      unbind_cnt, views);
+      }
+      dev->bound_srv_count[stage] = max_tex;
       if (max_srv_ssbo > AURORA_SSBO_SRV_BASE) {
          dev->pctx->set_shader_buffers(
             dev->pctx, mst, AURORA_SSBO_SRV_BASE,
@@ -1202,26 +1235,49 @@ aurora_sync_draw_state(struct aurora_device *dev)
    }
 
    if (dev->velems_dirty) {
-      if (dev->active_velems_cso) {
-         if (dev->empty_velems_cso)
-            dev->pctx->bind_vertex_elements_state(dev->pctx, dev->empty_velems_cso);
-         dev->pctx->delete_vertex_elements_state(dev->pctx, dev->active_velems_cso);
-         dev->active_velems_cso = NULL;
-      }
       if (dev->velems && dev->velems->count > 0u) {
-         struct pipe_vertex_element elems[PIPE_MAX_ATTRIBS];
-         memcpy(elems, dev->velems->elems,
-                dev->velems->count * sizeof(struct pipe_vertex_element));
-         for (unsigned i = 0; i < dev->velems->count; ++i) {
-            unsigned slot = elems[i].vertex_buffer_index;
-            elems[i].src_stride =
-               (slot < AURORA_MAX_VBS) ? dev->vb_strides[slot] : 0u;
+         struct aurora_velems *ve = dev->velems;
+         uint32_t cur_strides[PIPE_MAX_ATTRIBS];
+         for (unsigned i = 0; i < ve->count; ++i) {
+            unsigned slot = ve->elems[i].vertex_buffer_index;
+            cur_strides[i] = (slot < AURORA_MAX_VBS) ? dev->vb_strides[slot] : 0u;
          }
-         dev->active_velems_cso = dev->pctx->create_vertex_elements_state(
-            dev->pctx, dev->velems->count, elems);
-         dev->pctx->bind_vertex_elements_state(dev->pctx, dev->active_velems_cso);
+         void *cso = NULL;
+         for (unsigned i = 0; i < ve->cache_count; ++i) {
+            if (ve->cache[i].cso &&
+                memcmp(ve->cache[i].strides, cur_strides,
+                       ve->count * sizeof(uint32_t)) == 0) {
+               cso = ve->cache[i].cso;
+               break;
+            }
+         }
+         if (!cso) {
+            struct pipe_vertex_element elems[PIPE_MAX_ATTRIBS];
+            memcpy(elems, ve->elems, ve->count * sizeof(struct pipe_vertex_element));
+            for (unsigned i = 0; i < ve->count; ++i)
+               elems[i].src_stride = cur_strides[i];
+            cso = dev->pctx->create_vertex_elements_state(dev->pctx, ve->count, elems);
+            unsigned dst_idx;
+            if (ve->cache_count < AURORA_VELEMS_CACHE_SLOTS) {
+               dst_idx = ve->cache_count++;
+            } else {
+               dst_idx = ve->cache_next++ % AURORA_VELEMS_CACHE_SLOTS;
+               if (ve->cache[dst_idx].cso) {
+                  if (dev->bound_velems_cso == ve->cache[dst_idx].cso) {
+                     dev->bound_velems_cso = NULL;
+                     aurora_bind_velems_locked(dev, dev->empty_velems_cso);
+                  }
+                  dev->pctx->delete_vertex_elements_state(dev->pctx,
+                                                          ve->cache[dst_idx].cso);
+               }
+            }
+            ve->cache[dst_idx].cso = cso;
+            memcpy(ve->cache[dst_idx].strides, cur_strides,
+                   ve->count * sizeof(uint32_t));
+         }
+         aurora_bind_velems_locked(dev, cso);
       } else if (dev->empty_velems_cso) {
-         dev->pctx->bind_vertex_elements_state(dev->pctx, dev->empty_velems_cso);
+         aurora_bind_velems_locked(dev, dev->empty_velems_cso);
       }
       dev->velems_dirty = false;
    }
@@ -1229,17 +1285,17 @@ aurora_sync_draw_state(struct aurora_device *dev)
    /* Ensure default blend / dsa / rast are bound; when no DSV is bound, ALWAYS
     * bind no_depth_dsa_cso because G17G refuses depth_enabled=1 without zsbuf. */
    if (!dev->blend && dev->default_blend_cso)
-      dev->pctx->bind_blend_state(dev->pctx, dev->default_blend_cso);
+      aurora_bind_blend_locked(dev, dev->default_blend_cso);
    if (!dev->dsv) {
       if (dev->no_depth_dsa_cso)
-         dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dev->no_depth_dsa_cso);
+         aurora_bind_dsa_locked(dev, dev->no_depth_dsa_cso);
    } else {
       void *dsa_cso = (dev->dsa && dev->dsa->cso) ? dev->dsa->cso : dev->default_dsa_cso;
       if (dsa_cso)
-         dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dsa_cso);
+         aurora_bind_dsa_locked(dev, dsa_cso);
    }
    if (!dev->rast && dev->default_rast_cso)
-      dev->pctx->bind_rasterizer_state(dev->pctx, dev->default_rast_cso);
+      aurora_bind_rast_locked(dev, dev->default_rast_cso);
 
    aurora_sync_stage_resources(dev, AURORA_STAGE_VS);
    if (dev->hs)

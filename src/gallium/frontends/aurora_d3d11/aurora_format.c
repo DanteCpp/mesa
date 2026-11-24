@@ -248,8 +248,18 @@ aurora_dxgi_to_d3dddi_format(DXGI_FORMAT fmt)
    case DXGI_FORMAT_R8G8B8A8_UNORM:
    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
    case DXGI_FORMAT_R8G8B8A8_TYPELESS:   return (uint32_t)D3DDDIFMT_A8B8G8R8;
-   case DXGI_FORMAT_R10G10B10A2_UNORM:   return (uint32_t)D3DDDIFMT_A2B10G10R10;
-   case DXGI_FORMAT_R16G16B16A16_FLOAT:  return (uint32_t)D3DDDIFMT_A16B16G16R16F;
+   case DXGI_FORMAT_R10G10B10A2_UNORM:
+   case DXGI_FORMAT_R10G10B10A2_TYPELESS: return (uint32_t)D3DDDIFMT_A2B10G10R10;
+   case DXGI_FORMAT_R16G16B16A16_FLOAT:
+   case DXGI_FORMAT_R16G16B16A16_TYPELESS: return (uint32_t)D3DDDIFMT_A16B16G16R16F;
+   case DXGI_FORMAT_A8_UNORM:            return (uint32_t)D3DDDIFMT_A8;
+   case DXGI_FORMAT_R8_UNORM:
+   case DXGI_FORMAT_R8_TYPELESS:         return (uint32_t)D3DDDIFMT_L8;
+   case DXGI_FORMAT_R8G8_UNORM:
+   case DXGI_FORMAT_R8G8_TYPELESS:       return (uint32_t)D3DDDIFMT_A8L8;
+   case DXGI_FORMAT_R16_FLOAT:           return (uint32_t)D3DDDIFMT_R16F;
+   case DXGI_FORMAT_R16G16_FLOAT:        return (uint32_t)D3DDDIFMT_G16R16F;
+   case DXGI_FORMAT_R32_FLOAT:           return (uint32_t)D3DDDIFMT_R32F;
    default:                              return 0u;
    }
 }
@@ -263,6 +273,12 @@ aurora_d3dddi_to_dxgi_format(uint32_t d3d_fmt)
    case D3DDDIFMT_A8B8G8R8:       return DXGI_FORMAT_R8G8B8A8_UNORM;
    case D3DDDIFMT_A2B10G10R10:    return DXGI_FORMAT_R10G10B10A2_UNORM;
    case D3DDDIFMT_A16B16G16R16F:  return DXGI_FORMAT_R16G16B16A16_FLOAT;
+   case D3DDDIFMT_A8:             return DXGI_FORMAT_A8_UNORM;
+   case D3DDDIFMT_L8:             return DXGI_FORMAT_R8_UNORM;
+   case D3DDDIFMT_A8L8:           return DXGI_FORMAT_R8G8_UNORM;
+   case D3DDDIFMT_R16F:           return DXGI_FORMAT_R16_FLOAT;
+   case D3DDDIFMT_G16R16F:        return DXGI_FORMAT_R16G16_FLOAT;
+   case D3DDDIFMT_R32F:           return DXGI_FORMAT_R32_FLOAT;
    default:                       return DXGI_FORMAT_UNKNOWN;
    }
 }

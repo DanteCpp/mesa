@@ -201,6 +201,16 @@ build_pipe_template(const D3D11DDIARG_CREATERESOURCE *args,
       }
    } else if (args->Usage == D3D10_DDI_USAGE_DYNAMIC) {
       templ->usage = PIPE_USAGE_STREAM;
+      /* Keep CPU-written dynamic 2D textures (DWrite/D2D glyph & UI atlases)
+       * linear so Map(WRITE_DISCARD) writes directly to a shadowed BO without
+       * allocating a heap staging buffer + running CPU ail_tile() on Unmap. */
+      if (args->ResourceDimension != D3D10DDIRESOURCE_BUFFER &&
+          !(args->BindFlags & (D3D10_DDI_BIND_RENDER_TARGET | D3D10_DDI_BIND_DEPTH_STENCIL)) &&
+          templ->format != PIPE_FORMAT_NONE &&
+          !util_format_is_depth_or_stencil(templ->format) &&
+          !util_format_is_compressed(templ->format)) {
+         templ->bind |= PIPE_BIND_LINEAR;
+      }
    } else if (args->Usage == D3D10_DDI_USAGE_IMMUTABLE) {
       templ->usage = PIPE_USAGE_IMMUTABLE;
    } else {
@@ -370,13 +380,11 @@ aurora_CreateResource(D3D10DDI_HDEVICE hDevice,
                         AURORA_AGXW_ALLOC_NO_CPU_MAP;
       } else if (is_primary) {
          alloc_flags |= AURORA_AGXW_ALLOC_PRIMARY;
-      } else if (bpp == 4u && ((r->width * 4u) & 15u) != 0u) {
+      } else if (((r->width * bpp) & 15u) != 0u) {
          /* AGX linear texture strides must be 16-byte aligned (ail_initialize_linear). */
          alloc_flags |= AURORA_AGXW_ALLOC_PITCH_ALIGN128;
       }
-      uint32_t row_bytes = (bpp == 4u)
-                              ? aurora_agxw_alloc_pitch(r->width, alloc_flags)
-                              : (r->width * bpp);
+      uint32_t row_bytes = aurora_agxw_alloc_pitch_bpp(r->width, bpp, alloc_flags);
       uint64_t used_bytes = (uint64_t)row_bytes * (uint64_t)r->height;
       uint64_t alloc_size = (used_bytes + AURORA_AGXW_WDDM_LARGE_PAGE_MASK) &
                             ~AURORA_AGXW_WDDM_LARGE_PAGE_MASK;
@@ -432,12 +440,15 @@ aurora_CreateResource(D3D10DDI_HDEVICE hDevice,
          }
       }
    } else if (is_shared) {
-      aurora_log_err("CreateResource: SHARED fallthrough (no AllocateCb) dim=%u %ux%u fmt=%u mips=%u arr=%u smp=%u misc=0x%x bind=0x%x usage=%u hRT=%p",
-                     (unsigned)r->dim, (unsigned)r->width, (unsigned)r->height,
-                     (unsigned)r->dxgi_format, (unsigned)r->mip_levels,
-                     (unsigned)r->array_size, (unsigned)r->sample_count,
-                     (unsigned)pArgs->MiscFlags, (unsigned)pArgs->BindFlags,
-                     (unsigned)pArgs->Usage, hRTResource.handle);
+      static volatile LONG fallthrough_log_count = 0;
+      if (InterlockedIncrement(&fallthrough_log_count) <= 8) {
+         aurora_log_err("CreateResource: SHARED fallthrough (no AllocateCb) dim=%u %ux%u fmt=%u mips=%u arr=%u smp=%u misc=0x%x bind=0x%x usage=%u hRT=%p",
+                        (unsigned)r->dim, (unsigned)r->width, (unsigned)r->height,
+                        (unsigned)r->dxgi_format, (unsigned)r->mip_levels,
+                        (unsigned)r->array_size, (unsigned)r->sample_count,
+                        (unsigned)pArgs->MiscFlags, (unsigned)pArgs->BindFlags,
+                        (unsigned)pArgs->Usage, hRTResource.handle);
+      }
    }
 
    if (!r->prsrc && is_cpu_shadowed_cb(r, is_shared, is_primary)) {
@@ -513,7 +524,8 @@ aurora_OpenResource(D3D10DDI_HDEVICE hDevice,
    bool is_primary =
       (priv->flags & (AURORA_AGXW_ALLOC_PRIMARY | AURORA_AGXW_ALLOC_DIRECT_SCANOUT)) != 0u;
    bool is_direct = (priv->flags & AURORA_AGXW_ALLOC_DIRECT_SCANOUT) != 0u;
-   uint32_t row_pitch = aurora_agxw_alloc_pitch(width, priv->flags);
+   uint32_t bpp = util_format_get_blocksize(pf);
+   uint32_t row_pitch = aurora_agxw_alloc_pitch_bpp(width, bpp, priv->flags);
 
    struct pipe_resource templ;
    memset(&templ, 0, sizeof(templ));
@@ -878,21 +890,40 @@ aurora_ResourceUpdateSubresourceUP_11_1(D3D10DDI_HDEVICE hDevice,
 }
 
 static bool
-should_gpu_blit_copy(const struct aurora_resource *dst,
-                     const struct aurora_resource *src)
+should_gpu_blit_copy(struct aurora_device *dev,
+                     const struct aurora_resource *dst,
+                     const struct aurora_resource *src,
+                     UINT dst_lvl, UINT src_lvl, UINT dst_lyr, UINT src_lyr,
+                     UINT depth)
 {
-   if (!dst || !src || !dst->prsrc || !src->prsrc)
+   if (!dev || !dev->screen || !dst || !src || !dst->prsrc || !src->prsrc)
       return false;
    if (dst->dim != D3D10DDIRESOURCE_TEXTURE2D ||
        src->dim != D3D10DDIRESOURCE_TEXTURE2D)
       return false;
-   if (!(src->is_shared || dst->is_shared ||
-         src->is_direct_scanout || dst->is_direct_scanout))
+   if (dst->prsrc->nr_samples > 1 || src->prsrc->nr_samples > 1)
       return false;
    if (util_format_is_depth_or_stencil(dst->prsrc->format) ||
        util_format_is_depth_or_stencil(src->prsrc->format) ||
        util_format_is_compressed(dst->prsrc->format) ||
        util_format_is_compressed(src->prsrc->format))
+      return false;
+   if (!dev->screen->is_format_supported(dev->screen, dst->prsrc->format,
+                                         PIPE_TEXTURE_2D, 0, 0,
+                                         PIPE_BIND_RENDER_TARGET) ||
+       !dev->screen->is_format_supported(dev->screen, src->prsrc->format,
+                                         PIPE_TEXTURE_2D, 0, 0,
+                                         PIPE_BIND_SAMPLER_VIEW))
+      return false;
+   /* Shared and direct-scanout primaries always prefer GPU blit (NO_CPU_MAP). */
+   if (src->is_shared || dst->is_shared ||
+       src->is_direct_scanout || dst->is_direct_scanout)
+      return true;
+   /* Private 2D color copies on G17G: keep level-0 single-slice renderable/
+    * samplable copies on the GPU instead of stalling + CPU detiling/retiling. */
+   if (dst_lvl != 0u || src_lvl != 0u || dst_lyr != 0u || src_lyr != 0u || depth != 1u)
+      return false;
+   if (dst->usage == D3D10_DDI_USAGE_STAGING || src->usage == D3D10_DDI_USAGE_STAGING)
       return false;
    return true;
 }
@@ -975,7 +1006,6 @@ aurora_ResourceCopy(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDst,
       dev->pctx->resource_copy_region(dev->pctx, dst->prsrc, 0, 0, 0, 0,
                                       src->prsrc, 0, &box);
    } else {
-      bool use_blit = should_gpu_blit_copy(dst, src);
       UINT mips = MIN2(MAX2(dst->mip_levels, 1u), MAX2(src->mip_levels, 1u));
       UINT layers = (dst->dim == D3D10DDIRESOURCE_TEXTURE3D)
                        ? 1u : MIN2(MAX2(dst->array_size, 1u), MAX2(src->array_size, 1u));
@@ -987,7 +1017,7 @@ aurora_ResourceCopy(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDst,
             .depth = (dst->dim == D3D10DDIRESOURCE_TEXTURE3D)
                         ? (int)u_minify(src->depth, m) : (int)layers,
          };
-         if (use_blit)
+         if (should_gpu_blit_copy(dev, dst, src, m, m, 0u, 0u, (UINT)box.depth))
             gpu_blit_2d_locked(dev, dst->prsrc, m, 0, 0, 0, src->prsrc, m, &box);
          else
             dev->pctx->resource_copy_region(dev->pctx, dst->prsrc, m, 0, 0, 0,
@@ -1076,7 +1106,8 @@ aurora_ResourceCopyRegion(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDst,
       return;
 
    aurora_lock(dev);
-   if (should_gpu_blit_copy(dst, src))
+   if (should_gpu_blit_copy(dev, dst, src, dst_lvl, src_lvl, dst_lyr,
+                            (UINT)box.z, (UINT)box.depth))
       gpu_blit_2d_locked(dev, dst->prsrc, dst_lvl, DstX, DstY, dst_lyr,
                          src->prsrc, src_lvl, &box);
    else

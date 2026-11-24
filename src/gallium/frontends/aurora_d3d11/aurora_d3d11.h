@@ -138,12 +138,18 @@ struct aurora_gpu_bridge_v4 {
 };
 
 static inline uint32_t
-aurora_agxw_alloc_pitch(uint32_t width, uint32_t flags)
+aurora_agxw_alloc_pitch_bpp(uint32_t width, uint32_t bpp, uint32_t flags)
 {
-   const uint32_t pitch = width * 4u;
+   const uint32_t pitch = width * bpp;
    return (flags & AURORA_AGXW_ALLOC_PITCH_ALIGN128)
              ? ((pitch + 127u) & ~127u)
              : pitch;
+}
+
+static inline uint32_t
+aurora_agxw_alloc_pitch(uint32_t width, uint32_t flags)
+{
+   return aurora_agxw_alloc_pitch_bpp(width, 4u, flags);
 }
 
 static inline int
@@ -317,9 +323,18 @@ struct aurora_sampler {
    struct pipe_sampler_state state;
 };
 
+#define AURORA_VELEMS_CACHE_SLOTS 4u
+struct aurora_velems_cached {
+   void *cso;
+   uint32_t strides[PIPE_MAX_ATTRIBS];
+};
+
 struct aurora_velems {
    unsigned count;
    struct pipe_vertex_element elems[PIPE_MAX_ATTRIBS];
+   struct aurora_velems_cached cache[AURORA_VELEMS_CACHE_SLOTS];
+   unsigned cache_count;
+   unsigned cache_next;
 };
 
 struct aurora_query {
@@ -396,6 +411,7 @@ struct aurora_device {
 
    struct aurora_srv *srvs[AURORA_STAGE_COUNT][AURORA_MAX_SRVS];
    UINT max_srv_slot[AURORA_STAGE_COUNT];
+   UINT bound_srv_count[AURORA_STAGE_COUNT];
    bool srv_dirty[AURORA_STAGE_COUNT];
    bool uav_dirty[AURORA_STAGE_COUNT];
 
@@ -443,6 +459,12 @@ struct aurora_device {
    void *clear_dsa_cso;
    void *clear_rast_cso;
 
+   /* Currently bound Gallium CSOs to skip redundant bind_* calls per draw. */
+   void *bound_blend_cso;
+   void *bound_dsa_cso;
+   void *bound_rast_cso;
+   void *bound_velems_cso;
+
    /* Cached per-format CheckFormatSupport results (fast path for D2D/DWM). */
    UINT fmt_caps_cache[192];
    volatile LONG fmt_caps_valid[192];
@@ -475,6 +497,42 @@ aurora_unlock(struct aurora_device *dev)
 {
    if (dev && dev->locks_init)
       LeaveCriticalSection(&dev->lock);
+}
+
+static inline void
+aurora_bind_blend_locked(struct aurora_device *dev, void *cso)
+{
+   if (cso && dev->bound_blend_cso != cso) {
+      dev->pctx->bind_blend_state(dev->pctx, cso);
+      dev->bound_blend_cso = cso;
+   }
+}
+
+static inline void
+aurora_bind_dsa_locked(struct aurora_device *dev, void *cso)
+{
+   if (cso && dev->bound_dsa_cso != cso) {
+      dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, cso);
+      dev->bound_dsa_cso = cso;
+   }
+}
+
+static inline void
+aurora_bind_rast_locked(struct aurora_device *dev, void *cso)
+{
+   if (cso && dev->bound_rast_cso != cso) {
+      dev->pctx->bind_rasterizer_state(dev->pctx, cso);
+      dev->bound_rast_cso = cso;
+   }
+}
+
+static inline void
+aurora_bind_velems_locked(struct aurora_device *dev, void *cso)
+{
+   if (cso && dev->bound_velems_cso != cso) {
+      dev->pctx->bind_vertex_elements_state(dev->pctx, cso);
+      dev->bound_velems_cso = cso;
+   }
 }
 
 static inline mesa_shader_stage

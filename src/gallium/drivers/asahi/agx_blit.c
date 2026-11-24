@@ -872,10 +872,20 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    }
 
    if (!util_blitter_is_blit_supported(ctx->blitter, info)) {
-      fprintf(stderr, "\n");
-      util_dump_blit_info(stderr, info);
-      fprintf(stderr, "\n\n");
-      UNREACHABLE("Unsupported blit");
+      if (info->dst.format == info->src.format &&
+          info->dst.box.width == info->src.box.width &&
+          info->dst.box.height == info->src.box.height &&
+          info->dst.box.depth == info->src.box.depth &&
+          info->dst.box.width > 0 && info->dst.box.height > 0 &&
+          !info->scissor_enable && !info->alpha_blend) {
+         util_resource_copy_region(pipe, info->dst.resource, info->dst.level,
+                                   info->dst.box.x, info->dst.box.y, info->dst.box.z,
+                                   info->src.resource, info->src.level, &info->src.box);
+         return;
+      }
+      mesa_loge("asahi: skipping unsupported blit src=%s dst=%s",
+                util_format_name(info->src.format), util_format_name(info->dst.format));
+      return;
    }
 
    /* Handle self-blits without splitting non-self-blit batches onto the same target. */
@@ -1016,11 +1026,25 @@ agx_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst,
                          unsigned src_level, const struct pipe_box *src_box)
 {
    if (agx_chip_g17_m5(agx_device(pctx->screen)->chip)) {
-      /* Copy through transfer maps, which synchronize with the GPU: G17G
-       * has no precompiled copy kernels (agx_launch_precomp refuses the
-       * batch), and a copy blit's render target is mostly outside the
-       * native PBE profile (mip levels, layers, most formats), so its batch
-       * would be dropped while the blit reported success. */
+      /* Prefer a GPU blit for simple level-0 single-slice 2D color copies with
+       * renderable/samplable formats so DWM/D2D copies stay on the GPU without
+       * draining the pipeline + CPU detiling/retiling. Keep the transfer-map
+       * fallback for buffers, depth/stencil, BC, mips, arrays, and formats
+       * outside G17G's native PBE profile. */
+      if (dst->target == PIPE_TEXTURE_2D && src->target == PIPE_TEXTURE_2D &&
+          dst_level == 0 && src_level == 0 && dstz == 0 &&
+          src_box->z == 0 && src_box->depth == 1 &&
+          dst->nr_samples <= 1 && src->nr_samples <= 1 &&
+          dst->format == src->format &&
+          !util_format_is_depth_or_stencil(dst->format) &&
+          !util_format_is_compressed(dst->format) &&
+          pctx->screen->is_format_supported(
+             pctx->screen, dst->format, PIPE_TEXTURE_2D, 0, 0,
+             PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW) &&
+          try_copy_via_blit(pctx, dst, dst_level, dstx, dsty, dstz, src,
+                            src_level, src_box)) {
+         return;
+      }
       util_resource_copy_region(pctx, dst, dst_level, dstx, dsty, dstz, src,
                                 src_level, src_box);
       return;

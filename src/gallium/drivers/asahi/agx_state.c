@@ -4223,19 +4223,39 @@ agx_create_shader_state(struct pipe_context *pctx,
                       (so->type == MESA_SHADER_FRAGMENT &&
                        !so->info.uses_fbfetch))) {
       union asahi_shader_key key = {0};
+      if (so->type == MESA_SHADER_FRAGMENT &&
+          (agx_chip_g17_m5(dev->chip) || agx_native_graphics(dev) ||
+           dev->chip == AGX_CHIP_G18G || so->info.needs_sample_count ||
+           so->info.uses_sample_shading)) {
+         /* Match agx_update_fs() for 1x render targets so the precompiled
+          * variant hits on first draw instead of recompiling synchronously. */
+         key.fs.nr_samples = 1;
+      }
       if (!agx_precompile_variant(dev, pctx, so, cso, &key))
          return NULL;
    } else if (so->type == MESA_SHADER_VERTEX) {
-      union asahi_shader_key key = {
-         .vs.hw = next_stage == MESA_SHADER_FRAGMENT,
-      };
-      if (!agx_precompile_variant(dev, pctx, so, cso, &key))
-         return NULL;
-
-      if (next_stage == MESA_SHADER_NONE) {
-         key.vs.hw = true;
+      if (agx_chip_g17_m5(dev->chip)) {
+         /* On G17G, agx_update_vs() sets hw=true and g17g_link_uvs=true for
+          * standard VS+FS pipelines. Precompile that exact key directly and
+          * skip the unused software-VS and unlinked variants. */
+         union asahi_shader_key key = {
+            .vs.hw = true,
+            .vs.g17g_link_uvs = true,
+         };
          if (!agx_precompile_variant(dev, pctx, so, cso, &key))
             return NULL;
+      } else {
+         union asahi_shader_key key = {
+            .vs.hw = next_stage == MESA_SHADER_FRAGMENT,
+         };
+         if (!agx_precompile_variant(dev, pctx, so, cso, &key))
+            return NULL;
+
+         if (next_stage == MESA_SHADER_NONE) {
+            key.vs.hw = true;
+            if (!agx_precompile_variant(dev, pctx, so, cso, &key))
+               return NULL;
+         }
       }
    } else if (dev->debug & AGX_DBG_PRECOMPILE) {
       union asahi_shader_key key = {0};

@@ -33,6 +33,7 @@ static bool g_sw_test = false;
 static bool g_sw_all = false;
 static bool g_sw_present = false;
 static WCHAR g_log_path[MAX_PATH];
+static bool g_verbose_log = false;
 static SRWLOCK g_log_lock = SRWLOCK_INIT;
 static volatile LONG g_log_lines = 0;
 static volatile LONG g_err_log_lines = 0;
@@ -80,6 +81,10 @@ gate_init_once(PINIT_ONCE once, PVOID param, PVOID *ctx)
    if (RegGetValueW(key, NULL, L"AgxwFirstDrawLog", RRF_RT_REG_SZ, NULL,
                     g_log_path, &lsz) != ERROR_SUCCESS)
       g_log_path[0] = L'\0';
+
+   WCHAR vbuf[8] = {0};
+   DWORD vn = GetEnvironmentVariableW(L"AURORA_VERBOSE_LOG", vbuf, ARRAY_SIZE(vbuf));
+   g_verbose_log = (vn > 0 && vbuf[0] != L'\0' && vbuf[0] != L'0');
 
    RegCloseKey(key);
    return TRUE;
@@ -148,6 +153,8 @@ aurora_log_v(bool is_err, const char *fmt, va_list ap)
 {
    gate_ensure_loaded();
    if (g_log_path[0] == L'\0')
+      return;
+   if (!is_err && !g_verbose_log)
       return;
    if (is_err) {
       if (InterlockedIncrement(&g_err_log_lines) > AURORA_ERR_LOG_CAP)
@@ -962,7 +969,7 @@ aurora_GetCaps(D3D10DDI_HADAPTER hAdapter, const D3D10_2DDIARG_GETCAPS *pArgs)
    }
    case D3D11_1DDICAPS_ARCHITECTURE_INFO: {
       D3D11_1DDI_ARCHITECTURE_INFO_DATA *c = (D3D11_1DDI_ARCHITECTURE_INFO_DATA *)pArgs->pData;
-      c->TileBasedDeferredRenderer = FALSE;
+      c->TileBasedDeferredRenderer = TRUE;
       break;
    }
    case D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT: {

@@ -877,12 +877,13 @@ clear_rtv_rects_locked(struct aurora_device *dev, const struct pipe_surface *sur
    vp.swizzle_w = PIPE_VIEWPORT_SWIZZLE_POSITIVE_W;
    dev->pctx->set_viewport_states(dev->pctx, 0, 1, &vp);
 
+   void *saved_velems = dev->bound_velems_cso;
    dev->pctx->bind_vs_state(dev->pctx, dev->clear_vs_cso);
    dev->pctx->bind_fs_state(dev->pctx, dev->clear_fs_cso);
-   dev->pctx->bind_blend_state(dev->pctx, dev->clear_blend_cso);
-   dev->pctx->bind_depth_stencil_alpha_state(dev->pctx, dev->clear_dsa_cso);
-   dev->pctx->bind_rasterizer_state(dev->pctx, dev->clear_rast_cso);
-   dev->pctx->bind_vertex_elements_state(dev->pctx, dev->empty_velems_cso);
+   aurora_bind_blend_locked(dev, dev->clear_blend_cso);
+   aurora_bind_dsa_locked(dev, dev->clear_dsa_cso);
+   aurora_bind_rast_locked(dev, dev->clear_rast_cso);
+   aurora_bind_velems_locked(dev, dev->empty_velems_cso);
    dev->pctx->set_sample_mask(dev->pctx, 0xffffffffu);
 
    struct pipe_constant_buffer cb;
@@ -915,12 +916,17 @@ clear_rtv_rects_locked(struct aurora_device *dev, const struct pipe_surface *sur
    /* Restore caller's pipeline state. */
    dev->pctx->bind_vs_state(dev->pctx, dev->vs ? dev->vs->cso : NULL);
    dev->pctx->bind_fs_state(dev->pctx, dev->ps ? dev->ps->cso : NULL);
-   dev->pctx->bind_blend_state(dev->pctx,
+   aurora_bind_blend_locked(dev,
       (dev->blend && dev->blend->cso) ? dev->blend->cso : dev->default_blend_cso);
-   dev->pctx->bind_depth_stencil_alpha_state(dev->pctx,
-      (dev->dsa && dev->dsa->cso) ? dev->dsa->cso : dev->default_dsa_cso);
-   dev->pctx->bind_rasterizer_state(dev->pctx,
+   aurora_bind_dsa_locked(dev,
+      !dev->dsv ? dev->no_depth_dsa_cso
+                : ((dev->dsa && dev->dsa->cso) ? dev->dsa->cso : dev->default_dsa_cso));
+   aurora_bind_rast_locked(dev,
       (dev->rast && dev->rast->cso) ? dev->rast->cso : dev->default_rast_cso);
+   if (saved_velems)
+      aurora_bind_velems_locked(dev, saved_velems);
+   else
+      dev->velems_dirty = true;
    dev->pctx->set_sample_mask(dev->pctx, dev->sample_mask);
    dev->pctx->set_constant_buffer(dev->pctx, MESA_SHADER_FRAGMENT, 0,
       dev->cbs[AURORA_STAGE_PS][0].buffer ? &dev->cbs[AURORA_STAGE_PS][0] : NULL);
@@ -928,7 +934,6 @@ clear_rtv_rects_locked(struct aurora_device *dev, const struct pipe_surface *sur
       dev->pctx->set_viewport_states(dev->pctx, 0, dev->num_viewports, dev->viewports);
    if (dev->num_scissors > 0u)
       dev->pctx->set_scissor_states(dev->pctx, 0, dev->num_scissors, dev->scissors);
-   dev->velems_dirty = true;
    dev->fb_dirty = true;
 }
 
@@ -1067,7 +1072,40 @@ aurora_CopyStructureCount(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hDst,
 void APIENTRY
 aurora_Discard(D3D10DDI_HDEVICE hDevice, D3D11DDI_HANDLETYPE ResourceType,
                VOID *hResourceOrView, const D3D10_DDI_RECT *pRects, UINT NumRects)
-{ (void)hDevice; (void)ResourceType; (void)hResourceOrView; (void)pRects; (void)NumRects; }
+{
+   (void)pRects;
+   struct aurora_device *dev = (struct aurora_device *)hDevice.pDrvPrivate;
+   if (!dev || !dev->pctx || !dev->pctx->invalidate_resource ||
+       !hResourceOrView || NumRects != 0u)
+      return;
+
+   struct aurora_resource *res = NULL;
+   switch (ResourceType) {
+   case D3D10DDI_HT_RESOURCE:
+      res = (struct aurora_resource *)hResourceOrView;
+      break;
+   case D3D10DDI_HT_RENDERTARGETVIEW:
+      res = ((struct aurora_rtv *)hResourceOrView)->res;
+      break;
+   case D3D10DDI_HT_DEPTHSTENCILVIEW:
+      res = ((struct aurora_dsv *)hResourceOrView)->res;
+      break;
+   case D3D10DDI_HT_SHADERRESOURCEVIEW:
+      res = ((struct aurora_srv *)hResourceOrView)->res;
+      break;
+   case D3D11DDI_HT_UNORDEREDACCESSVIEW:
+      res = ((struct aurora_uav *)hResourceOrView)->res;
+      break;
+   default:
+      return;
+   }
+   if (!res || !res->prsrc || res->is_primary || res->is_direct_scanout)
+      return;
+
+   aurora_lock(dev);
+   dev->pctx->invalidate_resource(dev->pctx, res->prsrc);
+   aurora_unlock(dev);
+}
 
 void APIENTRY
 aurora_GenerateMips(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADERRESOURCEVIEW hSRV)

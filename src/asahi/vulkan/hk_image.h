@@ -119,14 +119,17 @@ hk_image_base_address(const struct hk_image *image, uint8_t plane)
    return hk_image_plane_base_address(&image->planes[plane]);
 }
 
-/* These destinations need alias/sparse ownership tracking outside this first
- * primary contract. Never treat their plain VA span as a complete declaration. */
+/* Sparse images have dynamically bound sub-page VA backing outside this
+ * contiguous primary-write contract. Non-sparse VK_IMAGE_CREATE_ALIAS_BIT
+ * images (including WSI swapchain images from wsi_configure_image) still bind
+ * a known contiguous GPU VA span (plane->addr, plane->layout.size_B) that KMD
+ * resolves directly. */
 static inline bool
 hk_primary_image_ambiguous(const struct hk_image *image)
 {
    return image->vk.create_flags &
       (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
-       VK_IMAGE_CREATE_SPARSE_ALIASED_BIT | VK_IMAGE_CREATE_ALIAS_BIT);
+       VK_IMAGE_CREATE_SPARSE_ALIASED_BIT);
 }
 
 /* The GPU VA range [*lo, *hi) covering every bound plane of the image. Empty

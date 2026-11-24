@@ -213,7 +213,13 @@ bool
 agx_bo_cache_has(struct agx_device *dev, size_t size, size_t align,
                  uint32_t flags)
 {
+#ifdef _WIN32
+   /* D3DKMT allocates in 64 KiB granularity; match bucket rounding so small
+    * allocations reuse cached 64 KiB BOs instead of missing the cache. */
+   size = ALIGN_POT(size, 65536u);
+#else
    size = ALIGN_POT(size, AIL_PAGESIZE);
+#endif
    align = MAX2(align, AIL_PAGESIZE);
    if (dev->ops.bo_normalize_flags)
       flags = (uint32_t)dev->ops.bo_normalize_flags(dev, (enum agx_bo_flags)flags);
@@ -234,6 +240,7 @@ agx_bo_cache_has(struct agx_device *dev, size_t size, size_t align,
 static void
 agx_bo_cache_evict_stale_bos(struct agx_device *dev, int64_t now_sec)
 {
+   unsigned evicted = 0;
    list_for_each_entry_safe(struct agx_bo, entry, &dev->bo_cache.lru,
                             lru_link) {
       /* Retain cached BOs across normal desktop pauses (up to 15 s, still
@@ -245,6 +252,14 @@ agx_bo_cache_evict_stale_bos(struct agx_device *dev, int64_t now_sec)
 
       agx_bo_cache_remove_locked(dev, entry);
       agx_bo_free(dev, entry);
+#ifdef _WIN32
+      /* Bound synchronous eviction on the render thread per put so a burst of
+       * aged BOs cannot stall a frame with dozens of DestroyAllocation calls. */
+      if (++evicted >= 2u)
+         break;
+#else
+      (void)evicted;
+#endif
    }
 }
 
@@ -650,8 +665,12 @@ agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
    bool reused = false;
    assert(size > 0);
 
-   /* BOs are allocated in pages */
+   /* BOs are allocated in pages (64 KiB granularity on Windows D3DKMT). */
+#ifdef _WIN32
+   size = ALIGN_POT(size, 65536u);
+#else
    size = ALIGN_POT(size, AIL_PAGESIZE);
+#endif
    align = MAX2(align, AIL_PAGESIZE);
    if (dev->ops.bo_normalize_flags)
       flags = dev->ops.bo_normalize_flags(dev, flags);

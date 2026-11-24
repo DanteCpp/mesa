@@ -3494,14 +3494,19 @@ agx_d3dkmt_open_device_rt(struct agx_device *dev, const struct agx_kmt_luid *lui
       identity.gpu_generation == AGXW_AGREE_J813_GPU_GENERATION &&
       identity.gpu_variant == AGXW_AGREE_J813_GPU_VARIANT &&
       identity.submit_private_max_version == AGXW_AGREE_SUBMIT_VERSION;
-   ws->v6_log = dev->primary_write_contract;
-   d3dkmt_log_flushed("agxw-v6: package %s\n", AGXW_PACKAGE_VERSION_STRING);
-   d3dkmt_log_flushed("agxw-v6: device contract=%s chip=0x%x gen=%u variant=%c max_version=%u\n",
-                      dev->primary_write_contract ? "v6" : "off",
-                      (unsigned)identity.chip_id, (unsigned)identity.gpu_generation,
-                      identity.gpu_variant >= 0x20 && identity.gpu_variant < 0x7f
-                         ? (int)identity.gpu_variant : '?',
-                      (unsigned)identity.submit_private_max_version);
+   {
+      const char *v6_env = getenv("AGX_D3DKMT_V6_LOG");
+      ws->v6_log = dev->primary_write_contract && v6_env && v6_env[0] && v6_env[0] != '0';
+   }
+   if (ws->v6_log) {
+      d3dkmt_log_flushed("agxw-v6: package %s\n", AGXW_PACKAGE_VERSION_STRING);
+      d3dkmt_log_flushed("agxw-v6: device contract=%s chip=0x%x gen=%u variant=%c max_version=%u\n",
+                         dev->primary_write_contract ? "v6" : "off",
+                         (unsigned)identity.chip_id, (unsigned)identity.gpu_generation,
+                         identity.gpu_variant >= 0x20 && identity.gpu_variant < 0x7f
+                            ? (int)identity.gpu_variant : '?',
+                         (unsigned)identity.submit_private_max_version);
+   }
    if (enum_log_enabled())
       d3dkmt_log_flushed("NTAGX_ENUM open_device=ready\n");
    return true; /* caller then runs agx_open_device() */

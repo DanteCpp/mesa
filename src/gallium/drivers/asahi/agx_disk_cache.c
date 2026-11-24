@@ -74,6 +74,7 @@ write_shader(struct blob *blob, const struct agx_compiled_shader *binary,
                     sizeof(binary->attrib_components_read));
    blob_write_bytes(blob, &binary->epilog_key, sizeof(binary->epilog_key));
    blob_write_uint8(blob, binary->g17p_texture_resources);
+   blob_write_uint8(blob, binary->g17p_storage_write);
    blob_write_uint8(blob, binary->g17p_custom_border_emulation);
    blob_write_uint8(blob, binary->g17g_samples_unrolled);
    blob_write_uint32(blob, binary->push_range_count);
@@ -140,9 +141,17 @@ read_shader(struct agx_screen *screen, struct blob_reader *blob,
                    sizeof(binary->attrib_components_read));
    blob_copy_bytes(blob, &binary->epilog_key, sizeof(binary->epilog_key));
    binary->g17p_texture_resources = blob_read_uint8(blob);
+   binary->g17p_storage_write = blob_read_uint8(blob);
    binary->g17p_custom_border_emulation = blob_read_uint8(blob);
    binary->g17g_samples_unrolled = blob_read_uint8(blob);
    binary->push_range_count = blob_read_uint32(blob);
+   if (blob->overrun || binary->push_range_count > AGX_MAX_PUSH_RANGES) {
+      if (binary->bo)
+         agx_bo_unreference(&screen->dev, binary->bo);
+      free(binary->b.binary);
+      free(binary);
+      return NULL;
+   }
    blob_copy_bytes(blob, binary->push,
                    sizeof(binary->push[0]) * binary->push_range_count);
 
@@ -239,6 +248,16 @@ agx_disk_cache_init(struct agx_screen *screen)
 
    const char *renderer = screen->pscreen.get_name(&screen->pscreen);
 
+   char timestamp[BLAKE3_HEX_LEN];
+#ifdef _WIN32
+   blake3_hasher b3;
+   blake3_hash b3_out;
+   _mesa_blake3_init(&b3);
+   if (!disk_cache_get_function_identifier((void *)&agx_disk_cache_init, &b3))
+      return;
+   _mesa_blake3_final(&b3, b3_out);
+   _mesa_blake3_format(timestamp, b3_out);
+#else
    const struct build_id_note *note =
       build_id_find_nhdr_for_addr(agx_disk_cache_init);
    assert(note && build_id_length(note) == BUILD_ID_EXPECTED_HASH_LENGTH);
@@ -246,8 +265,8 @@ agx_disk_cache_init(struct agx_screen *screen)
    const uint8_t *id_sha1 = build_id_data(note);
    assert(id_sha1);
 
-   char timestamp[BLAKE3_HEX_LEN];
    _mesa_sha1_format(timestamp, id_sha1);
+#endif
 
    uint64_t driver_flags = screen->dev.debug;
    screen->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);

@@ -1931,8 +1931,14 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
 
    /* A G17 refusal fills every output with an error fence, and another
     * context's timeline wait can find it. Add the screen point only once the
-    * kernel has accepted the batch. */
+    * kernel has accepted the batch. On Windows D3DKMT, d3dkmt_submit() only
+    * signals out_syncs after D3DKMTSubmitCommand succeeds, so late_point
+    * would only add two redundant cross-context kernel calls per batch. */
+#ifdef _WIN32
+   const bool late_point = false;
+#else
    const bool late_point = agx_m5_render_resources(dev);
+#endif
    if (late_point)
       out_syncs[1] = out_syncs[2];
 
