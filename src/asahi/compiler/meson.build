@@ -20,6 +20,7 @@ libasahi_agx_files = files(
   'agx_nir_opt_select_load.c',
   'agx_nir_opt_licm.c',
   'agx_nir_opt_sink_loop_sample_uses.c',
+  'agx_nir_opt_image_idioms.c',
   'agx_nir_lower_clip_m1_1.c',
   'agx_nir_lower_cull_distance.c',
   'agx_nir_lower_fminmax.c',
@@ -944,6 +945,19 @@ if with_tests
       gnu_symbol_visibility : 'hidden',
       dependencies : [idep_nir, idep_mesautil],
       link_with : [libasahi_compiler]),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx_nir_opt_image_idioms',
+    executable(
+      'agx_nir_opt_image_idioms_test',
+      files('test/test-opt-image-idioms.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
     suite : ['asahi'],
   )
 

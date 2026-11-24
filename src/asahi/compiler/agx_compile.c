@@ -10758,6 +10758,18 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       spec_progress || any_flattened || addr_progress || sub_progress ||
       pre_alg_progress || progress;
 
+   if (mesa_shader_stage_is_compute(nir->info.stage)) {
+      bool image_idioms = false;
+      NIR_PASS(image_idioms, nir, agx_nir_opt_image_idioms_early);
+      if (image_idioms) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_constant_folding);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+         nir_divergence_analysis(nir);
+      }
+   }
+
    /* Reassociate before forming preambles because it makes preambles more
     * effective. Clean up after. On M5, also order the loop-invariant terms of
     * a chain in a loop first, so accumulations of per-iteration constants
@@ -16819,6 +16831,15 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, nir_opt_dce);
    }
 
+   if (mesa_shader_stage_is_compute(nir->info.stage)) {
+      bool late_idioms = false;
+      NIR_PASS(late_idioms, nir, agx_nir_opt_image_idioms_late);
+      if (late_idioms) {
+         NIR_PASS(_, nir, nir_opt_dce);
+         NIR_PASS(_, nir, nir_opt_cse);
+         nir_divergence_analysis(nir);
+      }
+   }
 
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
       bool guarded = false;
