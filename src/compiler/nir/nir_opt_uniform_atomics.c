@@ -79,6 +79,10 @@ get_dim(nir_scalar scalar)
 
    if (nir_scalar_is_intrinsic(scalar)) {
       switch (nir_scalar_intrinsic_op(scalar)) {
+      /* AGX lowers elect to a comparison of the active lane rank with zero
+       * before uniform atomic optimization. Active ranks are unique too.
+       */
+      case nir_intrinsic_load_active_subgroup_invocation_agx:
       case nir_intrinsic_load_subgroup_invocation:
          return 0x8;
       case nir_intrinsic_load_global_invocation_index:

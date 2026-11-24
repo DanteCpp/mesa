@@ -50,6 +50,22 @@ protected:
    }
 };
 
+TEST_F(nir_cf_test, uniform_atomic_in_elected_lane)
+{
+   b->shader->info.workgroup_size[0] = 64;
+   nir_def *addr = nir_imm_int64(b, 0);
+   nir_def *one = nir_imm_int(b, 1);
+   nir_def *rank = nir_load_active_subgroup_invocation_agx(b, 16);
+   nir_if *first = nir_push_if(b, nir_ieq_imm(b, rank, 0));
+   nir_global_atomic(b, 32, addr, one, ACCESS_COHERENT, nir_atomic_op_iadd);
+   nir_pop_if(b, first);
+   EXPECT_FALSE(nir_opt_uniform_atomics(b->shader, true));
+
+   /* The same atomic after reconvergence can still be combined. */
+   nir_global_atomic(b, 32, addr, one, ACCESS_COHERENT, nir_atomic_op_iadd);
+   EXPECT_TRUE(nir_opt_uniform_atomics(b->shader, true));
+}
+
 TEST_F(nir_cf_test, delete_break_in_loop)
 {
    /* Create IR:
