@@ -72,15 +72,14 @@ struct hk_tess_batch {
  * primitives-generated counters are incremented without atomics by every
  * draw's stages, so concurrent stages would lose counts.
  *
- * shortcut: G17P only, measured on the M4 Pro (T6040); the A18 Pro (T8140)
- * shares the chip id. G15/G16 native graphics take the same dispatch path
- * and could join once tested.
+ * shortcut: native AGX3 (G15/G16/G17P), which share the direct CDM launch and
+ * weak-barrier upgrade path.
  */
 static inline bool
 hk_tess_batchable(enum agx_chip chip, struct agx_draw draw, bool geometry,
                   bool counters)
 {
-   return agx_chip_native_hal200(chip) && !agx_is_indirect(draw.b) &&
+   return agx_chip_native_agx3(chip) && !agx_is_indirect(draw.b) &&
           !geometry && !counters;
 }
 

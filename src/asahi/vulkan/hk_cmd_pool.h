@@ -51,7 +51,7 @@ static inline unsigned
 hk_cmd_pool_span_cache_max(const struct agx_device *dev,
                            enum hk_cmd_bo_type type)
 {
-   return agx_chip_native_or_m5(dev->chip) && !dev->is_virtio &&
+   return !dev->is_virtio &&
              (type == HK_CMD_BO_MAIN || type == HK_CMD_BO_ROOT)
              ? HK_G17P_CMD_POOL_MAIN_BO_MAX
              : HK_CMD_POOL_BO_MAX;
@@ -60,7 +60,7 @@ hk_cmd_pool_span_cache_max(const struct agx_device *dev,
 static inline unsigned
 hk_cmd_pool_ioto_span_cache_max(const struct agx_device *dev)
 {
-   return agx_chip_native_or_m5(dev->chip) && !dev->is_virtio
+   return !dev->is_virtio
              ? HK_G17P_CMD_POOL_MAIN_BO_MAX
              : HK_CMD_POOL_BO_MAX;
 }

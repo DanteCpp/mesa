@@ -481,13 +481,16 @@ main(void)
    struct agx_draw direct = {.b = agx_3d(3, 1, 1)};
    struct agx_draw indirect = {.b = agx_grid_indirect(0x10000)};
    T("batchable: direct", hk_tess_batchable(AGX_CHIP_G17P, direct, false, false));
+   T("batchable: native AGX3 G15/G16",
+     hk_tess_batchable(AGX_CHIP_G15G, direct, false, false) &&
+        hk_tess_batchable(AGX_CHIP_G16G, direct, false, false));
    T("batchable: not indirect",
      !hk_tess_batchable(AGX_CHIP_G17P, indirect, false, false));
    T("batchable: not with a geometry shader",
      !hk_tess_batchable(AGX_CHIP_G17P, direct, true, false));
    T("batchable: not with queries counting",
      !hk_tess_batchable(AGX_CHIP_G17P, direct, false, true));
-   T("batchable: not on other chips",
+   T("batchable: not on AGX2",
      !hk_tess_batchable(AGX_CHIP_G13G, direct, false, false));
 
    for (unsigned i = 0; i < nchunks; ++i)

@@ -4043,7 +4043,7 @@ hk_g17p_tiled_upload_shape(const struct hk_device *dev, bool dest_tiled,
                            struct hk_g17p_tiled_upload_key *key,
                            uint32_t groups[3])
 {
-   if (!agx_chip_g17p_or_m5(dev->dev.chip) || !dest_tiled || !plan->width_el ||
+   if (!agx_chip_native_or_m5(dev->dev.chip) || !dest_tiled || !plan->width_el ||
        !plan->height_el)
       return false;
 
