@@ -144,7 +144,7 @@ hk_m5_as_table_entry(struct hk_device *dev, unsigned id)
 
 /* Native instance records and the AS header name entries in the same table.
  * Per-lane replacement of those entries aliases child IDs with root IDs. */
-static uint32_t
+uint32_t
 hk_m5_as_id(struct hk_device *dev, struct vk_acceleration_structure *as)
 {
    uint32_t result = 0, i = 1;
@@ -330,8 +330,8 @@ static_assert(sizeof(struct hk_agx3_plan_args) == 120, "native planner push ABI"
 /* The M5 layout: the plan state alone after its scratch offset, 48-byte
  * bounding-box records within the 64-byte child slots, 1 KiB images, and one
  * node per 8-lane encoding workgroup (bvh/agx3_leaf.comp). */
-static_assert(HK_AGX3_M5_PLAN_TAIL_B == sizeof(struct hk_agx3_plan_state),
-              "M5 scratch: no node-encoding dispatch arguments");
+static_assert(HK_AGX3_M5_PLAN_TAIL_B == HK_AGX3_GEN1_PLAN_TAIL_B,
+              "M5 scratch includes node-encoding dispatch arguments");
 struct hk_agx3_m5_aabb_record {
    uint32_t marker; /* leaf type 24 */
    float min[3];
@@ -551,11 +551,29 @@ hk_as_size(VkGeometryTypeKHR geometry_type, uint32_t leaf_node_count)
    return sizeof(struct hk_bvh_header) + nodes_size;
 }
 
+static bool
+hk_m5_uses_modern_as(const struct vk_acceleration_structure_build_state *state)
+{
+   return vk_get_as_geometry_type(state->build_info) != VK_GEOMETRY_TYPE_AABBS_KHR;
+}
+
 static VkDeviceSize
 hk_agx3_retained_offset(const struct vk_acceleration_structure_build_state *state)
 {
    struct hk_agx3_as_layout layout;
    if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
+      return 0;
+   return ALIGN_POT(layout.as_bytes +
+      (vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_INSTANCES_KHR
+          ? (uint64_t)state->leaf_node_count * 80 : 0), 8);
+}
+
+/* Offset of retained refit jobs relative to the 1KiB-aligned native VA. */
+static VkDeviceSize
+hk_m5_agx3_retained_offset(const struct vk_acceleration_structure_build_state *state)
+{
+   struct hk_agx3_as_layout layout;
+   if (!hk_gen1_as_layout_init(state->leaf_node_count, &layout))
       return 0;
    return ALIGN_POT(layout.as_bytes +
       (vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_INSTANCES_KHR
@@ -571,9 +589,15 @@ hk_get_as_size(VkDevice _device,
       struct hk_agx3_as_layout layout;
       if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
          return 0;
-      if (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
+      if (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) {
+         if (hk_m5_uses_modern_as(state))
+            return (HK_AGX3_M5_IMAGE_ALIGN - 1) +
+                   hk_m5_agx3_retained_offset(state) +
+                   HK_AGX3_RETAINED_BYTES((uint64_t)layout.node_bound,
+                                          (uint64_t)state->leaf_node_count);
          return hk_agx3_retained_offset(state) + sizeof(struct vk_ir_header) +
                 (uint64_t)state->internal_node_count * sizeof(struct vk_ir_box_node);
+      }
       return layout.as_bytes +
          (vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_INSTANCES_KHR
              ? (uint64_t)state->leaf_node_count * 80 : 0);
@@ -590,7 +614,9 @@ hk_get_encode_scratch_size(VkDevice _device,
    struct hk_agx3_as_layout layout;
    return dev->m5_native_as &&
           hk_agx3_as_layout_init(state->leaf_node_count, &layout)
-             ? layout.encode_bytes : 0;
+             ? layout.encode_bytes + ALIGN_POT(sizeof(struct vk_ir_header), 8) -
+                  sizeof(struct vk_ir_header)
+             : 0;
 }
 
 static uint64_t
@@ -770,12 +796,14 @@ static void
 hk_native_build_config(VkDevice device,
                        struct vk_acceleration_structure_build_state *state)
 {
+   VK_FROM_HANDLE(hk_device, dev, device);
+   if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_PLOC &&
+       dev->m5_native_as)
+      state->config.internal_type = VK_INTERNAL_BUILD_TYPE_HPLOC;
    if (state->build_info->mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR)
       state->config.internal_type = VK_INTERNAL_BUILD_TYPE_UPDATE;
    state->config.updateable =
       (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) != 0;
-   /* The upstream runtime always builds the internal topology; the former
-    * single-leaf shortcut needed a runtime hook this base does not have. */
 }
 
 static VkDeviceSize
@@ -795,9 +823,28 @@ hk_init_update_scratch(VkCommandBuffer commandBuffer,
                        const struct vk_acceleration_structure_build_state *states,
                        uint32_t count)
 {
-   for (unsigned i = 0; i < count; ++i)
-      if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct vk_device *device = cmd->vk.base.device;
+   struct vk_ir_header header = {
+      .min_bounds = {0x7fffffff, 0x7fffffff, 0x7fffffff},
+      .max_bounds = {0x80000000, 0x80000000, 0x80000000},
+      .dispatch_size_y = 1,
+      .dispatch_size_z = 1,
+   };
+   for (unsigned i = 0; i < count; ++i) {
+      if (states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
+         continue;
+      if (hk_m5_uses_modern_as(&states[i])) {
+         if (!hk_agx3_refit_skips_leaves(dev, &states[i]))
+            device->write_buffer_cp(commandBuffer,
+                                    states[i].build_info->scratchData.deviceAddress +
+                                       states[i].scratch.header_offset,
+                                    &header, sizeof(header));
+      } else {
          hk_agx3_refit_phase(commandBuffer, &states[i], 1);
+      }
+   }
 }
 
 static void
@@ -839,6 +886,104 @@ hk_encode_dispatch(VkCommandBuffer commandBuffer, struct vk_device *device,
                    uint32_t build_count, bool flushed_compute_after_init_update_scratch)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (dev->m5_native_as) {
+      if (flushed_compute_after_init_update_scratch)
+         vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+      const VkResult update_result = hk_cmd_refit_agx3(
+         commandBuffer, device, meta, build_args, states, build_count);
+      if (update_result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmd->vk, update_result);
+         return;
+      }
+
+      const bool enable_pairs = debug_get_bool_option("ASAHI_M5_AS_PAIRS", true);
+      struct hk_agx3_build_item stack_items[32];
+      struct hk_agx3_build_item *items =
+         build_count <= ARRAY_SIZE(stack_items)
+            ? stack_items
+            : malloc(sizeof(*items) * build_count);
+      if (!items) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return;
+      }
+      uint32_t item_count = 0;
+
+      for (uint32_t i = 0; i < build_count; ++i) {
+         const struct vk_acceleration_structure_build_state *state = &states[i];
+         if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE ||
+             !hk_m5_uses_modern_as(state))
+            continue;
+         VK_FROM_HANDLE(vk_acceleration_structure, dst,
+                        state->build_info->dstAccelerationStructure);
+         const bool allow_update =
+            (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) != 0;
+         struct hk_agx3_as_layout native;
+         if (!hk_agx3_as_layout_init(state->leaf_node_count, &native)) {
+            if (items != stack_items)
+               free(items);
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            return;
+         }
+         const uint64_t scratch = state->build_info->scratchData.deviceAddress;
+         const uint64_t encode = ALIGN_POT(scratch + state->scratch.header_offset +
+                                           sizeof(struct vk_ir_header), UINT64_C(8));
+         items[item_count++] = (struct hk_agx3_build_item){
+            .plan = {
+               .intermediate_bvh = scratch + state->scratch.ir_offset,
+               .header = scratch + state->scratch.header_offset,
+               .nodes = encode + native.nodes, .jobs = encode + native.jobs,
+               .envelope = encode + native.envelope, .state = encode + native.state,
+               .output_bvh = hk_as_native_va(dst),
+               .root_offset = state->scratch.internal_node_offset - state->scratch.ir_offset,
+               .leaf_bound = state->leaf_node_count,
+               .node_bound = native.node_bound, .slot_bound = native.slot_bound,
+               .resource_id = hk_m5_as_id(dev, dst),
+               .geometry_type = vk_get_as_geometry_type(state->build_info),
+               .retained_offset = hk_m5_agx3_retained_offset(state),
+               .build_flags = state->build_info->flags,
+               .pairs = enable_pairs && !allow_update &&
+                        vk_get_as_geometry_type(state->build_info) ==
+                           VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
+                        !(state->build_info->flags &
+                          VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR),
+               .metadata = 0,
+            },
+            .node_status = encode + native.node_status,
+            .envelope_status = encode + native.envelope_status,
+            .slot_bias = 0,
+         };
+      }
+
+      if (item_count > 0) {
+         VkResult result = hk_cmd_build_agx3_batch_from_ir(commandBuffer, items, item_count);
+         if (items != stack_items)
+            free(items);
+         if (result != VK_SUCCESS) {
+            vk_command_buffer_set_error(&cmd->vk, result);
+            return;
+         }
+         hk_agx3_refit_save_batch(commandBuffer, states, build_count);
+      } else if (items != stack_items) {
+         free(items);
+      }
+
+      /* Procedural AABBs keep the legacy 48-byte M5 path. */
+      for (uint32_t i = 0; i < build_count; ++i) {
+         if (hk_m5_uses_modern_as(&states[i]))
+            continue;
+         if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE) {
+            hk_update_prepare(commandBuffer, &states[i], true,
+                              flushed_compute_after_init_update_scratch);
+            hk_update_as(commandBuffer, &states[i]);
+         } else {
+            hk_encode_as(commandBuffer, &states[i]);
+         }
+      }
+      return;
+   }
+
    bool prepared = false;
 
    /* The common builder hands encoding the completed intermediate tree. */
@@ -971,7 +1116,6 @@ static const struct vk_acceleration_structure_build_ops hk_native_batched_leaf_b
    .get_update_scratch_size = hk_update_scratch_size,
    .init_update_scratch = hk_init_update_scratch,
    .encode = hk_encode_dispatch,
-   .build_leaves = hk_build_leaves_batched,
 };
 
 static const struct vk_acceleration_structure_build_ops hk_as_build_ops = {
@@ -1199,6 +1343,9 @@ hk_m5_backend_device_init_accel_struct_state(struct hk_device *dev)
       .morton_sort_workgroup_size = 512,
       .morton_sort_kvs_per_thread = 2,
       .propagate_cull_flags = false,
+      .has_update = dev->m5_native_as,
+      .morton_phase_dispatch = dev->m5_native_as,
+      .hploc_shuffle_max_leaves = dev->m5_native_as ? 4096 : 0,
    };
 
    dev->vk.as_build_ops = dev->m5_native_as ? &hk_native_batched_leaf_build_ops
@@ -1358,6 +1505,7 @@ hk_m5_backend_CmdBuildAccelerationStructuresKHR(
          return;
       }
    }
+
    /* A build binds its own compute pipelines and push constants, so the
     * application's compute state has to survive it. */
    struct hk_meta_save save;

@@ -227,7 +227,7 @@ list_levels(uint id)
 void
 prepare(uint id)
 {
-   uint64_t source = args.retained;
+   uint64_t source = args.plan_nodes != 0ul ? args.plan_nodes : args.retained;
    if (args.metadata != 0ul) {
       libagx_gen1_as_metadata live = DEREF(REF(libagx_gen1_as_metadata)(args.metadata));
       source = live.native_base + live.retained_offset;

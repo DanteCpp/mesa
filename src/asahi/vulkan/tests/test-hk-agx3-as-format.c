@@ -40,7 +40,7 @@ check_layout(enum hk_agx3_as_format format, uint32_t leaves,
              const struct hk_agx3_as_layout *l)
 {
    const uint32_t align = format == HK_AGX3_AS_FORMAT_M5 ? 1024 : 16384;
-   const uint32_t tail = format == HK_AGX3_AS_FORMAT_M5 ? 32 : 48;
+   const uint32_t tail = 48;
    assert(hk_agx3_as_image_align(format) == align);
    assert(hk_agx3_as_plan_tail(format) == tail);
    if (!leaves) {
@@ -58,8 +58,7 @@ check_layout(enum hk_agx3_as_format format, uint32_t leaves,
    assert(l->envelope_status == l->node_status + nodes * 4);
    const uint64_t refit_levels = (l->envelope_status + 4 + 7) & ~7u;
    assert(l->refit_levels == refit_levels);
-   assert(l->encode_bytes == refit_levels +
-          (format == HK_AGX3_AS_FORMAT_GEN1 ? 16 * 12 : 0));
+   assert(l->encode_bytes == refit_levels + 16 * 12);
    assert(l->as_bytes == slots * HK_AGX3_AS_SLOT_B + 184 +
                             (align == 16384 ? 0 : align - 1));
 }
@@ -124,7 +123,7 @@ main(void)
    /* The layouts differ exactly where the formats do. */
    struct hk_agx3_as_layout g, m;
    assert(hk_gen1_as_layout_init(64, &g) && hk_agx3_as_layout_init(64, &m));
-   assert(g.state == m.state && g.node_status == m.node_status + 16);
+   assert(g.state == m.state && g.node_status == m.node_status);
    assert(m.as_bytes == g.as_bytes + 1023);
 
    printf("hk_agx3_as_format: %u M5 and %u GEN1 chips, each with its own "

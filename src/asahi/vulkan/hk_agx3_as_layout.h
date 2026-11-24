@@ -44,8 +44,7 @@ hk_agx3_as_layout_init_format(enum hk_agx3_as_format format, uint32_t leaves,
    const uint64_t refit_levels = (status + nodes * 4 + 4 + 7) & ~UINT64_C(7);
    /* GEN1's current refit uses per-level dispatches. The M5 backend keeps
     * its independent IR-topology refit and needs no level-dispatch tail. */
-   const uint64_t end = refit_levels +
-      (format == HK_AGX3_AS_FORMAT_GEN1 ? 16 * 12 : 0);
+   const uint64_t end = refit_levels + 16 * 12;
    if (nodes > UINT32_MAX / 8 || slots > UINT32_MAX || end > UINT32_MAX)
       return false;
    *out = (struct hk_agx3_as_layout){

@@ -43,7 +43,7 @@ hk_agx3_as_format_for_chip(enum agx_chip chip)
  * encoding dispatch arguments (HK_AGX3_PLAN_ENCODE_DISPATCH) there, M5 only
  * the plan state. */
 #define HK_AGX3_GEN1_PLAN_TAIL_B 48u
-#define HK_AGX3_M5_PLAN_TAIL_B   32u
+#define HK_AGX3_M5_PLAN_TAIL_B   48u
 
 /* Bounding-box leaf record size. The M5 record size,
  * HK_AGX3_M5_AABB_RECORD_B, is defined with its layout in
