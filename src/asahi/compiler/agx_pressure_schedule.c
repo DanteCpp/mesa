@@ -1486,6 +1486,21 @@ ilp_block_samples(const agx_context *ctx, const agx_block *block)
    return samples;
 }
 
+static bool
+ilp_agx2_shadow_block(const agx_context *ctx, const agx_block *block)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2)
+      return false;
+
+   unsigned compares = 0;
+   agx_foreach_instr_in_block(block, I) {
+      if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && I->shadow &&
+          ++compares >= AGX_ILP_FS_MIN_SAMPLES)
+         return true;
+   }
+   return false;
+}
+
 static unsigned
 ilp_block_compute_loads(const agx_block *block)
 {
@@ -1788,7 +1803,7 @@ agx_ilp_agx3b_fragment_max_halves(const agx_context *ctx)
 }
 
 static signed
-agx_ilp_agx3b_fragment_cap(agx_context *ctx, uint8_t **size16_out, void *memctx)
+agx_ilp_fragment_cap(agx_context *ctx, uint8_t **size16_out, void *memctx)
 {
    uint8_t *size16 = *size16_out;
    if (!size16) {
@@ -1807,7 +1822,11 @@ agx_ilp_agx3b_fragment_cap(agx_context *ctx, uint8_t **size16_out, void *memctx)
       program_peak = MAX2(program_peak,
                           ilp_block_peak(ctx, block, size16, memctx));
 
-   const int max_halves = agx_ilp_agx3b_fragment_max_halves(ctx);
+   /* Allow AGX2 fragments to issue independent samples together when the
+    * enlarged live range still fits the full-occupancy register budget. */
+   const int max_halves = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX2
+                             ? agx_max_registers_for_occupancy(1024)
+                             : agx_ilp_agx3b_fragment_max_halves(ctx);
    if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN > max_halves)
       return 0;
 
@@ -1826,8 +1845,8 @@ agx_ilp_schedule(agx_context *ctx)
    struct sched_dag_state dag_state = {0};
 
    bool native_uniforms = false;
-   bool agx3b_frag_cap_ready = false;
-   signed agx3b_frag_cap = 0;
+   bool frag_cap_ready = false;
+   signed frag_cap = 0;
    agx_foreach_instr_global(ctx, I) {
       native_uniforms |= native_uniform_write(I) ||
                          I->op == AGX_OPCODE_UNIFORM_STORE;
@@ -2081,7 +2100,7 @@ agx_ilp_schedule(agx_context *ctx)
                   * to one target (background reloads and unrolled MSAA FS). */
                  !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
                    ilp_block_has_multi_sample_tile_stores(ctx, block, memctx)) &&
-                 ilp_block_samples(ctx, block) >= AGX_ILP_FS_MIN_SAMPLES) {
+                 samples >= AGX_ILP_FS_MIN_SAMPLES) {
          /* The pressure schedule places each sample's consumers right after
           * it, so the program waits for one sample before issuing the next.
           * Apple's fragment programs issue independent samples back to back
@@ -2091,15 +2110,15 @@ agx_ilp_schedule(agx_context *ctx)
          if (m5_fragment) {
             const signed peak = ilp_block_peak(ctx, block, size16, memctx);
             slack = MAX2(slack, m5_occupancy_cap - peak);
-         } else if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
-            if (!agx3b_frag_cap_ready) {
-               agx3b_frag_cap =
-                  agx_ilp_agx3b_fragment_cap(ctx, &size16, memctx);
-               agx3b_frag_cap_ready = true;
+         } else if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+                    ilp_agx2_shadow_block(ctx, block)) {
+            if (!frag_cap_ready) {
+               frag_cap = agx_ilp_fragment_cap(ctx, &size16, memctx);
+               frag_cap_ready = true;
             }
             if (size16) {
                const signed peak = ilp_block_peak(ctx, block, size16, memctx);
-               slack = MAX2(slack, agx3b_frag_cap - peak);
+               slack = MAX2(slack, frag_cap - peak);
             }
          }
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,

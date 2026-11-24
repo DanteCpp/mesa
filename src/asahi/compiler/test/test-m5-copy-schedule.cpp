@@ -521,7 +521,8 @@ emit_frag_samples_and_count(enum agx_isa_encoding enc, enum agx_chip chip,
                             enum agx_dim dim, enum frag_sample_kind kind,
                             enum frag_desc_kind desc_kind,
                             enum agx_lod_mode lod_mode, bool reg_lod,
-                            bool with_cube_array, unsigned prefix_live_32)
+                            bool with_cube_array, unsigned prefix_live_32,
+                            bool shadow = false)
 {
    copy_shader s;
    copy_shader_init(&s, MESA_SHADER_FRAGMENT, false);
@@ -634,8 +635,9 @@ emit_frag_samples_and_count(enum agx_isa_encoding enc, enum agx_chip chip,
             agx_null(), dim, lod_mode, 0xf, false, false);
       } else {
          agx_texture_sample_to(
-            b, texel, coords, lod, agx_immediate(0), tex, smp, agx_null(), dim,
-            lod_mode, 0xf, false, false, false, AGX_GATHER_NONE, false);
+            b, texel, coords, lod, agx_immediate(0), tex, smp,
+            shadow ? agx_uniform(0, AGX_SIZE_32) : agx_null(), dim, lod_mode,
+            shadow ? 1 : 0xf, false, shadow, false, AGX_GATHER_NONE, false);
       }
 
       agx_instr *sp = agx_split(b, 4, texel);
@@ -738,6 +740,22 @@ TEST(M5CopySchedule, AGX3BFragmentNonRelocatableSamplesStayInOrder)
                 AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, AGX_DIM_2D,
                 FRAG_SAMPLE_TEX_LOAD, FRAG_DESC_IMM, AGX_LOD_MODE_LOD_MIN, true,
                 false, 0),
+             1u);
+}
+
+TEST(M5CopySchedule, AGX2FragmentHoistsWithinFullOccupancy)
+{
+   for (unsigned live : {0u, 64u}) {
+      EXPECT_EQ(emit_frag_samples_and_count(
+                   AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13X, AGX_DIM_2D_ARRAY,
+                   FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD,
+                   false, false, live, true),
+                live ? 1u : 5u);
+   }
+   EXPECT_EQ(emit_frag_samples_and_count(
+                AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13X, AGX_DIM_2D_ARRAY,
+                FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD,
+                false, false, 0),
              1u);
 }
 
