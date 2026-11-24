@@ -38,6 +38,7 @@ struct sim_block {
 };
 
 struct licm_estimate {
+   enum agx_isa_encoding encoding;
    uint8_t *halves;
    BITSET_DECLARE(non_load_uniform_pair, AGX_NUM_UNIFORMS / 4);
    unsigned reserve;
@@ -49,7 +50,8 @@ struct licm_estimate {
 };
 
 static bool
-pack_preamble_pair_base(nir_def *def, unsigned *lo_base_out)
+pack_preamble_pair_base(nir_def *def, unsigned *lo_base_out,
+                        enum agx_isa_encoding encoding)
 {
    nir_instr *instr = nir_def_instr(def);
    if (instr->type != nir_instr_type_alu)
@@ -76,7 +78,7 @@ pack_preamble_pair_base(nir_def *def, unsigned *lo_base_out)
    unsigned hi_base = nir_intrinsic_base(hi_i) + 2 * alu->src[1].swizzle[0];
    if ((lo_base & 3) != 0 || hi_base != lo_base + 2 ||
        lo_base >= AGX_NUM_UNIFORMS ||
-       !agx_instr_accepts_uniform(AGX_ISA_ENCODING_AGX3C, AGX_OPCODE_DEVICE_LOAD,
+       !agx_instr_accepts_uniform(encoding, AGX_OPCODE_DEVICE_LOAD,
                                   0, lo_base, AGX_SIZE_64))
       return false;
 
@@ -119,7 +121,7 @@ def_is_zero_half_uniform(const struct licm_estimate *est, nir_def *def)
     * GPRs, provided no pack of that same uniform pair in the function has a
     * non-load use that post-LICM CSE could merge into it. */
    unsigned lo_base;
-   if (pack_preamble_pair_base(def, &lo_base) &&
+   if (pack_preamble_pair_base(def, &lo_base, est->encoding) &&
        !BITSET_TEST(est->non_load_uniform_pair, lo_base / 4))
       return true;
 
@@ -164,7 +166,7 @@ scan_shader_ra_props(struct licm_estimate *est, nir_function_impl *impl,
       nir_foreach_instr(instr, block) {
          nir_def *def = nir_instr_def(instr);
          unsigned lo_base;
-         if (def && pack_preamble_pair_base(def, &lo_base) &&
+         if (def && pack_preamble_pair_base(def, &lo_base, est->encoding) &&
              !pack_uses_are_load_bases(def))
             BITSET_SET(est->non_load_uniform_pair, lo_base / 4);
 
@@ -328,7 +330,43 @@ block_peak_instrs(struct licm_estimate *est, nir_block *block,
    return peak;
 }
 
+/* Integer address arithmetic in the loop body is safe to execute in its
+ * preheader even when the first loop test exits immediately. Keep work in
+ * conditional branches local to those branches. */
+static bool
+agx2_integer_invariant(nir_instr *instr, nir_block *block, nir_loop *loop)
+{
+   if (block->cf_node.parent != &loop->cf_node)
+      return false;
+
+   if (instr->type == nir_instr_type_intrinsic)
+      return nir_instr_as_intrinsic(instr)->intrinsic ==
+             nir_intrinsic_load_preamble;
+   if (instr->type != nir_instr_type_alu)
+      return false;
+
+   switch (nir_instr_as_alu(instr)->op) {
+   case nir_op_iadd:
+   case nir_op_isub:
+   case nir_op_imul:
+   case nir_op_imin:
+   case nir_op_imax:
+   case nir_op_umin:
+   case nir_op_umax:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+agx2_integer_licm_filter(nir_instr *instr, nir_loop *loop, bool dominates)
+{
+   return agx2_integer_invariant(instr, instr->block, loop);
+}
+
 struct licm_sim {
+   bool integer_only;
    struct sim_block *blocks;
    unsigned *def_block;
    nir_loop *loop;
@@ -342,9 +380,9 @@ sim_defined_before_loop(nir_src *src, void *data)
           nir_loop_predecessor_block(sim->loop)->index;
 }
 
-/* Mirror nir_opt_licm's invariance predicate when filter == NULL */
+/* Match nir_opt_licm using the block after simulated inner-loop motion. */
 static bool
-sim_instr_invariant(nir_instr *instr, struct licm_sim *sim)
+sim_instr_invariant(nir_instr *instr, nir_block *block, struct licm_sim *sim)
 {
    switch (instr->type) {
    case nir_instr_type_load_const:
@@ -359,7 +397,9 @@ sim_instr_invariant(nir_instr *instr, struct licm_sim *sim)
    case nir_instr_type_alu:
    case nir_instr_type_tex:
    case nir_instr_type_deref:
-      return nir_foreach_src(instr, sim_defined_before_loop, sim);
+      return (!sim->integer_only ||
+              agx2_integer_invariant(instr, block, sim->loop)) &&
+             nir_foreach_src(instr, sim_defined_before_loop, sim);
 
    default:
       return false;
@@ -367,7 +407,7 @@ sim_instr_invariant(nir_instr *instr, struct licm_sim *sim)
 }
 
 static bool
-loop_hoists(nir_loop *loop)
+loop_hoists(nir_loop *loop, bool integer_only)
 {
    if (!nir_loop_has_back_edge(loop))
       return false;
@@ -377,7 +417,7 @@ loop_hoists(nir_loop *loop)
          return false;
 
       nir_foreach_instr(instr, block) {
-         if (instr->type == nir_instr_type_intrinsic &&
+         if (!integer_only && instr->type == nir_instr_type_intrinsic &&
              (nir_instr_as_intrinsic(instr)->intrinsic ==
                  nir_intrinsic_terminate ||
               nir_instr_as_intrinsic(instr)->intrinsic ==
@@ -402,7 +442,7 @@ sim_visit_block(nir_block *block, struct licm_sim *sim)
 
    for (unsigned i = 0; i < nr; ++i) {
       nir_instr *instr = data[i];
-      if (sim_instr_invariant(instr, sim)) {
+      if (sim_instr_invariant(instr, block, sim)) {
          util_dynarray_append(&dst->instrs, instr);
          nir_def *def = nir_instr_def(instr);
          if (def)
@@ -431,7 +471,7 @@ sim_visit_cf_list(struct exec_list *list, struct licm_sim *sim)
 
          if (next && next->type == nir_cf_node_loop) {
             nir_loop *inner_loop = nir_cf_node_as_loop(next);
-            optimize_loop = loop_hoists(inner_loop);
+            optimize_loop = loop_hoists(inner_loop, sim->integer_only);
             if (optimize_loop) {
                nir_loop *outer_loop = sim->loop;
                sim->loop = inner_loop;
@@ -443,7 +483,8 @@ sim_visit_cf_list(struct exec_list *list, struct licm_sim *sim)
 
          nir_block *block = nir_cf_node_as_block(node);
          if (sim->loop &&
-             nir_block_dominates(block, nir_loop_successor_block(sim->loop)))
+             (sim->integer_only ||
+              nir_block_dominates(block, nir_loop_successor_block(sim->loop))))
             progress |= sim_visit_block(block, sim);
 
          if (next && next->type == nir_cf_node_loop && !optimize_loop) {
@@ -623,7 +664,8 @@ cf_list_has_loop(struct exec_list *list)
  * exceed budget halves or cross an occupancy step with the invariants hoisted.
  */
 bool
-agx_nir_opt_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute)
+agx_nir_opt_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute,
+                 bool integer_only)
 {
    bool any_hoist = false;
 
@@ -637,6 +679,8 @@ agx_nir_opt_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute)
 
       void *mem_ctx = ralloc_context(NULL);
       struct licm_estimate est = {
+         .encoding =
+            integer_only ? AGX_ISA_ENCODING_AGX2 : AGX_ISA_ENCODING_AGX3C,
          .halves = rzalloc_array(mem_ctx, uint8_t, impl->ssa_alloc),
          .mem_ctx = mem_ctx,
       };
@@ -671,6 +715,7 @@ agx_nir_opt_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute)
       }
 
       struct licm_sim sim = {
+         .integer_only = integer_only,
          .blocks = blocks,
          .def_block = def_block,
       };
@@ -704,5 +749,5 @@ agx_nir_opt_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute)
    if (!any_hoist)
       return false;
 
-   return nir_opt_licm(shader, NULL);
+   return nir_opt_licm(shader, integer_only ? agx2_integer_licm_filter : NULL);
 }
