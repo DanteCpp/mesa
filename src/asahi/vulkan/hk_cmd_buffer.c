@@ -1254,7 +1254,7 @@ hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info
    state.depth_stencil_writes =
       state.attachment_count > state.color_attachment_count;
    state.color_input_local_read =
-      agx_chip_local_read_tilebuffer(dev->dev.chip) && render->view_mask == 0 &&
+      hk_local_read_tilebuffer(dev->dev.chip) && render->view_mask == 0 &&
       cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
       !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
                          VK_RENDERING_RESUMING_BIT |
@@ -1404,6 +1404,22 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    /* M5 records its barriers with the native dependency tracker. */
    if (!agx_chip_native_or_m5(dev->dev.chip)) {
+      /* A BY_REGION colour input may stay in this render. The consuming
+       * draw checks the bound descriptors and compiled tile-read program
+       * before emitting geometry. A failed check splits the render. */
+      bool local_read = false;
+      if (cmd->sync.in_pass && cmd->current_cs.gfx &&
+          (pDependencyInfo->dependencyFlags & VK_DEPENDENCY_BY_REGION_BIT) &&
+          !hk_classify_pass_barrier(cmd, pDependencyInfo, &local_read) &&
+          local_read) {
+         uint8_t src, dst;
+         hk_sync_dependency_kinds(pDependencyInfo, hk_sync_image_class(cmd),
+                                  &src, &dst);
+         cmd->state.gfx.render.kept_local_read_barrier = true;
+         cmd->state.barrier_stats.kept++;
+         hk_sync_pass_barrier(cmd, src, dst);
+         return;
+      }
       hk_cmd_buffer_end_compute(cmd);
       hk_cmd_buffer_end_graphics(cmd);
       /* Preserve the same conservative ordering in the shared submit graph,
