@@ -110,6 +110,9 @@ struct nir_def *agx_nir_quad_ddy(struct nir_builder *b, struct nir_def *v);
  * still guarantees it for any AGX3 target. */
 bool agx_nir_lower_shared_element_index(struct nir_shader *s);
 bool agx_nir_opt_shared_byte_offsets(struct nir_shader *s);
+/* Measured byte stride of the immediate in G13X I32 local loads and stores. */
+#define G13X_I32_SHARED_INDEX_UNIT_B 16
+bool agx_nir_opt_g13x_shared_offsets(struct nir_shader *s);
 bool agx_nir_opt_licm(struct nir_shader *shader, unsigned budget,
                       bool cap_rt_compute, bool integer_only);
 bool agx_nir_opt_monotonic_bit_insert(struct nir_shader *shader);

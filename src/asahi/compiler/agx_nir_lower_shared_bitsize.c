@@ -290,6 +290,74 @@ compare_scalars(const void *a, const void *b)
    return (int)x->comp - (int)y->comp;
 }
 
+/* Factor an aligned byte displacement out of a shared address. Stencil taps
+ * such as (row + C) + col can then share the same narrowed register base.
+ * Moving C across u2u16 is valid only if the original sum cannot wrap. */
+static bool
+fold_g13x_shared_offset(nir_builder *b, nir_intrinsic_instr *intr, void *ranges)
+{
+   if ((intr->intrinsic != nir_intrinsic_load_shared &&
+        intr->intrinsic != nir_intrinsic_store_shared) ||
+       nir_intrinsic_base(intr) != 0)
+      return false;
+
+   unsigned bits = intr->intrinsic == nir_intrinsic_load_shared
+                      ? intr->def.bit_size : nir_src_bit_size(intr->src[0]);
+   nir_src *offset = nir_get_io_offset_src(intr);
+   if (bits != 32 || nir_src_bit_size(*offset) != 16)
+      return false;
+
+   nir_scalar sum = nir_scalar_resolved(offset->ssa, 0);
+   if (!nir_scalar_is_const(sum)) {
+      if (!nir_scalar_is_alu(sum) || nir_scalar_alu_op(sum) != nir_op_u2u16)
+         return false;
+
+      sum = nir_scalar_chase_alu_src(sum, 0);
+      if (sum.def->bit_size != 32 || !nir_scalar_is_alu(sum) ||
+          nir_scalar_alu_op(sum) != nir_op_iadd)
+         return false;
+   }
+
+   nir_scalar terms[4];
+   unsigned count = 0;
+   uint64_t add = 0;
+   if (!gather_sum(sum, 3, terms, &count, &add) || !add ||
+       add % G13X_I32_SHARED_INDEX_UNIT_B)
+      return false;
+
+   uint64_t bound = add;
+   for (unsigned t = 0; t < count; ++t)
+      bound += term_upper_bound(b->shader, ranges, terms[t], 2);
+   if (bound > UINT16_MAX)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *base;
+   if (count) {
+      qsort(terms, count, sizeof(terms[0]), compare_scalars);
+      base = nir_mov_scalar(b, terms[0]);
+      for (unsigned t = 1; t < count; ++t)
+         base = nir_iadd(b, base, nir_mov_scalar(b, terms[t]));
+      base = nir_u2u16(b, base);
+   } else {
+      base = nir_imm_intN_t(b, 0, 16);
+   }
+
+   nir_src_rewrite(offset, base);
+   nir_intrinsic_set_base(intr, add);
+   return true;
+}
+
+bool
+agx_nir_opt_g13x_shared_offsets(nir_shader *shader)
+{
+   struct hash_table *ranges = _mesa_pointer_hash_table_create(NULL);
+   bool progress = nir_shader_intrinsics_pass(shader, fold_g13x_shared_offset,
+                                              nir_metadata_control_flow, ranges);
+   _mesa_hash_table_destroy(ranges, NULL);
+   return progress;
+}
+
 struct elem_candidate {
    nir_intrinsic_instr *intr;
    nir_scalar sum;

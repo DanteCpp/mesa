@@ -5,6 +5,8 @@
 #include "compiler/nir/nir_builder.h"
 extern "C" {
 #include "agx_nir.h"
+#include "asahi/isa/disasm.h"
+#include "util/memstream.h"
 }
 
 static void
@@ -53,6 +55,107 @@ workgroup_shader(const char *name)
    b.shader->info.workgroup_size[1] = 8;
    b.shader->info.workgroup_size[2] = 1;
    return b;
+}
+
+TEST(SharedByteOffsets, G13xDynamicByteOffset)
+{
+   const struct {
+      unsigned bits, add, mask;
+      bool fold;
+   } cases[] = {
+      {8, 16, 63, false}, {16, 16, 255, false}, {32, 64, 255, true},
+      {32, 16, 65519, true}, {32, 16, 65535, false},
+      {32, 4, 255, false}, {32, 12, 7, false}, {32, 65520, 15, true},
+      {32, 65536, 7, false},
+   };
+
+   for (const auto &c : cases) {
+      for (bool store : {false, true}) {
+         SCOPED_TRACE(::testing::Message() << c.bits << " bits, offset " << c.add
+                                           << ", mask " << c.mask << ", store " << store);
+         nir_builder b = workgroup_shader("G13X shared byte offset");
+         nir_def *v = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                             .range = 4);
+         nir_def *variable = nir_iand_imm(&b, v, c.mask);
+         nir_def *offset = nir_u2u16(&b, nir_iadd_imm(&b, variable, c.add));
+         nir_intrinsic_instr *intr = store
+            ? nir_store_shared(&b, nir_imm_intN_t(&b, 0, c.bits), offset,
+                               .align_mul = 1)
+            : nir_def_as_intrinsic(nir_load_shared(&b, 1, c.bits, offset,
+                                                    .align_mul = 1));
+         EXPECT_EQ(agx_nir_opt_g13x_shared_offsets(b.shader), c.fold);
+         EXPECT_EQ(nir_intrinsic_base(intr), c.fold ? c.add : 0);
+         if (c.fold) {
+            nir_def *base = nir_get_io_offset_src(intr)->ssa;
+            ASSERT_TRUE(nir_def_is_alu(base));
+            EXPECT_EQ(nir_def_as_alu(base)->op, nir_op_u2u16);
+            EXPECT_EQ(nir_def_as_alu(base)->src[0].src.ssa, variable);
+         } else {
+            EXPECT_EQ(nir_get_io_offset_src(intr)->ssa, offset);
+         }
+         nir_validate_shader(b.shader, "G13X shared byte offset");
+         ralloc_free(b.shader);
+      }
+   }
+}
+
+TEST(SharedByteOffsets, G13xFixedByteOffset)
+{
+   for (unsigned bytes : {0u, 12u, 16u, 1024u, 65520u, 65532u}) {
+      SCOPED_TRACE(bytes);
+      nir_builder b = workgroup_shader("G13X fixed byte offset");
+      nir_def *offset = nir_imm_intN_t(&b, bytes, 16);
+      nir_def *value = nir_load_shared(&b, 4, 32, offset, .align_mul = 4);
+      nir_intrinsic_instr *store =
+         nir_store_shared(&b, value, offset, .align_mul = 4);
+      bool fold = bytes > 0 && bytes % 16 == 0;
+      EXPECT_EQ(agx_nir_opt_g13x_shared_offsets(b.shader), fold);
+      for (auto *intr : {nir_def_as_intrinsic(value), store}) {
+         EXPECT_EQ(nir_intrinsic_base(intr), fold ? bytes : 0);
+         EXPECT_EQ(nir_src_as_uint(*nir_get_io_offset_src(intr)), fold ? 0 : bytes);
+      }
+      EXPECT_FALSE(agx_nir_opt_g13x_shared_offsets(b.shader));
+      nir_validate_shader(b.shader, "G13X fixed byte offset");
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(SharedByteOffsets, G13xEncodesI32IndexInSixteenByteUnits)
+{
+   for (auto chip : {AGX_CHIP_G13X, AGX_CHIP_G13G}) {
+      SCOPED_TRACE(chip);
+      nir_builder b = workgroup_shader("shared displacement encoding");
+      b.shader->info.internal = false;
+      b.shader->info.shared_size = 2048;
+      nir_def *word = nir_load_shared(&b, 1, 32, nir_imm_int(&b, 1024),
+                                      .align_mul = 4);
+      nir_store_shared(&b, word, nir_imm_int(&b, 1040), .align_mul = 4);
+      agx_preprocess_nir(b.shader);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX2;
+      key.dev.chip = chip;
+      key.no_preamble = true;
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+
+      char *assembly = nullptr;
+      size_t len = 0;
+      u_memstream stream;
+      ASSERT_TRUE(u_memstream_open(&stream, &assembly, &len));
+      EXPECT_FALSE(agx2_disassemble(static_cast<uint8_t *>(part.binary) +
+                                       part.info.main_offset,
+                                    part.info.main_size, stream.f));
+      u_memstream_close(&stream);
+      EXPECT_NE(strstr(assembly, "lload"), nullptr) << assembly;
+      EXPECT_NE(strstr(assembly, "lstore"), nullptr) << assembly;
+      EXPECT_EQ(strstr(assembly, ", 64, i32") != nullptr, chip == AGX_CHIP_G13X)
+         << assembly;
+      EXPECT_EQ(strstr(assembly, ", 65, i32") != nullptr, chip == AGX_CHIP_G13X)
+         << assembly;
+      free(assembly);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
 }
 
 static unsigned

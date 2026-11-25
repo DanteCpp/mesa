@@ -2660,37 +2660,42 @@ format_for_bitsize(unsigned bitsize)
    }
 }
 
-/* AGX3 ldtg/sttg carry an immediate byte offset next to the element index.
- * agx_nir_opt_shared_byte_offsets() folds a constant addend of the byte
- * address into the intrinsic's base; it rides in the base operand here
- * (agx3_translate_local() moves it into the descriptor's byte_offset).
- * AGX2 keeps its byte-addressed base register and never sees a nonzero base.
- */
-static agx_index
-agx_local_immediate_base(agx_builder *b, nir_intrinsic_instr *instr)
+static void
+agx_local_address(agx_builder *b, nir_intrinsic_instr *intr,
+                  enum agx_format format, agx_index *base, agx_index *index)
 {
-   const unsigned base = nir_intrinsic_base(instr);
-   assert(base == 0 ||
-          b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2);
-   if (base == 0)
-      return agx_zero();
+   agx_index address = agx_local_base(*nir_get_io_offset_src(intr));
+   unsigned offset_B = nir_intrinsic_base(intr);
+   assert(address.size == AGX_SIZE_16);
 
-   agx_index imm = agx_immediate(base);
-   imm.size = AGX_SIZE_16;
-   return imm;
+   if (b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2) {
+      /* AGX3 takes an element index and a separate immediate byte offset. */
+      *base = agx_immediate(offset_B);
+      *index = address;
+      return;
+   }
+
+   *base = address;
+   *index = agx_zero();
+   if (!offset_B)
+      return;
+
+   /* G13X I32 lload/lstore take the displacement in 16-byte units,
+    * even for a scalar access. Other byte displacements use the register. */
+   if (b->shader->key->dev.chip == AGX_CHIP_G13X && format == AGX_FORMAT_I32 &&
+       offset_B <= UINT16_MAX && offset_B % G13X_I32_SHARED_INDEX_UNIT_B == 0) {
+      *index = agx_immediate(offset_B / G13X_I32_SHARED_INDEX_UNIT_B);
+   } else {
+      *base = agx_iadd(b, address, agx_mov_imm(b, 16, (uint16_t)offset_B), 0);
+   }
 }
 
 static void
 agx_emit_local_load(agx_builder *b, agx_index dst, nir_intrinsic_instr *instr)
 {
-   agx_index address = agx_local_base(instr->src[0]);
-   const bool agx3 = b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2;
-   /* Shared offsets are relative to the workgroup allocation. */
-   agx_index base = agx3 ? agx_local_immediate_base(b, instr) : address;
-   agx_index index = agx3 ? address : agx_zero();
-   assert(address.size == AGX_SIZE_16);
-
    enum agx_format format = format_for_bitsize(instr->def.bit_size);
+   agx_index base, index;
+   agx_local_address(b, instr, format, &base, &index);
    unsigned nr = instr->def.num_components;
    unsigned mask = BITFIELD_MASK(nr);
 
@@ -2717,13 +2722,9 @@ static void
 agx_emit_local_store(agx_builder *b, nir_intrinsic_instr *instr)
 {
    agx_index value = agx_src_index(&instr->src[0]);
-   agx_index address = agx_local_base(instr->src[1]);
-   const bool agx3 = b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2;
-   agx_index base = agx3 ? agx_local_immediate_base(b, instr) : address;
-   agx_index index = agx3 ? address : agx_zero();
-   assert(address.size == AGX_SIZE_16);
-
    enum agx_format format = format_for_bitsize(nir_src_bit_size(instr->src[0]));
+   agx_index base, index;
+   agx_local_address(b, instr, format, &base, &index);
    unsigned mask = BITFIELD_MASK(
       nir_src_num_components(instr->src[0])); /* XXX: there's a write mask */
 
@@ -18273,8 +18274,20 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
        !key->secondary) {
       /* Generic NIR: a read-only phase between two workgroup barriers sees
        * no shared store, so this holds for every chip. */
-      if (nir->info.shared_size)
+      if (nir->info.shared_size) {
          NIR_PASS(_, nir, agx_nir_opt_shared_phase_cse);
+
+         /* Only G13X has a measured I32 local index stride. */
+         if (key->dev.encoding == AGX_ISA_ENCODING_AGX2 &&
+             key->dev.chip == AGX_CHIP_G13X) {
+            bool folded = false;
+            NIR_PASS(folded, nir, agx_nir_opt_g13x_shared_offsets);
+            if (folded) {
+               NIR_PASS(_, nir, nir_opt_cse);
+               NIR_PASS(_, nir, nir_opt_dce);
+            }
+         }
+      }
 
       /* Every AGX3B part returns a four-lane W8 load as one byte-packed
        * word (the W8 path of agx_emit_load()), which the fold extracts with
