@@ -2533,8 +2533,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
              * overlap their fragment work. Compute dependencies keep ordering
              * the vertex half either way. */
             if (!stage_prefixes && !m5_staged_v2 && !g17p_staged && !queue->sync.serialize &&
-                (dev->dev.params.features &
-                 DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+                agx_ordered_fragment_barriers(&dev->dev) &&
                 cs->sync.ta_split &&
                 cs->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
                 cs->sync.prior_ta[HK_SYNC_VDM] == 0 &&
@@ -2563,8 +2562,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
              * for its narrower tiling prefix. */
             if (agx_chip_native_hal200(dev->dev.chip) && !g17p_staged &&
                 !queue->sync.serialize && queue->sync.exact_prior &&
-                (dev->dev.params.features &
-                 DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)) {
+                agx_ordered_fragment_barriers(&dev->dev)) {
                const uint64_t base = prior_base[HK_SYNC_VDM];
                const uint64_t whole = hk_drm_render_prefix(
                   base, cs->sync.barrier[HK_SYNC_VDM],
@@ -3822,8 +3820,7 @@ hk_queue_create(struct hk_device *dev,
     * a historical dependency per engine for every command, which costs
     * single-submission latency on G13 and G14. Keep upstream's payload. */
    queue->sync.stage_overlap =
-      queue->sync.serialize &&
-      (dev->dev.params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS);
+      queue->sync.serialize && agx_ordered_fragment_barriers(&dev->dev);
    queue->sync.exact_prior =
       !queue->sync.serialize &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;

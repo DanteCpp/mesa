@@ -434,8 +434,9 @@ run_coalesced_tests(struct pipe_screen *screen)
       struct drm_asahi_cmd_render r = {0};
       struct drm_asahi_cmd_compute c = {0};
 
-      dev->params.features =
-         saved_features | DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS;
+      dev->params.features = saved_features |
+                             DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS |
+                             DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS;
       coalesced_calls = 0;
       coalesced_fail = false;
 
@@ -471,15 +472,20 @@ run_coalesced_tests(struct pipe_screen *screen)
       CHECK(!(coalesced_log[0].render_flags[3] &
               DRM_ASAHI_RENDER_FRAGMENT_BARRIERS));
 
-      /* Without kernel feature bit, flag stays clear. */
+      /* A kernel that accepts the flag but may drop the wait
+       * (no ORDERED_FRAGMENT_BARRIERS) never gets it. */
       dev->params.features =
-         saved_features & ~DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS;
+         (saved_features | DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &
+         ~DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS;
       coalesced_calls = 0;
       struct agx_batch *b4 = agx_get_batch(ctx);
       agx_batch_queue_or_submit(ctx, b4, NULL, &r);
+      struct agx_batch *b5 = agx_get_batch(ctx);
+      agx_batch_queue_or_submit(ctx, b5, NULL, &r);
       pctx->flush(pctx, NULL, 0);
-      CHECK(coalesced_calls == 1 && coalesced_log[0].renders == 1);
-      CHECK(!(coalesced_log[0].render_flags[0] &
+      CHECK(coalesced_calls == 1 && coalesced_log[0].renders == 2);
+      CHECK(coalesced_log[0].render_vdm_barriers[1] == 1);
+      CHECK(!(coalesced_log[0].render_flags[1] &
               DRM_ASAHI_RENDER_FRAGMENT_BARRIERS));
 
       /* FEW_PRIMITIVES via real agx_cmdbuf() path on native/M5 chips. */

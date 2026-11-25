@@ -519,6 +519,18 @@ agx_bo_unmap_owned(struct agx_bo *bo, void *map, size_t size)
    bo->dev->ops.bo_munmap(bo->dev, &copy);
 }
 
+/* DRM_ASAHI_RENDER_FRAGMENT_BARRIERS moves a render's wait for earlier renders
+ * to its fragment half. Kernels that accept the flag without
+ * DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS may drop that wait instead, so
+ * the flag is only set when both are reported. */
+static inline bool
+agx_ordered_fragment_barriers(const struct agx_device *dev)
+{
+   const uint64_t needed = DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS |
+                           DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS;
+   return (dev->params.features & needed) == needed;
+}
+
 /* The kernel can create BOs over application memory (GEM_USERPTR). */
 static inline bool
 agx_has_userptr(const struct agx_device *dev)

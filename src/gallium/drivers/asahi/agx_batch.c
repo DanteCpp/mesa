@@ -2451,7 +2451,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       struct drm_asahi_cmd_header header = agx_cmd_header(
          false, compute_here ? DRM_ASAHI_BARRIER_NONE : vdm_barrier,
          compute_here ? compute_commands : cdm_barrier);
-      if ((dev->params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+      if (agx_ordered_fragment_barriers(dev) &&
           (header.vdm_barrier != DRM_ASAHI_BARRIER_NONE ||
            header.cdm_barrier != DRM_ASAHI_BARRIER_NONE) &&
           !compute_here && !batch->vs_needs_render_barrier)
@@ -3047,7 +3047,7 @@ agx_submit_pending(struct agx_context *ctx)
          const uint16_t render_cdm = nr_cdm ? nr_cdm : prior_cdm;
          struct drm_asahi_cmd_header header =
             agx_cmd_header(false, render_vdm, render_cdm);
-         if ((dev->params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+         if (agx_ordered_fragment_barriers(dev) &&
              !batch_compute_cmds && !batch->vs_needs_render_barrier &&
              (render_vdm != DRM_ASAHI_BARRIER_NONE ||
               render_cdm != DRM_ASAHI_BARRIER_NONE))
