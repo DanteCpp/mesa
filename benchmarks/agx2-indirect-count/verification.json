@@ -1,0 +1,55 @@
+{
+  "hardware": "Apple MacBook Pro (16-inch, M1 Max, 2021)",
+  "kernel": "7.2.11-14-1-ARCH",
+  "power": "AC",
+  "compiler": "16.1.1",
+  "meson": "1.12.1",
+  "benchmark_commit": "ae90a40f11b9ce22542fe55dabdb60033859fd13",
+  "benchmark_sha256": "baca83ca3c17bfd8707c26f2e6ab95e6f889e2ccb0d9151c9fb9a45cac9c3239",
+  "cts_version": [
+    "dEQP VK version vulkan-cts-1.4.6.2",
+    "The following local patches are applied on top:",
+    "- android: Implement headless WSI fallback using AImageReader",
+    "- Check requirements in checkSupport, part 11 (binding_model module)",
+    "- Use -frounding-math by default with GCC",
+    "- Check requirements in checkSupport, part 12 (conditional_rendering module)"
+  ],
+  "cts_binary_sha256": "f957e1622082dca23332c6c66861ecad19daf8e7456b657b6a08a3fea53a7fd6",
+  "cts_cases_sha256": "babe9c64b90c1ac2a602d1adcc31bff944251a64aa5f56274ca0588d85b37ad5",
+  "cts_image_layer": "sha256:9d923a60465a191401522d790718bbbccc0134e4fb460fda10e2a2b0f9f721df",
+  "cts_per_case_matches": true,
+  "cts_per_arm": {
+    "Pass": 1690,
+    "NotSupported": 128
+  },
+  "base": {
+    "commit": "bc9c9269f6350c2ae927853ea02a89a16ae332a1",
+    "driver_sha256": "c13dc804f0b456ae417ef8a432167c6960e9e60fb506151f59f2294efab165f7"
+  },
+  "candidate": {
+    "commit": "4953f3324d9badf21d4b27ac88b7de260920d214",
+    "driver_sha256": "5000b3146d2aee85eb075bbac5157029aecbbd6d6f9337bb5a60f26c4cfc57b1"
+  },
+  "replay_binary_sha256": "d3fa9ebf88411513b0bb630aa15e6e26f61a7ab8f107d76ddf218658d148a952",
+  "counter_sha256": "10b4337a8c88e480c699d0a343874a7cb2d223e01f98de67a910fe4205848562",
+  "host_tests": {
+    "asahi_suite": 207,
+    "targeted_including_nir": 11,
+    "failures": 0
+  },
+  "final_test_window": {
+    "from": "2026-11-25T19:46:34+01:00",
+    "through": "2026-11-25T19:51:16+01:00",
+    "gpu_errors": [],
+    "active_lsm": "capability,landlock,yama,apparmor",
+    "avc_denials": 0,
+    "failed_system_units_at_end": []
+  },
+  "preliminary_run_note": "An earlier CTS process on the preceding base stopped in hk_CreateImage at the same instant the build pipeline rewrote its mapped driver library. That run was discarded. Replacing the driver atomically and completing the build before CTS gave two matching reruns on that base, then a complete matched run on the final revisions.",
+  "subsequent_upstream": {
+    "revision": "88d3774014d6126fccd1eee1b489e1f7fefe74d0",
+    "clean_merge_tree": "6833d00a38f87a2f89f0e077902362751ca024d8",
+    "patch_applies": true,
+    "hardware_tested_revision": "bc9c9269f6350c2ae927853ea02a89a16ae332a1"
+  }
+}

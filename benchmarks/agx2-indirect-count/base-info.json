@@ -1,0 +1,1 @@
+{"schema":"gpubench-info/1","api":"vulkan","device_name":"Apple M1 Max (G13C C0)","driver_name":"Borealis","driver_info":"Mesa 26.3.0-devel (git-bc9c9269f6), Borealis, derived from Honeykrisp","api_version":"1.4.363","driver_version":"0x6802063","vendor_id":"0x10005","device_id":"0x6001","timestamp_period_ns":1,"queue_count":1,"device_local_heap_bytes":53687091200}

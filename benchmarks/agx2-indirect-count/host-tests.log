@@ -1,0 +1,29 @@
+ninja: Entering directory `/workspace/aurora/build/mdi-submission/obj'
+[1/18] Compiling C object src/asahi/vulkan/hk_pack_test.p/hk_pack.c.o
+[2/18] Compiling C object src/asahi/vulkan/hk_pack_test.p/tests_test-hk-pack.c.o
+[3/18] Compiling C object src/asahi/vulkan/hk_pack_test.p/hk_sync.c.o
+[4/18] Compiling C object src/asahi/vulkan/hk_pack_test.p/meson-generated_.._.._lib_libagx_shaders.c.o
+[5/18] Compiling C object src/asahi/vulkan/hk_indirect_vdm_test.p/meson-generated_.._.._lib_libagx_shaders.c.o
+[6/18] Generating src/git_sha1.h with a custom command
+[7/12] Linking target src/asahi/vulkan/hk_vdm_indirect_count_test
+[8/12] Linking target src/asahi/vulkan/hk_pack_test
+[9/12] Linking target src/asahi/vulkan/hk_indirect_vdm_test
+[10/12] Linking target src/asahi/compiler/agx3_pso_compile_fastpath_test
+[11/12] Compiling C object src/asahi/compiler/agx3_compile_fail_closed_test.p/test_test-agx3-compile-fail-closed.c.o
+[12/12] Linking target src/asahi/compiler/agx3_compile_fail_closed_test
+ 1/11 asahi - mesa:agx3_pso_compile_fastpath   OK               0.01s
+ 2/11 asahi - mesa:asahi-vdm-decode-core       OK               0.01s
+ 3/11 asahi - mesa:asahi-vdm-index-list-core   OK               0.01s
+ 4/11 asahi - mesa:agx3_compile_fail_closed    OK               0.04s
+ 5/11 asahi - mesa:asahi-agx3-packing          OK               0.05s
+ 6/11 asahi - mesa:asahi-vdm-state-update-core OK               0.03s
+ 7/11 asahi - mesa:hk_root_size                OK               0.03s
+ 8/11 asahi - mesa:hk_vdm_indirect_count       OK               0.03s
+ 9/11 asahi - mesa:hk_indirect_vdm             OK               0.02s
+10/11 compiler+nir - mesa:nir_tests            OK               1.62s
+11/11 asahi - mesa:hk_pack                     OK               1.59s
+
+Ok:                11
+Fail:              0
+
+Full log written to /workspace/aurora/build/mdi-submission/obj/meson-logs/testlog.txt

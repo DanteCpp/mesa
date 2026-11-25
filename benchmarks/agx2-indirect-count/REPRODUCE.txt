@@ -1,0 +1,72 @@
+Borealis AGX2 indirect-count batching on the M1 Max
+
+Mesa upstream: https://github.com/aurora-silicon/mesa
+Target: bc9c9269f6350c2ae927853ea02a89a16ae332a1 (aurora-wip)
+Proposed: 4953f3324d9badf21d4b27ac88b7de260920d214
+GPUBench: https://github.com/aurora-silicon/gpubench at ae90a40
+The patch applies directly to the target. The only Mesa files it changes are
+src/asahi/vulkan/hk_cmd_draw.c and its indirect-draw hardware test under tests/.
+
+Build the baseline and the patched Mesa with GCC and the same Meson options.
+Use a different output location for each driver. If building a source archive,
+set MESA_GIT_SHA1_OVERRIDE to its corresponding revision during setup and Ninja.
+
+  meson setup obj -Dbuildtype=release -Db_ndebug=true -Dvulkan-drivers=asahi \
+    -Dgallium-drivers= -Dplatforms=wayland,x11 -Dopengl=false -Dglx=disabled \
+    -Degl=disabled -Dgbm=disabled -Dgles1=disabled -Dgles2=disabled \
+    -Dvideo-codecs= -Dvulkan-layers= -Dbuild-tests=true
+  ninja -C obj src/asahi/vulkan/libvulkan_asahi.so \
+    src/asahi/vulkan/g17p-vulkan-indirect-multi
+
+Use a private Vulkan ICD manifest for each shared library. BASE_ICD and
+CANDIDATE_ICD below refer to those two manifests. Set HK_SYSMEM=53687091200
+for both drivers, as in the recorded runs. The system driver is unnecessary.
+
+For each manifest, run the patched test executable against the corresponding
+driver. It compares actual GPU pixels to the reference on each replay.
+
+  VK_DRIVER_FILES="$ICD" "$CANDIDATE_OBJ/src/asahi/vulkan/g17p-vulkan-indirect-multi"
+
+The six recorded hardware runs used three fresh test processes per driver.
+For conformance, use the ARM64 Mesa CI build of Vulkan CTS 1.4.6.2. Its source
+revision from the QPA header is 30a800ba789f14a311923a8d0e94d2c7d3bc41b2.
+The image is registry.freedesktop.org/mesa/mesa/debian/arm64_test-vk with tag
+20260820-deqp--20260805-spirv-llvm--f0340389--aec7a6ce7bb38902c70641526f6611e27141784a.
+From its external/vulkancts/modules/vulkan directory, once per driver, run
+
+  VK_DRIVER_FILES="$ICD" ./deqp-vk --deqp-caselist-file="$EVIDENCE/cts-cases.txt" \
+    --deqp-visibility=hidden --deqp-log-images=disable --deqp-log-shader-sources=disable \
+    --deqp-log-filename="$OUTPUT.qpa"
+
+To reproduce the paired throughput runs, build GPUBench in release mode and
+set BENCH to gpubench-vk. The optional counter records this process's successful
+Asahi DRM submissions. Its source uses Mesa's public UAPI and libdrm headers.
+
+  cc -O2 -fPIC -shared "$EVIDENCE/submit-counter.c" \
+    $(pkg-config --cflags libdrm) -I"$MESA_SRC/include/drm-uapi" \
+    -o "$SCRATCH/submit-counter.so" -ldl
+  python "$EVIDENCE/bench.py" --bench "$BENCH" --base "$BASE_ICD" \
+    --candidate "$CANDIDATE_ICD" --scratch "$SCRATCH" \
+    --counter "$SCRATCH/submit-counter.so" --output "$SCRATCH/benchmarks.jsonl.gz"
+
+Each workload has six paired processes per driver. Pair order alternates and
+the starting workload rotates. Both arms use separate, initially empty caches.
+There is a 300 ms warmup, five 250 ms throughput windows and three timestamped
+windows per process. The output includes every process, its raw timestamps,
+image checksums, and global and per-process submission counts. The default
+desktop session remained active. No display, clock or power setting was changed.
+
+For the separate path checks, the measured release binaries retained local
+symbols. GDB stopped once at hk_vdm_spans_append_one (baseline) or
+hk_vdm_spans_append_range (candidate) for draw 1 on AArch64. Argument x5 is
+the first draw. For the range helper, x6 is the number of consecutive records.
+Each workload then continued through its image check. These short diagnostic
+runs are excluded from the timing results.
+
+For the candidate host tests, run the following from its Mesa source directory.
+
+  meson test -C obj --print-errorlogs -j6 nir_tests hk_vdm_indirect_count \
+    hk_pack hk_indirect_vdm hk_root_size asahi-vdm-decode-core \
+    asahi-vdm-index-list-core asahi-vdm-state-update-core agx3_compile_fail_closed \
+    agx3_pso_compile_fastpath asahi-agx3-packing
+  meson test -C obj --suite asahi --print-errorlogs -j6
