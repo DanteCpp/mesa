@@ -2109,11 +2109,10 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
       load->memory_byte_offset = byte_offset;
    load->memory_is_packed = packed_count != 0;
    /* nir_opt_access proved nothing writes this memory and it is not
-    * volatile, so the read is a function of its address alone. The AGX3
-    * spiller may then repeat it in place of filling the value from a spill
-    * slot. */
+    * volatile, so the read is a function of its address alone. On AGX3 the
+    * spiller may repeat it in place of filling a spill slot; on AGX2 wait
+    * insertion may keep it in flight across a threadgroup barrier. */
    load->memory_can_reorder =
-      agx_isa_is_agx3(b->shader->key->dev.encoding) &&
       nir_intrinsic_can_reorder(instr) && !nir_is_coherent(instr);
    agx_emit_cached_split(b, dest, instr->def.num_components);
 }
@@ -18285,6 +18284,17 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
             if (folded) {
                NIR_PASS(_, nir, nir_opt_cse);
                NIR_PASS(_, nir, nir_opt_dce);
+               if (!key->is_helper) {
+                  const unsigned threads = nir->info.workgroup_size_variable
+                     ? 1024
+                     : nir->info.workgroup_size[0] *
+                          nir->info.workgroup_size[1] *
+                          nir->info.workgroup_size[2];
+                  if (threads)
+                     NIR_PASS(_, nir, agx_nir_opt_licm,
+                              agx_max_registers_for_occupancy(threads), false,
+                              true);
+               }
             }
          }
       }

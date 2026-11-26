@@ -1944,6 +1944,42 @@ agx_optimizer_signext(agx_context *ctx, agx_instr **defs, agx_instr *I)
    }
 }
 
+/*
+ * AGX2 byte-to-float conversions (s8_to_f, u8_to_f) only read the low 8 bits
+ * of their 16-bit source, so a preceding `and x, 0xff` from u2u8 is redundant.
+ */
+static void
+agx_optimizer_convert_byte_mask(agx_context *ctx, agx_instr **defs, agx_instr *I)
+{
+   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2)
+      return;
+   if (I->nr_srcs < 2 || I->src[0].type != AGX_INDEX_IMMEDIATE ||
+       (I->src[0].value != AGX_CONVERT_S8_TO_F &&
+        I->src[0].value != AGX_CONVERT_U8_TO_F))
+      return;
+
+   agx_index src = I->src[1];
+   if (src.type != AGX_INDEX_NORMAL || src.size != AGX_SIZE_16 ||
+       src.abs || src.neg || src.memory)
+      return;
+
+   agx_instr *def = defs[src.value];
+   if (!def || def->op != AGX_OPCODE_BITOP || def->truth_table != 8 ||
+       def->saturate)
+      return;
+
+   for (unsigned i = 0; i < 2; ++i) {
+      agx_index imm = def->src[i];
+      agx_index val = def->src[1 - i];
+      if (imm.type == AGX_INDEX_IMMEDIATE && (imm.value & 0xff) == 0xff &&
+          val.type == AGX_INDEX_NORMAL && val.size == AGX_SIZE_16 &&
+          !val.abs && !val.neg && !val.memory) {
+         agx_replace_src(I, 1, val);
+         return;
+      }
+   }
+}
+
 
 void
 agx_optimizer_forward(agx_context *ctx)
@@ -2016,6 +2052,8 @@ agx_optimizer_forward(agx_context *ctx)
          agx_optimizer_bitop(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD) {
          agx_optimizer_signext(ctx, defs, I);
+      } else if (I->op == AGX_OPCODE_CONVERT) {
+         agx_optimizer_convert_byte_mask(ctx, defs, I);
       }
    }
 

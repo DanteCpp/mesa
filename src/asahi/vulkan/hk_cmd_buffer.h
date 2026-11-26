@@ -3344,6 +3344,11 @@ void hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
                           struct agx_grid grid,
                           struct agx_workgroup local_size);
 
+void hk_dispatch_with_usc_flush(struct hk_device *dev, struct hk_cs *cs,
+                                struct agx_shader_info *info, uint32_t usc,
+                                struct agx_grid grid,
+                                struct agx_workgroup local_size, bool flush);
+
 void hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                             struct hk_shader *s, struct agx_grid grid,
                             struct agx_workgroup local_size);
@@ -3457,7 +3462,9 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    uint32_t usc = uploaded;
 
    hk_reserve_scratch(cmd, cs, s);
-   hk_dispatch_with_usc(dev, cs, &s->b.info, usc, grid, local_size);
+   const bool flush = s->info.stage != MESA_SHADER_COMPUTE || cmd->in_meta;
+   hk_dispatch_with_usc_flush(dev, cs, &s->b.info, usc, grid, local_size,
+                              flush);
 }
 
 void hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,

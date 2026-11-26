@@ -257,26 +257,90 @@ gather_sum(nir_scalar s, unsigned depth, nir_scalar *terms, unsigned *count,
 }
 
 /* nir_unsigned_upper_bound() with the AGX address multiply-add understood:
- * (src0 * src1) + (src2 << src3), bounded termwise. */
+ * (src0 * src1) + (src2 << src3), bounded termwise across bitwise/shift/add
+ * ops that may wrap imadshl_agx after AGX algebraic lowering. */
 static uint64_t
 term_upper_bound(nir_shader *shader, struct hash_table *ranges, nir_scalar s,
                  unsigned depth)
 {
-   if (depth && nir_scalar_is_alu(s) &&
-       nir_scalar_alu_op(s) == nir_op_imadshl_agx) {
-      const nir_scalar amount = nir_scalar_chase_alu_src(s, 3);
-      if (!nir_scalar_is_const(amount) || nir_scalar_as_uint(amount) > 31)
-         return UINT32_MAX;
-      const uint64_t x =
-         term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 0), depth - 1);
-      const uint64_t y =
-         term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 1), depth - 1);
-      const uint64_t z =
-         term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 2), depth - 1);
-      const unsigned k = nir_scalar_as_uint(amount);
-      if ((x && y > UINT32_MAX / x) || z > (UINT32_MAX >> k))
-         return UINT32_MAX;
-      return MIN2(x * y + (z << k), UINT32_MAX);
+   if (depth && nir_scalar_is_alu(s)) {
+      switch (nir_scalar_alu_op(s)) {
+      case nir_op_imadshl_agx: {
+         const nir_scalar amount = nir_scalar_chase_alu_src(s, 3);
+         if (!nir_scalar_is_const(amount) || nir_scalar_as_uint(amount) > 31)
+            return UINT32_MAX;
+         const uint64_t x =
+            term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 0), depth - 1);
+         const uint64_t y =
+            term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 1), depth - 1);
+         const uint64_t z =
+            term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 2), depth - 1);
+         const unsigned k = nir_scalar_as_uint(amount);
+         if ((x && y > UINT32_MAX / x) || z > (UINT32_MAX >> k))
+            return UINT32_MAX;
+         return MIN2(x * y + (z << k), UINT32_MAX);
+      }
+      case nir_op_ior: {
+         const uint64_t a =
+            term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 0), depth - 1);
+         const uint64_t b =
+            term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 1), depth - 1);
+         const uint64_t u = a | b;
+         if (!u)
+            return 0;
+         const unsigned bits = util_last_bit64(u);
+         return bits >= 32 ? UINT32_MAX : (UINT64_C(1) << bits) - 1;
+      }
+      case nir_op_iand: {
+         const uint64_t a =
+            term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 0), depth - 1);
+         const uint64_t b =
+            term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 1), depth - 1);
+         return MIN2(a, b);
+      }
+      case nir_op_ishl: {
+         const nir_scalar amount = nir_scalar_chase_alu_src(s, 1);
+         if (!nir_scalar_is_const(amount) || nir_scalar_as_uint(amount) > 31)
+            return UINT32_MAX;
+         const unsigned k = nir_scalar_as_uint(amount);
+         const uint64_t a =
+            term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 0), depth - 1);
+         return a > (UINT32_MAX >> k) ? UINT32_MAX : (a << k);
+      }
+      case nir_op_ushr: {
+         const nir_scalar amount = nir_scalar_chase_alu_src(s, 1);
+         if (!nir_scalar_is_const(amount) || nir_scalar_as_uint(amount) > 31)
+            return UINT32_MAX;
+         const unsigned k = nir_scalar_as_uint(amount);
+         const uint64_t a =
+            term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 0), depth - 1);
+         return a >> k;
+      }
+      case nir_op_ubitfield_extract: {
+         const nir_scalar bits = nir_scalar_chase_alu_src(s, 2);
+         if (!nir_scalar_is_const(bits))
+            return UINT32_MAX;
+         const uint64_t width = nir_scalar_as_uint(bits);
+         return width >= 32 ? UINT32_MAX : (UINT64_C(1) << width) - 1;
+      }
+      case nir_op_imul:
+      case nir_op_amul: {
+         const uint64_t a =
+            term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 0), depth - 1);
+         const uint64_t b =
+            term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 1), depth - 1);
+         return (a && b > UINT32_MAX / a) ? UINT32_MAX : (a * b);
+      }
+      case nir_op_iadd: {
+         const uint64_t a =
+            term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 0), depth - 1);
+         const uint64_t b =
+            term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 1), depth - 1);
+         return (a > UINT32_MAX - b) ? UINT32_MAX : (a + b);
+      }
+      default:
+         break;
+      }
    }
    return nir_unsigned_upper_bound(shader, ranges, s);
 }
@@ -303,31 +367,48 @@ fold_g13x_shared_offset(nir_builder *b, nir_intrinsic_instr *intr, void *ranges)
 
    unsigned bits = intr->intrinsic == nir_intrinsic_load_shared
                       ? intr->def.bit_size : nir_src_bit_size(intr->src[0]);
+   const bool widen_16x2 =
+      intr->intrinsic == nir_intrinsic_load_shared && bits == 16 &&
+      intr->def.num_components == 2 && nir_intrinsic_align_mul(intr) >= 4 &&
+      nir_intrinsic_align_offset(intr) == 0;
    nir_src *offset = nir_get_io_offset_src(intr);
-   if (bits != 32 || nir_src_bit_size(*offset) != 16)
+   if ((bits != 32 && !widen_16x2) || nir_src_bit_size(*offset) != 16)
       return false;
 
    nir_scalar sum = nir_scalar_resolved(offset->ssa, 0);
+   bool can_fold = true;
    if (!nir_scalar_is_const(sum)) {
-      if (!nir_scalar_is_alu(sum) || nir_scalar_alu_op(sum) != nir_op_u2u16)
-         return false;
-
-      sum = nir_scalar_chase_alu_src(sum, 0);
-      if (sum.def->bit_size != 32 || !nir_scalar_is_alu(sum) ||
-          nir_scalar_alu_op(sum) != nir_op_iadd)
-         return false;
+      if (!nir_scalar_is_alu(sum) || nir_scalar_alu_op(sum) != nir_op_u2u16) {
+         can_fold = false;
+      } else {
+         sum = nir_scalar_chase_alu_src(sum, 0);
+         if (sum.def->bit_size != 32 || !nir_scalar_is_alu(sum) ||
+             nir_scalar_alu_op(sum) != nir_op_iadd)
+            can_fold = false;
+      }
    }
 
    nir_scalar terms[4];
    unsigned count = 0;
    uint64_t add = 0;
-   if (!gather_sum(sum, 3, terms, &count, &add) || !add ||
-       add % G13X_I32_SHARED_INDEX_UNIT_B)
-      return false;
+   if (!can_fold || !gather_sum(sum, 3, terms, &count, &add) || !add ||
+       add % G13X_I32_SHARED_INDEX_UNIT_B) {
+      if (!widen_16x2)
+         return false;
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *word = nir_load_shared(
+         b, 1, 32, offset->ssa, .base = 0,
+         .align_mul = nir_intrinsic_align_mul(intr), .align_offset = 0,
+         .access = nir_intrinsic_access(intr));
+      nir_def *pair = nir_vec2(b, nir_unpack_32_2x16_split_x(b, word),
+                               nir_unpack_32_2x16_split_y(b, word));
+      nir_def_replace(&intr->def, pair);
+      return true;
+   }
 
    uint64_t bound = add;
    for (unsigned t = 0; t < count; ++t)
-      bound += term_upper_bound(b->shader, ranges, terms[t], 2);
+      bound += term_upper_bound(b->shader, ranges, terms[t], 5);
    if (bound > UINT16_MAX)
       return false;
 
@@ -341,6 +422,17 @@ fold_g13x_shared_offset(nir_builder *b, nir_intrinsic_instr *intr, void *ranges)
       base = nir_u2u16(b, base);
    } else {
       base = nir_imm_intN_t(b, 0, 16);
+   }
+
+   if (widen_16x2) {
+      nir_def *word = nir_load_shared(
+         b, 1, 32, base, .base = add,
+         .align_mul = nir_intrinsic_align_mul(intr), .align_offset = 0,
+         .access = nir_intrinsic_access(intr));
+      nir_def *pair = nir_vec2(b, nir_unpack_32_2x16_split_x(b, word),
+                               nir_unpack_32_2x16_split_y(b, word));
+      nir_def_replace(&intr->def, pair);
+      return true;
    }
 
    nir_src_rewrite(offset, base);

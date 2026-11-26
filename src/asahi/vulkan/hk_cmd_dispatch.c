@@ -770,6 +770,15 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    if (cs->stats.cmds == 0)
       return;
 
+   if (agx_chip_command_stream_generation(dev->dev.chip) ==
+       AGX_CS_GENERATION_AGX2) {
+      if (hk_cdm_visibility_flush_needed(dev, cs, false)) {
+         hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
+         hk_cdm_visibility_flush(dev, cs, false);
+      }
+      return;
+   }
+
    if (!hk_cmd_alias_scope(cmd)) {
       hk_cdm_note_alias_site(cmd, cs);
       return;
@@ -782,11 +791,11 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    hk_cdm_visibility_flush(dev, cs, true);
 }
 
-void
-hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
-                            struct agx_cdm_launch_word_0_packed launch,
-                            uint32_t usc, struct agx_grid grid,
-                            struct agx_workgroup wg)
+static void
+hk_dispatch_with_usc_launch_ex(struct hk_device *dev, struct hk_cs *cs,
+                               struct agx_cdm_launch_word_0_packed launch,
+                               uint32_t usc, struct agx_grid grid,
+                               struct agx_workgroup wg, bool flush)
 {
    switch (agx_chip_command_stream_generation(dev->dev.chip)) {
    case AGX_CS_GENERATION_AGX2:
@@ -819,13 +828,24 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
 
-   hk_cdm_cache_flush(dev, cs);
+   if (flush)
+      hk_cdm_cache_flush(dev, cs);
 }
 
 void
-hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
-                     struct agx_shader_info *info, uint32_t usc,
-                     struct agx_grid grid, struct agx_workgroup local_size)
+hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
+                            struct agx_cdm_launch_word_0_packed launch,
+                            uint32_t usc, struct agx_grid grid,
+                            struct agx_workgroup wg)
+{
+   hk_dispatch_with_usc_launch_ex(dev, cs, launch, usc, grid, wg, true);
+}
+
+void
+hk_dispatch_with_usc_flush(struct hk_device *dev, struct hk_cs *cs,
+                           struct agx_shader_info *info, uint32_t usc,
+                           struct agx_grid grid,
+                           struct agx_workgroup local_size, bool flush)
 {
    struct agx_cdm_launch_word_0_packed launch;
    agx_pack(&launch, CDM_LAUNCH_WORD_0, cfg) {
@@ -836,7 +856,16 @@ hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
       cfg.preshader_register_count = info->nr_preamble_gprs;
    }
 
-   hk_dispatch_with_usc_launch(dev, cs, launch, usc, grid, local_size);
+   hk_dispatch_with_usc_launch_ex(dev, cs, launch, usc, grid, local_size,
+                                  flush);
+}
+
+void
+hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
+                     struct agx_shader_info *info, uint32_t usc,
+                     struct agx_grid grid, struct agx_workgroup local_size)
+{
+   hk_dispatch_with_usc_flush(dev, cs, info, usc, grid, local_size, true);
 }
 
 static bool

@@ -1420,8 +1420,24 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
          hk_sync_pass_barrier(cmd, src, dst);
          return;
       }
-      hk_cmd_buffer_end_compute(cmd);
-      hk_cmd_buffer_end_graphics(cmd);
+      /* Keep an open AGX2 compute stream across non-host, non-render barriers:
+       * every AGX2 launch already ends with an in-stream CDM barrier, and any
+       * later render that waits on this compute stream closes it in
+       * hk_sync_first_render_stream(). Avoids splitting compute-heavy command
+       * buffers into hundreds of tiny hk_cs chunks and CDM_STREAM_LINK chains. */
+      struct hk_cs *open_cs = cmd->current_cs.cs;
+      const bool keep_open_cs =
+         open_cs && !cmd->sync.in_pass && !cmd->current_cs.gfx &&
+         !open_cs->timestamp.end.handle && !open_cs->imm_writes.size &&
+         !hk_sync_dependency_has_host_access(pDependencyInfo) &&
+         pDependencyInfo->imageMemoryBarrierCount == 0;
+      if (!keep_open_cs) {
+         hk_cmd_buffer_end_compute(cmd);
+         hk_cmd_buffer_end_graphics(cmd);
+      } else if (hk_cdm_visibility_flush_needed(dev, open_cs, false)) {
+         hk_ensure_cs_has_space(cmd, open_cs, AGX_CDM_BARRIER_LENGTH);
+         hk_cdm_visibility_flush(dev, open_cs, false);
+      }
       /* Preserve the same conservative ordering in the shared submit graph,
        * including kernels that advertise exact prior barriers on AGX2. */
       uint8_t init_dst;
