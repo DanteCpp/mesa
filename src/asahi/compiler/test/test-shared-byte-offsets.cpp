@@ -547,3 +547,82 @@ TEST(SharedByteOffsets, ValueEquivalence16BitElementsAndStoreShared)
       ralloc_free(b.shader);
    }
 }
+
+/* Aligned 2x16-bit shared loads widen to one 32-bit shared load plus unpack,
+ * both with and without a foldable G13X 16-byte displacement; unaligned 2x16
+ * loads stay untouched. */
+TEST(SharedByteOffsets, G13xWiden16x2Load)
+{
+   const struct {
+      unsigned add;
+      unsigned align_mul;
+      bool expect_progress;
+      unsigned expect_base;
+   } cases[] = {
+      {32, 4, true, 32},
+      {4, 4, true, 0},
+      {32, 2, false, 0},
+   };
+
+   for (const auto &c : cases) {
+      SCOPED_TRACE(::testing::Message()
+                   << "add=" << c.add << " align=" << c.align_mul);
+      nir_builder b = workgroup_shader("G13X widen 16x2");
+      nir_def *v = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                          .range = 4);
+      nir_def *variable = nir_iand_imm(&b, v, 255);
+      nir_def *offset = nir_u2u16(&b, nir_iadd_imm(&b, variable, c.add));
+      nir_def *pair = nir_load_shared(&b, 2, 16, offset,
+                                      .align_mul = c.align_mul);
+      nir_store_global(&b, pair, nir_imm_int64(&b, 0), .align_mul = 4);
+
+      EXPECT_EQ(agx_nir_opt_g13x_shared_offsets(b.shader), c.expect_progress);
+      nir_opt_dce(b.shader);
+
+      unsigned load32 = 0, load16 = 0;
+      nir_foreach_function_impl(impl, b.shader) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_load_shared)
+                  continue;
+               if (intr->def.bit_size == 32) {
+                  load32++;
+                  EXPECT_EQ(nir_intrinsic_base(intr), c.expect_base);
+               } else if (intr->def.bit_size == 16) {
+                  load16++;
+               }
+            }
+         }
+      }
+      EXPECT_EQ(load32, c.expect_progress ? 1u : 0u);
+      EXPECT_EQ(load16, c.expect_progress ? 0u : 1u);
+      nir_validate_shader(b.shader, "G13X widen 16x2 result");
+      ralloc_free(b.shader);
+   }
+}
+
+/* Deep bitwise/shift bounds around imadshl_agx still prove no u16 wrap so
+ * G13X folds constant 16-byte displacements. */
+TEST(SharedByteOffsets, G13xDeepBitwiseTermBound)
+{
+   nir_builder b = workgroup_shader("G13X deep bitwise bound");
+   nir_def *v = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                       .range = 4);
+   nir_def *lo = nir_ubitfield_extract_imm(&b, v, 0, 6);
+   nir_def *hi = nir_ishl_imm(&b, nir_ushr_imm(&b, nir_iand_imm(&b, v, 0x3ff), 6), 6);
+   nir_def *comb = nir_ior(&b, hi, lo);
+   nir_def *scaled =
+      nir_imadshl_agx(&b, comb, nir_imm_int(&b, 4), lo, nir_imm_int(&b, 2));
+   nir_def *offset = nir_u2u16(&b, nir_iadd_imm(&b, scaled, 64));
+   nir_intrinsic_instr *load =
+      nir_def_as_intrinsic(nir_load_shared(&b, 1, 32, offset, .align_mul = 4));
+   nir_store_global(&b, &load->def, nir_imm_int64(&b, 0), .align_mul = 4);
+
+   EXPECT_TRUE(agx_nir_opt_g13x_shared_offsets(b.shader));
+   EXPECT_EQ(nir_intrinsic_base(load), 64);
+   nir_validate_shader(b.shader, "G13X deep bitwise bound result");
+   ralloc_free(b.shader);
+}

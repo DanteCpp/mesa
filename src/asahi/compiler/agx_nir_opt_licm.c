@@ -356,6 +356,7 @@ agx2_integer_invariant(nir_instr *instr, nir_block *block, nir_loop *loop)
       return false;
 
    switch (nir_instr_as_alu(instr)->op) {
+   case nir_op_mov:
    case nir_op_iadd:
    case nir_op_isub:
    case nir_op_imul:
