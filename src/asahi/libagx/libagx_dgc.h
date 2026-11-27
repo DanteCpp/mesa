@@ -717,8 +717,13 @@ agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip,
    return out;
 }
 
+/* compute_only: leave unk_11 clear. Measured on G13X (M1 Max) with dependent
+ * compute launches over storage buffers, indirect arguments and storage /
+ * sampled images: results stay exact without it, and a small dependent launch
+ * gets 1-2.5 us cheaper. Every other bit is still set; unk_2 in particular is
+ * required (dropping it corrupted an LLM workload). */
 static inline GLOBAL uint32_t *
-agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
+agx_cdm_barrier_ex(GLOBAL uint32_t *out, enum agx_chip chip, bool compute_only)
 {
    agx_push(out, CDM_BARRIER, cfg) {
       cfg.unk_5 = true;
@@ -750,7 +755,7 @@ agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
       cfg.unk_8 = true;
       cfg.unk_9 = true;
       cfg.unk_10 = true;
-      cfg.unk_11 = true;
+      cfg.unk_11 = !compute_only;
       cfg.unk_12 = true;
       cfg.unk_13 = true;
       cfg.unk_14 = true;
@@ -762,6 +767,12 @@ agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
    }
 
    return out;
+}
+
+static inline GLOBAL uint32_t *
+agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
+{
+   return agx_cdm_barrier_ex(out, chip, false);
 }
 
 static inline GLOBAL uint32_t *

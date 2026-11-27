@@ -702,6 +702,23 @@ hk_cdm_visibility_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
    hk_cdm_flush(dev, cs, memory);
 }
 
+/* AGX2: the CDM barrier for a compute-to-compute memory dependency inside one
+ * open stream (agx_cdm_barrier_ex()). It leaves strong_flush_end alone, so
+ * anything that needs the full flush later (end of stream, host access,
+ * graphics) still emits one. */
+void
+hk_cdm_compute_dependency_flush(struct hk_device *dev, struct hk_cs *cs)
+{
+   assert(cs->type == HK_CS_CDM);
+   assert(agx_chip_command_stream_generation(dev->dev.chip) ==
+          AGX_CS_GENERATION_AGX2);
+   assert(cs->current + AGX_CDM_BARRIER_LENGTH < cs->end &&
+          "caller must ensure space");
+
+   cs->current = agx_cdm_barrier_ex(cs->current, dev->dev.chip, true);
+   cs->stats.flushes++;
+}
+
 bool
 hk_cmd_alias_scope(struct hk_cmd_buffer *cmd)
 {

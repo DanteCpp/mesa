@@ -446,6 +446,9 @@ enum hk_perftest {
     * upgrading it to a strong cache flush, when memory is unaliased and no
     * host or pending graphics transfer dependency is involved. */
    HK_PERF_WEAKBARRIER = BITFIELD_BIT(5),
+   /* G13X: keep the full CDM barrier at compute-only pipeline barriers
+    * (hk_cdm_compute_dependency_flush() otherwise). */
+   HK_PERF_FULLBARRIER = BITFIELD_BIT(6),
 };
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)

@@ -78,6 +78,13 @@ enum agx_chip_cap {
     * has finished, without the strong cache flush. Measured on G17P and M5
     * (G17G, G17S, G17C); G15 and G16G keep the flush until measured there. */
    AGX_CAP_CDM_WAR_WEAK_BARRIER = 1u << 11,
+
+   /* A compute-to-compute dependency kept inside an open AGX2 CDM stream may
+    * use the lighter CDM barrier (unk_11 clear) when only compute, indirect,
+    * and buffer-transfer stages on storage or sampled data are ordered.
+    * Measured on G13X (M1 Max); other AGX2 chips keep the full barrier until
+    * measured there. */
+   AGX_CAP_CDM_LIGHT_COMPUTE_BARRIER = 1u << 12,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -112,7 +119,7 @@ enum agx_chip_cap {
  */
 #define AGX_CHIP_CAPS(X, ...)                                                  \
    X(G13G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
-   X(G13X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
+   X(G13X, AGX_CAPS_AGX2 | AGX_CAP_CDM_LIGHT_COMPUTE_BARRIER, __VA_ARGS__)     \
    X(G14G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G14X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G15P, 0, __VA_ARGS__)                                                     \

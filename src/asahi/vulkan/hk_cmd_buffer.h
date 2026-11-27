@@ -3344,6 +3344,8 @@ void hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
                           struct agx_grid grid,
                           struct agx_workgroup local_size);
 
+void hk_cdm_compute_dependency_flush(struct hk_device *dev, struct hk_cs *cs);
+
 void hk_dispatch_with_usc_flush(struct hk_device *dev, struct hk_cs *cs,
                                 struct agx_shader_info *info, uint32_t usc,
                                 struct agx_grid grid,

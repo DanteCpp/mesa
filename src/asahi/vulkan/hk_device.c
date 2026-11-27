@@ -97,6 +97,7 @@ static const struct debug_named_value hk_perf_options[] = {
    {"nobatch",   HK_PERF_NOBATCH,  "Disable submission batching"},
    {"norobust",  HK_PERF_NOROBUST, "Disable robustness"},
    {"weakbarrier", HK_PERF_WEAKBARRIER, "Keep ordering-only barriers between compute dispatches"},
+   {"fullbarrier", HK_PERF_FULLBARRIER, "G13X: full CDM barrier at compute-only pipeline barriers"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
